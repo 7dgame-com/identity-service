@@ -38,6 +38,9 @@ hkccr.ccs.tencentyun.com/services/identity-service:<branch>
 hkccr.ccs.tencentyun.com/services/identity-service:latest  # publish only
 ```
 
+Docker publishing uses the existing 7dgame organization registry secrets:
+`TENCENT_REGISTRY_USER` or `TENCENT_REGISTRY_USERNAME`, and `TENCENT_REGISTRY_PASSWORD`.
+
 ## Phase 3 Safety Rules
 
 - Keep `IDENTITY_READONLY_MODE=true`.
