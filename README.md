@@ -60,3 +60,45 @@ identity-service as the stable contract and must not bind directly to Keycloak.
 - Do not point production frontend or backend traffic to this service yet.
 - Keycloak is deployed only as an empty realm placeholder in this phase.
 - Legacy auth remains the source of truth until a later spec explicitly switches traffic.
+
+## Phase 3.5 Login Audit
+
+Login audit is optional and disabled by default. It records successful login
+source events and per-user login stats in the identity database only. It does
+not write the legacy business database, does not bill users, does not deduct
+quota, and does not block login or content access.
+
+Required runtime settings when enabling it:
+
+```bash
+IDENTITY_LOGIN_AUDIT_ENABLED=true
+IDENTITY_INTERNAL_API_TOKEN=<internal-service-token>
+IDENTITY_DB_HOST=identity-mysql
+IDENTITY_DB_NAME=xrugc_identity
+IDENTITY_DB_USER=identity
+IDENTITY_DB_PASSWORD=<identity-db-password>
+```
+
+Internal endpoints:
+
+- `POST /internal/login-events`
+- `GET /internal/login-audit/users/:legacyUserId`
+
+These endpoints are intended for internal service-to-service calls only and
+must not be exposed by the public Traefik/Nginx route.
+
+## OpenTelemetry
+
+Telemetry is disabled by default and does not change local or development
+runtime behavior. To export phase-3 request spans, configure an OTLP HTTP
+collector endpoint:
+
+```bash
+OTEL_SERVICE_NAME=identity-adapter
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+```
+
+`OTEL_EXPORTER_OTLP_ENDPOINT` is normalized to `/v1/traces`; use
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` when a provider requires an explicit trace
+endpoint. Optional headers can be supplied with
+`OTEL_EXPORTER_OTLP_HEADERS` or `OTEL_EXPORTER_OTLP_TRACES_HEADERS`.
