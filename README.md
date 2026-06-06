@@ -34,8 +34,8 @@ This repository follows the main frontend branch model:
 GitHub Actions runs `npm ci`, `npm audit`, `npm test`, `npm run build`, and Docker Compose config validation on `main`, `develop`, and `publish`. Pushes to those branches also build and push the Docker image:
 
 ```text
-hkccr.ccs.tencentyun.com/services/identity-service:<branch>
-hkccr.ccs.tencentyun.com/services/identity-service:latest  # publish only
+hkccr.ccs.tencentyun.com/gdgeek/identity-service:<branch>
+hkccr.ccs.tencentyun.com/gdgeek/identity-service:latest  # publish only
 ```
 
 Docker publishing uses the existing 7dgame organization registry secrets:
