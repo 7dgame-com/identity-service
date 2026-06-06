@@ -41,6 +41,18 @@ hkccr.ccs.tencentyun.com/gdgeek/identity-service:latest  # publish only
 Docker publishing uses the existing 7dgame organization registry secrets:
 `TENCENT_REGISTRY_USER` or `TENCENT_REGISTRY_USERNAME`, and `TENCENT_REGISTRY_PASSWORD`.
 
+## IAM Engine Boundary
+
+Keycloak is the default IAM engine behind identity-service. Product code must treat
+identity-service as the stable contract and must not bind directly to Keycloak.
+
+- Frontends, backends, plugins and future content services use identity-service APIs, SDKs, OpenAPI, JWKS or published OIDC client configuration.
+- Business systems must not call the Keycloak Admin API directly.
+- Business systems must not modify Keycloak database tables or schema.
+- MRPP users, organizations, roles, invitations and plugin permissions belong to the identity-adapter domain model.
+- Keycloak owns protocol-level identity concerns: OIDC/OAuth2, clients, sessions, JWKS, MFA and the minimal user mapping needed for those flows.
+- If another IAM engine is selected later, replace the identity-service IAM provider adapter instead of changing every consumer.
+
 ## Phase 3 Safety Rules
 
 - Keep `IDENTITY_READONLY_MODE=true`.
