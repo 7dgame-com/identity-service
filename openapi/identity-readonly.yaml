@@ -1,0 +1,53 @@
+openapi: 3.0.3
+info:
+  title: XR UGC Identity Readonly API
+  version: 0.1.0
+  description: Phase 3 readonly identity-adapter API. It does not issue tokens or write legacy data.
+paths:
+  /health:
+    get:
+      summary: Health check
+      responses:
+        "200":
+          description: Service health
+  /jwks.json:
+    get:
+      summary: JWKS placeholder
+      responses:
+        "200":
+          description: JSON Web Key Set
+  /userinfo:
+    get:
+      summary: Future userinfo endpoint
+      responses:
+        "401":
+          description: Bearer token required
+        "501":
+          description: Token introspection is not active in phase 3
+  /admin/users/{id}:
+    get:
+      summary: Read legacy user by id
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Legacy user read model
+        "404":
+          description: User not found
+  /admin/roles:
+    get:
+      summary: Read legacy Yii RBAC roles
+      responses:
+        "200":
+          description: Role collection
+  /admin/organizations:
+    get:
+      summary: Read legacy organizations
+      responses:
+        "200":
+          description: Organization collection
+

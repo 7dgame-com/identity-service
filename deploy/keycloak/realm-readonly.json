@@ -1,0 +1,45 @@
+{
+  "realm": "xrugc",
+  "enabled": true,
+  "displayName": "XR UGC",
+  "clients": [
+    {
+      "clientId": "xrugc-web",
+      "enabled": true,
+      "publicClient": true,
+      "protocol": "openid-connect",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": ["http://localhost:3001/*", "https://dev.xrugc.com/*"],
+      "webOrigins": ["+"]
+    },
+    {
+      "clientId": "identity-adapter",
+      "enabled": true,
+      "publicClient": false,
+      "protocol": "openid-connect",
+      "serviceAccountsEnabled": true
+    }
+  ],
+  "roles": {
+    "realm": [
+      {
+        "name": "root",
+        "description": "Legacy root role placeholder. Not active for traffic in phase 3."
+      },
+      {
+        "name": "admin",
+        "description": "Legacy admin role placeholder. Not active for traffic in phase 3."
+      },
+      {
+        "name": "manager",
+        "description": "Legacy manager role placeholder. Not active for traffic in phase 3."
+      },
+      {
+        "name": "user",
+        "description": "Legacy user role placeholder. Not active for traffic in phase 3."
+      }
+    ]
+  }
+}
+

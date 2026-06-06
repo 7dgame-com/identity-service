@@ -1,0 +1,84 @@
+services:
+  identity-mysql:
+    image: mysql:8.4
+    command: --sql-mode="NO_ENGINE_SUBSTITUTION"
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpassword}
+      MYSQL_DATABASE: ${IDENTITY_DB_NAME:-xrugc_identity}
+      MYSQL_USER: ${IDENTITY_DB_USER:-identity}
+      MYSQL_PASSWORD: ${IDENTITY_DB_PASSWORD:-identity_password}
+    ports:
+      - "3317:3306"
+    volumes:
+      - identity_mysql_data:/var/lib/mysql
+      - ./deploy/mysql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-rootpassword}"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+
+  identity-redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6387:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:25.0
+    restart: unless-stopped
+    profiles: ["identity"]
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_DB: mysql
+      KC_DB_URL: jdbc:mysql://identity-mysql:3306/${KEYCLOAK_DB_NAME:-xrugc_keycloak}
+      KC_DB_USERNAME: ${KEYCLOAK_DB_USER:-keycloak}
+      KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:-keycloak_password}
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+    ports:
+      - "8087:8080"
+    volumes:
+      - ./deploy/keycloak/realm-readonly.json:/opt/keycloak/data/import/realm-readonly.json:ro
+    depends_on:
+      identity-mysql:
+        condition: service_healthy
+
+  identity-adapter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    profiles: ["identity"]
+    environment:
+      PORT: 8086
+      IDENTITY_READONLY_MODE: "true"
+      LEGACY_DB_HOST: ${LEGACY_DB_HOST:-host.docker.internal}
+      LEGACY_DB_PORT: ${LEGACY_DB_PORT:-3306}
+      LEGACY_DB_NAME: ${LEGACY_DB_NAME:-bujiaban}
+      LEGACY_DB_USER: ${LEGACY_DB_USER:-bujiaban}
+      LEGACY_DB_PASSWORD: ${LEGACY_DB_PASSWORD:-testpassword}
+      KEYCLOAK_BASE_URL: http://keycloak:8080
+      REDIS_URL: redis://identity-redis:6379/1
+      JWKS_PUBLIC_KEYS_JSON: '${JWKS_PUBLIC_KEYS_JSON:-{"keys":[]}}'
+    ports:
+      - "8086:8086"
+    depends_on:
+      identity-redis:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8086/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+volumes:
+  identity_mysql_data:
