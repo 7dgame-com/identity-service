@@ -33,6 +33,15 @@ export interface LegacyUserReadModel {
   source: "legacy";
 }
 
+export interface LegacyUserCredential {
+  id: number;
+  username: string | null;
+  email: string | null;
+  status: number;
+  nickname: string | null;
+  passwordHash: string | null;
+}
+
 @Injectable()
 export class LegacyIdentityReader implements OnModuleDestroy {
   private readonly config = loadConfig();
@@ -104,6 +113,34 @@ export class LegacyIdentityReader implements OnModuleDestroy {
       roles,
       organizations,
       source: "legacy"
+    };
+  }
+
+  async getUserCredentialByUsername(username: string): Promise<LegacyUserCredential | null> {
+    if (!this.pool) {
+      return null;
+    }
+
+    const users = await this.query<RowDataPacket[]>(
+      `SELECT id, username, email, status, nickname, password_hash AS passwordHash
+         FROM user
+        WHERE username = ?
+        LIMIT 1`,
+      [username]
+    );
+
+    if (users.length === 0) {
+      return null;
+    }
+
+    const user = users[0];
+    return {
+      id: Number(user.id),
+      username: user.username ?? null,
+      email: user.email ?? null,
+      status: Number(user.status),
+      nickname: user.nickname ?? null,
+      passwordHash: user.passwordHash ?? null
     };
   }
 

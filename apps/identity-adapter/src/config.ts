@@ -58,6 +58,20 @@ export const configSchema = z.object({
     internalToken: optionalStringFromEnv,
     hashSalt: z.string().default("xrugc-login-audit-v1")
   }),
+  tokenIssuance: z.object({
+    enabled: boolFromEnv.default(false),
+    accessTokenTtlSeconds: numberFromEnv.default(10800),
+    refreshTokenTtlSeconds: numberFromEnv.default(604800)
+  }),
+  jwt: z.object({
+    privateKeyPem: optionalStringFromEnv,
+    privateKeyFile: optionalStringFromEnv,
+    publicKeyPem: optionalStringFromEnv,
+    publicKeyFile: optionalStringFromEnv,
+    keyId: z.string().default("identity-stage4"),
+    issuer: z.string().default("identity-service"),
+    audience: optionalStringFromEnv
+  }),
   keycloak: z.object({
     baseUrl: z.string().optional()
   }),
@@ -94,6 +108,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
       enabled: env.IDENTITY_LOGIN_AUDIT_ENABLED,
       internalToken: env.IDENTITY_INTERNAL_API_TOKEN,
       hashSalt: env.IDENTITY_LOGIN_AUDIT_HASH_SALT
+    },
+    tokenIssuance: {
+      enabled: env.IDENTITY_TOKEN_ISSUANCE_ENABLED,
+      accessTokenTtlSeconds: env.IDENTITY_ACCESS_TOKEN_TTL_SECONDS,
+      refreshTokenTtlSeconds: env.IDENTITY_REFRESH_TOKEN_TTL_SECONDS
+    },
+    jwt: {
+      privateKeyPem: env.IDENTITY_JWT_PRIVATE_KEY_PEM,
+      privateKeyFile: env.IDENTITY_JWT_PRIVATE_KEY_FILE,
+      publicKeyPem: env.IDENTITY_JWT_PUBLIC_KEY_PEM,
+      publicKeyFile: env.IDENTITY_JWT_PUBLIC_KEY_FILE,
+      keyId: env.IDENTITY_JWT_KEY_ID,
+      issuer: env.IDENTITY_JWT_ISSUER,
+      audience: env.IDENTITY_JWT_AUDIENCE
     },
     keycloak: {
       baseUrl: env.KEYCLOAK_BASE_URL

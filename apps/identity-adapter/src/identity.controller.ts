@@ -1,15 +1,24 @@
 import { Controller, Get, Headers, HttpException, HttpStatus, Inject, Param } from "@nestjs/common";
 import { loadConfig } from "./config.js";
+import { JwtIssuerService } from "./jwt-issuer.service.js";
 import { LegacyIdentityReader } from "./legacy-identity.reader.js";
 
 @Controller()
 export class IdentityController {
   private readonly config = loadConfig();
 
-  constructor(@Inject(LegacyIdentityReader) private readonly legacyReader: LegacyIdentityReader) {}
+  constructor(
+    @Inject(LegacyIdentityReader) private readonly legacyReader: LegacyIdentityReader,
+    @Inject(JwtIssuerService) private readonly jwtIssuer: JwtIssuerService
+  ) {}
 
   @Get("jwks.json")
   jwks() {
+    const generated = this.jwtIssuer.jwks();
+    if (generated.keys.length > 0) {
+      return generated;
+    }
+
     try {
       const parsed = JSON.parse(this.config.jwksPublicKeysJson);
       if (Array.isArray(parsed.keys)) {

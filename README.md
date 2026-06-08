@@ -1,6 +1,6 @@
 # XR UGC Identity Service
 
-This repository is the independent identity-service used by the XR UGC platform migration. Phase 3 runs it in readonly mode only: it can read legacy users, roles and organizations for comparison, but it does not issue tokens or write the legacy platform database.
+This repository is the independent identity-service used by the XR UGC platform migration. It starts in readonly mode and can read legacy users, roles and organizations for comparison. Phase 4 adds optional token issuance, but it remains disabled by default and must be explicitly enabled for gray rollout.
 
 ## Local Start
 
@@ -86,6 +86,42 @@ Internal endpoints:
 
 These endpoints are intended for internal service-to-service calls only and
 must not be exposed by the public Traefik/Nginx route.
+
+## Phase 4 Token Issuance
+
+Token issuance is optional and disabled by default. When enabled, identity-adapter
+can authenticate legacy username/password, issue ES256 access tokens, rotate
+refresh tokens in the identity database, and revoke sessions on logout.
+
+Required runtime settings when enabling it:
+
+```bash
+IDENTITY_TOKEN_ISSUANCE_ENABLED=true
+IDENTITY_JWT_PRIVATE_KEY_FILE=/run/secrets/identity-jwt-key.pem
+IDENTITY_JWT_KEY_ID=identity-stage4
+IDENTITY_JWT_ISSUER=identity-service
+IDENTITY_JWT_AUDIENCE=xrugc-api
+IDENTITY_DB_HOST=identity-mysql
+IDENTITY_DB_NAME=xrugc_identity
+IDENTITY_DB_USER=identity
+IDENTITY_DB_PASSWORD=<identity-db-password>
+```
+
+Public gray endpoints:
+
+- `POST /v1/auth/login`
+- `POST /v1/auth/refresh`
+- `POST /v1/auth/logout`
+- `GET /jwks.json`
+
+Safety rules:
+
+- Keep `IDENTITY_TOKEN_ISSUANCE_ENABLED=false` unless the backend and frontend
+  gray switches are ready.
+- Main backend must default to `AUTH_PROVIDER=legacy`.
+- Main frontend must default to `VITE_AUTH_PROVIDER=legacy`.
+- `/api-auth` must not be captured by a broader `/api` reverse proxy route.
+- Phase 4 does not migrate registration, password reset, email, invitations, or billing.
 
 ## OpenTelemetry
 

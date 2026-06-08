@@ -22,6 +22,10 @@ export class HealthController {
         dependencies: {
           legacyDatabase,
           keycloak: this.config.keycloak.baseUrl ? "configured" : "not_configured"
+        },
+        capabilities: {
+          tokenIssuance: this.config.tokenIssuance.enabled ? "enabled" : "disabled",
+          loginAudit: this.config.loginAudit.enabled ? "enabled" : "disabled"
         }
       };
     } finally {
