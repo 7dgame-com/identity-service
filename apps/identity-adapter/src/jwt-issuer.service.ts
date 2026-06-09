@@ -1,4 +1,4 @@
-import { createPrivateKey, createPublicKey, randomBytes, sign } from "node:crypto";
+import { createPrivateKey, createPublicKey, randomBytes, sign, verify } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { Injectable, ServiceUnavailableException } from "@nestjs/common";
 import { loadConfig } from "./config.js";
@@ -8,6 +8,13 @@ export interface IssuedAccessToken {
   accessToken: string;
   expiresAt: Date;
   jwtId: string;
+}
+
+export interface VerifiedAccessToken {
+  uid: number;
+  username: string | null;
+  sessionId: string | null;
+  roles: string[];
 }
 
 @Injectable()
@@ -76,6 +83,52 @@ export class JwtIssuerService {
     }
   }
 
+  verifyAccessToken(token: string): VerifiedAccessToken {
+    const [encodedHeader, encodedPayload, encodedSignature] = token.split(".");
+    if (!encodedHeader || !encodedPayload || !encodedSignature) {
+      throw new Error("invalid token format");
+    }
+
+    const header = parseJwtPart(encodedHeader);
+    if (header.alg !== "ES256") {
+      throw new Error("unsupported token algorithm");
+    }
+
+    const signingInput = `${encodedHeader}.${encodedPayload}`;
+    const signature = Buffer.from(encodedSignature, "base64url");
+    const valid = verify("sha256", Buffer.from(signingInput), { key: this.publicKey(), dsaEncoding: "ieee-p1363" }, signature);
+    if (!valid) {
+      throw new Error("invalid token signature");
+    }
+
+    const payload = parseJwtPart(encodedPayload);
+    const now = seconds(new Date());
+    if (typeof payload.exp === "number" && payload.exp <= now) {
+      throw new Error("token expired");
+    }
+    if (typeof payload.nbf === "number" && payload.nbf > now) {
+      throw new Error("token not active");
+    }
+    if (payload.iss !== this.config.jwt.issuer) {
+      throw new Error("invalid token issuer");
+    }
+    if (this.config.jwt.audience && payload.aud !== this.config.jwt.audience) {
+      throw new Error("invalid token audience");
+    }
+
+    const uid = Number(payload.uid ?? payload.sub);
+    if (!Number.isInteger(uid) || uid <= 0) {
+      throw new Error("invalid token subject");
+    }
+
+    return {
+      uid,
+      username: typeof payload.username === "string" ? payload.username : null,
+      sessionId: typeof payload.session_id === "string" ? payload.session_id : null,
+      roles: Array.isArray(payload.roles) ? payload.roles.filter((role): role is string => typeof role === "string") : []
+    };
+  }
+
   private privateKey() {
     const pem = this.config.jwt.privateKeyPem ?? readOptionalFile(this.config.jwt.privateKeyFile);
     if (!pem) {
@@ -100,6 +153,15 @@ export class JwtIssuerService {
 
 function base64urlJson(value: unknown): string {
   return Buffer.from(JSON.stringify(value)).toString("base64url");
+}
+
+function parseJwtPart(value: string): Record<string, unknown> {
+  const parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("invalid token payload");
+  }
+
+  return parsed as Record<string, unknown>;
 }
 
 function seconds(value: Date): number {

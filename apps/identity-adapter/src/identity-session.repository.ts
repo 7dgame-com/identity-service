@@ -126,6 +126,19 @@ export class IdentitySessionRepository implements OnModuleDestroy {
     return true;
   }
 
+  async revokeUserSessions(legacyUserId: number): Promise<number> {
+    const pool = this.requirePool();
+    await this.ensureSchema();
+    const [result] = await pool.execute<ResultSetHeader>(
+      `UPDATE identity_refresh_sessions
+          SET revoked_at = COALESCE(revoked_at, ?)
+        WHERE legacy_user_id = ? AND revoked_at IS NULL`,
+      [new Date(), legacyUserId]
+    );
+
+    return result.affectedRows;
+  }
+
   async findValidSession(refreshToken: string): Promise<StoredIdentitySession> {
     const pool = this.requirePool();
     await this.ensureSchema();
