@@ -9,3 +9,60 @@ GRANT ALL PRIVILEGES ON `xrugc_keycloak`.* TO 'keycloak'@'%';
 
 FLUSH PRIVILEGES;
 
+USE `xrugc_identity`;
+
+CREATE TABLE IF NOT EXISTS `auth_login_events` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `event_key` VARCHAR(128) NOT NULL,
+  `legacy_user_id` BIGINT NULL,
+  `identity_user_id` VARCHAR(128) NULL,
+  `username` VARCHAR(255) NULL,
+  `event_type` VARCHAR(64) NOT NULL DEFAULT 'login',
+  `success` TINYINT(1) NOT NULL DEFAULT 1,
+  `occurred_at` DATETIME(3) NOT NULL,
+  `ip_address_hash` CHAR(64) NULL,
+  `user_agent_hash` CHAR(64) NULL,
+  `source` VARCHAR(64) NOT NULL DEFAULT 'legacy-backend',
+  `trace_id` VARCHAR(128) NULL,
+  `metadata` JSON NULL,
+  `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `idx_auth_login_events_event_key` (`event_key`),
+  KEY `idx_auth_login_events_legacy_user` (`legacy_user_id`, `occurred_at`),
+  KEY `idx_auth_login_events_username` (`username`, `occurred_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `user_login_stats` (
+  `stats_key` VARCHAR(255) NOT NULL,
+  `legacy_user_id` BIGINT NULL,
+  `identity_user_id` VARCHAR(128) NULL,
+  `username` VARCHAR(255) NULL,
+  `login_count` BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  `failed_login_count` BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  `last_login_at` DATETIME(3) NULL,
+  `last_failed_login_at` DATETIME(3) NULL,
+  `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`stats_key`),
+  KEY `idx_user_login_stats_legacy_user` (`legacy_user_id`),
+  KEY `idx_user_login_stats_username` (`username`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `identity_refresh_sessions` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `refresh_token_hash` CHAR(64) NOT NULL,
+  `session_id` VARCHAR(128) NOT NULL,
+  `legacy_user_id` BIGINT NOT NULL,
+  `username` VARCHAR(255) NULL,
+  `issued_at` DATETIME(3) NOT NULL,
+  `expires_at` DATETIME(3) NOT NULL,
+  `revoked_at` DATETIME(3) NULL,
+  `replaced_by_hash` CHAR(64) NULL,
+  `ip_hash` CHAR(64) NULL,
+  `user_agent_hash` CHAR(64) NULL,
+  `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `idx_identity_refresh_sessions_token_hash` (`refresh_token_hash`),
+  KEY `idx_identity_refresh_sessions_legacy_user` (`legacy_user_id`, `expires_at`),
+  KEY `idx_identity_refresh_sessions_session` (`session_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

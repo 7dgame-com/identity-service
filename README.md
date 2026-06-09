@@ -1,6 +1,6 @@
 # XR UGC Identity Service
 
-This repository is the independent identity-service used by the XR UGC platform migration. Phase 3 runs it in readonly mode only: it can read legacy users, roles and organizations for comparison, but it does not issue tokens or write the legacy platform database.
+This repository is the independent identity-service used by the XR UGC platform migration. It starts in readonly mode and can read legacy users, roles and organizations for comparison. Phase 4 adds optional token issuance, but it remains disabled by default and must be explicitly enabled for gray rollout.
 
 ## Local Start
 
@@ -60,3 +60,81 @@ identity-service as the stable contract and must not bind directly to Keycloak.
 - Do not point production frontend or backend traffic to this service yet.
 - Keycloak is deployed only as an empty realm placeholder in this phase.
 - Legacy auth remains the source of truth until a later spec explicitly switches traffic.
+
+## Phase 3.5 Login Audit
+
+Login audit is optional and disabled by default. It records successful login
+source events and per-user login stats in the identity database only. It does
+not write the legacy business database, does not bill users, does not deduct
+quota, and does not block login or content access.
+
+Required runtime settings when enabling it:
+
+```bash
+IDENTITY_LOGIN_AUDIT_ENABLED=true
+IDENTITY_INTERNAL_API_TOKEN=<internal-service-token>
+IDENTITY_DB_HOST=identity-mysql
+IDENTITY_DB_NAME=xrugc_identity
+IDENTITY_DB_USER=identity
+IDENTITY_DB_PASSWORD=<identity-db-password>
+```
+
+Internal endpoints:
+
+- `POST /internal/login-events`
+- `GET /internal/login-audit/users/:legacyUserId`
+
+These endpoints are intended for internal service-to-service calls only and
+must not be exposed by the public Traefik/Nginx route.
+
+## Phase 4 Token Issuance
+
+Token issuance is optional and disabled by default. When enabled, identity-adapter
+can authenticate legacy username/password, issue ES256 access tokens, rotate
+refresh tokens in the identity database, and revoke sessions on logout.
+
+Required runtime settings when enabling it:
+
+```bash
+IDENTITY_TOKEN_ISSUANCE_ENABLED=true
+IDENTITY_JWT_PRIVATE_KEY_FILE=/run/secrets/identity-jwt-key.pem
+IDENTITY_JWT_KEY_ID=identity-stage4
+IDENTITY_JWT_ISSUER=identity-service
+IDENTITY_JWT_AUDIENCE=xrugc-api
+IDENTITY_DB_HOST=identity-mysql
+IDENTITY_DB_NAME=xrugc_identity
+IDENTITY_DB_USER=identity
+IDENTITY_DB_PASSWORD=<identity-db-password>
+```
+
+Public gray endpoints:
+
+- `POST /v1/auth/login`
+- `POST /v1/auth/refresh`
+- `POST /v1/auth/logout`
+- `GET /jwks.json`
+
+Safety rules:
+
+- Keep `IDENTITY_TOKEN_ISSUANCE_ENABLED=false` unless the backend and frontend
+  gray switches are ready.
+- Main backend must default to `AUTH_PROVIDER=legacy`.
+- Main frontend must default to `VITE_AUTH_PROVIDER=legacy`.
+- `/api-auth` must not be captured by a broader `/api` reverse proxy route.
+- Phase 4 does not migrate registration, password reset, email, invitations, or billing.
+
+## OpenTelemetry
+
+Telemetry is disabled by default and does not change local or development
+runtime behavior. To export phase-3 request spans, configure an OTLP HTTP
+collector endpoint:
+
+```bash
+OTEL_SERVICE_NAME=identity-adapter
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+```
+
+`OTEL_EXPORTER_OTLP_ENDPOINT` is normalized to `/v1/traces`; use
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` when a provider requires an explicit trace
+endpoint. Optional headers can be supplied with
+`OTEL_EXPORTER_OTLP_HEADERS` or `OTEL_EXPORTER_OTLP_TRACES_HEADERS`.
