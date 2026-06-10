@@ -65,6 +65,15 @@ export const configSchema = z.object({
     internalToken: optionalStringFromEnv,
     hashSalt: z.string().default("xrugc-login-audit-v1")
   }),
+  usageBilling: z.object({
+    shadowEnabled: boolFromEnv.default(false),
+    dryRun: boolFromEnv.default(true),
+    loginRule: z.string().default("successful-login-v1"),
+    freeLoginQuota: numberFromEnv.default(0),
+    subjectStrategy: z.enum(["user", "organization", "customer"]).default("user"),
+    replayBatchSize: numberFromEnv.default(500),
+    internalToken: optionalStringFromEnv
+  }),
   legacySessionRevoke: z.object({
     enabled: boolFromEnv.default(false),
     url: optionalStringFromEnv,
@@ -172,6 +181,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
       enabled: env.IDENTITY_LOGIN_AUDIT_ENABLED,
       internalToken: env.IDENTITY_INTERNAL_API_TOKEN,
       hashSalt: env.IDENTITY_LOGIN_AUDIT_HASH_SALT
+    },
+    usageBilling: {
+      shadowEnabled: env.IDENTITY_USAGE_BILLING_SHADOW_ENABLED,
+      dryRun: env.IDENTITY_USAGE_BILLING_DRY_RUN,
+      loginRule: env.IDENTITY_USAGE_BILLING_LOGIN_RULE,
+      freeLoginQuota: env.IDENTITY_USAGE_BILLING_FREE_LOGIN_QUOTA,
+      subjectStrategy: env.IDENTITY_USAGE_BILLING_SUBJECT_STRATEGY,
+      replayBatchSize: env.IDENTITY_USAGE_BILLING_REPLAY_BATCH_SIZE,
+      internalToken: env.IDENTITY_USAGE_BILLING_INTERNAL_API_TOKEN ?? env.IDENTITY_INTERNAL_API_TOKEN
     },
     legacySessionRevoke: {
       enabled: env.IDENTITY_LEGACY_SESSION_REVOKE_ENABLED,

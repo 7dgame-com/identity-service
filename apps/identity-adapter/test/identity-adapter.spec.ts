@@ -29,6 +29,12 @@ import { PasswordResetChallengeError, PasswordResetChallengeRepository } from ".
 import { sanitizeMetadata } from "../src/login-audit.service.js";
 import { assertReadonlySql } from "../src/readonly-write.guard.js";
 import { normalizeOtlpTraceEndpoint, startTelemetry } from "../src/telemetry.js";
+import {
+  LoginAuditSourceEvent,
+  UsageBillingRepository,
+  UsageLedgerRecord,
+  UsageReplayRunRow
+} from "../src/usage-billing.repository.js";
 
 class FakeLegacyIdentityReader {
   readonly passwordHash = bcrypt.hashSync("123456", 4);
@@ -858,6 +864,135 @@ class FakeLoginAuditRepository {
           traceId: event.traceId,
           metadata: event.metadata
         }))
+    };
+  }
+}
+
+class FakeUsageBillingRepository {
+  configured = true;
+  readonly events: LoginAuditSourceEvent[] = [];
+  readonly ledger = new Map<string, UsageLedgerRecord>();
+  readonly runs = new Map<string, UsageReplayRunRow>();
+  readonly balances = new Map<string, { includedQuota: number; usedQuantity: number; remainingQuantity: number }>();
+
+  isConfigured() {
+    return this.configured;
+  }
+
+  async listSuccessfulLoginEvents(input: { afterId: number; limit: number }) {
+    return this.events.filter((event) => event.id > input.afterId && event.success && event.eventType === "login").slice(0, input.limit);
+  }
+
+  async insertLedger(record: UsageLedgerRecord) {
+    if (this.ledger.has(record.ledgerKey)) {
+      return { duplicate: true };
+    }
+
+    this.ledger.set(record.ledgerKey, record);
+    return { duplicate: false };
+  }
+
+  async createReplayRun(input: { runKey: string; mode: string; metadata: Record<string, unknown> }) {
+    this.runs.set(input.runKey, {
+      runKey: input.runKey,
+      mode: input.mode,
+      status: "running",
+      startedAt: new Date().toISOString(),
+      finishedAt: null,
+      processedCount: 0,
+      createdCount: 0,
+      skippedCount: 0,
+      metadata: input.metadata
+    });
+  }
+
+  async finishReplayRun(input: {
+    runKey: string;
+    status: "succeeded" | "failed";
+    processedCount: number;
+    createdCount: number;
+    skippedCount: number;
+    metadata: Record<string, unknown>;
+  }) {
+    const current = this.runs.get(input.runKey);
+    this.runs.set(input.runKey, {
+      runKey: input.runKey,
+      mode: current?.mode ?? "apply",
+      status: input.status,
+      startedAt: current?.startedAt ?? new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+      processedCount: input.processedCount,
+      createdCount: input.createdCount,
+      skippedCount: input.skippedCount,
+      metadata: input.metadata
+    });
+  }
+
+  async rebuildShadowBalances(input: { includedQuota: number; billingCycle: string }) {
+    this.balances.clear();
+    for (const record of this.ledger.values()) {
+      if (record.billingStatus !== "shadow") {
+        continue;
+      }
+      const key = `${record.subjectType}:${record.subjectId}:${record.usageType}`;
+      const current = this.balances.get(key) ?? {
+        includedQuota: input.includedQuota,
+        usedQuantity: 0,
+        remainingQuantity: input.includedQuota
+      };
+      current.usedQuantity += record.quantity;
+      current.remainingQuantity = input.includedQuota - current.usedQuantity;
+      this.balances.set(key, current);
+    }
+
+    return this.balances.size;
+  }
+
+  async getBalance(subjectType: string, subjectId: string, usageType = "login") {
+    const balance = this.balances.get(`${subjectType}:${subjectId}:${usageType}`);
+    return balance
+      ? {
+          subjectType,
+          subjectId,
+          usageType,
+          includedQuota: balance.includedQuota,
+          usedQuantity: balance.usedQuantity,
+          remainingQuantity: balance.remainingQuantity,
+          billingCycle: "default",
+          updatedAt: new Date().toISOString()
+        }
+      : null;
+  }
+
+  async listLedger() {
+    return [...this.ledger.values()].map((record) => ({
+      ledgerKey: record.ledgerKey,
+      sourceEventId: record.sourceEventId,
+      subjectType: record.subjectType,
+      subjectId: record.subjectId,
+      usageType: record.usageType,
+      quantity: record.quantity,
+      unit: record.unit,
+      chargeMode: record.chargeMode,
+      billingStatus: record.billingStatus,
+      occurredAt: record.occurredAt.toISOString(),
+      createdAt: new Date().toISOString(),
+      metadata: record.metadata
+    }));
+  }
+
+  async getReplayRun(runKey: string) {
+    return this.runs.get(runKey) ?? null;
+  }
+
+  async getLoginUsageReport() {
+    const records = [...this.ledger.values()].filter((record) => record.usageType === "login");
+    return {
+      totalLedgerRecords: records.length,
+      freeLoginRecords: records.filter((record) => record.chargeMode === "free").length,
+      billableLoginRecords: records.filter((record) => record.chargeMode === "billable").length,
+      shadowRecords: records.filter((record) => record.billingStatus === "shadow").length,
+      usedQuantity: records.reduce((total, record) => total + record.quantity, 0)
     };
   }
 }
@@ -3215,6 +3350,212 @@ describe("identity-adapter login audit API", () => {
         authorization: "[filtered]",
         safe: "value"
       }
+    });
+  });
+});
+
+describe("identity-adapter usage billing shadow API", () => {
+  let app: INestApplication;
+  let repository: FakeUsageBillingRepository;
+  const originalEnv = { ...process.env };
+
+  async function createApp(env: Record<string, string | undefined> = {}) {
+    process.env = {
+      ...originalEnv,
+      IDENTITY_INTERNAL_API_TOKEN: "test-internal-token",
+      IDENTITY_USAGE_BILLING_INTERNAL_API_TOKEN: "test-internal-token",
+      IDENTITY_USAGE_BILLING_SHADOW_ENABLED: "false",
+      IDENTITY_USAGE_BILLING_DRY_RUN: "true",
+      IDENTITY_USAGE_BILLING_LOGIN_RULE: "successful-login-v1",
+      IDENTITY_USAGE_BILLING_FREE_LOGIN_QUOTA: "1",
+      IDENTITY_USAGE_BILLING_SUBJECT_STRATEGY: "user",
+      IDENTITY_USAGE_BILLING_REPLAY_BATCH_SIZE: "500",
+      IDENTITY_DB_HOST: "identity-mysql",
+      IDENTITY_DB_USER: "identity",
+      ...env
+    };
+
+    repository = new FakeUsageBillingRepository();
+    repository.events.push(
+      {
+        id: 1,
+        eventKey: "login-event-1",
+        legacyUserId: 24,
+        identityUserId: null,
+        username: "guanfei",
+        eventType: "login",
+        success: true,
+        occurredAt: new Date("2026-06-10T01:00:00.000Z"),
+        source: "identity-service"
+      },
+      {
+        id: 2,
+        eventKey: "login-event-2",
+        legacyUserId: 24,
+        identityUserId: null,
+        username: "guanfei",
+        eventType: "login",
+        success: true,
+        occurredAt: new Date("2026-06-10T02:00:00.000Z"),
+        source: "identity-service"
+      },
+      {
+        id: 3,
+        eventKey: "failed-login-event",
+        legacyUserId: 24,
+        identityUserId: null,
+        username: "guanfei",
+        eventType: "login",
+        success: false,
+        occurredAt: new Date("2026-06-10T03:00:00.000Z"),
+        source: "identity-service"
+      }
+    );
+
+    const moduleRef = await Test.createTestingModule({
+      imports: [AppModule]
+    })
+      .overrideProvider(LegacyIdentityReader)
+      .useClass(FakeLegacyIdentityReader)
+      .overrideProvider(UsageBillingRepository)
+      .useValue(repository)
+      .compile();
+
+    app = moduleRef.createNestApplication();
+    await app.init();
+  }
+
+  afterEach(async () => {
+    process.env = { ...originalEnv };
+    await app?.close();
+  });
+
+  it("requires the internal service token", async () => {
+    await createApp();
+
+    await request(app.getHttpServer()).post("/internal/usage-billing/replay").send({ dryRun: true }).expect(401);
+  });
+
+  it("allows dry-run while shadow billing is disabled and does not write ledger records", async () => {
+    await createApp({
+      IDENTITY_USAGE_BILLING_SHADOW_ENABLED: "false",
+      IDENTITY_USAGE_BILLING_DRY_RUN: "true"
+    });
+
+    const response = await request(app.getHttpServer())
+      .post("/internal/usage-billing/replay")
+      .set("X-Identity-Internal-Token", "test-internal-token")
+      .send({ dryRun: true, afterId: 0, limit: 10, runKey: "dry-run-usage-billing" })
+      .expect(201);
+
+    expect(response.body.data).toMatchObject({
+      runKey: "dry-run-usage-billing",
+      dryRun: true,
+      shadowEnabled: false,
+      nonBilling: true,
+      summary: {
+        processedEvents: 2,
+        plannedLedgerRecords: 2,
+        createdLedgerRecords: 0,
+        skippedEvents: 0,
+        freeLoginRecords: 1,
+        billableLoginRecords: 1
+      }
+    });
+    expect(response.body.data.plannedRecords).toHaveLength(2);
+    expect(repository.ledger.size).toBe(0);
+    expect(repository.runs.size).toBe(0);
+  });
+
+  it("refuses apply mode while shadow billing is disabled", async () => {
+    await createApp({
+      IDENTITY_USAGE_BILLING_SHADOW_ENABLED: "false",
+      IDENTITY_USAGE_BILLING_DRY_RUN: "false"
+    });
+
+    await request(app.getHttpServer())
+      .post("/internal/usage-billing/replay")
+      .set("X-Identity-Internal-Token", "test-internal-token")
+      .send({ dryRun: false, runKey: "apply-disabled" })
+      .expect(404);
+
+    expect(repository.ledger.size).toBe(0);
+  });
+
+  it("applies shadow ledger records idempotently and rebuilds balance", async () => {
+    await createApp({
+      IDENTITY_USAGE_BILLING_SHADOW_ENABLED: "true",
+      IDENTITY_USAGE_BILLING_DRY_RUN: "false"
+    });
+
+    const first = await request(app.getHttpServer())
+      .post("/internal/usage-billing/replay")
+      .set("X-Identity-Internal-Token", "test-internal-token")
+      .send({ dryRun: false, runKey: "apply-shadow-1", afterId: 0, limit: 10, rebuildBalance: true })
+      .expect(201);
+
+    expect(first.body.data.summary).toMatchObject({
+      processedEvents: 2,
+      plannedLedgerRecords: 2,
+      createdLedgerRecords: 2,
+      duplicateLedgerRecords: 0,
+      rebuiltBalances: 1
+    });
+
+    const second = await request(app.getHttpServer())
+      .post("/internal/usage-billing/replay")
+      .set("X-Identity-Internal-Token", "test-internal-token")
+      .send({ dryRun: false, runKey: "apply-shadow-2", afterId: 0, limit: 10, rebuildBalance: true })
+      .expect(201);
+
+    expect(second.body.data.summary).toMatchObject({
+      createdLedgerRecords: 0,
+      duplicateLedgerRecords: 2,
+      rebuiltBalances: 1
+    });
+    expect(repository.ledger.size).toBe(2);
+
+    const balance = await request(app.getHttpServer())
+      .get("/internal/usage-billing/subjects/user/legacy:24/balance")
+      .set("X-Identity-Internal-Token", "test-internal-token")
+      .expect(200);
+
+    expect(balance.body.data).toMatchObject({
+      subjectType: "user",
+      subjectId: "legacy:24",
+      usageType: "login",
+      includedQuota: 1,
+      usedQuantity: 2,
+      remainingQuantity: -1
+    });
+
+    const run = await request(app.getHttpServer())
+      .get("/internal/usage-billing/runs/apply-shadow-2")
+      .set("X-Identity-Internal-Token", "test-internal-token")
+      .expect(200);
+
+    expect(run.body.data).toMatchObject({
+      runKey: "apply-shadow-2",
+      mode: "apply",
+      status: "succeeded",
+      processedCount: 2,
+      createdCount: 0,
+      skippedCount: 2
+    });
+
+    const report = await request(app.getHttpServer())
+      .get("/internal/usage-billing/reports/login-usage")
+      .set("X-Identity-Internal-Token", "test-internal-token")
+      .expect(200);
+
+    expect(report.body.data).toMatchObject({
+      totalLedgerRecords: 2,
+      freeLoginRecords: 1,
+      billableLoginRecords: 1,
+      shadowRecords: 2,
+      usedQuantity: 2,
+      shadow: true,
+      nonBilling: true
     });
   });
 });

@@ -26,6 +26,7 @@ export class HealthController {
         capabilities: {
           tokenIssuance: this.config.tokenIssuance.enabled ? "enabled" : "disabled",
           loginAudit: this.config.loginAudit.enabled ? "enabled" : "disabled",
+          usageBillingShadow: this.config.usageBilling.shadowEnabled ? "enabled" : "disabled",
           accountLifecycle: this.config.accountLifecycle.enabled ? "enabled" : "disabled",
           accountLifecycleScopes: {
             register: this.config.accountLifecycle.registerEnabled ? "enabled" : "disabled",

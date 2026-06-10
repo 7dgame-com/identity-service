@@ -47,6 +47,57 @@ CREATE TABLE IF NOT EXISTS `user_login_stats` (
   KEY `idx_user_login_stats_username` (`username`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS `usage_billing_ledger` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `ledger_key` VARCHAR(255) NOT NULL,
+  `source_event_id` BIGINT UNSIGNED NOT NULL,
+  `subject_type` VARCHAR(32) NOT NULL,
+  `subject_id` VARCHAR(128) NOT NULL,
+  `usage_type` VARCHAR(64) NOT NULL,
+  `quantity` BIGINT NOT NULL DEFAULT 1,
+  `unit` VARCHAR(32) NOT NULL DEFAULT 'times',
+  `charge_mode` VARCHAR(64) NOT NULL DEFAULT 'shadow',
+  `billing_status` VARCHAR(64) NOT NULL DEFAULT 'shadow',
+  `occurred_at` DATETIME(3) NOT NULL,
+  `metadata` JSON NULL,
+  `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `idx_usage_billing_ledger_key` (`ledger_key`),
+  KEY `idx_usage_billing_ledger_source` (`source_event_id`),
+  KEY `idx_usage_billing_ledger_subject` (`subject_type`, `subject_id`, `usage_type`, `occurred_at`),
+  KEY `idx_usage_billing_ledger_status` (`billing_status`, `occurred_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `account_usage_balance_shadow` (
+  `subject_type` VARCHAR(32) NOT NULL,
+  `subject_id` VARCHAR(128) NOT NULL,
+  `usage_type` VARCHAR(64) NOT NULL,
+  `included_quota` BIGINT NOT NULL DEFAULT 0,
+  `used_quantity` BIGINT NOT NULL DEFAULT 0,
+  `remaining_quantity` BIGINT NOT NULL DEFAULT 0,
+  `billing_cycle` VARCHAR(64) NOT NULL DEFAULT 'default',
+  `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`subject_type`, `subject_id`, `usage_type`, `billing_cycle`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `usage_billing_replay_runs` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `run_key` VARCHAR(160) NOT NULL,
+  `mode` VARCHAR(32) NOT NULL,
+  `status` VARCHAR(32) NOT NULL,
+  `started_at` DATETIME(3) NOT NULL,
+  `finished_at` DATETIME(3) NULL,
+  `processed_count` BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  `created_count` BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  `skipped_count` BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  `metadata` JSON NULL,
+  `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `idx_usage_billing_replay_runs_key` (`run_key`),
+  KEY `idx_usage_billing_replay_runs_status` (`status`, `started_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS `identity_refresh_sessions` (
   `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   `refresh_token_hash` CHAR(64) NOT NULL,

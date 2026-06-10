@@ -34,6 +34,9 @@ import { LoginAuditService } from "./login-audit.service.js";
 import { PasswordResetChallengeRepository } from "./password-reset-challenge.repository.js";
 import { TelemetryInterceptor } from "./telemetry.interceptor.js";
 import { TokenIssuanceService } from "./token-issuance.service.js";
+import { UsageBillingController } from "./usage-billing.controller.js";
+import { UsageBillingRepository } from "./usage-billing.repository.js";
+import { UsageBillingService } from "./usage-billing.service.js";
 
 @Module({
   controllers: [
@@ -42,7 +45,8 @@ import { TokenIssuanceService } from "./token-issuance.service.js";
     LoginAuditController,
     AuthController,
     AccountLifecycleController,
-    InvitationDiagnosticsController
+    InvitationDiagnosticsController,
+    UsageBillingController
   ],
   providers: [
     AccountLifecycleService,
@@ -87,6 +91,8 @@ import { TokenIssuanceService } from "./token-issuance.service.js";
     PasswordResetChallengeRepository,
     LoginAuditRepository,
     LoginAuditService,
+    UsageBillingRepository,
+    UsageBillingService,
     TokenIssuanceService,
     { provide: APP_INTERCEPTOR, useClass: TelemetryInterceptor }
   ]
