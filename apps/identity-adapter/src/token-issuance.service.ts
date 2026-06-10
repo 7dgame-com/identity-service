@@ -1,11 +1,11 @@
 import { createHash, randomBytes } from "node:crypto";
 import { BadRequestException, Injectable, NotFoundException, UnauthorizedException } from "@nestjs/common";
-import bcrypt from "bcryptjs";
 import { z } from "zod";
 import { loadConfig } from "./config.js";
 import { IdentitySessionRepository, InvalidRefreshTokenError } from "./identity-session.repository.js";
 import { JwtIssuerService } from "./jwt-issuer.service.js";
 import { LegacyIdentityReader, LegacyUserReadModel } from "./legacy-identity.reader.js";
+import { verifyLegacyPassword } from "./legacy-password.js";
 import { LoginAuditService } from "./login-audit.service.js";
 
 const loginSchema = z.object({
@@ -28,7 +28,7 @@ export interface RequestContext {
 
 export interface AuthTokenResponse {
   success: true;
-  message: "login" | "refresh";
+  message: "login" | "refresh" | "register";
   token: {
     token: string;
     accessToken: string;
@@ -109,11 +109,18 @@ export class TokenIssuanceService {
     return { success: true, message: "logout", revoked };
   }
 
+  async issueRegisteredUser(user: LegacyUserReadModel, context: RequestContext = {}): Promise<AuthTokenResponse> {
+    this.assertEnabled();
+    const sessionId = randomId();
+
+    return this.issueForUser(user, sessionId, context, "register");
+  }
+
   private async issueForUser(
     user: LegacyUserReadModel,
     sessionId: string,
     context: RequestContext,
-    message: "login" | "refresh"
+    message: "login" | "refresh" | "register"
   ): Promise<AuthTokenResponse> {
     if (!this.sessions.isConfigured()) {
       throw new BadRequestException({
@@ -189,7 +196,7 @@ export class TokenIssuanceService {
 }
 
 function tokenResponse(
-  message: "login" | "refresh",
+  message: "login" | "refresh" | "register",
   accessToken: string,
   refreshToken: string,
   expiresAt: Date
@@ -218,14 +225,6 @@ function parseBody<T extends z.ZodTypeAny>(schema: T, payload: unknown): z.infer
   }
 
   return parsed.data;
-}
-
-async function verifyLegacyPassword(password: string, hash: string): Promise<boolean> {
-  return bcrypt.compare(password, normalizeBcryptHash(hash));
-}
-
-function normalizeBcryptHash(hash: string): string {
-  return hash.startsWith("$2y$") ? `$2a$${hash.slice(4)}` : hash;
 }
 
 function randomId(): string {
