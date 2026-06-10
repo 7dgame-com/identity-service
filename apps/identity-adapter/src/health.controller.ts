@@ -25,7 +25,16 @@ export class HealthController {
         },
         capabilities: {
           tokenIssuance: this.config.tokenIssuance.enabled ? "enabled" : "disabled",
-          loginAudit: this.config.loginAudit.enabled ? "enabled" : "disabled"
+          loginAudit: this.config.loginAudit.enabled ? "enabled" : "disabled",
+          accountLifecycle: this.config.accountLifecycle.enabled ? "enabled" : "disabled",
+          accountLifecycleScopes: {
+            register: this.config.accountLifecycle.registerEnabled ? "enabled" : "disabled",
+            password: this.config.accountLifecycle.passwordEnabled ? "enabled" : "disabled",
+            passwordChangeNative: this.config.accountLifecycle.passwordChangeNativeEnabled ? "enabled" : "disabled",
+            passwordResetNative: this.config.accountLifecycle.passwordResetNativeEnabled ? "enabled" : "disabled",
+            email: this.config.accountLifecycle.emailEnabled ? "enabled" : "disabled",
+            invitation: this.config.accountLifecycle.invitationEnabled ? "enabled" : "disabled"
+          }
         }
       };
     } finally {
