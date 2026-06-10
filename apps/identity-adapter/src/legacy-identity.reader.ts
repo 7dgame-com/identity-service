@@ -48,6 +48,11 @@ export interface LegacyUserCredential {
   passwordHash: string | null;
 }
 
+export interface LegacyUserListInput {
+  afterId: number;
+  limit: number;
+}
+
 @Injectable()
 export class LegacyIdentityReader implements OnModuleDestroy {
   private readonly config = loadConfig();
@@ -148,6 +153,25 @@ export class LegacyIdentityReader implements OnModuleDestroy {
       nickname: user.nickname ?? null,
       passwordHash: user.passwordHash ?? null
     };
+  }
+
+  async listUsers(input: LegacyUserListInput): Promise<LegacyUserReadModel[]> {
+    if (!this.pool) {
+      return [];
+    }
+
+    const safeLimit = Math.max(1, Math.min(input.limit, 5000));
+    const rows = await this.query<RowDataPacket[]>(
+      `SELECT id
+         FROM user
+        WHERE id > ?
+        ORDER BY id ASC
+        LIMIT ${safeLimit}`,
+      [input.afterId]
+    );
+
+    const users = await Promise.all(rows.map((row) => this.getUserById(Number(row.id))));
+    return users.filter((user): user is LegacyUserReadModel => user !== null);
   }
 
   async listRoles(): Promise<LegacyRole[]> {

@@ -126,6 +126,11 @@ class FakeLegacyIdentityReader {
     };
   }
 
+  async listUsers(input: { afterId: number; limit: number }) {
+    const users = [await this.getUserById(24), await this.getUserById(25)].filter((user) => user !== null);
+    return users.filter((user) => user!.id > input.afterId).slice(0, input.limit);
+  }
+
   async listRoles() {
     return [{ name: "admin", description: "Administrator", createdAt: 1, updatedAt: 1 }];
   }
@@ -147,6 +152,74 @@ class FakeLegacyIdentityReader {
 }
 
 class FakeIamRepository {
+  readonly identityUsers = new Map<number, any>([
+    [
+      24,
+      {
+        id: "id-user-24",
+        legacyUserId: 24,
+        keycloakSubject: "keycloak-subject-24",
+        username: "guanfei",
+        email: "ogre3d@163.com",
+        status: "active",
+        source: "legacy-shadow",
+        metadata: null,
+        createdAt: "2026-06-10T00:00:00.000Z",
+        updatedAt: "2026-06-10T00:00:00.000Z"
+      }
+    ]
+  ]);
+  readonly subjectMaps = new Map<string, any[]>([
+    [
+      "id-user-24",
+      [
+        {
+          identityUserId: "id-user-24",
+          subjectType: "legacy_user",
+          subjectId: "24",
+          source: "legacy-shadow",
+          status: "active",
+          metadata: null,
+          createdAt: null,
+          updatedAt: null
+        }
+      ]
+    ]
+  ]);
+  readonly roleAssignments = new Map<number, any[]>([
+    [
+      24,
+      [
+        {
+          identityUserId: "id-user-24",
+          legacyUserId: 24,
+          roleName: "admin",
+          source: "legacy-shadow",
+          status: "shadow",
+          observedAt: "2026-06-10T00:00:00.000Z"
+        }
+      ]
+    ]
+  ]);
+  readonly organizationMemberships = new Map<number, any[]>([
+    [
+      24,
+      [
+        {
+          identityUserId: "id-user-24",
+          legacyUserId: 24,
+          organizationId: 1,
+          organizationRole: "member",
+          source: "legacy-shadow",
+          status: "shadow",
+          observedAt: "2026-06-10T00:00:00.000Z"
+        }
+      ]
+    ]
+  ]);
+  readonly runs = new Map<string, any>();
+  readonly items = new Map<string, any[]>();
+
   isConfigured() {
     return true;
   }
@@ -170,64 +243,171 @@ class FakeIamRepository {
   }
 
   async getIdentityUserByLegacyId(legacyUserId: number) {
-    if (legacyUserId !== 24) {
-      return null;
-    }
-
-    return {
-      id: "id-user-24",
-      legacyUserId: 24,
-      keycloakSubject: "keycloak-subject-24",
-      username: "guanfei",
-      email: "ogre3d@163.com",
-      status: "shadow",
-      source: "legacy-shadow",
-      metadata: null,
-      createdAt: "2026-06-10T00:00:00.000Z",
-      updatedAt: "2026-06-10T00:00:00.000Z"
-    };
+    return this.identityUsers.get(legacyUserId) ?? null;
   }
 
   async listSubjectMaps(identityUserId: string) {
-    return [
-      {
-        identityUserId,
-        subjectType: "legacy_user",
-        subjectId: "24",
-        source: "legacy-shadow",
-        status: "active",
-        metadata: null,
-        createdAt: null,
-        updatedAt: null
-      }
-    ];
+    return this.subjectMaps.get(identityUserId) ?? [];
   }
 
   async listRoleAssignmentsShadow(legacyUserId: number) {
-    return [
-      {
-        identityUserId: `id-user-${legacyUserId}`,
-        legacyUserId,
-        roleName: "admin",
-        source: "yii-rbac",
-        status: "shadow",
-        observedAt: "2026-06-10T00:00:00.000Z"
-      }
-    ];
+    return this.roleAssignments.get(legacyUserId) ?? [];
   }
 
   async listOrganizationMembershipsShadow(legacyUserId: number) {
-    return [
+    return this.organizationMemberships.get(legacyUserId) ?? [];
+  }
+
+  async upsertIdentityUserShadow(input: {
+    identityUserId: string;
+    legacyUserId: number;
+    username: string | null;
+    email: string | null;
+    status: string;
+    metadata: Record<string, unknown>;
+  }) {
+    this.identityUsers.set(input.legacyUserId, {
+      id: input.identityUserId,
+      legacyUserId: input.legacyUserId,
+      keycloakSubject: null,
+      username: input.username,
+      email: input.email,
+      status: input.status,
+      source: "legacy-shadow",
+      metadata: input.metadata,
+      createdAt: "2026-06-10T00:00:00.000Z",
+      updatedAt: "2026-06-10T00:00:00.000Z"
+    });
+    const current = this.subjectMaps.get(input.identityUserId) ?? [];
+    const withoutLegacy = current.filter((subject) => !(subject.subjectType === "legacy_user" && subject.subjectId === String(input.legacyUserId)));
+    this.subjectMaps.set(input.identityUserId, [
+      ...withoutLegacy,
       {
-        identityUserId: `id-user-${legacyUserId}`,
-        legacyUserId,
-        organizationId: 1,
-        organizationRole: "member",
-        source: "legacy-organization",
+        identityUserId: input.identityUserId,
+        subjectType: "legacy_user",
+        subjectId: String(input.legacyUserId),
+        source: "legacy-shadow",
+        status: "active",
+        metadata: { legacyUserId: input.legacyUserId },
+        createdAt: null,
+        updatedAt: null
+      }
+    ]);
+  }
+
+  async upsertPluginSubjectMap(input: { identityUserId: string; legacyUserId: number; metadata: Record<string, unknown> }) {
+    const current = this.subjectMaps.get(input.identityUserId) ?? [];
+    const withoutPlugin = current.filter(
+      (subject) => !(subject.subjectType === "plugin_user" && subject.subjectId === `legacy:${input.legacyUserId}`)
+    );
+    this.subjectMaps.set(input.identityUserId, [
+      ...withoutPlugin,
+      {
+        identityUserId: input.identityUserId,
+        subjectType: "plugin_user",
+        subjectId: `legacy:${input.legacyUserId}`,
+        source: "legacy-shadow",
+        status: "active",
+        metadata: input.metadata,
+        createdAt: null,
+        updatedAt: null
+      }
+    ]);
+  }
+
+  async replaceRoleAssignmentsShadow(
+    legacyUserId: number,
+    roles: Array<{ identityUserId: string; legacyUserId: number; roleName: string; source: string }>
+  ) {
+    this.roleAssignments.set(
+      legacyUserId,
+      roles.map((role) => ({
+        ...role,
         status: "shadow",
         observedAt: "2026-06-10T00:00:00.000Z"
-      }
-    ];
+      }))
+    );
+    return roles.length;
+  }
+
+  async replaceOrganizationMembershipsShadow(
+    legacyUserId: number,
+    organizations: Array<{
+      identityUserId: string;
+      legacyUserId: number;
+      organizationId: number;
+      organizationRole: string | null;
+      source: string;
+    }>
+  ) {
+    this.organizationMemberships.set(
+      legacyUserId,
+      organizations.map((organization) => ({
+        ...organization,
+        status: "shadow",
+        observedAt: "2026-06-10T00:00:00.000Z"
+      }))
+    );
+    return organizations.length;
+  }
+
+  async createReconciliationRun(input: { runKey: string; scope: string; mode: string; metadata: Record<string, unknown> }) {
+    this.runs.set(input.runKey, {
+      runKey: input.runKey,
+      scope: input.scope,
+      mode: input.mode,
+      status: "running",
+      startedAt: "2026-06-10T00:00:00.000Z",
+      finishedAt: null,
+      sampleCount: 0,
+      mismatchCount: 0,
+      p0Count: 0,
+      p1Count: 0,
+      metadata: input.metadata
+    });
+    this.items.set(input.runKey, []);
+  }
+
+  async insertReconciliationItems(items: any[]) {
+    for (const item of items) {
+      const list = this.items.get(item.runKey) ?? [];
+      list.push({
+        ...item,
+        createdAt: "2026-06-10T00:00:00.000Z"
+      });
+      this.items.set(item.runKey, list);
+    }
+    return items.length;
+  }
+
+  async finishReconciliationRun(input: {
+    runKey: string;
+    status: "succeeded" | "failed";
+    sampleCount: number;
+    mismatchCount: number;
+    p0Count: number;
+    p1Count: number;
+    metadata: Record<string, unknown>;
+  }) {
+    const current = this.runs.get(input.runKey);
+    this.runs.set(input.runKey, {
+      ...current,
+      status: input.status,
+      finishedAt: "2026-06-10T00:00:01.000Z",
+      sampleCount: input.sampleCount,
+      mismatchCount: input.mismatchCount,
+      p0Count: input.p0Count,
+      p1Count: input.p1Count,
+      metadata: input.metadata
+    });
+  }
+
+  async getReconciliationRun(runKey: string) {
+    return this.runs.get(runKey) ?? null;
+  }
+
+  async listReconciliationItems(runKey: string) {
+    return this.items.get(runKey) ?? [];
   }
 }
 
@@ -1491,6 +1671,7 @@ describe("identity-adapter readonly API", () => {
 
 describe("identity-adapter IAM readonly API", () => {
   let app: INestApplication;
+  let iamRepository: FakeIamRepository;
   const originalEnv = { ...process.env };
   const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
   const privateKeyPem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
@@ -1509,6 +1690,7 @@ describe("identity-adapter IAM readonly API", () => {
     process.env.IDENTITY_JWT_KEY_ID = "iam-readonly-test-key";
     process.env.IDENTITY_JWT_ISSUER = "identity-iam-test";
     process.env.IDENTITY_JWT_AUDIENCE = "xrugc-iam";
+    iamRepository = new FakeIamRepository();
 
     const moduleRef = await Test.createTestingModule({
       imports: [AppModule]
@@ -1516,7 +1698,7 @@ describe("identity-adapter IAM readonly API", () => {
       .overrideProvider(LegacyIdentityReader)
       .useClass(FakeLegacyIdentityReader)
       .overrideProvider(IamRepository)
-      .useClass(FakeIamRepository)
+      .useValue(iamRepository)
       .compile();
 
     app = moduleRef.createNestApplication();
@@ -3805,6 +3987,163 @@ describe("identity-adapter usage billing shadow API", () => {
       usedQuantity: 2,
       shadow: true,
       nonBilling: true
+    });
+  });
+});
+
+describe("identity-adapter IAM reconciliation API", () => {
+  let app: INestApplication;
+  let iamRepository: FakeIamRepository;
+  const originalEnv = { ...process.env };
+
+  async function createApp(env: Record<string, string | undefined> = {}) {
+    process.env = {
+      ...originalEnv,
+      IDENTITY_IAM_ENABLED: "true",
+      IDENTITY_IAM_MODE: "shadow",
+      IDENTITY_IAM_INTERNAL_API_TOKEN: "iam-test-token",
+      IDENTITY_IAM_USER_VIEW_ENABLED: "true",
+      IDENTITY_IAM_ROLE_VIEW_ENABLED: "true",
+      IDENTITY_IAM_PERMISSION_VIEW_ENABLED: "true",
+      IDENTITY_IAM_ORGANIZATION_VIEW_ENABLED: "true",
+      IDENTITY_IAM_PLUGIN_VIEW_ENABLED: "true",
+      IDENTITY_IAM_RECONCILIATION_ENABLED: "false",
+      IDENTITY_IAM_RECONCILIATION_BATCH_SIZE: "5",
+      IDENTITY_DB_HOST: "identity-mysql",
+      IDENTITY_DB_USER: "identity",
+      ...env
+    };
+    iamRepository = new FakeIamRepository();
+
+    const moduleRef = await Test.createTestingModule({
+      imports: [AppModule]
+    })
+      .overrideProvider(LegacyIdentityReader)
+      .useClass(FakeLegacyIdentityReader)
+      .overrideProvider(IamRepository)
+      .useValue(iamRepository)
+      .compile();
+
+    app = moduleRef.createNestApplication();
+    await app.init();
+  }
+
+  afterEach(async () => {
+    process.env = { ...originalEnv };
+    await app?.close();
+  });
+
+  it("allows dry-run reconciliation while writes are disabled", async () => {
+    await createApp();
+
+    const response = await request(app.getHttpServer())
+      .post("/internal/iam/reconciliation/run")
+      .set("x-identity-internal-token", "iam-test-token")
+      .send({ dryRun: true, runKey: "iam-dry-run-25", scopes: ["user", "permission"], legacyUserIds: [25] })
+      .expect(201);
+
+    expect(response.body.data).toMatchObject({
+      runKey: "iam-dry-run-25",
+      dryRun: true,
+      reconciliationEnabled: false,
+      summary: {
+        sampledUsers: 1,
+        p1Count: 1,
+        infoCount: 1,
+        shadowWriteCount: 0
+      },
+      safetyGate: {
+        passed: false
+      }
+    });
+    expect(response.body.data.items).toHaveLength(2);
+    expect(iamRepository.runs.size).toBe(0);
+  });
+
+  it("refuses shadow apply while reconciliation is disabled", async () => {
+    await createApp();
+
+    await request(app.getHttpServer())
+      .post("/internal/iam/reconciliation/run")
+      .set("x-identity-internal-token", "iam-test-token")
+      .send({ dryRun: false, runKey: "iam-apply-disabled", scopes: ["user"], legacyUserIds: [25] })
+      .expect(404);
+
+    expect(iamRepository.identityUsers.has(25)).toBe(false);
+    expect(iamRepository.runs.size).toBe(0);
+  });
+
+  it("applies IAM shadow snapshots idempotently and reports the safety gate", async () => {
+    await createApp({ IDENTITY_IAM_RECONCILIATION_ENABLED: "true" });
+
+    const first = await request(app.getHttpServer())
+      .post("/internal/iam/reconciliation/run")
+      .set("x-identity-internal-token", "iam-test-token")
+      .send({
+        dryRun: false,
+        runKey: "iam-apply-25",
+        scopes: ["user", "role", "organization", "plugin"],
+        legacyUserIds: [25]
+      })
+      .expect(201);
+
+    expect(first.body.data).toMatchObject({
+      runKey: "iam-apply-25",
+      dryRun: false,
+      applyShadow: true,
+      summary: {
+        sampledUsers: 1,
+        mismatchCount: 0,
+        p0Count: 0,
+        p1Count: 0
+      },
+      safetyGate: {
+        passed: true
+      }
+    });
+    expect(iamRepository.identityUsers.get(25)).toMatchObject({
+      id: "legacy:25",
+      username: "unverified",
+      status: "active"
+    });
+    expect(iamRepository.roleAssignments.get(25)).toHaveLength(1);
+    expect(iamRepository.subjectMaps.get("legacy:25")?.filter((subject) => subject.subjectType === "plugin_user")).toHaveLength(1);
+
+    const second = await request(app.getHttpServer())
+      .post("/internal/iam/reconciliation/run")
+      .set("x-identity-internal-token", "iam-test-token")
+      .send({
+        dryRun: false,
+        runKey: "iam-apply-25-repeat",
+        scopes: ["user", "role", "organization", "plugin"],
+        legacyUserIds: [25]
+      })
+      .expect(201);
+
+    expect(second.body.data.summary).toMatchObject({
+      mismatchCount: 0,
+      p0Count: 0,
+      p1Count: 0
+    });
+    expect(iamRepository.roleAssignments.get(25)).toHaveLength(1);
+    expect(iamRepository.subjectMaps.get("legacy:25")?.filter((subject) => subject.subjectType === "plugin_user")).toHaveLength(1);
+
+    const report = await request(app.getHttpServer())
+      .get("/internal/iam/reconciliation/runs/iam-apply-25")
+      .set("x-identity-internal-token", "iam-test-token")
+      .expect(200);
+
+    expect(report.body.data).toMatchObject({
+      run: {
+        runKey: "iam-apply-25",
+        status: "succeeded",
+        sampleCount: 1,
+        mismatchCount: 0
+      },
+      safetyGate: {
+        passed: true
+      },
+      items: []
     });
   });
 });

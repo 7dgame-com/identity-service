@@ -69,6 +69,22 @@ export class IamController {
     };
   }
 
+  @Post("reconciliation/run")
+  async reconciliationRun(@Headers("x-identity-internal-token") token: string | undefined, @Body() body: unknown) {
+    this.assertEnabledAndAuthorized(token);
+    return {
+      data: await this.iam.reconcile(body)
+    };
+  }
+
+  @Get("reconciliation/runs/:runKey")
+  async reconciliationReport(@Headers("x-identity-internal-token") token: string | undefined, @Param("runKey") runKey: string) {
+    this.assertEnabledAndAuthorized(token);
+    return {
+      data: await this.iam.reconciliationReport(runKey)
+    };
+  }
+
   private assertEnabledAndAuthorized(token: string | undefined): void {
     if (!this.config.iam.enabled || this.config.iam.mode === "disabled") {
       throw new NotFoundException({
