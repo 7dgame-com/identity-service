@@ -13,6 +13,9 @@ import { AccountRegistrationRepository } from "./account-registration.repository
 import { AccountRegistrationService } from "./account-registration.service.js";
 import { AuthController } from "./auth.controller.js";
 import { HealthController } from "./health.controller.js";
+import { IamController } from "./iam.controller.js";
+import { IamRepository } from "./iam.repository.js";
+import { IamService } from "./iam.service.js";
 import { IdentityController } from "./identity.controller.js";
 import { IdentitySessionRepository } from "./identity-session.repository.js";
 import { InvitationDiagnosticsController } from "./invitation-diagnostics.controller.js";
@@ -46,6 +49,7 @@ import { UsageBillingService } from "./usage-billing.service.js";
     AuthController,
     AccountLifecycleController,
     InvitationDiagnosticsController,
+    IamController,
     UsageBillingController
   ],
   providers: [
@@ -91,6 +95,8 @@ import { UsageBillingService } from "./usage-billing.service.js";
     PasswordResetChallengeRepository,
     LoginAuditRepository,
     LoginAuditService,
+    IamRepository,
+    IamService,
     UsageBillingRepository,
     UsageBillingService,
     TokenIssuanceService,

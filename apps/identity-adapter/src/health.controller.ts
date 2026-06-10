@@ -27,6 +27,14 @@ export class HealthController {
           tokenIssuance: this.config.tokenIssuance.enabled ? "enabled" : "disabled",
           loginAudit: this.config.loginAudit.enabled ? "enabled" : "disabled",
           usageBillingShadow: this.config.usageBilling.shadowEnabled ? "enabled" : "disabled",
+          iam: this.config.iam.enabled ? this.config.iam.mode : "disabled",
+          iamViews: {
+            user: this.config.iam.userViewEnabled ? "enabled" : "disabled",
+            role: this.config.iam.roleViewEnabled ? "enabled" : "disabled",
+            permission: this.config.iam.permissionViewEnabled ? "enabled" : "disabled",
+            organization: this.config.iam.organizationViewEnabled ? "enabled" : "disabled",
+            plugin: this.config.iam.pluginViewEnabled ? "enabled" : "disabled"
+          },
           accountLifecycle: this.config.accountLifecycle.enabled ? "enabled" : "disabled",
           accountLifecycleScopes: {
             register: this.config.accountLifecycle.registerEnabled ? "enabled" : "disabled",

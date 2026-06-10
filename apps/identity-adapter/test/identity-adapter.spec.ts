@@ -14,6 +14,7 @@ import { AccountRegistrationRepository, NativeRegistrationError } from "../src/a
 import { EmailChangeTokenError, EmailChangeTokenRepository } from "../src/email-change-token.repository.js";
 import { EmailDeliveryService } from "../src/email-delivery.service.js";
 import { EmailVerificationChallengeError, EmailVerificationChallengeRepository } from "../src/email-verification-challenge.repository.js";
+import { IamRepository } from "../src/iam.repository.js";
 import { loadConfig } from "../src/config.js";
 import { IdentitySessionRepository, InvalidRefreshTokenError } from "../src/identity-session.repository.js";
 import { IdentityInvitation, InvitationIdentityRepository } from "../src/invitation-identity.repository.js";
@@ -38,6 +39,10 @@ import {
 
 class FakeLegacyIdentityReader {
   readonly passwordHash = bcrypt.hashSync("123456", 4);
+
+  isConfigured() {
+    return true;
+  }
 
   async health() {
     return "not_configured";
@@ -127,6 +132,102 @@ class FakeLegacyIdentityReader {
 
   async listOrganizations() {
     return [{ id: 1, name: "test-university", title: "测试大学", createdAt: 1, updatedAt: 1 }];
+  }
+
+  async listUserPermissions(userId: number) {
+    if (userId !== 24) {
+      return [];
+    }
+
+    return [
+      { name: "course.manage", description: "Manage courses", source: "role-child" as const },
+      { name: "plugin.open", description: "Open plugins", source: "direct" as const }
+    ];
+  }
+}
+
+class FakeIamRepository {
+  isConfigured() {
+    return true;
+  }
+
+  async health() {
+    return "configured";
+  }
+
+  async diagnostics() {
+    return {
+      identityDatabaseConfigured: true,
+      tables: {
+        identity_users: true,
+        identity_subject_maps: true,
+        identity_role_assignments_shadow: true,
+        identity_organization_memberships_shadow: true,
+        iam_reconciliation_runs: true,
+        iam_reconciliation_items: true
+      }
+    };
+  }
+
+  async getIdentityUserByLegacyId(legacyUserId: number) {
+    if (legacyUserId !== 24) {
+      return null;
+    }
+
+    return {
+      id: "id-user-24",
+      legacyUserId: 24,
+      keycloakSubject: "keycloak-subject-24",
+      username: "guanfei",
+      email: "ogre3d@163.com",
+      status: "shadow",
+      source: "legacy-shadow",
+      metadata: null,
+      createdAt: "2026-06-10T00:00:00.000Z",
+      updatedAt: "2026-06-10T00:00:00.000Z"
+    };
+  }
+
+  async listSubjectMaps(identityUserId: string) {
+    return [
+      {
+        identityUserId,
+        subjectType: "legacy_user",
+        subjectId: "24",
+        source: "legacy-shadow",
+        status: "active",
+        metadata: null,
+        createdAt: null,
+        updatedAt: null
+      }
+    ];
+  }
+
+  async listRoleAssignmentsShadow(legacyUserId: number) {
+    return [
+      {
+        identityUserId: `id-user-${legacyUserId}`,
+        legacyUserId,
+        roleName: "admin",
+        source: "yii-rbac",
+        status: "shadow",
+        observedAt: "2026-06-10T00:00:00.000Z"
+      }
+    ];
+  }
+
+  async listOrganizationMembershipsShadow(legacyUserId: number) {
+    return [
+      {
+        identityUserId: `id-user-${legacyUserId}`,
+        legacyUserId,
+        organizationId: 1,
+        organizationRole: "member",
+        source: "legacy-organization",
+        status: "shadow",
+        observedAt: "2026-06-10T00:00:00.000Z"
+      }
+    ];
   }
 }
 
@@ -1367,6 +1468,154 @@ describe("identity-adapter readonly API", () => {
       .post("/v1/wechat/register")
       .send({ token: "wechat-token", username: "new-user", password: "123456" })
       .expect(404);
+  });
+
+  it("keeps IAM readonly views disabled by default", async () => {
+    const readiness = await request(app.getHttpServer()).get("/internal/iam/readiness").expect(200);
+
+    expect(readiness.body.data).toMatchObject({
+      enabled: false,
+      mode: "disabled",
+      views: {
+        user: false,
+        role: false,
+        permission: false,
+        organization: false,
+        plugin: false
+      }
+    });
+
+    await request(app.getHttpServer()).get("/internal/iam/users/24").expect(404);
+  });
+});
+
+describe("identity-adapter IAM readonly API", () => {
+  let app: INestApplication;
+  const originalEnv = { ...process.env };
+  const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
+  const privateKeyPem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+
+  beforeEach(async () => {
+    process.env = { ...originalEnv };
+    process.env.IDENTITY_IAM_ENABLED = "true";
+    process.env.IDENTITY_IAM_MODE = "readonly";
+    process.env.IDENTITY_IAM_INTERNAL_API_TOKEN = "iam-test-token";
+    process.env.IDENTITY_IAM_USER_VIEW_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_VIEW_ENABLED = "true";
+    process.env.IDENTITY_IAM_PERMISSION_VIEW_ENABLED = "true";
+    process.env.IDENTITY_IAM_ORGANIZATION_VIEW_ENABLED = "true";
+    process.env.IDENTITY_IAM_PLUGIN_VIEW_ENABLED = "true";
+    process.env.IDENTITY_JWT_PRIVATE_KEY_PEM = privateKeyPem;
+    process.env.IDENTITY_JWT_KEY_ID = "iam-readonly-test-key";
+    process.env.IDENTITY_JWT_ISSUER = "identity-iam-test";
+    process.env.IDENTITY_JWT_AUDIENCE = "xrugc-iam";
+
+    const moduleRef = await Test.createTestingModule({
+      imports: [AppModule]
+    })
+      .overrideProvider(LegacyIdentityReader)
+      .useClass(FakeLegacyIdentityReader)
+      .overrideProvider(IamRepository)
+      .useClass(FakeIamRepository)
+      .compile();
+
+    app = moduleRef.createNestApplication();
+    await app.init();
+  });
+
+  afterEach(async () => {
+    vi.unstubAllGlobals();
+    process.env = { ...originalEnv };
+    await app.close();
+  });
+
+  it("reports IAM readiness without changing write modes", async () => {
+    const readiness = await request(app.getHttpServer()).get("/internal/iam/readiness").expect(200);
+
+    expect(readiness.body.data).toMatchObject({
+      enabled: true,
+      mode: "readonly",
+      fallbackEnabled: true,
+      identityRepositoryConfigured: true,
+      views: {
+        user: true,
+        role: true,
+        permission: true,
+        organization: true,
+        plugin: true
+      },
+      writes: {
+        profile: "disabled",
+        role: "disabled",
+        organization: "disabled",
+        pluginUser: "disabled"
+      }
+    });
+  });
+
+  it("requires the internal token for IAM data views", async () => {
+    await request(app.getHttpServer()).get("/internal/iam/users/24").expect(401);
+  });
+
+  it("returns user, role, permission and organization views from readonly sources", async () => {
+    const headers = { "x-identity-internal-token": "iam-test-token" };
+    const user = await request(app.getHttpServer()).get("/internal/iam/users/24").set(headers).expect(200);
+    const roles = await request(app.getHttpServer()).get("/internal/iam/users/24/roles").set(headers).expect(200);
+    const permissions = await request(app.getHttpServer()).get("/internal/iam/users/24/permissions").set(headers).expect(200);
+    const organizations = await request(app.getHttpServer()).get("/internal/iam/users/24/organizations").set(headers).expect(200);
+
+    expect(user.body.data).toMatchObject({
+      identityUserId: "id-user-24",
+      legacyUserId: 24,
+      keycloakSubject: "keycloak-subject-24",
+      username: "guanfei",
+      source: {
+        profile: "legacy",
+        identityMap: "identity-db"
+      }
+    });
+    expect(roles.body.data.roles).toEqual([{ name: "admin", source: "legacy-yii-rbac" }]);
+    expect(roles.body.data.shadow).toHaveLength(1);
+    expect(permissions.body.data.permissions.map((permission: { name: string }) => permission.name)).toEqual([
+      "course.manage",
+      "plugin.open"
+    ]);
+    expect(organizations.body.data.organizations).toEqual([
+      {
+        id: 1,
+        name: "test-university",
+        title: "测试大学",
+        createdAt: 1,
+        updatedAt: 1,
+        source: "legacy"
+      }
+    ]);
+    expect(organizations.body.data.shadow).toHaveLength(1);
+  });
+
+  it("returns plugin identity views from identity JWT and legacy profile", async () => {
+    const legacyUser = await new FakeLegacyIdentityReader().getUserById(24);
+    expect(legacyUser).not.toBeNull();
+    const token = new JwtIssuerService().issue(legacyUser!, "session-24").accessToken;
+    const response = await request(app.getHttpServer())
+      .post("/internal/iam/plugin/verify-token")
+      .set("x-identity-internal-token", "iam-test-token")
+      .send({ token })
+      .expect(201);
+
+    expect(response.body.data).toMatchObject({
+      valid: true,
+      user: {
+        uid: 24,
+        username: "guanfei",
+        roles: ["admin"],
+        sessionId: "session-24"
+      },
+      source: {
+        token: "identity-jwt",
+        profile: "legacy"
+      }
+    });
   });
 });
 
