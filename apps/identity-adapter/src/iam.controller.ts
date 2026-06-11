@@ -18,6 +18,14 @@ export class IamController {
     };
   }
 
+  @Post("schema/ensure")
+  async ensureSchema(@Headers("x-identity-internal-token") token: string | undefined) {
+    this.assertEnabledAndAuthorized(token);
+    return {
+      data: await this.iam.ensureSchema()
+    };
+  }
+
   @Get("users/:legacyUserId")
   async user(@Headers("x-identity-internal-token") token: string | undefined, @Param("legacyUserId") legacyUserId: string) {
     this.assertEnabledAndAuthorized(token);

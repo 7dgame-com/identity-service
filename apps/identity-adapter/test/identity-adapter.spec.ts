@@ -152,6 +152,8 @@ class FakeLegacyIdentityReader {
 }
 
 class FakeIamRepository {
+  schemaEnsureCount = 0;
+  schemaTablesReady = true;
   readonly identityUsers = new Map<number, any>([
     [
       24,
@@ -232,14 +234,19 @@ class FakeIamRepository {
     return {
       identityDatabaseConfigured: true,
       tables: {
-        identity_users: true,
-        identity_subject_maps: true,
-        identity_role_assignments_shadow: true,
-        identity_organization_memberships_shadow: true,
-        iam_reconciliation_runs: true,
-        iam_reconciliation_items: true
+        identity_users: this.schemaTablesReady,
+        identity_subject_maps: this.schemaTablesReady,
+        identity_role_assignments_shadow: this.schemaTablesReady,
+        identity_organization_memberships_shadow: this.schemaTablesReady,
+        iam_reconciliation_runs: this.schemaTablesReady,
+        iam_reconciliation_items: this.schemaTablesReady
       }
     };
+  }
+
+  async ensureSchema() {
+    this.schemaEnsureCount += 1;
+    this.schemaTablesReady = true;
   }
 
   async getIdentityUserByLegacyId(legacyUserId: number) {
@@ -4058,6 +4065,33 @@ describe("identity-adapter IAM reconciliation API", () => {
     });
     expect(response.body.data.items).toHaveLength(2);
     expect(iamRepository.runs.size).toBe(0);
+  });
+
+  it("ensures IAM schema through an internal endpoint", async () => {
+    await createApp();
+    iamRepository.schemaTablesReady = false;
+
+    const response = await request(app.getHttpServer())
+      .post("/internal/iam/schema/ensure")
+      .set("x-identity-internal-token", "iam-test-token")
+      .expect(201);
+
+    expect(iamRepository.schemaEnsureCount).toBe(1);
+    expect(response.body.data).toMatchObject({
+      identityDatabase: "configured",
+      diagnostics: {
+        identityDatabaseConfigured: true,
+        tables: {
+          identity_users: true,
+          identity_subject_maps: true,
+          identity_role_assignments_shadow: true,
+          identity_organization_memberships_shadow: true,
+          iam_reconciliation_runs: true,
+          iam_reconciliation_items: true
+        }
+      },
+      nonUserFacing: true
+    });
   });
 
   it("refuses shadow apply while reconciliation is disabled", async () => {

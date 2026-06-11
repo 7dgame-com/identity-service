@@ -539,7 +539,7 @@ export class IamRepository implements OnModuleDestroy {
     return rows.map(normalizeReconciliationItem);
   }
 
-  private async ensureSchema(): Promise<void> {
+  async ensureSchema(): Promise<void> {
     if (!this.schemaReady) {
       this.schemaReady = this.createSchema();
     }

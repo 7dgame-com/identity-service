@@ -1,5 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
-import { BadRequestException, Injectable, NotFoundException, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
+import {
+  BadRequestException,
+  Injectable,
+  NotFoundException,
+  OnApplicationBootstrap,
+  ServiceUnavailableException,
+  UnauthorizedException
+} from "@nestjs/common";
 import { z } from "zod";
 import { loadConfig } from "./config.js";
 import { IamReconciliationItemInput, IamRepository } from "./iam.repository.js";
@@ -24,7 +31,7 @@ const reconciliationSchema = z.object({
 type IamReconciliationInput = z.infer<typeof reconciliationSchema>;
 
 @Injectable()
-export class IamService {
+export class IamService implements OnApplicationBootstrap {
   private readonly config = loadConfig();
 
   constructor(
@@ -33,6 +40,12 @@ export class IamService {
     private readonly jwtIssuer: JwtIssuerService
   ) {}
 
+  async onApplicationBootstrap() {
+    if (this.config.iam.schemaAutoEnsureEnabled) {
+      await this.ensureSchema();
+    }
+  }
+
   async readiness() {
     const { iam } = this.config;
 
@@ -40,6 +53,7 @@ export class IamService {
       enabled: iam.enabled,
       mode: iam.mode,
       fallbackEnabled: iam.fallbackEnabled,
+      schemaAutoEnsureEnabled: iam.schemaAutoEnsureEnabled,
       reconciliationEnabled: iam.reconciliationEnabled,
       reconciliationBatchSize: iam.reconciliationBatchSize,
       identityRepositoryConfigured: this.repository.isConfigured(),
@@ -65,6 +79,23 @@ export class IamService {
         requiredBeforeIdentityPrimary: true,
         supportedScopes: reconciliationScopes
       }
+    };
+  }
+
+  async ensureSchema() {
+    if (!this.repository.isConfigured()) {
+      throw new ServiceUnavailableException({
+        code: "IDENTITY_DB_NOT_CONFIGURED",
+        message: "Identity database is not configured for IAM schema bootstrap."
+      });
+    }
+
+    await this.repository.ensureSchema();
+
+    return {
+      identityDatabase: await this.repository.health(),
+      diagnostics: await this.repository.diagnostics(),
+      nonUserFacing: true
     };
   }
 
