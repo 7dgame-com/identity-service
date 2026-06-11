@@ -37,6 +37,51 @@ curl -sS https://identity.d.tmrpp.com/health
 curl -sS -o /dev/null -w '%{http_code}\n' https://identity.d.xrteeth.com/internal/iam/reconciliation/status
 ```
 
+## tmrpp Deployment Note
+
+Do not use `tmrpp` Portainer for stage 7 acceptance. The `tmrpp` side is
+deployed through the elastic server image workflow. Validate it with public
+health checks and with command output copied from the target container or host
+shell.
+
+The minimum public checks are:
+
+```sh
+curl -sS https://identity.d.tmrpp.com/health
+curl -sS https://identity.tmrpp.com/health
+curl -sS -o /dev/null -w '%{http_code}\n' https://identity.d.tmrpp.com/internal/iam/reconciliation/status
+curl -sS -o /dev/null -w '%{http_code}\n' https://identity.tmrpp.com/internal/iam/reconciliation/status
+```
+
+The internal smoke/dry-run/gate checks below still need to run inside the
+`identity-adapter` container, either directly from the container shell or
+through a host-side `docker exec`.
+
+If running from the host shell, first find the adapter container:
+
+```sh
+docker ps --format '{{.Names}}' | grep 'identity-adapter'
+```
+
+Then replace `<adapter-container>` and run these read-only checks:
+
+```sh
+docker exec <adapter-container> /bin/sh -lc \
+  'node dist/scripts/iam-reconciliation-smoke.js >/tmp/stage7-smoke.log 2>&1; echo STAGE7_SMOKE_EXIT:$?; grep -E "^\[(health|readiness|reconciliation\.status\.(before|after))\]" /tmp/stage7-smoke.log'
+
+docker exec <adapter-container> /bin/sh -lc \
+  'node dist/scripts/iam-reconciliation-smoke.js --dry-run --legacy-user-id=25 --run-key=stage7-tmrpp-dev-dry-run-25 >/tmp/stage7-dryrun.log 2>&1; echo STAGE7_DRYRUN_EXIT:$?; grep -E "\"dryRun\"|\"applyShadow\"|\"shadowWriteCount\"|\"passed\"|\"blockers\"|P0|P1" /tmp/stage7-dryrun.log | tail -n 40'
+
+docker exec <adapter-container> /bin/sh -lc \
+  'node dist/scripts/iam-reconciliation-smoke.js --require-gate >/tmp/stage7-gate.log 2>&1; echo STAGE7_GATE_EXIT:$?; grep -E "\"passed\"|\"blockers\"|lastSucceededRun|runKey|P0|P1|canCutoverIdentityPrimary" /tmp/stage7-gate.log | tail -n 40'
+```
+
+Expected:
+
+- all three exit markers are `0`
+- dry-run shows `dryRun:true`, `applyShadow:false` and `shadowWriteCount:0`
+- gate shows `passed:true`, `blockers:[]` and `canCutoverIdentityPrimary:false`
+
 ## Container Checks
 
 Run these inside the `identity-adapter` container. The runtime image contains
