@@ -14,6 +14,7 @@ import { AccountRegistrationRepository, NativeRegistrationError } from "../src/a
 import { EmailChangeTokenError, EmailChangeTokenRepository } from "../src/email-change-token.repository.js";
 import { EmailDeliveryService } from "../src/email-delivery.service.js";
 import { EmailVerificationChallengeError, EmailVerificationChallengeRepository } from "../src/email-verification-challenge.repository.js";
+import { IamRepository } from "../src/iam.repository.js";
 import { loadConfig } from "../src/config.js";
 import { IdentitySessionRepository, InvalidRefreshTokenError } from "../src/identity-session.repository.js";
 import { IdentityInvitation, InvitationIdentityRepository } from "../src/invitation-identity.repository.js";
@@ -29,9 +30,19 @@ import { PasswordResetChallengeError, PasswordResetChallengeRepository } from ".
 import { sanitizeMetadata } from "../src/login-audit.service.js";
 import { assertReadonlySql } from "../src/readonly-write.guard.js";
 import { normalizeOtlpTraceEndpoint, startTelemetry } from "../src/telemetry.js";
+import {
+  LoginAuditSourceEvent,
+  UsageBillingRepository,
+  UsageLedgerRecord,
+  UsageReplayRunRow
+} from "../src/usage-billing.repository.js";
 
 class FakeLegacyIdentityReader {
   readonly passwordHash = bcrypt.hashSync("123456", 4);
+
+  isConfigured() {
+    return true;
+  }
 
   async health() {
     return "not_configured";
@@ -115,12 +126,295 @@ class FakeLegacyIdentityReader {
     };
   }
 
+  async listUsers(input: { afterId: number; limit: number }) {
+    const users = [await this.getUserById(24), await this.getUserById(25)].filter((user) => user !== null);
+    return users.filter((user) => user!.id > input.afterId).slice(0, input.limit);
+  }
+
   async listRoles() {
     return [{ name: "admin", description: "Administrator", createdAt: 1, updatedAt: 1 }];
   }
 
   async listOrganizations() {
     return [{ id: 1, name: "test-university", title: "测试大学", createdAt: 1, updatedAt: 1 }];
+  }
+
+  async listUserPermissions(userId: number) {
+    if (userId !== 24) {
+      return [];
+    }
+
+    return [
+      { name: "course.manage", description: "Manage courses", source: "role-child" as const },
+      { name: "plugin.open", description: "Open plugins", source: "direct" as const }
+    ];
+  }
+}
+
+class FakeIamRepository {
+  schemaEnsureCount = 0;
+  schemaTablesReady = true;
+  readonly identityUsers = new Map<number, any>([
+    [
+      24,
+      {
+        id: "id-user-24",
+        legacyUserId: 24,
+        keycloakSubject: "keycloak-subject-24",
+        username: "guanfei",
+        email: "ogre3d@163.com",
+        status: "active",
+        source: "legacy-shadow",
+        metadata: null,
+        createdAt: "2026-06-10T00:00:00.000Z",
+        updatedAt: "2026-06-10T00:00:00.000Z"
+      }
+    ]
+  ]);
+  readonly subjectMaps = new Map<string, any[]>([
+    [
+      "id-user-24",
+      [
+        {
+          identityUserId: "id-user-24",
+          subjectType: "legacy_user",
+          subjectId: "24",
+          source: "legacy-shadow",
+          status: "active",
+          metadata: null,
+          createdAt: null,
+          updatedAt: null
+        }
+      ]
+    ]
+  ]);
+  readonly roleAssignments = new Map<number, any[]>([
+    [
+      24,
+      [
+        {
+          identityUserId: "id-user-24",
+          legacyUserId: 24,
+          roleName: "admin",
+          source: "legacy-shadow",
+          status: "shadow",
+          observedAt: "2026-06-10T00:00:00.000Z"
+        }
+      ]
+    ]
+  ]);
+  readonly organizationMemberships = new Map<number, any[]>([
+    [
+      24,
+      [
+        {
+          identityUserId: "id-user-24",
+          legacyUserId: 24,
+          organizationId: 1,
+          organizationRole: "member",
+          source: "legacy-shadow",
+          status: "shadow",
+          observedAt: "2026-06-10T00:00:00.000Z"
+        }
+      ]
+    ]
+  ]);
+  readonly runs = new Map<string, any>();
+  readonly items = new Map<string, any[]>();
+
+  isConfigured() {
+    return true;
+  }
+
+  async health() {
+    return "configured";
+  }
+
+  async diagnostics() {
+    return {
+      identityDatabaseConfigured: true,
+      tables: {
+        identity_users: this.schemaTablesReady,
+        identity_subject_maps: this.schemaTablesReady,
+        identity_role_assignments_shadow: this.schemaTablesReady,
+        identity_organization_memberships_shadow: this.schemaTablesReady,
+        iam_reconciliation_runs: this.schemaTablesReady,
+        iam_reconciliation_items: this.schemaTablesReady
+      }
+    };
+  }
+
+  async ensureSchema() {
+    this.schemaEnsureCount += 1;
+    this.schemaTablesReady = true;
+  }
+
+  async getIdentityUserByLegacyId(legacyUserId: number) {
+    return this.identityUsers.get(legacyUserId) ?? null;
+  }
+
+  async listSubjectMaps(identityUserId: string) {
+    return this.subjectMaps.get(identityUserId) ?? [];
+  }
+
+  async listRoleAssignmentsShadow(legacyUserId: number) {
+    return this.roleAssignments.get(legacyUserId) ?? [];
+  }
+
+  async listOrganizationMembershipsShadow(legacyUserId: number) {
+    return this.organizationMemberships.get(legacyUserId) ?? [];
+  }
+
+  async upsertIdentityUserShadow(input: {
+    identityUserId: string;
+    legacyUserId: number;
+    username: string | null;
+    email: string | null;
+    status: string;
+    metadata: Record<string, unknown>;
+  }) {
+    this.identityUsers.set(input.legacyUserId, {
+      id: input.identityUserId,
+      legacyUserId: input.legacyUserId,
+      keycloakSubject: null,
+      username: input.username,
+      email: input.email,
+      status: input.status,
+      source: "legacy-shadow",
+      metadata: input.metadata,
+      createdAt: "2026-06-10T00:00:00.000Z",
+      updatedAt: "2026-06-10T00:00:00.000Z"
+    });
+    const current = this.subjectMaps.get(input.identityUserId) ?? [];
+    const withoutLegacy = current.filter((subject) => !(subject.subjectType === "legacy_user" && subject.subjectId === String(input.legacyUserId)));
+    this.subjectMaps.set(input.identityUserId, [
+      ...withoutLegacy,
+      {
+        identityUserId: input.identityUserId,
+        subjectType: "legacy_user",
+        subjectId: String(input.legacyUserId),
+        source: "legacy-shadow",
+        status: "active",
+        metadata: { legacyUserId: input.legacyUserId },
+        createdAt: null,
+        updatedAt: null
+      }
+    ]);
+  }
+
+  async upsertPluginSubjectMap(input: { identityUserId: string; legacyUserId: number; metadata: Record<string, unknown> }) {
+    const current = this.subjectMaps.get(input.identityUserId) ?? [];
+    const withoutPlugin = current.filter(
+      (subject) => !(subject.subjectType === "plugin_user" && subject.subjectId === `legacy:${input.legacyUserId}`)
+    );
+    this.subjectMaps.set(input.identityUserId, [
+      ...withoutPlugin,
+      {
+        identityUserId: input.identityUserId,
+        subjectType: "plugin_user",
+        subjectId: `legacy:${input.legacyUserId}`,
+        source: "legacy-shadow",
+        status: "active",
+        metadata: input.metadata,
+        createdAt: null,
+        updatedAt: null
+      }
+    ]);
+  }
+
+  async replaceRoleAssignmentsShadow(
+    legacyUserId: number,
+    roles: Array<{ identityUserId: string; legacyUserId: number; roleName: string; source: string }>
+  ) {
+    this.roleAssignments.set(
+      legacyUserId,
+      roles.map((role) => ({
+        ...role,
+        status: "shadow",
+        observedAt: "2026-06-10T00:00:00.000Z"
+      }))
+    );
+    return roles.length;
+  }
+
+  async replaceOrganizationMembershipsShadow(
+    legacyUserId: number,
+    organizations: Array<{
+      identityUserId: string;
+      legacyUserId: number;
+      organizationId: number;
+      organizationRole: string | null;
+      source: string;
+    }>
+  ) {
+    this.organizationMemberships.set(
+      legacyUserId,
+      organizations.map((organization) => ({
+        ...organization,
+        status: "shadow",
+        observedAt: "2026-06-10T00:00:00.000Z"
+      }))
+    );
+    return organizations.length;
+  }
+
+  async createReconciliationRun(input: { runKey: string; scope: string; mode: string; metadata: Record<string, unknown> }) {
+    this.runs.set(input.runKey, {
+      runKey: input.runKey,
+      scope: input.scope,
+      mode: input.mode,
+      status: "running",
+      startedAt: "2026-06-10T00:00:00.000Z",
+      finishedAt: null,
+      sampleCount: 0,
+      mismatchCount: 0,
+      p0Count: 0,
+      p1Count: 0,
+      metadata: input.metadata
+    });
+    this.items.set(input.runKey, []);
+  }
+
+  async insertReconciliationItems(items: any[]) {
+    for (const item of items) {
+      const list = this.items.get(item.runKey) ?? [];
+      list.push({
+        ...item,
+        createdAt: "2026-06-10T00:00:00.000Z"
+      });
+      this.items.set(item.runKey, list);
+    }
+    return items.length;
+  }
+
+  async finishReconciliationRun(input: {
+    runKey: string;
+    status: "succeeded" | "failed";
+    sampleCount: number;
+    mismatchCount: number;
+    p0Count: number;
+    p1Count: number;
+    metadata: Record<string, unknown>;
+  }) {
+    const current = this.runs.get(input.runKey);
+    this.runs.set(input.runKey, {
+      ...current,
+      status: input.status,
+      finishedAt: "2026-06-10T00:00:01.000Z",
+      sampleCount: input.sampleCount,
+      mismatchCount: input.mismatchCount,
+      p0Count: input.p0Count,
+      p1Count: input.p1Count,
+      metadata: input.metadata
+    });
+  }
+
+  async getReconciliationRun(runKey: string) {
+    return this.runs.get(runKey) ?? null;
+  }
+
+  async listReconciliationItems(runKey: string) {
+    return this.items.get(runKey) ?? [];
   }
 }
 
@@ -862,6 +1156,135 @@ class FakeLoginAuditRepository {
   }
 }
 
+class FakeUsageBillingRepository {
+  configured = true;
+  readonly events: LoginAuditSourceEvent[] = [];
+  readonly ledger = new Map<string, UsageLedgerRecord>();
+  readonly runs = new Map<string, UsageReplayRunRow>();
+  readonly balances = new Map<string, { includedQuota: number; usedQuantity: number; remainingQuantity: number }>();
+
+  isConfigured() {
+    return this.configured;
+  }
+
+  async listSuccessfulLoginEvents(input: { afterId: number; limit: number }) {
+    return this.events.filter((event) => event.id > input.afterId && event.success && event.eventType === "login").slice(0, input.limit);
+  }
+
+  async insertLedger(record: UsageLedgerRecord) {
+    if (this.ledger.has(record.ledgerKey)) {
+      return { duplicate: true };
+    }
+
+    this.ledger.set(record.ledgerKey, record);
+    return { duplicate: false };
+  }
+
+  async createReplayRun(input: { runKey: string; mode: string; metadata: Record<string, unknown> }) {
+    this.runs.set(input.runKey, {
+      runKey: input.runKey,
+      mode: input.mode,
+      status: "running",
+      startedAt: new Date().toISOString(),
+      finishedAt: null,
+      processedCount: 0,
+      createdCount: 0,
+      skippedCount: 0,
+      metadata: input.metadata
+    });
+  }
+
+  async finishReplayRun(input: {
+    runKey: string;
+    status: "succeeded" | "failed";
+    processedCount: number;
+    createdCount: number;
+    skippedCount: number;
+    metadata: Record<string, unknown>;
+  }) {
+    const current = this.runs.get(input.runKey);
+    this.runs.set(input.runKey, {
+      runKey: input.runKey,
+      mode: current?.mode ?? "apply",
+      status: input.status,
+      startedAt: current?.startedAt ?? new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+      processedCount: input.processedCount,
+      createdCount: input.createdCount,
+      skippedCount: input.skippedCount,
+      metadata: input.metadata
+    });
+  }
+
+  async rebuildShadowBalances(input: { includedQuota: number; billingCycle: string }) {
+    this.balances.clear();
+    for (const record of this.ledger.values()) {
+      if (record.billingStatus !== "shadow") {
+        continue;
+      }
+      const key = `${record.subjectType}:${record.subjectId}:${record.usageType}`;
+      const current = this.balances.get(key) ?? {
+        includedQuota: input.includedQuota,
+        usedQuantity: 0,
+        remainingQuantity: input.includedQuota
+      };
+      current.usedQuantity += record.quantity;
+      current.remainingQuantity = input.includedQuota - current.usedQuantity;
+      this.balances.set(key, current);
+    }
+
+    return this.balances.size;
+  }
+
+  async getBalance(subjectType: string, subjectId: string, usageType = "login") {
+    const balance = this.balances.get(`${subjectType}:${subjectId}:${usageType}`);
+    return balance
+      ? {
+          subjectType,
+          subjectId,
+          usageType,
+          includedQuota: balance.includedQuota,
+          usedQuantity: balance.usedQuantity,
+          remainingQuantity: balance.remainingQuantity,
+          billingCycle: "default",
+          updatedAt: new Date().toISOString()
+        }
+      : null;
+  }
+
+  async listLedger() {
+    return [...this.ledger.values()].map((record) => ({
+      ledgerKey: record.ledgerKey,
+      sourceEventId: record.sourceEventId,
+      subjectType: record.subjectType,
+      subjectId: record.subjectId,
+      usageType: record.usageType,
+      quantity: record.quantity,
+      unit: record.unit,
+      chargeMode: record.chargeMode,
+      billingStatus: record.billingStatus,
+      occurredAt: record.occurredAt.toISOString(),
+      createdAt: new Date().toISOString(),
+      metadata: record.metadata
+    }));
+  }
+
+  async getReplayRun(runKey: string) {
+    return this.runs.get(runKey) ?? null;
+  }
+
+  async getLoginUsageReport() {
+    const records = [...this.ledger.values()].filter((record) => record.usageType === "login");
+    return {
+      totalLedgerRecords: records.length,
+      freeLoginRecords: records.filter((record) => record.chargeMode === "free").length,
+      billableLoginRecords: records.filter((record) => record.chargeMode === "billable").length,
+      shadowRecords: records.filter((record) => record.billingStatus === "shadow").length,
+      usedQuantity: records.reduce((total, record) => total + record.quantity, 0)
+    };
+  }
+}
+
 class FakeInvitationRedisReader {
   readonly calls: Array<string | null> = [];
   configured = true;
@@ -1232,6 +1655,156 @@ describe("identity-adapter readonly API", () => {
       .post("/v1/wechat/register")
       .send({ token: "wechat-token", username: "new-user", password: "123456" })
       .expect(404);
+  });
+
+  it("keeps IAM readonly views disabled by default", async () => {
+    const readiness = await request(app.getHttpServer()).get("/internal/iam/readiness").expect(200);
+
+    expect(readiness.body.data).toMatchObject({
+      enabled: false,
+      mode: "disabled",
+      views: {
+        user: false,
+        role: false,
+        permission: false,
+        organization: false,
+        plugin: false
+      }
+    });
+
+    await request(app.getHttpServer()).get("/internal/iam/users/24").expect(404);
+  });
+});
+
+describe("identity-adapter IAM readonly API", () => {
+  let app: INestApplication;
+  let iamRepository: FakeIamRepository;
+  const originalEnv = { ...process.env };
+  const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
+  const privateKeyPem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+
+  beforeEach(async () => {
+    process.env = { ...originalEnv };
+    process.env.IDENTITY_IAM_ENABLED = "true";
+    process.env.IDENTITY_IAM_MODE = "readonly";
+    process.env.IDENTITY_IAM_INTERNAL_API_TOKEN = "iam-test-token";
+    process.env.IDENTITY_IAM_USER_VIEW_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_VIEW_ENABLED = "true";
+    process.env.IDENTITY_IAM_PERMISSION_VIEW_ENABLED = "true";
+    process.env.IDENTITY_IAM_ORGANIZATION_VIEW_ENABLED = "true";
+    process.env.IDENTITY_IAM_PLUGIN_VIEW_ENABLED = "true";
+    process.env.IDENTITY_JWT_PRIVATE_KEY_PEM = privateKeyPem;
+    process.env.IDENTITY_JWT_KEY_ID = "iam-readonly-test-key";
+    process.env.IDENTITY_JWT_ISSUER = "identity-iam-test";
+    process.env.IDENTITY_JWT_AUDIENCE = "xrugc-iam";
+    iamRepository = new FakeIamRepository();
+
+    const moduleRef = await Test.createTestingModule({
+      imports: [AppModule]
+    })
+      .overrideProvider(LegacyIdentityReader)
+      .useClass(FakeLegacyIdentityReader)
+      .overrideProvider(IamRepository)
+      .useValue(iamRepository)
+      .compile();
+
+    app = moduleRef.createNestApplication();
+    await app.init();
+  });
+
+  afterEach(async () => {
+    vi.unstubAllGlobals();
+    process.env = { ...originalEnv };
+    await app.close();
+  });
+
+  it("reports IAM readiness without changing write modes", async () => {
+    const readiness = await request(app.getHttpServer()).get("/internal/iam/readiness").expect(200);
+
+    expect(readiness.body.data).toMatchObject({
+      enabled: true,
+      mode: "readonly",
+      fallbackEnabled: true,
+      identityRepositoryConfigured: true,
+      views: {
+        user: true,
+        role: true,
+        permission: true,
+        organization: true,
+        plugin: true
+      },
+      writes: {
+        profile: "disabled",
+        role: "disabled",
+        organization: "disabled",
+        pluginUser: "disabled"
+      }
+    });
+  });
+
+  it("requires the internal token for IAM data views", async () => {
+    await request(app.getHttpServer()).get("/internal/iam/users/24").expect(401);
+  });
+
+  it("returns user, role, permission and organization views from readonly sources", async () => {
+    const headers = { "x-identity-internal-token": "iam-test-token" };
+    const user = await request(app.getHttpServer()).get("/internal/iam/users/24").set(headers).expect(200);
+    const roles = await request(app.getHttpServer()).get("/internal/iam/users/24/roles").set(headers).expect(200);
+    const permissions = await request(app.getHttpServer()).get("/internal/iam/users/24/permissions").set(headers).expect(200);
+    const organizations = await request(app.getHttpServer()).get("/internal/iam/users/24/organizations").set(headers).expect(200);
+
+    expect(user.body.data).toMatchObject({
+      identityUserId: "id-user-24",
+      legacyUserId: 24,
+      keycloakSubject: "keycloak-subject-24",
+      username: "guanfei",
+      source: {
+        profile: "legacy",
+        identityMap: "identity-db"
+      }
+    });
+    expect(roles.body.data.roles).toEqual([{ name: "admin", source: "legacy-yii-rbac" }]);
+    expect(roles.body.data.shadow).toHaveLength(1);
+    expect(permissions.body.data.permissions.map((permission: { name: string }) => permission.name)).toEqual([
+      "course.manage",
+      "plugin.open"
+    ]);
+    expect(organizations.body.data.organizations).toEqual([
+      {
+        id: 1,
+        name: "test-university",
+        title: "测试大学",
+        createdAt: 1,
+        updatedAt: 1,
+        source: "legacy"
+      }
+    ]);
+    expect(organizations.body.data.shadow).toHaveLength(1);
+  });
+
+  it("returns plugin identity views from identity JWT and legacy profile", async () => {
+    const legacyUser = await new FakeLegacyIdentityReader().getUserById(24);
+    expect(legacyUser).not.toBeNull();
+    const token = new JwtIssuerService().issue(legacyUser!, "session-24").accessToken;
+    const response = await request(app.getHttpServer())
+      .post("/internal/iam/plugin/verify-token")
+      .set("x-identity-internal-token", "iam-test-token")
+      .send({ token })
+      .expect(201);
+
+    expect(response.body.data).toMatchObject({
+      valid: true,
+      user: {
+        uid: 24,
+        username: "guanfei",
+        roles: ["admin"],
+        sessionId: "session-24"
+      },
+      source: {
+        token: "identity-jwt",
+        profile: "legacy"
+      }
+    });
   });
 });
 
@@ -3215,6 +3788,396 @@ describe("identity-adapter login audit API", () => {
         authorization: "[filtered]",
         safe: "value"
       }
+    });
+  });
+});
+
+describe("identity-adapter usage billing shadow API", () => {
+  let app: INestApplication;
+  let repository: FakeUsageBillingRepository;
+  const originalEnv = { ...process.env };
+
+  async function createApp(env: Record<string, string | undefined> = {}) {
+    process.env = {
+      ...originalEnv,
+      IDENTITY_INTERNAL_API_TOKEN: "test-internal-token",
+      IDENTITY_USAGE_BILLING_INTERNAL_API_TOKEN: "test-internal-token",
+      IDENTITY_USAGE_BILLING_SHADOW_ENABLED: "false",
+      IDENTITY_USAGE_BILLING_DRY_RUN: "true",
+      IDENTITY_USAGE_BILLING_LOGIN_RULE: "successful-login-v1",
+      IDENTITY_USAGE_BILLING_FREE_LOGIN_QUOTA: "1",
+      IDENTITY_USAGE_BILLING_SUBJECT_STRATEGY: "user",
+      IDENTITY_USAGE_BILLING_REPLAY_BATCH_SIZE: "500",
+      IDENTITY_DB_HOST: "identity-mysql",
+      IDENTITY_DB_USER: "identity",
+      ...env
+    };
+
+    repository = new FakeUsageBillingRepository();
+    repository.events.push(
+      {
+        id: 1,
+        eventKey: "login-event-1",
+        legacyUserId: 24,
+        identityUserId: null,
+        username: "guanfei",
+        eventType: "login",
+        success: true,
+        occurredAt: new Date("2026-06-10T01:00:00.000Z"),
+        source: "identity-service"
+      },
+      {
+        id: 2,
+        eventKey: "login-event-2",
+        legacyUserId: 24,
+        identityUserId: null,
+        username: "guanfei",
+        eventType: "login",
+        success: true,
+        occurredAt: new Date("2026-06-10T02:00:00.000Z"),
+        source: "identity-service"
+      },
+      {
+        id: 3,
+        eventKey: "failed-login-event",
+        legacyUserId: 24,
+        identityUserId: null,
+        username: "guanfei",
+        eventType: "login",
+        success: false,
+        occurredAt: new Date("2026-06-10T03:00:00.000Z"),
+        source: "identity-service"
+      }
+    );
+
+    const moduleRef = await Test.createTestingModule({
+      imports: [AppModule]
+    })
+      .overrideProvider(LegacyIdentityReader)
+      .useClass(FakeLegacyIdentityReader)
+      .overrideProvider(UsageBillingRepository)
+      .useValue(repository)
+      .compile();
+
+    app = moduleRef.createNestApplication();
+    await app.init();
+  }
+
+  afterEach(async () => {
+    process.env = { ...originalEnv };
+    await app?.close();
+  });
+
+  it("requires the internal service token", async () => {
+    await createApp();
+
+    await request(app.getHttpServer()).post("/internal/usage-billing/replay").send({ dryRun: true }).expect(401);
+  });
+
+  it("allows dry-run while shadow billing is disabled and does not write ledger records", async () => {
+    await createApp({
+      IDENTITY_USAGE_BILLING_SHADOW_ENABLED: "false",
+      IDENTITY_USAGE_BILLING_DRY_RUN: "true"
+    });
+
+    const response = await request(app.getHttpServer())
+      .post("/internal/usage-billing/replay")
+      .set("X-Identity-Internal-Token", "test-internal-token")
+      .send({ dryRun: true, afterId: 0, limit: 10, runKey: "dry-run-usage-billing" })
+      .expect(201);
+
+    expect(response.body.data).toMatchObject({
+      runKey: "dry-run-usage-billing",
+      dryRun: true,
+      shadowEnabled: false,
+      nonBilling: true,
+      summary: {
+        processedEvents: 2,
+        plannedLedgerRecords: 2,
+        createdLedgerRecords: 0,
+        skippedEvents: 0,
+        freeLoginRecords: 1,
+        billableLoginRecords: 1
+      }
+    });
+    expect(response.body.data.plannedRecords).toHaveLength(2);
+    expect(repository.ledger.size).toBe(0);
+    expect(repository.runs.size).toBe(0);
+  });
+
+  it("refuses apply mode while shadow billing is disabled", async () => {
+    await createApp({
+      IDENTITY_USAGE_BILLING_SHADOW_ENABLED: "false",
+      IDENTITY_USAGE_BILLING_DRY_RUN: "false"
+    });
+
+    await request(app.getHttpServer())
+      .post("/internal/usage-billing/replay")
+      .set("X-Identity-Internal-Token", "test-internal-token")
+      .send({ dryRun: false, runKey: "apply-disabled" })
+      .expect(404);
+
+    expect(repository.ledger.size).toBe(0);
+  });
+
+  it("applies shadow ledger records idempotently and rebuilds balance", async () => {
+    await createApp({
+      IDENTITY_USAGE_BILLING_SHADOW_ENABLED: "true",
+      IDENTITY_USAGE_BILLING_DRY_RUN: "false"
+    });
+
+    const first = await request(app.getHttpServer())
+      .post("/internal/usage-billing/replay")
+      .set("X-Identity-Internal-Token", "test-internal-token")
+      .send({ dryRun: false, runKey: "apply-shadow-1", afterId: 0, limit: 10, rebuildBalance: true })
+      .expect(201);
+
+    expect(first.body.data.summary).toMatchObject({
+      processedEvents: 2,
+      plannedLedgerRecords: 2,
+      createdLedgerRecords: 2,
+      duplicateLedgerRecords: 0,
+      rebuiltBalances: 1
+    });
+
+    const second = await request(app.getHttpServer())
+      .post("/internal/usage-billing/replay")
+      .set("X-Identity-Internal-Token", "test-internal-token")
+      .send({ dryRun: false, runKey: "apply-shadow-2", afterId: 0, limit: 10, rebuildBalance: true })
+      .expect(201);
+
+    expect(second.body.data.summary).toMatchObject({
+      createdLedgerRecords: 0,
+      duplicateLedgerRecords: 2,
+      rebuiltBalances: 1
+    });
+    expect(repository.ledger.size).toBe(2);
+
+    const balance = await request(app.getHttpServer())
+      .get("/internal/usage-billing/subjects/user/legacy:24/balance")
+      .set("X-Identity-Internal-Token", "test-internal-token")
+      .expect(200);
+
+    expect(balance.body.data).toMatchObject({
+      subjectType: "user",
+      subjectId: "legacy:24",
+      usageType: "login",
+      includedQuota: 1,
+      usedQuantity: 2,
+      remainingQuantity: -1
+    });
+
+    const run = await request(app.getHttpServer())
+      .get("/internal/usage-billing/runs/apply-shadow-2")
+      .set("X-Identity-Internal-Token", "test-internal-token")
+      .expect(200);
+
+    expect(run.body.data).toMatchObject({
+      runKey: "apply-shadow-2",
+      mode: "apply",
+      status: "succeeded",
+      processedCount: 2,
+      createdCount: 0,
+      skippedCount: 2
+    });
+
+    const report = await request(app.getHttpServer())
+      .get("/internal/usage-billing/reports/login-usage")
+      .set("X-Identity-Internal-Token", "test-internal-token")
+      .expect(200);
+
+    expect(report.body.data).toMatchObject({
+      totalLedgerRecords: 2,
+      freeLoginRecords: 1,
+      billableLoginRecords: 1,
+      shadowRecords: 2,
+      usedQuantity: 2,
+      shadow: true,
+      nonBilling: true
+    });
+  });
+});
+
+describe("identity-adapter IAM reconciliation API", () => {
+  let app: INestApplication;
+  let iamRepository: FakeIamRepository;
+  const originalEnv = { ...process.env };
+
+  async function createApp(env: Record<string, string | undefined> = {}) {
+    process.env = {
+      ...originalEnv,
+      IDENTITY_IAM_ENABLED: "true",
+      IDENTITY_IAM_MODE: "shadow",
+      IDENTITY_IAM_INTERNAL_API_TOKEN: "iam-test-token",
+      IDENTITY_IAM_USER_VIEW_ENABLED: "true",
+      IDENTITY_IAM_ROLE_VIEW_ENABLED: "true",
+      IDENTITY_IAM_PERMISSION_VIEW_ENABLED: "true",
+      IDENTITY_IAM_ORGANIZATION_VIEW_ENABLED: "true",
+      IDENTITY_IAM_PLUGIN_VIEW_ENABLED: "true",
+      IDENTITY_IAM_RECONCILIATION_ENABLED: "false",
+      IDENTITY_IAM_RECONCILIATION_BATCH_SIZE: "5",
+      IDENTITY_DB_HOST: "identity-mysql",
+      IDENTITY_DB_USER: "identity",
+      ...env
+    };
+    iamRepository = new FakeIamRepository();
+
+    const moduleRef = await Test.createTestingModule({
+      imports: [AppModule]
+    })
+      .overrideProvider(LegacyIdentityReader)
+      .useClass(FakeLegacyIdentityReader)
+      .overrideProvider(IamRepository)
+      .useValue(iamRepository)
+      .compile();
+
+    app = moduleRef.createNestApplication();
+    await app.init();
+  }
+
+  afterEach(async () => {
+    process.env = { ...originalEnv };
+    await app?.close();
+  });
+
+  it("allows dry-run reconciliation while writes are disabled", async () => {
+    await createApp();
+
+    const response = await request(app.getHttpServer())
+      .post("/internal/iam/reconciliation/run")
+      .set("x-identity-internal-token", "iam-test-token")
+      .send({ dryRun: true, runKey: "iam-dry-run-25", scopes: ["user", "permission"], legacyUserIds: [25] })
+      .expect(201);
+
+    expect(response.body.data).toMatchObject({
+      runKey: "iam-dry-run-25",
+      dryRun: true,
+      reconciliationEnabled: false,
+      summary: {
+        sampledUsers: 1,
+        p1Count: 1,
+        infoCount: 1,
+        shadowWriteCount: 0
+      },
+      safetyGate: {
+        passed: false
+      }
+    });
+    expect(response.body.data.items).toHaveLength(2);
+    expect(iamRepository.runs.size).toBe(0);
+  });
+
+  it("ensures IAM schema through an internal endpoint", async () => {
+    await createApp();
+    iamRepository.schemaTablesReady = false;
+
+    const response = await request(app.getHttpServer())
+      .post("/internal/iam/schema/ensure")
+      .set("x-identity-internal-token", "iam-test-token")
+      .expect(201);
+
+    expect(iamRepository.schemaEnsureCount).toBe(1);
+    expect(response.body.data).toMatchObject({
+      identityDatabase: "configured",
+      diagnostics: {
+        identityDatabaseConfigured: true,
+        tables: {
+          identity_users: true,
+          identity_subject_maps: true,
+          identity_role_assignments_shadow: true,
+          identity_organization_memberships_shadow: true,
+          iam_reconciliation_runs: true,
+          iam_reconciliation_items: true
+        }
+      },
+      nonUserFacing: true
+    });
+  });
+
+  it("refuses shadow apply while reconciliation is disabled", async () => {
+    await createApp();
+
+    await request(app.getHttpServer())
+      .post("/internal/iam/reconciliation/run")
+      .set("x-identity-internal-token", "iam-test-token")
+      .send({ dryRun: false, runKey: "iam-apply-disabled", scopes: ["user"], legacyUserIds: [25] })
+      .expect(404);
+
+    expect(iamRepository.identityUsers.has(25)).toBe(false);
+    expect(iamRepository.runs.size).toBe(0);
+  });
+
+  it("applies IAM shadow snapshots idempotently and reports the safety gate", async () => {
+    await createApp({ IDENTITY_IAM_RECONCILIATION_ENABLED: "true" });
+
+    const first = await request(app.getHttpServer())
+      .post("/internal/iam/reconciliation/run")
+      .set("x-identity-internal-token", "iam-test-token")
+      .send({
+        dryRun: false,
+        runKey: "iam-apply-25",
+        scopes: ["user", "role", "organization", "plugin"],
+        legacyUserIds: [25]
+      })
+      .expect(201);
+
+    expect(first.body.data).toMatchObject({
+      runKey: "iam-apply-25",
+      dryRun: false,
+      applyShadow: true,
+      summary: {
+        sampledUsers: 1,
+        mismatchCount: 0,
+        p0Count: 0,
+        p1Count: 0
+      },
+      safetyGate: {
+        passed: true
+      }
+    });
+    expect(iamRepository.identityUsers.get(25)).toMatchObject({
+      id: "legacy:25",
+      username: "unverified",
+      status: "active"
+    });
+    expect(iamRepository.roleAssignments.get(25)).toHaveLength(1);
+    expect(iamRepository.subjectMaps.get("legacy:25")?.filter((subject) => subject.subjectType === "plugin_user")).toHaveLength(1);
+
+    const second = await request(app.getHttpServer())
+      .post("/internal/iam/reconciliation/run")
+      .set("x-identity-internal-token", "iam-test-token")
+      .send({
+        dryRun: false,
+        runKey: "iam-apply-25-repeat",
+        scopes: ["user", "role", "organization", "plugin"],
+        legacyUserIds: [25]
+      })
+      .expect(201);
+
+    expect(second.body.data.summary).toMatchObject({
+      mismatchCount: 0,
+      p0Count: 0,
+      p1Count: 0
+    });
+    expect(iamRepository.roleAssignments.get(25)).toHaveLength(1);
+    expect(iamRepository.subjectMaps.get("legacy:25")?.filter((subject) => subject.subjectType === "plugin_user")).toHaveLength(1);
+
+    const report = await request(app.getHttpServer())
+      .get("/internal/iam/reconciliation/runs/iam-apply-25")
+      .set("x-identity-internal-token", "iam-test-token")
+      .expect(200);
+
+    expect(report.body.data).toMatchObject({
+      run: {
+        runKey: "iam-apply-25",
+        status: "succeeded",
+        sampleCount: 1,
+        mismatchCount: 0
+      },
+      safetyGate: {
+        passed: true
+      },
+      items: []
     });
   });
 });

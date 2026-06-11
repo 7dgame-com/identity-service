@@ -47,6 +47,57 @@ CREATE TABLE IF NOT EXISTS `user_login_stats` (
   KEY `idx_user_login_stats_username` (`username`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS `usage_billing_ledger` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `ledger_key` VARCHAR(255) NOT NULL,
+  `source_event_id` BIGINT UNSIGNED NOT NULL,
+  `subject_type` VARCHAR(32) NOT NULL,
+  `subject_id` VARCHAR(128) NOT NULL,
+  `usage_type` VARCHAR(64) NOT NULL,
+  `quantity` BIGINT NOT NULL DEFAULT 1,
+  `unit` VARCHAR(32) NOT NULL DEFAULT 'times',
+  `charge_mode` VARCHAR(64) NOT NULL DEFAULT 'shadow',
+  `billing_status` VARCHAR(64) NOT NULL DEFAULT 'shadow',
+  `occurred_at` DATETIME(3) NOT NULL,
+  `metadata` JSON NULL,
+  `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `idx_usage_billing_ledger_key` (`ledger_key`),
+  KEY `idx_usage_billing_ledger_source` (`source_event_id`),
+  KEY `idx_usage_billing_ledger_subject` (`subject_type`, `subject_id`, `usage_type`, `occurred_at`),
+  KEY `idx_usage_billing_ledger_status` (`billing_status`, `occurred_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `account_usage_balance_shadow` (
+  `subject_type` VARCHAR(32) NOT NULL,
+  `subject_id` VARCHAR(128) NOT NULL,
+  `usage_type` VARCHAR(64) NOT NULL,
+  `included_quota` BIGINT NOT NULL DEFAULT 0,
+  `used_quantity` BIGINT NOT NULL DEFAULT 0,
+  `remaining_quantity` BIGINT NOT NULL DEFAULT 0,
+  `billing_cycle` VARCHAR(64) NOT NULL DEFAULT 'default',
+  `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`subject_type`, `subject_id`, `usage_type`, `billing_cycle`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `usage_billing_replay_runs` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `run_key` VARCHAR(160) NOT NULL,
+  `mode` VARCHAR(32) NOT NULL,
+  `status` VARCHAR(32) NOT NULL,
+  `started_at` DATETIME(3) NOT NULL,
+  `finished_at` DATETIME(3) NULL,
+  `processed_count` BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  `created_count` BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  `skipped_count` BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  `metadata` JSON NULL,
+  `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `idx_usage_billing_replay_runs_key` (`run_key`),
+  KEY `idx_usage_billing_replay_runs_status` (`status`, `started_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS `identity_refresh_sessions` (
   `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   `refresh_token_hash` CHAR(64) NOT NULL,
@@ -196,4 +247,119 @@ CREATE TABLE IF NOT EXISTS `invitation_email_challenges` (
   UNIQUE KEY `idx_invitation_email_challenges_key` (`challenge_key`),
   KEY `idx_invitation_email_challenges_email` (`email`, `created_at`),
   KEY `idx_invitation_email_challenges_code` (`invite_code`, `created_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `identity_users` (
+  `id` VARCHAR(128) NOT NULL,
+  `legacy_user_id` BIGINT NULL,
+  `keycloak_subject` VARCHAR(255) NULL,
+  `username` VARCHAR(255) NULL,
+  `email` VARCHAR(255) NULL,
+  `status` VARCHAR(32) NOT NULL DEFAULT 'shadow',
+  `source` VARCHAR(64) NOT NULL DEFAULT 'legacy-shadow',
+  `metadata` JSON NULL,
+  `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `idx_identity_users_legacy_user` (`legacy_user_id`),
+  UNIQUE KEY `idx_identity_users_keycloak_subject` (`keycloak_subject`),
+  KEY `idx_identity_users_username` (`username`),
+  KEY `idx_identity_users_email` (`email`),
+  KEY `idx_identity_users_status` (`status`, `updated_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `identity_subject_maps` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `identity_user_id` VARCHAR(128) NOT NULL,
+  `subject_type` VARCHAR(64) NOT NULL,
+  `subject_id` VARCHAR(255) NOT NULL,
+  `source` VARCHAR(64) NOT NULL DEFAULT 'legacy-shadow',
+  `status` VARCHAR(32) NOT NULL DEFAULT 'active',
+  `metadata` JSON NULL,
+  `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `idx_identity_subject_maps_subject` (`subject_type`, `subject_id`),
+  KEY `idx_identity_subject_maps_identity_user` (`identity_user_id`, `status`),
+  KEY `idx_identity_subject_maps_source` (`source`, `updated_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `identity_role_assignments_shadow` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `identity_user_id` VARCHAR(128) NULL,
+  `legacy_user_id` BIGINT NULL,
+  `role_name` VARCHAR(128) NOT NULL,
+  `source` VARCHAR(64) NOT NULL DEFAULT 'yii-rbac',
+  `status` VARCHAR(32) NOT NULL DEFAULT 'shadow',
+  `observed_at` DATETIME(3) NOT NULL,
+  `metadata` JSON NULL,
+  `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `idx_identity_role_shadow_legacy_role` (`legacy_user_id`, `role_name`, `source`),
+  KEY `idx_identity_role_shadow_identity_user` (`identity_user_id`, `status`),
+  KEY `idx_identity_role_shadow_role` (`role_name`, `status`),
+  KEY `idx_identity_role_shadow_observed` (`observed_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `identity_organization_memberships_shadow` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `identity_user_id` VARCHAR(128) NULL,
+  `legacy_user_id` BIGINT NULL,
+  `organization_id` BIGINT NOT NULL,
+  `organization_role` VARCHAR(128) NULL,
+  `source` VARCHAR(64) NOT NULL DEFAULT 'legacy-organization',
+  `status` VARCHAR(32) NOT NULL DEFAULT 'shadow',
+  `observed_at` DATETIME(3) NOT NULL,
+  `metadata` JSON NULL,
+  `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `idx_identity_org_shadow_legacy_org` (`legacy_user_id`, `organization_id`, `source`),
+  KEY `idx_identity_org_shadow_identity_user` (`identity_user_id`, `status`),
+  KEY `idx_identity_org_shadow_org` (`organization_id`, `status`),
+  KEY `idx_identity_org_shadow_observed` (`observed_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `iam_reconciliation_runs` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `run_key` VARCHAR(160) NOT NULL,
+  `scope` VARCHAR(64) NOT NULL,
+  `mode` VARCHAR(32) NOT NULL DEFAULT 'shadow',
+  `status` VARCHAR(32) NOT NULL,
+  `started_at` DATETIME(3) NOT NULL,
+  `finished_at` DATETIME(3) NULL,
+  `sample_count` BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  `mismatch_count` BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  `p0_count` BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  `p1_count` BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  `metadata` JSON NULL,
+  `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `idx_iam_reconciliation_runs_key` (`run_key`),
+  KEY `idx_iam_reconciliation_runs_scope` (`scope`, `started_at`),
+  KEY `idx_iam_reconciliation_runs_status` (`status`, `started_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `iam_reconciliation_items` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `run_key` VARCHAR(160) NOT NULL,
+  `scope` VARCHAR(64) NOT NULL,
+  `severity` VARCHAR(16) NOT NULL,
+  `legacy_subject_type` VARCHAR(64) NULL,
+  `legacy_subject_id` VARCHAR(255) NULL,
+  `identity_subject_type` VARCHAR(64) NULL,
+  `identity_subject_id` VARCHAR(255) NULL,
+  `field_path` VARCHAR(255) NOT NULL,
+  `legacy_value_hash` CHAR(64) NULL,
+  `identity_value_hash` CHAR(64) NULL,
+  `message` VARCHAR(1024) NULL,
+  `metadata` JSON NULL,
+  `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  KEY `idx_iam_reconciliation_items_run` (`run_key`, `severity`),
+  KEY `idx_iam_reconciliation_items_legacy` (`legacy_subject_type`, `legacy_subject_id`),
+  KEY `idx_iam_reconciliation_items_identity` (`identity_subject_type`, `identity_subject_id`),
+  KEY `idx_iam_reconciliation_items_scope` (`scope`, `created_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

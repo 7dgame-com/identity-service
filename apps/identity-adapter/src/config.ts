@@ -65,6 +65,33 @@ export const configSchema = z.object({
     internalToken: optionalStringFromEnv,
     hashSalt: z.string().default("xrugc-login-audit-v1")
   }),
+  usageBilling: z.object({
+    shadowEnabled: boolFromEnv.default(false),
+    dryRun: boolFromEnv.default(true),
+    loginRule: z.string().default("successful-login-v1"),
+    freeLoginQuota: numberFromEnv.default(0),
+    subjectStrategy: z.enum(["user", "organization", "customer"]).default("user"),
+    replayBatchSize: numberFromEnv.default(500),
+    internalToken: optionalStringFromEnv
+  }),
+  iam: z.object({
+    enabled: boolFromEnv.default(false),
+    mode: z.enum(["disabled", "readonly", "shadow", "identity-primary"]).default("disabled"),
+    fallbackEnabled: boolFromEnv.default(true),
+    schemaAutoEnsureEnabled: boolFromEnv.default(false),
+    reconciliationEnabled: boolFromEnv.default(false),
+    reconciliationBatchSize: numberFromEnv.default(500),
+    internalToken: optionalStringFromEnv,
+    userViewEnabled: boolFromEnv.default(false),
+    roleViewEnabled: boolFromEnv.default(false),
+    permissionViewEnabled: boolFromEnv.default(false),
+    organizationViewEnabled: boolFromEnv.default(false),
+    pluginViewEnabled: boolFromEnv.default(false),
+    profileWriteMode: z.enum(["disabled", "legacy-proxy", "dual-write", "identity-native"]).default("disabled"),
+    roleWriteMode: z.enum(["disabled", "legacy-proxy", "dual-write", "identity-native"]).default("disabled"),
+    organizationWriteMode: z.enum(["disabled", "legacy-proxy", "dual-write", "identity-native"]).default("disabled"),
+    pluginUserWriteMode: z.enum(["disabled", "legacy-proxy", "dual-write", "identity-native"]).default("disabled")
+  }),
   legacySessionRevoke: z.object({
     enabled: boolFromEnv.default(false),
     url: optionalStringFromEnv,
@@ -172,6 +199,33 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
       enabled: env.IDENTITY_LOGIN_AUDIT_ENABLED,
       internalToken: env.IDENTITY_INTERNAL_API_TOKEN,
       hashSalt: env.IDENTITY_LOGIN_AUDIT_HASH_SALT
+    },
+    usageBilling: {
+      shadowEnabled: env.IDENTITY_USAGE_BILLING_SHADOW_ENABLED,
+      dryRun: env.IDENTITY_USAGE_BILLING_DRY_RUN,
+      loginRule: env.IDENTITY_USAGE_BILLING_LOGIN_RULE,
+      freeLoginQuota: env.IDENTITY_USAGE_BILLING_FREE_LOGIN_QUOTA,
+      subjectStrategy: env.IDENTITY_USAGE_BILLING_SUBJECT_STRATEGY,
+      replayBatchSize: env.IDENTITY_USAGE_BILLING_REPLAY_BATCH_SIZE,
+      internalToken: env.IDENTITY_USAGE_BILLING_INTERNAL_API_TOKEN ?? env.IDENTITY_INTERNAL_API_TOKEN
+    },
+    iam: {
+      enabled: env.IDENTITY_IAM_ENABLED,
+      mode: env.IDENTITY_IAM_MODE,
+      fallbackEnabled: env.IDENTITY_IAM_FALLBACK_ENABLED,
+      schemaAutoEnsureEnabled: env.IDENTITY_IAM_AUTO_ENSURE_SCHEMA,
+      reconciliationEnabled: env.IDENTITY_IAM_RECONCILIATION_ENABLED,
+      reconciliationBatchSize: env.IDENTITY_IAM_RECONCILIATION_BATCH_SIZE,
+      internalToken: env.IDENTITY_IAM_INTERNAL_API_TOKEN ?? env.IDENTITY_INTERNAL_API_TOKEN,
+      userViewEnabled: env.IDENTITY_IAM_USER_VIEW_ENABLED,
+      roleViewEnabled: env.IDENTITY_IAM_ROLE_VIEW_ENABLED,
+      permissionViewEnabled: env.IDENTITY_IAM_PERMISSION_VIEW_ENABLED,
+      organizationViewEnabled: env.IDENTITY_IAM_ORGANIZATION_VIEW_ENABLED,
+      pluginViewEnabled: env.IDENTITY_IAM_PLUGIN_VIEW_ENABLED,
+      profileWriteMode: env.IDENTITY_IAM_PROFILE_WRITE_MODE,
+      roleWriteMode: env.IDENTITY_IAM_ROLE_WRITE_MODE,
+      organizationWriteMode: env.IDENTITY_IAM_ORG_WRITE_MODE,
+      pluginUserWriteMode: env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE
     },
     legacySessionRevoke: {
       enabled: env.IDENTITY_LEGACY_SESSION_REVOKE_ENABLED,
