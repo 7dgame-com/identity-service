@@ -10,6 +10,12 @@ export interface LegacyRole {
   updatedAt: number | null;
 }
 
+export interface LegacyPermission {
+  name: string;
+  description: string | null;
+  source: "direct" | "role-child";
+}
+
 export interface LegacyOrganization {
   id: number;
   name: string;
@@ -40,6 +46,11 @@ export interface LegacyUserCredential {
   status: number;
   nickname: string | null;
   passwordHash: string | null;
+}
+
+export interface LegacyUserListInput {
+  afterId: number;
+  limit: number;
 }
 
 @Injectable()
@@ -144,6 +155,25 @@ export class LegacyIdentityReader implements OnModuleDestroy {
     };
   }
 
+  async listUsers(input: LegacyUserListInput): Promise<LegacyUserReadModel[]> {
+    if (!this.pool) {
+      return [];
+    }
+
+    const safeLimit = Math.max(1, Math.min(input.limit, 5000));
+    const rows = await this.query<RowDataPacket[]>(
+      `SELECT id
+         FROM user
+        WHERE id > ?
+        ORDER BY id ASC
+        LIMIT ${safeLimit}`,
+      [input.afterId]
+    );
+
+    const users = await Promise.all(rows.map((row) => this.getUserById(Number(row.id))));
+    return users.filter((user): user is LegacyUserReadModel => user !== null);
+  }
+
   async listRoles(): Promise<LegacyRole[]> {
     if (!this.pool) {
       return [];
@@ -176,6 +206,72 @@ export class LegacyIdentityReader implements OnModuleDestroy {
     );
 
     return rows.map(normalizeOrganization);
+  }
+
+  async listUserPermissions(userId: number): Promise<LegacyPermission[]> {
+    if (!this.pool) {
+      return [];
+    }
+
+    const assignments = await this.query<RowDataPacket[]>(
+      `SELECT item_name AS itemName
+         FROM auth_assignment
+        WHERE user_id = ?`,
+      [String(userId)]
+    );
+
+    if (assignments.length === 0) {
+      return [];
+    }
+
+    const items = await this.query<RowDataPacket[]>(
+      `SELECT name, description, type
+         FROM auth_item`
+    );
+    const children = await this.query<RowDataPacket[]>(
+      `SELECT parent, child
+         FROM auth_item_child`
+    );
+
+    const itemByName = new Map(items.map((row) => [String(row.name), row]));
+    const childrenByParent = new Map<string, string[]>();
+    for (const row of children) {
+      const parent = String(row.parent);
+      const list = childrenByParent.get(parent) ?? [];
+      list.push(String(row.child));
+      childrenByParent.set(parent, list);
+    }
+
+    const assignedNames = assignments.map((row) => String(row.itemName));
+    const queue = [...assignedNames];
+    const visited = new Set<string>();
+    const directAssignments = new Set(assignedNames);
+    const permissions = new Map<string, LegacyPermission>();
+
+    while (queue.length > 0) {
+      const name = queue.shift()!;
+      if (visited.has(name)) {
+        continue;
+      }
+      visited.add(name);
+
+      const item = itemByName.get(name);
+      if (item && Number(item.type) === 2) {
+        permissions.set(name, {
+          name,
+          description: item.description ?? null,
+          source: directAssignments.has(name) ? "direct" : "role-child"
+        });
+      }
+
+      for (const child of childrenByParent.get(name) ?? []) {
+        if (!visited.has(child)) {
+          queue.push(child);
+        }
+      }
+    }
+
+    return [...permissions.values()].sort((a, b) => a.name.localeCompare(b.name));
   }
 
   async diagnostics(): Promise<Record<string, unknown>> {
