@@ -413,8 +413,22 @@ class FakeIamRepository {
     return this.runs.get(runKey) ?? null;
   }
 
+  async listRecentReconciliationRuns(limit = 10) {
+    return [...this.runs.values()].slice(-limit).reverse();
+  }
+
   async listReconciliationItems(runKey: string) {
     return this.items.get(runKey) ?? [];
+  }
+
+  async summarizeReconciliationItems(runKey: string) {
+    const items = this.items.get(runKey) ?? [];
+    return {
+      p0: items.filter((item) => item.severity === "p0").length,
+      p1: items.filter((item) => item.severity === "p1").length,
+      p2: items.filter((item) => item.severity === "p2").length,
+      info: items.filter((item) => item.severity === "info").length
+    };
   }
 }
 
@@ -4067,6 +4081,39 @@ describe("identity-adapter IAM reconciliation API", () => {
     expect(iamRepository.runs.size).toBe(0);
   });
 
+  it("reports stage 7 reconciliation status before a succeeded baseline exists", async () => {
+    await createApp();
+
+    const response = await request(app.getHttpServer())
+      .get("/internal/iam/reconciliation/status")
+      .set("x-identity-internal-token", "iam-test-token")
+      .expect(200);
+
+    expect(response.body.data).toMatchObject({
+      stage: "7",
+      capability: "identity-iam-data-reconciliation",
+      nonUserFacing: true,
+      readiness: {
+        enabled: true,
+        mode: "shadow",
+        reconciliationEnabled: false,
+        schemaReady: true,
+        writeModesDisabled: true,
+        usageBillingDryRun: true
+      },
+      safetyGate: {
+        passed: false,
+        baselinePassed: false,
+        canRunDryRun: true,
+        canApplyShadow: false,
+        canCutoverIdentityPrimary: false
+      },
+      lastSucceededRun: null,
+      nextRecommendedAction: "run_small_dry_run_baseline"
+    });
+    expect(response.body.data.blockers).toContain("no_succeeded_reconciliation_baseline");
+  });
+
   it("ensures IAM schema through an internal endpoint", async () => {
     await createApp();
     iamRepository.schemaTablesReady = false;
@@ -4135,6 +4182,11 @@ describe("identity-adapter IAM reconciliation API", () => {
         passed: true
       }
     });
+    expect(first.body.data.batch).toMatchObject({
+      explicitLegacyUserIds: [25],
+      maxLegacyUserId: 25,
+      nextAfterLegacyUserId: null
+    });
     expect(iamRepository.identityUsers.get(25)).toMatchObject({
       id: "legacy:25",
       username: "unverified",
@@ -4178,6 +4230,87 @@ describe("identity-adapter IAM reconciliation API", () => {
         passed: true
       },
       items: []
+    });
+
+    expect(report.body.data.run.metadata).toMatchObject({
+      phase: "7",
+      migrationStage: "identity-iam-data-reconciliation",
+      batch: {
+        explicitLegacyUserIds: [25],
+        maxLegacyUserId: 25,
+        nextAfterLegacyUserId: null
+      }
+    });
+
+    const status = await request(app.getHttpServer())
+      .get("/internal/iam/reconciliation/status")
+      .set("x-identity-internal-token", "iam-test-token")
+      .expect(200);
+
+    expect(status.body.data).toMatchObject({
+      stage: "7",
+      safetyGate: {
+        passed: true,
+        baselinePassed: true,
+        canApplyShadow: true,
+        canCutoverIdentityPrimary: false
+      },
+      lastSucceededRun: {
+        runKey: "iam-apply-25-repeat",
+        status: "succeeded",
+        sampleCount: 1,
+        mismatchCount: 0,
+        p0Count: 0,
+        p1Count: 0,
+        p2Count: 0,
+        infoCount: 0,
+        safetyGatePassed: true
+      },
+      nextRecommendedAction: "expand_next_reconciliation_batch_with_cursor"
+    });
+    expect(status.body.data.blockers).toEqual([]);
+    expect(status.body.data.recentRuns).toHaveLength(2);
+  });
+
+  it("records cursor metadata for stage 7 reconciliation batches", async () => {
+    await createApp({ IDENTITY_IAM_RECONCILIATION_ENABLED: "true" });
+
+    const response = await request(app.getHttpServer())
+      .post("/internal/iam/reconciliation/run")
+      .set("x-identity-internal-token", "iam-test-token")
+      .send({
+        dryRun: false,
+        runKey: "iam-apply-cursor-25",
+        scopes: ["user"],
+        afterLegacyUserId: 24,
+        limit: 1
+      })
+      .expect(201);
+
+    expect(response.body.data).toMatchObject({
+      runKey: "iam-apply-cursor-25",
+      batch: {
+        explicitLegacyUserIds: null,
+        afterLegacyUserId: 24,
+        requestedLimit: 1,
+        sampledLegacyUserIds: [25],
+        maxLegacyUserId: 25,
+        nextAfterLegacyUserId: 25
+      }
+    });
+
+    const report = await request(app.getHttpServer())
+      .get("/internal/iam/reconciliation/runs/iam-apply-cursor-25")
+      .set("x-identity-internal-token", "iam-test-token")
+      .expect(200);
+
+    expect(report.body.data.run.metadata).toMatchObject({
+      phase: "7",
+      migrationStage: "identity-iam-data-reconciliation",
+      batch: {
+        afterLegacyUserId: 24,
+        nextAfterLegacyUserId: 25
+      }
     });
   });
 });

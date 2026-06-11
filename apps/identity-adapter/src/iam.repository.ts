@@ -96,6 +96,13 @@ export interface IamReconciliationItemRow extends IamReconciliationItemInput {
   createdAt: string | null;
 }
 
+export interface IamReconciliationSeveritySummary {
+  p0: number;
+  p1: number;
+  p2: number;
+  info: number;
+}
+
 export interface IdentityUserShadowInput {
   identityUserId: string;
   legacyUserId: number;
@@ -509,6 +516,32 @@ export class IamRepository implements OnModuleDestroy {
     return rows[0] ? normalizeReconciliationRun(rows[0]) : null;
   }
 
+  async listRecentReconciliationRuns(limit = 10): Promise<IamReconciliationRunRow[]> {
+    if (!(await this.tableExists("iam_reconciliation_runs"))) {
+      return [];
+    }
+
+    const safeLimit = Math.max(1, Math.min(limit, 50));
+    const rows = await this.query<RowDataPacket[]>(
+      `SELECT run_key AS runKey,
+              scope,
+              mode,
+              status,
+              started_at AS startedAt,
+              finished_at AS finishedAt,
+              sample_count AS sampleCount,
+              mismatch_count AS mismatchCount,
+              p0_count AS p0Count,
+              p1_count AS p1Count,
+              metadata
+         FROM iam_reconciliation_runs
+        ORDER BY started_at DESC, id DESC
+        LIMIT ${safeLimit}`
+    );
+
+    return rows.map(normalizeReconciliationRun);
+  }
+
   async listReconciliationItems(runKey: string, limit = 200): Promise<IamReconciliationItemRow[]> {
     if (!(await this.tableExists("iam_reconciliation_items"))) {
       return [];
@@ -537,6 +570,29 @@ export class IamRepository implements OnModuleDestroy {
     );
 
     return rows.map(normalizeReconciliationItem);
+  }
+
+  async summarizeReconciliationItems(runKey: string): Promise<IamReconciliationSeveritySummary> {
+    if (!(await this.tableExists("iam_reconciliation_items"))) {
+      return { p0: 0, p1: 0, p2: 0, info: 0 };
+    }
+
+    const rows = await this.query<RowDataPacket[]>(
+      `SELECT severity, COUNT(*) AS count
+         FROM iam_reconciliation_items
+        WHERE run_key = ?
+        GROUP BY severity`,
+      [runKey]
+    );
+    const summary: IamReconciliationSeveritySummary = { p0: 0, p1: 0, p2: 0, info: 0 };
+    for (const row of rows) {
+      const severity = String(row.severity);
+      if (severity === "p0" || severity === "p1" || severity === "p2" || severity === "info") {
+        summary[severity] = Number(row.count ?? 0);
+      }
+    }
+
+    return summary;
   }
 
   async ensureSchema(): Promise<void> {
