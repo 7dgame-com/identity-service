@@ -53,6 +53,11 @@ interface OidcTokenResponse {
   scope?: string;
 }
 
+interface OidcIssuerContext {
+  host?: string;
+  forwardedHost?: string;
+}
+
 @Injectable()
 export class OidcService {
   private readonly config = loadConfig();
@@ -65,8 +70,8 @@ export class OidcService {
     private readonly tokenIssuance: TokenIssuanceService
   ) {}
 
-  discovery() {
-    const issuer = this.issuer();
+  discovery(context?: OidcIssuerContext) {
+    const issuer = this.issuer(context);
 
     return {
       issuer,
@@ -111,13 +116,17 @@ export class OidcService {
     };
   }
 
-  readiness() {
+  readiness(context?: OidcIssuerContext) {
     const clients = this.clients();
     const enabledClients = clients.filter((client) => client.enabled);
+    const issuer = this.safeIssuerForReadiness(context);
 
     return {
       enabled: this.config.oidc.enabled,
-      issuer: this.issuer(),
+      issuer,
+      issuerMode: this.config.oidc.issuerMode,
+      issuerScheme: this.config.oidc.issuerScheme,
+      allowedIssuerHosts: this.allowedIssuerHosts(),
       endpoints: {
         discovery: "enabled",
         authorization: this.config.oidc.authorizationEndpointEnabled ? "enabled" : "disabled",
@@ -240,7 +249,7 @@ export class OidcService {
     };
   }
 
-  async token(payload: unknown, authorization: string | undefined): Promise<OidcTokenResponse> {
+  async token(payload: unknown, authorization: string | undefined, context?: OidcIssuerContext): Promise<OidcTokenResponse> {
     this.assertEndpointEnabled("token");
     const request = parseTokenRequest(payload, authorization);
     const client = this.requireClient(request.clientId);
@@ -284,7 +293,7 @@ export class OidcService {
     const accessToken = this.jwtIssuer.issue(user, session?.sessionId ?? randomId());
     const idToken = this.jwtIssuer.issueOidcIdToken({
       user,
-      issuer: this.issuer(),
+      issuer: this.issuer(context),
       audience: client.clientId,
       authTime: code.authTime,
       nonce: code.nonce,
@@ -335,8 +344,37 @@ export class OidcService {
     };
   }
 
-  private issuer() {
+  private issuer(context?: OidcIssuerContext) {
+    if (this.config.oidc.issuerMode === "request-host") {
+      const host = requestHost(context);
+      const allowedHosts = this.allowedIssuerHosts();
+      if (!host || !allowedHosts.includes(host)) {
+        throw new BadRequestException({
+          code: "OIDC_ISSUER_HOST_NOT_ALLOWED",
+          message: "OIDC issuer host is not allowlisted for this deployment."
+        });
+      }
+      return `${this.config.oidc.issuerScheme}://${host}`;
+    }
+
     return trimTrailingSlash(this.config.oidc.issuer ?? this.config.jwt.issuer);
+  }
+
+  private safeIssuerForReadiness(context?: OidcIssuerContext) {
+    try {
+      return this.issuer(context);
+    } catch {
+      return this.config.oidc.issuerMode === "request-host"
+        ? `${this.config.oidc.issuerScheme}://{request-host}`
+        : trimTrailingSlash(this.config.oidc.issuer ?? this.config.jwt.issuer);
+    }
+  }
+
+  private allowedIssuerHosts() {
+    return this.config.oidc.allowedIssuerHosts
+      .split(",")
+      .map((host) => normalizeIssuerHost(host))
+      .filter((host): host is string => Boolean(host));
   }
 
   private verifyIdentityBearer(authorization: string | undefined) {
@@ -674,6 +712,37 @@ function unsupportedResponseType(): BadRequestException {
     code: "UNSUPPORTED_RESPONSE_TYPE",
     message: "Only response_type=code is supported."
   });
+}
+
+function requestHost(context: OidcIssuerContext | undefined): string | null {
+  const raw = firstHeaderValue(context?.forwardedHost) || firstHeaderValue(context?.host);
+  return normalizeIssuerHost(raw);
+}
+
+function firstHeaderValue(value: string | undefined): string {
+  return value?.split(",")[0]?.trim() ?? "";
+}
+
+function normalizeIssuerHost(value: string | undefined): string | null {
+  const raw = value?.trim().toLowerCase();
+  if (!raw) {
+    return null;
+  }
+
+  let host = raw;
+  if (host.startsWith("http://") || host.startsWith("https://")) {
+    try {
+      host = new URL(host).host;
+    } catch {
+      return null;
+    }
+  }
+
+  if (host.includes("/") || host.includes("@")) {
+    return null;
+  }
+
+  return host.replace(/:\d+$/, "") || null;
 }
 
 function secondsUntil(value: Date): number {

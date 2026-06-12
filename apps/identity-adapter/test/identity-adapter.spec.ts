@@ -1927,6 +1927,64 @@ describe("identity-adapter OIDC standardization API", () => {
   });
 });
 
+describe("identity-adapter OIDC request-host issuer", () => {
+  let app: INestApplication;
+  const originalEnv = { ...process.env };
+
+  beforeEach(async () => {
+    process.env = { ...originalEnv };
+    process.env.IDENTITY_OIDC_ISSUER_MODE = "request-host";
+    process.env.IDENTITY_OIDC_ISSUER_SCHEME = "https";
+    process.env.IDENTITY_OIDC_ALLOWED_ISSUER_HOSTS = "identity.d.xrteeth.com,identity.d.tmrpp.com";
+
+    const moduleRef = await Test.createTestingModule({
+      imports: [AppModule]
+    })
+      .overrideProvider(LegacyIdentityReader)
+      .useClass(FakeLegacyIdentityReader)
+      .compile();
+
+    app = moduleRef.createNestApplication();
+    await app.init();
+  });
+
+  afterEach(async () => {
+    process.env = { ...originalEnv };
+    await app.close();
+  });
+
+  it("publishes discovery from the allowlisted request host only", async () => {
+    const xrteeth = await request(app.getHttpServer())
+      .get("/.well-known/openid-configuration")
+      .set("Host", "identity.d.xrteeth.com")
+      .expect(200);
+
+    expect(xrteeth.body).toMatchObject({
+      issuer: "https://identity.d.xrteeth.com",
+      authorization_endpoint: "https://identity.d.xrteeth.com/authorize",
+      token_endpoint: "https://identity.d.xrteeth.com/token"
+    });
+
+    const tmrpp = await request(app.getHttpServer())
+      .get("/.well-known/openid-configuration")
+      .set("Host", "identity.d.xrteeth.com")
+      .set("X-Forwarded-Host", "identity.d.tmrpp.com")
+      .expect(200);
+
+    expect(tmrpp.body).toMatchObject({
+      issuer: "https://identity.d.tmrpp.com",
+      jwks_uri: "https://identity.d.tmrpp.com/jwks.json"
+    });
+
+    const rejected = await request(app.getHttpServer())
+      .get("/.well-known/openid-configuration")
+      .set("Host", "evil.example.com")
+      .expect(400);
+
+    expect(rejected.body.code).toBe("OIDC_ISSUER_HOST_NOT_ALLOWED");
+  });
+});
+
 describe("identity-adapter OIDC authorization code + PKCE API", () => {
   let app: INestApplication;
   let sessions: FakeIdentitySessionRepository;

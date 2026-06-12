@@ -15,18 +15,22 @@ export class OidcController {
   ) {}
 
   @Get(".well-known/openid-configuration")
-  discovery() {
-    return this.oidc.discovery();
+  discovery(@Headers("host") host?: string, @Headers("x-forwarded-host") forwardedHost?: string) {
+    return this.oidc.discovery({ host, forwardedHost });
   }
 
   @Get("internal/oidc/readiness")
-  readiness(@Headers("x-identity-internal-token") token: string | undefined) {
+  readiness(
+    @Headers("x-identity-internal-token") token: string | undefined,
+    @Headers("host") host?: string,
+    @Headers("x-forwarded-host") forwardedHost?: string
+  ) {
     this.oidc.assertInternalToken(token);
     return {
       status: "ok",
       service: "identity-adapter",
       capability: "oidc",
-      data: this.oidc.readiness()
+      data: this.oidc.readiness({ host, forwardedHost })
     };
   }
 
@@ -51,8 +55,13 @@ export class OidcController {
 
   @Post("token")
   @HttpCode(200)
-  token(@Body() body: unknown, @Headers("authorization") authorization?: string) {
-    return this.oidc.token(body, authorization);
+  token(
+    @Body() body: unknown,
+    @Headers("authorization") authorization?: string,
+    @Headers("host") host?: string,
+    @Headers("x-forwarded-host") forwardedHost?: string
+  ) {
+    return this.oidc.token(body, authorization, { host, forwardedHost });
   }
 
   @Get("logout")

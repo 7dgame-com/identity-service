@@ -14,6 +14,9 @@ IDENTITY_OIDC_AUTHORIZATION_ENDPOINT_ENABLED=false
 IDENTITY_OIDC_TOKEN_ENDPOINT_ENABLED=false
 IDENTITY_OIDC_LOGOUT_ENDPOINT_ENABLED=false
 IDENTITY_OIDC_REQUIRE_PKCE=true
+IDENTITY_OIDC_ISSUER_MODE=request-host
+IDENTITY_OIDC_ISSUER_SCHEME=https
+IDENTITY_OIDC_ALLOWED_ISSUER_HOSTS=identity.xrteeth.com,identity.tmrpp.com
 
 IDENTITY_IAM_MODE=readonly
 IDENTITY_IAM_PROFILE_WRITE_MODE=disabled
@@ -26,6 +29,12 @@ IDENTITY_USAGE_BILLING_DRY_RUN=true
 These settings make discovery and readiness testable without enabling
 authorization-code traffic.
 
+`IDENTITY_OIDC_ISSUER_MODE=request-host` is recommended for the elastic-server
+image deployment pattern. The same stack can run on both xrteeth and tmrpp, and
+discovery will publish the issuer that matches the public Host header. Keep the
+allowed host list explicit; do not add internal Docker service names or wildcard
+hosts.
+
 ## Authorization Code + PKCE Gray Mode
 
 Only enable active OIDC endpoints for an allowlisted test client after
@@ -33,7 +42,9 @@ discovery/readiness and legacy login regression are green:
 
 ```env
 IDENTITY_OIDC_ENABLED=true
-IDENTITY_OIDC_ISSUER=https://identity.xrteeth.com
+IDENTITY_OIDC_ISSUER_MODE=request-host
+IDENTITY_OIDC_ISSUER_SCHEME=https
+IDENTITY_OIDC_ALLOWED_ISSUER_HOSTS=identity.xrteeth.com,identity.tmrpp.com
 IDENTITY_OIDC_AUTHORIZATION_ENDPOINT_ENABLED=true
 IDENTITY_OIDC_TOKEN_ENDPOINT_ENABLED=true
 IDENTITY_OIDC_LOGOUT_ENDPOINT_ENABLED=true

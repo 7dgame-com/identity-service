@@ -106,6 +106,9 @@ export const configSchema = z.object({
   oidc: z.object({
     enabled: boolFromEnv.default(false),
     issuer: optionalStringFromEnv,
+    issuerMode: z.enum(["fixed", "request-host"]).default("fixed"),
+    issuerScheme: z.enum(["https", "http"]).default("https"),
+    allowedIssuerHosts: z.string().default(""),
     authorizationEndpointEnabled: boolFromEnv.default(false),
     tokenEndpointEnabled: boolFromEnv.default(false),
     logoutEndpointEnabled: boolFromEnv.default(false),
@@ -252,6 +255,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
     oidc: {
       enabled: env.IDENTITY_OIDC_ENABLED,
       issuer: env.IDENTITY_OIDC_ISSUER,
+      issuerMode: env.IDENTITY_OIDC_ISSUER_MODE,
+      issuerScheme: env.IDENTITY_OIDC_ISSUER_SCHEME,
+      allowedIssuerHosts: env.IDENTITY_OIDC_ALLOWED_ISSUER_HOSTS,
       authorizationEndpointEnabled: env.IDENTITY_OIDC_AUTHORIZATION_ENDPOINT_ENABLED,
       tokenEndpointEnabled: env.IDENTITY_OIDC_TOKEN_ENDPOINT_ENABLED,
       logoutEndpointEnabled: env.IDENTITY_OIDC_LOGOUT_ENDPOINT_ENABLED,
