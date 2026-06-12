@@ -1,4 +1,4 @@
-import { Controller, Get, Headers, HttpException, HttpStatus, Inject, Param } from "@nestjs/common";
+import { Controller, Get, HttpException, HttpStatus, Inject, Param } from "@nestjs/common";
 import { loadConfig } from "./config.js";
 import { JwtIssuerService } from "./jwt-issuer.service.js";
 import { LegacyIdentityReader } from "./legacy-identity.reader.js";
@@ -29,27 +29,6 @@ export class IdentityController {
     }
 
     return { keys: [] };
-  }
-
-  @Get("userinfo")
-  userinfo(@Headers("authorization") authorization?: string) {
-    if (!authorization?.startsWith("Bearer ")) {
-      throw new HttpException(
-        {
-          code: "AUTHORIZATION_REQUIRED",
-          message: "Bearer token is required for userinfo."
-        },
-        HttpStatus.UNAUTHORIZED
-      );
-    }
-
-    throw new HttpException(
-      {
-        code: "TOKEN_INTROSPECTION_NOT_ACTIVE",
-        message: "Stage 3 is readonly. Legacy token introspection is enabled in a later phase."
-      },
-      HttpStatus.NOT_IMPLEMENTED
-    );
   }
 
   @Get("admin/users/:id")

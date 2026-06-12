@@ -3,7 +3,8 @@ const baseUrl = process.env.IDENTITY_ADAPTER_URL ?? "http://localhost:8086";
 async function main() {
   const checks = [
     { path: "/health", expectStatus: 200 },
-    { path: "/jwks.json", expectStatus: 200 }
+    { path: "/jwks.json", expectStatus: 200 },
+    { path: "/.well-known/openid-configuration", expectStatus: 200 }
   ];
 
   for (const check of checks) {
@@ -20,4 +21,3 @@ main().catch((error) => {
   console.error(error);
   process.exit(1);
 });
-
