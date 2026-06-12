@@ -85,6 +85,14 @@ export class IamController {
     };
   }
 
+  @Get("reconciliation/status")
+  async reconciliationStatus(@Headers("x-identity-internal-token") token: string | undefined) {
+    this.assertEnabledAndAuthorized(token);
+    return {
+      data: await this.iam.reconciliationStatus()
+    };
+  }
+
   @Get("reconciliation/runs/:runKey")
   async reconciliationReport(@Headers("x-identity-internal-token") token: string | undefined, @Param("runKey") runKey: string) {
     this.assertEnabledAndAuthorized(token);

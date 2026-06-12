@@ -9,7 +9,7 @@ import {
 } from "@nestjs/common";
 import { z } from "zod";
 import { loadConfig } from "./config.js";
-import { IamReconciliationItemInput, IamRepository } from "./iam.repository.js";
+import { IamReconciliationItemInput, IamReconciliationRunRow, IamRepository } from "./iam.repository.js";
 import { JwtIssuerService, VerifiedAccessToken } from "./jwt-issuer.service.js";
 import { LegacyIdentityReader, LegacyUserReadModel } from "./legacy-identity.reader.js";
 import { sanitizeMetadata } from "./login-audit.service.js";
@@ -234,6 +234,7 @@ export class IamService implements OnApplicationBootstrap {
     const limit = input.limit ?? this.config.iam.reconciliationBatchSize;
     const runKey = input.runKey ?? `iam-reconciliation:${randomUUID()}`;
     const users = await this.loadReconciliationUsers(input, limit);
+    const batch = this.reconciliationBatchMetadata(input, users, limit);
     const mode = dryRun ? "dry-run" : "shadow";
     const runScope = scopes.join(",");
 
@@ -242,7 +243,7 @@ export class IamService implements OnApplicationBootstrap {
         runKey,
         scope: runScope,
         mode,
-        metadata: this.runMetadata({ dryRun, applyShadow, scopes, limit, userCount: users.length })
+        metadata: this.runMetadata({ dryRun, applyShadow, scopes, limit, userCount: users.length, batch })
       });
     }
 
@@ -270,6 +271,7 @@ export class IamService implements OnApplicationBootstrap {
             applyShadow,
             scopes,
             limit,
+            batch,
             shadowWriteCount,
             safetyGatePassed: summary.p0 === 0 && summary.p1 === 0
           })
@@ -287,6 +289,7 @@ export class IamService implements OnApplicationBootstrap {
             applyShadow,
             scopes,
             limit,
+            batch,
             shadowWriteCount,
             error: error instanceof Error ? error.message : "unknown error"
           })
@@ -311,6 +314,7 @@ export class IamService implements OnApplicationBootstrap {
         infoCount: summary.info,
         shadowWriteCount
       },
+      batch,
       safetyGate: {
         passed: summary.p0 === 0 && summary.p1 === 0,
         p0BlocksCutover: true,
@@ -348,6 +352,111 @@ export class IamService implements OnApplicationBootstrap {
         p1BlocksCutover: true
       },
       items: redactItemsForResponse(items)
+    };
+  }
+
+  async reconciliationStatus() {
+    const { iam, usageBilling } = this.config;
+    const diagnostics = await this.repository.diagnostics();
+    const recentRuns = this.repository.isConfigured() ? await this.repository.listRecentReconciliationRuns(10) : [];
+    const lastSucceededRun = recentRuns.find((run) => run.status === "succeeded") ?? null;
+    const lastSucceededSummary = lastSucceededRun
+      ? await this.repository.summarizeReconciliationItems(lastSucceededRun.runKey)
+      : null;
+    const tables = diagnostics.tables && typeof diagnostics.tables === "object" ? (diagnostics.tables as Record<string, unknown>) : {};
+    const requiredTables = [
+      "identity_users",
+      "identity_subject_maps",
+      "identity_role_assignments_shadow",
+      "identity_organization_memberships_shadow",
+      "iam_reconciliation_runs",
+      "iam_reconciliation_items"
+    ];
+    const missingTables = requiredTables.filter((table) => tables[table] !== true);
+    const writeModes = {
+      profile: iam.profileWriteMode,
+      role: iam.roleWriteMode,
+      organization: iam.organizationWriteMode,
+      pluginUser: iam.pluginUserWriteMode
+    };
+    const writeModesDisabled = Object.values(writeModes).every((mode) => mode === "disabled");
+    const blockers: string[] = [];
+
+    if (!iam.enabled || iam.mode === "disabled") {
+      blockers.push("iam_disabled");
+    }
+    if (iam.mode === "identity-primary") {
+      blockers.push("identity_primary_forbidden_in_phase_7");
+    }
+    if (!this.repository.isConfigured()) {
+      blockers.push("identity_database_not_configured");
+    }
+    if (!this.legacyReader.isConfigured()) {
+      blockers.push("legacy_reader_not_configured");
+    }
+    if (missingTables.length > 0) {
+      blockers.push("identity_schema_not_ready");
+    }
+    if (!writeModesDisabled) {
+      blockers.push("iam_write_modes_must_stay_disabled");
+    }
+    if (!usageBilling.dryRun) {
+      blockers.push("usage_billing_must_stay_dry_run");
+    }
+    if (!lastSucceededRun) {
+      blockers.push("no_succeeded_reconciliation_baseline");
+    }
+    if (lastSucceededRun && lastSucceededRun.p0Count > 0) {
+      blockers.push("p0_mismatches_block_cutover");
+    }
+    if (lastSucceededRun && lastSucceededRun.p1Count > 0) {
+      blockers.push("p1_mismatches_block_cutover");
+    }
+
+    const schemaReady = missingTables.length === 0;
+    const canRunDryRun =
+      iam.enabled &&
+      iam.mode !== "disabled" &&
+      iam.mode !== "identity-primary" &&
+      this.repository.isConfigured() &&
+      this.legacyReader.isConfigured() &&
+      schemaReady;
+    const canApplyShadow = canRunDryRun && iam.reconciliationEnabled && writeModesDisabled;
+    const baselinePassed = Boolean(lastSucceededRun && lastSucceededRun.p0Count === 0 && lastSucceededRun.p1Count === 0);
+
+    return {
+      stage: "7",
+      capability: "identity-iam-data-reconciliation",
+      nonUserFacing: true,
+      readiness: {
+        enabled: iam.enabled,
+        mode: iam.mode,
+        reconciliationEnabled: iam.reconciliationEnabled,
+        reconciliationBatchSize: iam.reconciliationBatchSize,
+        schemaAutoEnsureEnabled: iam.schemaAutoEnsureEnabled,
+        identityRepositoryConfigured: this.repository.isConfigured(),
+        legacyReaderConfigured: this.legacyReader.isConfigured(),
+        schemaReady,
+        missingTables,
+        writeModes,
+        writeModesDisabled,
+        usageBillingDryRun: usageBilling.dryRun
+      },
+      safetyGate: {
+        passed: blockers.length === 0 && baselinePassed,
+        baselinePassed,
+        p0BlocksCutover: true,
+        p1BlocksCutover: true,
+        canRunDryRun,
+        canApplyShadow,
+        canCutoverIdentityPrimary: false
+      },
+      blockers,
+      lastSucceededRun: lastSucceededRun
+        ? this.reconciliationRunStatus(lastSucceededRun, lastSucceededSummary ?? undefined)
+        : null,
+      recentRuns: recentRuns.map((run) => this.reconciliationRunStatus(run)),
+      nextRecommendedAction: nextRecommendedAction(blockers, canApplyShadow)
     };
   }
 
@@ -511,7 +620,7 @@ export class IamService implements OnApplicationBootstrap {
         const permissions = await this.legacyReader.listUserPermissions(user.id);
         items.push(
           this.item(runKey, "permission", "info", user, identityUserId, "permissions", permissions.map((permission) => permission.name), null, {
-            message: "Permissions are still derived from legacy Yii RBAC in phase 6 readonly mode.",
+            message: "Permissions are still derived from legacy Yii RBAC in phase 7 reconciliation readonly mode.",
             metadata: {
               source: "legacy-yii-rbac",
               permissionCount: permissions.length,
@@ -672,10 +781,45 @@ export class IamService implements OnApplicationBootstrap {
 
   private runMetadata(input: Record<string, unknown>): Record<string, unknown> {
     return sanitizeMetadata({
-      phase: "6",
+      phase: "7",
+      migrationStage: "identity-iam-data-reconciliation",
       nonUserFacing: true,
       ...input
     });
+  }
+
+  private reconciliationBatchMetadata(input: IamReconciliationInput, users: LegacyUserReadModel[], limit: number): Record<string, unknown> {
+    const ids = users.map((user) => user.id);
+    const maxLegacyUserId = ids.length > 0 ? Math.max(...ids) : null;
+    const cursorBatch = !input.legacyUserIds?.length;
+
+    return {
+      explicitLegacyUserIds: input.legacyUserIds ?? null,
+      afterLegacyUserId: input.afterLegacyUserId ?? 0,
+      requestedLimit: limit,
+      sampledLegacyUserIds: ids,
+      maxLegacyUserId,
+      nextAfterLegacyUserId: cursorBatch && users.length === limit ? maxLegacyUserId : null
+    };
+  }
+
+  private reconciliationRunStatus(run: IamReconciliationRunRow, severitySummary?: ReturnType<typeof summarizeItems>) {
+    return {
+      runKey: run.runKey,
+      scope: run.scope,
+      mode: run.mode,
+      status: run.status,
+      startedAt: run.startedAt,
+      finishedAt: run.finishedAt,
+      sampleCount: run.sampleCount,
+      mismatchCount: run.mismatchCount,
+      p0Count: run.p0Count,
+      p1Count: run.p1Count,
+      p2Count: severitySummary?.p2,
+      infoCount: severitySummary?.info,
+      safetyGatePassed: run.status === "succeeded" && run.p0Count === 0 && run.p1Count === 0,
+      metadata: run.metadata
+    };
   }
 
   private verifyToken(token: string | null | undefined): VerifiedAccessToken {
@@ -767,6 +911,29 @@ function summarizeItems(items: Array<{ severity: string }>) {
     p2: items.filter((item) => item.severity === "p2").length,
     info: items.filter((item) => item.severity === "info").length
   };
+}
+
+function nextRecommendedAction(blockers: string[], canApplyShadow: boolean): string {
+  if (blockers.includes("identity_schema_not_ready")) {
+    return "run_schema_ensure_then_readiness";
+  }
+  if (blockers.includes("iam_disabled") || blockers.includes("identity_primary_forbidden_in_phase_7")) {
+    return "restore_phase_7_readonly_iam_flags";
+  }
+  if (blockers.includes("iam_write_modes_must_stay_disabled") || blockers.includes("usage_billing_must_stay_dry_run")) {
+    return "restore_safety_flags_before_reconciliation";
+  }
+  if (blockers.includes("no_succeeded_reconciliation_baseline")) {
+    return canApplyShadow ? "run_small_shadow_apply_then_dry_run_baseline" : "run_small_dry_run_baseline";
+  }
+  if (blockers.includes("p0_mismatches_block_cutover") || blockers.includes("p1_mismatches_block_cutover")) {
+    return "fix_or_exempt_p0_p1_before_expanding";
+  }
+  if (blockers.length > 0) {
+    return "resolve_blockers_before_expanding";
+  }
+
+  return "expand_next_reconciliation_batch_with_cursor";
 }
 
 function redactItemsForResponse(items: Array<IamReconciliationItemInput & { createdAt?: string | null }>) {

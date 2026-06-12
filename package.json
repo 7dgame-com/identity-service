@@ -10,6 +10,8 @@
     "start": "node dist/apps/identity-adapter/src/main.js",
     "test": "vitest run",
     "smoke": "tsx scripts/smoke.ts",
+    "iam:reconciliation:smoke": "tsx scripts/iam-reconciliation-smoke.ts",
+    "iam:reconciliation:smoke:dist": "node dist/scripts/iam-reconciliation-smoke.js",
     "invitation:import": "tsx scripts/invitation-import.ts"
   },
   "dependencies": {
