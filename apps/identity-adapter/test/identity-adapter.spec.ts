@@ -1,5 +1,5 @@
 import "reflect-metadata";
-import { generateKeyPairSync } from "node:crypto";
+import { createHash, generateKeyPairSync } from "node:crypto";
 import { INestApplication } from "@nestjs/common";
 import { Test } from "@nestjs/testing";
 import bcrypt from "bcryptjs";
@@ -26,6 +26,10 @@ import { JwtIssuerService } from "../src/jwt-issuer.service.js";
 import { LegacyIdentityReader } from "../src/legacy-identity.reader.js";
 import { LegacySessionRevocationService } from "../src/legacy-session-revocation.service.js";
 import { LoginAuditRepository, PersistedLoginAuditEvent } from "../src/login-audit.repository.js";
+import {
+  InvalidAuthorizationCodeError,
+  OidcAuthorizationCodeRepository
+} from "../src/oidc-authorization-code.repository.js";
 import { PasswordResetChallengeError, PasswordResetChallengeRepository } from "../src/password-reset-challenge.repository.js";
 import { sanitizeMetadata } from "../src/login-audit.service.js";
 import { assertReadonlySql } from "../src/readonly-write.guard.js";
@@ -548,6 +552,78 @@ class FakeLegacySessionRevocationService {
       attempted: true,
       ok: true,
       revoked: 2
+    };
+  }
+}
+
+class FakeOidcAuthorizationCodeRepository {
+  readonly codes = new Map<
+    string,
+    {
+      id: number;
+      clientId: string;
+      redirectUri: string;
+      legacyUserId: number;
+      username: string | null;
+      scope: string;
+      codeChallenge: string;
+      codeChallengeMethod: "S256";
+      nonce: string | null;
+      authTime: Date;
+      expiresAt: Date;
+      consumedAt: Date | null;
+    }
+  >();
+  nextId = 1;
+
+  isConfigured() {
+    return true;
+  }
+
+  async issue(input: {
+    clientId: string;
+    redirectUri: string;
+    legacyUserId: number;
+    username: string | null;
+    scope: string;
+    codeChallenge: string;
+    codeChallengeMethod: "S256";
+    nonce: string | null;
+    authTime: Date;
+    expiresAt: Date;
+  }) {
+    const code = `oidc-code-${this.nextId}`;
+    const record = {
+      id: this.nextId,
+      ...input,
+      consumedAt: null
+    };
+    this.nextId += 1;
+    this.codes.set(code, record);
+
+    return {
+      ...input,
+      code,
+      codeHash: `hash-${code}`
+    };
+  }
+
+  async consume(input: { code: string; clientId: string; redirectUri: string }) {
+    const record = this.codes.get(input.code);
+    if (
+      !record ||
+      record.clientId !== input.clientId ||
+      record.redirectUri !== input.redirectUri ||
+      record.consumedAt ||
+      record.expiresAt.getTime() <= Date.now()
+    ) {
+      throw new InvalidAuthorizationCodeError();
+    }
+
+    record.consumedAt = new Date();
+
+    return {
+      ...record
     };
   }
 }
@@ -1555,12 +1631,42 @@ describe("identity-adapter readonly API", () => {
         legacyDatabase: "not_configured"
       }
     });
+    expect(response.body.capabilities.oidc).toBe("disabled");
   });
 
   it("returns safe empty JWKS by default", async () => {
     const response = await request(app.getHttpServer()).get("/jwks.json").expect(200);
 
     expect(response.body).toEqual({ keys: [] });
+  });
+
+  it("publishes safe OIDC discovery while stage 8 endpoints stay disabled by default", async () => {
+    const discovery = await request(app.getHttpServer()).get("/.well-known/openid-configuration").expect(200);
+
+    expect(discovery.body).toMatchObject({
+      issuer: "identity-service",
+      authorization_endpoint: "identity-service/authorize",
+      token_endpoint: "identity-service/token",
+      userinfo_endpoint: "identity-service/userinfo",
+      jwks_uri: "identity-service/jwks.json",
+      response_types_supported: ["code"],
+      grant_types_supported: ["authorization_code", "refresh_token"],
+      code_challenge_methods_supported: ["S256"],
+      xrugc_stage: "identity-oidc-standardization",
+      xrugc_capabilities: {
+        enabled: false,
+        authorizationEndpoint: "disabled",
+        tokenEndpoint: "disabled",
+        logoutEndpoint: "disabled",
+        pkceRequired: true,
+        legacyAuthFallbackRequired: true,
+        identityPrimaryCutoverAllowed: false
+      }
+    });
+
+    await request(app.getHttpServer()).get("/authorize").expect(503);
+    await request(app.getHttpServer()).post("/token").expect(503);
+    await request(app.getHttpServer()).get("/logout").expect(503);
   });
 
   it("returns readonly legacy user details", async () => {
@@ -1585,11 +1691,11 @@ describe("identity-adapter readonly API", () => {
     ]);
   });
 
-  it("does not implement token introspection in phase 3", async () => {
+  it("rejects non-identity bearer tokens on userinfo", async () => {
     await request(app.getHttpServer())
       .get("/userinfo")
       .set("Authorization", "Bearer legacy-token")
-      .expect(501);
+      .expect(401);
   });
 
   it("blocks write-like SQL statements", () => {
@@ -1687,6 +1793,465 @@ describe("identity-adapter readonly API", () => {
     });
 
     await request(app.getHttpServer()).get("/internal/iam/users/24").expect(404);
+  });
+});
+
+describe("identity-adapter OIDC standardization API", () => {
+  let app: INestApplication;
+  const originalEnv = { ...process.env };
+
+  beforeEach(async () => {
+    process.env.IDENTITY_INTERNAL_API_TOKEN = "test-internal-token";
+    process.env.IDENTITY_OIDC_ENABLED = "true";
+    process.env.IDENTITY_OIDC_ISSUER = "https://identity.example.com";
+    process.env.IDENTITY_OIDC_CLIENTS_JSON = JSON.stringify([
+      {
+        clientId: "xrugc-web",
+        enabled: true,
+        type: "public",
+        redirectUris: ["https://xrugc.com/oidc/callback"],
+        scopes: ["openid", "profile", "email"],
+        requirePkce: true
+      },
+      {
+        clientId: "admin-console",
+        enabled: false,
+        type: "confidential",
+        redirectUris: ["https://admin.xrugc.com/oidc/callback"],
+        scopes: ["openid", "profile", "roles"],
+        clientSecret: "admin-secret",
+        adminMfaRequired: true
+      }
+    ]);
+
+    const moduleRef = await Test.createTestingModule({
+      imports: [AppModule]
+    })
+      .overrideProvider(LegacyIdentityReader)
+      .useClass(FakeLegacyIdentityReader)
+      .compile();
+
+    app = moduleRef.createNestApplication();
+    await app.init();
+  });
+
+  afterEach(async () => {
+    process.env = { ...originalEnv };
+    await app.close();
+  });
+
+  it("reports internal OIDC readiness without exposing client secrets", async () => {
+    await request(app.getHttpServer()).get("/internal/oidc/readiness").expect(401);
+
+    const response = await request(app.getHttpServer())
+      .get("/internal/oidc/readiness")
+      .set("x-identity-internal-token", "test-internal-token")
+      .expect(200);
+
+    expect(response.body).toMatchObject({
+      status: "ok",
+      service: "identity-adapter",
+      capability: "oidc",
+      data: {
+        enabled: true,
+        issuer: "https://identity.example.com",
+        endpoints: {
+          discovery: "enabled",
+          authorization: "disabled",
+          token: "disabled",
+          userinfo: "identity-token-only",
+          jwks: "enabled",
+          logout: "disabled"
+        },
+        clients: {
+          configured: 2,
+          enabled: 1,
+          entries: [
+            {
+              clientId: "xrugc-web",
+              enabled: true,
+              type: "public",
+              redirectUriCount: 1,
+              scopes: ["openid", "profile", "email"],
+              requirePkce: true,
+              adminMfaRequired: false
+            },
+            {
+              clientId: "admin-console",
+              enabled: false,
+              type: "confidential",
+              redirectUriCount: 1,
+              scopes: ["openid", "profile", "roles"],
+              requirePkce: true,
+              adminMfaRequired: true,
+              clientSecretConfigured: true
+            }
+          ]
+        },
+        stores: {
+          authorizationCode: "not_configured",
+          ttlSeconds: 300
+        },
+        safety: {
+          authorizationCodePkceRequired: true,
+          legacyAuthFallbackRequired: true,
+          identityPrimaryCutoverAllowed: false,
+          accountLifecycleRemainsLegacyCompatible: true,
+          adminMfaRequired: false
+        }
+      }
+    });
+    expect(JSON.stringify(response.body)).not.toContain("admin-secret");
+  });
+
+  it("keeps authorization and token exchange unavailable until explicitly enabled", async () => {
+    const authorize = await request(app.getHttpServer()).get("/authorize").query({
+      response_type: "code",
+      client_id: "xrugc-web",
+      redirect_uri: "https://xrugc.com/oidc/callback",
+      scope: "openid profile",
+      state: "state-1",
+      code_challenge: "challenge",
+      code_challenge_method: "S256"
+    });
+    expect(authorize.status).toBe(503);
+    expect(authorize.body.code).toBe("OIDC_ENDPOINT_DISABLED");
+
+    const token = await request(app.getHttpServer()).post("/token").send({
+      grant_type: "authorization_code",
+      code: "code",
+      code_verifier: "verifier"
+    });
+    expect(token.status).toBe(503);
+    expect(token.body.code).toBe("OIDC_ENDPOINT_DISABLED");
+  });
+});
+
+describe("identity-adapter OIDC authorization code + PKCE API", () => {
+  let app: INestApplication;
+  let sessions: FakeIdentitySessionRepository;
+  let codes: FakeOidcAuthorizationCodeRepository;
+  const originalEnv = { ...process.env };
+  const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
+  const privateKeyPem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+  const redirectUri = "https://xrugc.com/oidc/callback";
+  const codeVerifier = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~";
+
+  beforeEach(async () => {
+    process.env = { ...originalEnv };
+    process.env.IDENTITY_TOKEN_ISSUANCE_ENABLED = "true";
+    process.env.IDENTITY_JWT_PRIVATE_KEY_PEM = privateKeyPem;
+    process.env.IDENTITY_JWT_KEY_ID = "oidc-test-key";
+    process.env.IDENTITY_JWT_ISSUER = "identity-test";
+    process.env.IDENTITY_JWT_AUDIENCE = "xrugc-api";
+    process.env.IDENTITY_ACCESS_TOKEN_TTL_SECONDS = "3600";
+    process.env.IDENTITY_REFRESH_TOKEN_TTL_SECONDS = "604800";
+    process.env.IDENTITY_INTERNAL_API_TOKEN = "test-internal-token";
+    process.env.IDENTITY_OIDC_ENABLED = "true";
+    process.env.IDENTITY_OIDC_ISSUER = "https://identity.example.com";
+    process.env.IDENTITY_OIDC_AUTHORIZATION_ENDPOINT_ENABLED = "true";
+    process.env.IDENTITY_OIDC_TOKEN_ENDPOINT_ENABLED = "true";
+    process.env.IDENTITY_OIDC_LOGOUT_ENDPOINT_ENABLED = "true";
+    process.env.IDENTITY_OIDC_AUTHORIZATION_CODE_TTL_SECONDS = "300";
+    process.env.IDENTITY_OIDC_CLIENTS_JSON = JSON.stringify([
+      {
+        clientId: "xrugc-web",
+        enabled: true,
+        type: "public",
+        redirectUris: [redirectUri],
+        postLogoutRedirectUris: ["https://xrugc.com/logout/callback"],
+        scopes: ["openid", "profile", "email", "roles", "organization", "offline_access"],
+        requirePkce: true
+      },
+      {
+        clientId: "admin-console",
+        enabled: true,
+        type: "confidential",
+        redirectUris: ["https://admin.xrugc.com/oidc/callback"],
+        postLogoutRedirectUris: ["https://admin.xrugc.com/logout/callback"],
+        scopes: ["openid", "profile", "roles"],
+        clientSecret: "admin-secret",
+        adminMfaRequired: true
+      }
+    ]);
+
+    sessions = new FakeIdentitySessionRepository();
+    codes = new FakeOidcAuthorizationCodeRepository();
+
+    const moduleRef = await Test.createTestingModule({
+      imports: [AppModule]
+    })
+      .overrideProvider(LegacyIdentityReader)
+      .useClass(FakeLegacyIdentityReader)
+      .overrideProvider(IdentitySessionRepository)
+      .useValue(sessions)
+      .overrideProvider(OidcAuthorizationCodeRepository)
+      .useValue(codes)
+      .compile();
+
+    app = moduleRef.createNestApplication();
+    await app.init();
+  });
+
+  afterEach(async () => {
+    process.env = { ...originalEnv };
+    await app.close();
+  });
+
+  it("exchanges an allowlisted authorization code with PKCE and keeps the code single-use", async () => {
+    const login = await loginAs(app, "guanfei");
+    const challenge = pkceChallenge(codeVerifier);
+
+    const authorize = await request(app.getHttpServer())
+      .get("/authorize")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .query({
+        response_type: "code",
+        client_id: "xrugc-web",
+        redirect_uri: redirectUri,
+        scope: "openid profile email roles organization offline_access",
+        state: "state-1",
+        nonce: "nonce-1",
+        code_challenge: challenge,
+        code_challenge_method: "S256"
+      })
+      .expect(302);
+
+    const callback = new URL(authorize.headers.location);
+    expect(callback.origin + callback.pathname).toBe(redirectUri);
+    expect(callback.searchParams.get("state")).toBe("state-1");
+    const code = callback.searchParams.get("code");
+    expect(code).toEqual(expect.stringMatching(/^oidc-code-/));
+    expect(codes.codes.get(code!)?.codeChallenge).toBe(challenge);
+
+    const token = await request(app.getHttpServer())
+      .post("/token")
+      .send({
+        grant_type: "authorization_code",
+        client_id: "xrugc-web",
+        redirect_uri: redirectUri,
+        code,
+        code_verifier: codeVerifier
+      })
+      .expect(200);
+
+    expect(token.body).toMatchObject({
+      token_type: "Bearer",
+      expires_in: expect.any(Number),
+      refresh_token: "refresh-2",
+      scope: "openid profile email roles organization offline_access"
+    });
+    expect(token.body.access_token).toEqual(expect.any(String));
+    expect(token.body.id_token).toEqual(expect.any(String));
+
+    const idTokenPayload = decodeJwtPayload(token.body.id_token);
+    expect(idTokenPayload).toMatchObject({
+      iss: "https://identity.example.com",
+      aud: "xrugc-web",
+      sub: "24",
+      nonce: "nonce-1",
+      preferred_username: "guanfei",
+      email: "ogre3d@163.com",
+      email_verified: true,
+      roles: ["admin"]
+    });
+    expect(idTokenPayload.organization).toEqual([{ id: 1, name: "test-university", title: "测试大学" }]);
+
+    await request(app.getHttpServer())
+      .post("/token")
+      .send({
+        grant_type: "authorization_code",
+        client_id: "xrugc-web",
+        redirect_uri: redirectUri,
+        code,
+        code_verifier: codeVerifier
+      })
+      .expect(400);
+  });
+
+  it("rejects unsafe authorization requests before issuing a code", async () => {
+    const login = await loginAs(app, "guanfei");
+    const challenge = pkceChallenge(codeVerifier);
+
+    await request(app.getHttpServer())
+      .get("/authorize")
+      .query({
+        response_type: "code",
+        client_id: "xrugc-web",
+        redirect_uri: redirectUri,
+        scope: "openid profile",
+        code_challenge: challenge,
+        code_challenge_method: "S256"
+      })
+      .expect(401);
+
+    await request(app.getHttpServer())
+      .get("/authorize")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .query({
+        response_type: "code",
+        client_id: "xrugc-web",
+        redirect_uri: "https://evil.example.com/callback",
+        scope: "openid profile",
+        code_challenge: challenge,
+        code_challenge_method: "S256"
+      })
+      .expect(400);
+
+    await request(app.getHttpServer())
+      .get("/authorize")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .query({
+        response_type: "code",
+        client_id: "xrugc-web",
+        redirect_uri: redirectUri,
+        scope: "openid admin",
+        code_challenge: challenge,
+        code_challenge_method: "S256"
+      })
+      .expect(400);
+
+    expect(codes.codes.size).toBe(0);
+  });
+
+  it("supports JSON response mode for the frontend OIDC bridge", async () => {
+    const login = await loginAs(app, "guanfei");
+    const challenge = pkceChallenge(codeVerifier);
+
+    const authorize = await request(app.getHttpServer())
+      .get("/authorize")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .query({
+        response_type: "code",
+        response_mode: "json",
+        client_id: "xrugc-web",
+        redirect_uri: redirectUri,
+        scope: "openid profile",
+        state: "json-state",
+        code_challenge: challenge,
+        code_challenge_method: "S256"
+      })
+      .expect(200);
+
+    expect(authorize.body).toEqual({
+      code: expect.stringMatching(/^oidc-code-/),
+      state: "json-state",
+      redirect_uri: redirectUri
+    });
+  });
+
+  it("rejects an invalid PKCE verifier during token exchange", async () => {
+    const login = await loginAs(app, "guanfei");
+    const authorize = await request(app.getHttpServer())
+      .get("/authorize")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .query({
+        response_type: "code",
+        client_id: "xrugc-web",
+        redirect_uri: redirectUri,
+        scope: "openid profile",
+        code_challenge: pkceChallenge(codeVerifier),
+        code_challenge_method: "S256"
+      })
+      .expect(302);
+    const code = new URL(authorize.headers.location).searchParams.get("code");
+
+    const response = await request(app.getHttpServer())
+      .post("/token")
+      .send({
+        grant_type: "authorization_code",
+        client_id: "xrugc-web",
+        redirect_uri: redirectUri,
+        code,
+        code_verifier: "wrong-verifier-wrong-verifier-wrong-verifier-wrong"
+      })
+      .expect(400);
+
+    expect(response.body.code).toBe("INVALID_GRANT");
+  });
+
+  it("rotates OIDC refresh tokens through the token endpoint", async () => {
+    const login = await loginAs(app, "guanfei");
+    const challenge = pkceChallenge(codeVerifier);
+    const authorize = await request(app.getHttpServer())
+      .get("/authorize")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .query({
+        response_type: "code",
+        client_id: "xrugc-web",
+        redirect_uri: redirectUri,
+        scope: "openid offline_access",
+        code_challenge: challenge,
+        code_challenge_method: "S256"
+      })
+      .expect(302);
+    const code = new URL(authorize.headers.location).searchParams.get("code");
+
+    const token = await request(app.getHttpServer())
+      .post("/token")
+      .send({
+        grant_type: "authorization_code",
+        client_id: "xrugc-web",
+        redirect_uri: redirectUri,
+        code,
+        code_verifier: codeVerifier
+      })
+      .expect(200);
+
+    const refreshed = await request(app.getHttpServer())
+      .post("/token")
+      .send({
+        grant_type: "refresh_token",
+        client_id: "xrugc-web",
+        refresh_token: token.body.refresh_token
+      })
+      .expect(200);
+
+    expect(refreshed.body).toMatchObject({
+      token_type: "Bearer",
+      refresh_token: "refresh-3"
+    });
+  });
+
+  it("handles OIDC logout with a strict post logout redirect allowlist", async () => {
+    const login = await loginAs(app, "guanfei");
+
+    const logout = await request(app.getHttpServer())
+      .get("/logout")
+      .query({
+        client_id: "xrugc-web",
+        post_logout_redirect_uri: "https://xrugc.com/logout/callback",
+        state: "bye"
+      })
+      .expect(302);
+
+    const redirect = new URL(logout.headers.location);
+    expect(redirect.origin + redirect.pathname).toBe("https://xrugc.com/logout/callback");
+    expect(redirect.searchParams.get("state")).toBe("bye");
+
+    await request(app.getHttpServer())
+      .get("/logout")
+      .query({
+        client_id: "xrugc-web",
+        post_logout_redirect_uri: "https://evil.example.com/logout"
+      })
+      .expect(400);
+
+    const response = await request(app.getHttpServer())
+      .post("/logout")
+      .send({
+        client_id: "xrugc-web",
+        post_logout_redirect_uri: "https://xrugc.com/logout/callback",
+        refresh_token: login.refreshToken
+      })
+      .expect(200);
+
+    expect(response.body).toMatchObject({
+      success: true,
+      message: "logout",
+      redirectUrl: "https://xrugc.com/logout/callback"
+    });
+    expect(sessions.sessions.get(login.refreshToken)?.revokedAt).toBeInstanceOf(Date);
   });
 });
 
@@ -3612,6 +4177,18 @@ describe("identity-adapter token issuance API", () => {
       alg: "ES256",
       use: "sig"
     });
+
+    const userinfo = await request(app.getHttpServer())
+      .get("/userinfo")
+      .set("Authorization", `Bearer ${response.body.token.accessToken}`)
+      .expect(200);
+
+    expect(userinfo.body).toEqual({
+      sub: "24",
+      uid: 24,
+      preferred_username: "guanfei",
+      roles: ["admin"]
+    });
   });
 
   it("rejects wrong passwords without issuing a refresh session", async () => {
@@ -4363,4 +4940,8 @@ function identityInvite(code: string, overrides: Partial<IdentityInvitation> = {
 function decodeJwtPayload(token: string): Record<string, unknown> {
   const payload = token.split(".")[1];
   return JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+}
+
+function pkceChallenge(verifier: string): string {
+  return createHash("sha256").update(verifier).digest("base64url");
 }

@@ -34,6 +34,9 @@ import { EmailVerificationChallengeRepository } from "./email-verification-chall
 import { LoginAuditController } from "./login-audit.controller.js";
 import { LoginAuditRepository } from "./login-audit.repository.js";
 import { LoginAuditService } from "./login-audit.service.js";
+import { OidcAuthorizationCodeRepository } from "./oidc-authorization-code.repository.js";
+import { OidcController } from "./oidc.controller.js";
+import { OidcService } from "./oidc.service.js";
 import { PasswordResetChallengeRepository } from "./password-reset-challenge.repository.js";
 import { TelemetryInterceptor } from "./telemetry.interceptor.js";
 import { TokenIssuanceService } from "./token-issuance.service.js";
@@ -50,7 +53,8 @@ import { UsageBillingService } from "./usage-billing.service.js";
     AccountLifecycleController,
     InvitationDiagnosticsController,
     IamController,
-    UsageBillingController
+    UsageBillingController,
+    OidcController
   ],
   providers: [
     AccountLifecycleService,
@@ -97,6 +101,8 @@ import { UsageBillingService } from "./usage-billing.service.js";
     LoginAuditService,
     IamRepository,
     IamService,
+    OidcAuthorizationCodeRepository,
+    OidcService,
     UsageBillingRepository,
     UsageBillingService,
     TokenIssuanceService,

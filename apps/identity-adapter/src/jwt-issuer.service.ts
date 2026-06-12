@@ -17,6 +17,16 @@ export interface VerifiedAccessToken {
   roles: string[];
 }
 
+export interface OidcIdTokenInput {
+  user: LegacyUserReadModel;
+  issuer: string;
+  audience: string;
+  authTime: Date;
+  nonce?: string | null;
+  scope?: string[];
+  expiresInSeconds?: number;
+}
+
 @Injectable()
 export class JwtIssuerService {
   private readonly config = loadConfig();
@@ -47,6 +57,63 @@ export class JwtIssuerService {
 
     if (this.config.jwt.audience) {
       payload.aud = this.config.jwt.audience;
+    }
+
+    const signingInput = `${base64urlJson(header)}.${base64urlJson(payload)}`;
+    const signature = sign("sha256", Buffer.from(signingInput), {
+      key: privateKey,
+      dsaEncoding: "ieee-p1363"
+    });
+
+    return {
+      accessToken: `${signingInput}.${signature.toString("base64url")}`,
+      expiresAt,
+      jwtId
+    };
+  }
+
+  issueOidcIdToken(input: OidcIdTokenInput): IssuedAccessToken {
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + (input.expiresInSeconds ?? this.config.tokenIssuance.accessTokenTtlSeconds) * 1000);
+    const jwtId = randomId();
+    const privateKey = this.privateKey();
+    const scopes = new Set(input.scope ?? []);
+
+    const header = {
+      alg: "ES256",
+      typ: "JWT",
+      kid: this.config.jwt.keyId
+    };
+    const payload: Record<string, unknown> = {
+      iss: input.issuer,
+      sub: String(input.user.id),
+      aud: input.audience,
+      exp: seconds(expiresAt),
+      iat: seconds(now),
+      auth_time: seconds(input.authTime),
+      jti: jwtId
+    };
+
+    if (input.nonce) {
+      payload.nonce = input.nonce;
+    }
+    if (scopes.has("profile")) {
+      payload.preferred_username = input.user.username;
+      payload.name = input.user.nickname ?? input.user.username;
+    }
+    if (scopes.has("email")) {
+      payload.email = input.user.email;
+      payload.email_verified = Boolean(input.user.emailVerifiedAt);
+    }
+    if (scopes.has("roles")) {
+      payload.roles = input.user.roles;
+    }
+    if (scopes.has("organization")) {
+      payload.organization = input.user.organizations.map((organization) => ({
+        id: organization.id,
+        name: organization.name,
+        title: organization.title
+      }));
     }
 
     const signingInput = `${base64urlJson(header)}.${base64urlJson(payload)}`;

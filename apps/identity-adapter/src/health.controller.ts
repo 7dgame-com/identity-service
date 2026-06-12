@@ -25,6 +25,7 @@ export class HealthController {
         },
         capabilities: {
           tokenIssuance: this.config.tokenIssuance.enabled ? "enabled" : "disabled",
+          oidc: this.config.oidc.enabled ? "enabled" : "disabled",
           loginAudit: this.config.loginAudit.enabled ? "enabled" : "disabled",
           usageBillingShadow: this.config.usageBilling.shadowEnabled ? "enabled" : "disabled",
           iam: this.config.iam.enabled ? this.config.iam.mode : "disabled",
