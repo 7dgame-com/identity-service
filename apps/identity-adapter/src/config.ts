@@ -103,6 +103,20 @@ export const configSchema = z.object({
     accessTokenTtlSeconds: numberFromEnv.default(10800),
     refreshTokenTtlSeconds: numberFromEnv.default(604800)
   }),
+  oidc: z.object({
+    enabled: boolFromEnv.default(false),
+    issuer: optionalStringFromEnv,
+    issuerMode: z.enum(["fixed", "request-host"]).default("fixed"),
+    issuerScheme: z.enum(["https", "http"]).default("https"),
+    allowedIssuerHosts: z.string().default(""),
+    authorizationEndpointEnabled: boolFromEnv.default(false),
+    tokenEndpointEnabled: boolFromEnv.default(false),
+    logoutEndpointEnabled: boolFromEnv.default(false),
+    requirePkce: boolFromEnv.default(true),
+    authorizationCodeTtlSeconds: numberFromEnv.default(300),
+    clientsJson: z.string().default("[]"),
+    adminMfaRequired: boolFromEnv.default(false)
+  }),
   accountLifecycle: z.object({
     enabled: boolFromEnv.default(false),
     mode: z.enum(["disabled", "legacy-proxy", "native"]).default("disabled"),
@@ -237,6 +251,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
       enabled: env.IDENTITY_TOKEN_ISSUANCE_ENABLED,
       accessTokenTtlSeconds: env.IDENTITY_ACCESS_TOKEN_TTL_SECONDS,
       refreshTokenTtlSeconds: env.IDENTITY_REFRESH_TOKEN_TTL_SECONDS
+    },
+    oidc: {
+      enabled: env.IDENTITY_OIDC_ENABLED,
+      issuer: env.IDENTITY_OIDC_ISSUER,
+      issuerMode: env.IDENTITY_OIDC_ISSUER_MODE,
+      issuerScheme: env.IDENTITY_OIDC_ISSUER_SCHEME,
+      allowedIssuerHosts: env.IDENTITY_OIDC_ALLOWED_ISSUER_HOSTS,
+      authorizationEndpointEnabled: env.IDENTITY_OIDC_AUTHORIZATION_ENDPOINT_ENABLED,
+      tokenEndpointEnabled: env.IDENTITY_OIDC_TOKEN_ENDPOINT_ENABLED,
+      logoutEndpointEnabled: env.IDENTITY_OIDC_LOGOUT_ENDPOINT_ENABLED,
+      requirePkce: env.IDENTITY_OIDC_REQUIRE_PKCE,
+      authorizationCodeTtlSeconds: env.IDENTITY_OIDC_AUTHORIZATION_CODE_TTL_SECONDS,
+      clientsJson: env.IDENTITY_OIDC_CLIENTS_JSON,
+      adminMfaRequired: env.IDENTITY_OIDC_ADMIN_MFA_REQUIRED
     },
     accountLifecycle: {
       enabled: env.IDENTITY_ACCOUNT_LIFECYCLE_ENABLED,

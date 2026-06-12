@@ -113,11 +113,18 @@ Public gray endpoints:
 - `POST /v1/auth/refresh`
 - `POST /v1/auth/logout`
 - `GET /jwks.json`
+- `GET /.well-known/openid-configuration`
+- `GET /authorize`, `POST /token`, `GET|POST /logout` for stage 8 OIDC gray
+  traffic only when their endpoint flags are explicitly enabled
 
 Safety rules:
 
 - Keep `IDENTITY_TOKEN_ISSUANCE_ENABLED=false` unless the backend and frontend
   gray switches are ready.
+- Keep `IDENTITY_OIDC_AUTHORIZATION_ENDPOINT_ENABLED=false`,
+  `IDENTITY_OIDC_TOKEN_ENDPOINT_ENABLED=false` and
+  `IDENTITY_OIDC_LOGOUT_ENDPOINT_ENABLED=false` until an allowlisted test client
+  has passed PKCE and rollback checks.
 - Main backend must default to `AUTH_PROVIDER=legacy`.
 - Main frontend must default to `VITE_AUTH_PROVIDER=legacy`.
 - `/api-auth` must not be captured by a broader `/api` reverse proxy route.
