@@ -91,8 +91,8 @@ export class AccountRegistrationService {
     const operationType = "wechatToken" in input ? "register.wechat" : "register.standard";
     const operationKey =
       "wechatToken" in input
-        ? operationKeyForRegister("wechat", [input.wechatToken, input.username])
-        : operationKeyForRegister("standard", [input.username]);
+        ? operationKeyForRegister("wechat", [input.wechatToken, input.username, input.email ?? "", input.password])
+        : operationKeyForRegister("standard", [input.username, input.email ?? "", input.password]);
     const operation = {
       operationKey,
       operationType,
