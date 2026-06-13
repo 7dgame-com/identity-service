@@ -3197,6 +3197,25 @@ describe("identity-adapter native register lifecycle API", () => {
     expect(registrationRepository.users.size).toBe(1);
   });
 
+  it("does not issue a token when a completed native standard registration is retried with a different password", async () => {
+    await request(app!.getHttpServer())
+      .post("/v1/auth/register")
+      .send({ username: "retry-user@example.com", password: "R3gister!234" })
+      .expect(201);
+
+    const response = await request(app!.getHttpServer())
+      .post("/v1/auth/register")
+      .send({ username: "retry-user@example.com", password: "Different!234" })
+      .expect(400);
+
+    expect(response.body).toMatchObject({
+      username: ['Username "retry-user@example.com" has already been taken.'],
+      message: "username already exists"
+    });
+    expect(response.body.token).toBeUndefined();
+    expect(registrationRepository.users.size).toBe(1);
+  });
+
   it("creates a native wechat registration and binds the wechat token once", async () => {
     const response = await request(app!.getHttpServer())
       .post("/v1/wechat/register")
@@ -3228,6 +3247,22 @@ describe("identity-adapter native register lifecycle API", () => {
     expect(first.body.uid).toBe(1000);
     expect(second.body.uid).toBe(1000);
     expect(second.body.token.refreshToken).toBe("refresh-2");
+    expect(registrationRepository.users.size).toBe(1);
+  });
+
+  it("does not issue a token when a completed native wechat registration is retried with a different password", async () => {
+    await request(app!.getHttpServer())
+      .post("/v1/wechat/register")
+      .send({ token: "wechat-token", username: "wechat-retry@example.com", password: "R3gister!234" })
+      .expect(200);
+
+    const response = await request(app!.getHttpServer())
+      .post("/v1/wechat/register")
+      .send({ token: "wechat-token", username: "wechat-retry@example.com", password: "Different!234" })
+      .expect(400);
+
+    expect(response.text).toContain("already registered,1000");
+    expect(response.body.token).toBeUndefined();
     expect(registrationRepository.users.size).toBe(1);
   });
 
