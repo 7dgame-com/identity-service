@@ -135,6 +135,46 @@ class FakeLegacyIdentityReader {
     return users.filter((user) => user!.id > input.afterId).slice(0, input.limit);
   }
 
+  async listManagedUsers(input: {
+    page: number;
+    pageSize: number;
+    search?: string;
+    status?: number;
+    sort?: string;
+    order?: "asc" | "desc";
+  }) {
+    const all: any[] = [await this.getUserById(24), await this.getUserById(25)].filter((user) => user !== null);
+    const search = input.search?.toLowerCase();
+    let users = all.filter((user) => {
+      if (search && !`${user.username ?? ""} ${user.email ?? ""}`.toLowerCase().includes(search)) {
+        return false;
+      }
+      if (input.status !== undefined && user.status !== input.status) {
+        return false;
+      }
+      return true;
+    });
+
+    const direction = input.order === "asc" ? 1 : -1;
+    const sort = input.sort && ["id", "username", "nickname", "email", "created_at"].includes(input.sort) ? input.sort : "id";
+    users = users.sort((a, b) => {
+      const left = sort === "created_at" ? a.createdAt : a[sort];
+      const right = sort === "created_at" ? b.createdAt : b[sort];
+      return String(left ?? "").localeCompare(String(right ?? ""), undefined, { numeric: true }) * direction;
+    });
+
+    const page = Math.max(1, input.page);
+    const pageSize = Math.max(1, input.pageSize);
+    const total = users.length;
+    return {
+      users: users.slice((page - 1) * pageSize, page * pageSize),
+      page,
+      pageSize,
+      total,
+      totalPages: Math.ceil(total / pageSize)
+    };
+  }
+
   async listRoles() {
     return [{ name: "admin", description: "Administrator", createdAt: 1, updatedAt: 1 }];
   }
@@ -2553,6 +2593,104 @@ describe("identity-adapter account lifecycle compatibility API", () => {
   });
 });
 
+describe("identity-adapter plugin user readonly compatibility API", () => {
+  let app: INestApplication | null = null;
+  let repository: FakeIdentitySessionRepository;
+  const originalEnv = { ...process.env };
+  const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
+  const privateKeyPem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+    process.env.IDENTITY_TOKEN_ISSUANCE_ENABLED = "true";
+    process.env.IDENTITY_JWT_PRIVATE_KEY_PEM = privateKeyPem;
+    process.env.IDENTITY_JWT_KEY_ID = "plugin-user-readonly-test-key";
+    process.env.IDENTITY_JWT_ISSUER = "identity-plugin-user-test";
+    process.env.IDENTITY_JWT_AUDIENCE = "xrugc-plugin-user";
+    process.env.IDENTITY_ACCESS_TOKEN_TTL_SECONDS = "3600";
+    process.env.IDENTITY_REFRESH_TOKEN_TTL_SECONDS = "604800";
+    repository = new FakeIdentitySessionRepository();
+  });
+
+  afterEach(async () => {
+    process.env = { ...originalEnv };
+    await app?.close();
+    app = null;
+  });
+
+  it("keeps the readonly compatibility endpoint disabled by default", async () => {
+    app = await createPluginUserReadonlyTestApp(repository);
+    await request(app.getHttpServer())
+      .get("/v1/plugin-user/users?page=1&pageSize=1")
+      .expect(404);
+  });
+
+  it("returns the old user list response shape when enabled", async () => {
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    app = await createPluginUserReadonlyTestApp(repository);
+    const login = await loginAs(app, "guanfei");
+
+    const response = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users?page=1&pageSize=1&search=guan&sort=id&order=asc")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(200);
+
+    expect(response.body).toMatchObject({
+      data: [
+        {
+          id: 24,
+          username: "guanfei",
+          nickname: "babamama",
+          roles: ["admin"]
+        }
+      ],
+      pagination: {
+        page: 1,
+        pageSize: 1,
+        total: 1,
+        totalPages: 1
+      }
+    });
+  });
+
+  it("returns the old user detail response shape when enabled", async () => {
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    app = await createPluginUserReadonlyTestApp(repository);
+    const login = await loginAs(app, "guanfei");
+
+    const response = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users?id=25")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(200);
+
+    expect(response.body).toMatchObject({
+      code: 0,
+      data: {
+        id: 25,
+        username: "unverified",
+        nickname: "unverified",
+        roles: ["user"]
+      }
+    });
+  });
+
+  it("rejects non-elevated users without the legacy plugin permission", async () => {
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    app = await createPluginUserReadonlyTestApp(repository);
+    const login = await loginAs(app, "unverified");
+
+    const response = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users?page=1&pageSize=1")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(403);
+
+    expect(response.body).toMatchObject({
+      code: 2003,
+      message: "没有权限执行此操作"
+    });
+  });
+});
+
 describe("identity-adapter invitation diagnostics API", () => {
   let app: INestApplication | null = null;
   let redisReader: FakeInvitationRedisReader;
@@ -4011,6 +4149,22 @@ async function createLifecycleTestApp(): Promise<INestApplication> {
   await lifecycleApp.init();
 
   return lifecycleApp;
+}
+
+async function createPluginUserReadonlyTestApp(repository: FakeIdentitySessionRepository): Promise<INestApplication> {
+  const moduleRef = await Test.createTestingModule({
+    imports: [AppModule]
+  })
+    .overrideProvider(LegacyIdentityReader)
+    .useClass(FakeLegacyIdentityReader)
+    .overrideProvider(IdentitySessionRepository)
+    .useValue(repository)
+    .compile();
+
+  const pluginUserApp = moduleRef.createNestApplication();
+  await pluginUserApp.init();
+
+  return pluginUserApp;
 }
 
 async function createInvitationDiagnosticsTestApp(

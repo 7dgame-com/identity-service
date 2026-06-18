@@ -53,6 +53,23 @@ export interface LegacyUserListInput {
   limit: number;
 }
 
+export interface LegacyManagedUserListInput {
+  page: number;
+  pageSize: number;
+  search?: string;
+  status?: number;
+  sort?: string;
+  order?: "asc" | "desc";
+}
+
+export interface LegacyManagedUserListResult {
+  users: LegacyUserReadModel[];
+  page: number;
+  pageSize: number;
+  total: number;
+  totalPages: number;
+}
+
 @Injectable()
 export class LegacyIdentityReader implements OnModuleDestroy {
   private readonly config = loadConfig();
@@ -172,6 +189,82 @@ export class LegacyIdentityReader implements OnModuleDestroy {
 
     const users = await Promise.all(rows.map((row) => this.getUserById(Number(row.id))));
     return users.filter((user): user is LegacyUserReadModel => user !== null);
+  }
+
+  async listManagedUsers(input: LegacyManagedUserListInput): Promise<LegacyManagedUserListResult> {
+    if (!this.pool) {
+      return {
+        users: [],
+        page: input.page,
+        pageSize: input.pageSize,
+        total: 0,
+        totalPages: 0
+      };
+    }
+
+    const page = Math.max(1, input.page);
+    const pageSize = Math.max(1, Math.min(input.pageSize, 100));
+    const offset = (page - 1) * pageSize;
+    const where: string[] = [];
+    const params: unknown[] = [];
+
+    if (input.search?.trim()) {
+      where.push("(u.username LIKE ? OR u.email LIKE ?)");
+      const pattern = `%${input.search.trim()}%`;
+      params.push(pattern, pattern);
+    }
+    if (input.status !== undefined) {
+      where.push("u.status = ?");
+      params.push(input.status);
+    }
+
+    const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+    const totalRows = await this.query<RowDataPacket[]>(
+      `SELECT COUNT(*) AS total
+         FROM user u
+        ${whereSql}`,
+      params
+    );
+    const total = Number(totalRows[0]?.total ?? 0);
+    const sortOrder = input.order === "asc" ? "ASC" : "DESC";
+    const requestedSort = input.sort ?? "";
+    const sortField = ["id", "username", "nickname", "email", "created_at", "roles"].includes(requestedSort)
+      ? requestedSort
+      : "id";
+
+    let rows: RowDataPacket[];
+    if (sortField === "roles") {
+      rows = await this.query<RowDataPacket[]>(
+        `SELECT u.id
+           FROM user u
+      LEFT JOIN auth_assignment aa ON aa.user_id = u.id
+          ${whereSql}
+       GROUP BY u.id
+       ORDER BY MAX(CASE aa.item_name
+         WHEN 'root' THEN 4 WHEN 'admin' THEN 3 WHEN 'manager' THEN 2 WHEN 'user' THEN 1 ELSE 0 END) ${sortOrder},
+                u.id ${sortOrder}
+          LIMIT ${pageSize} OFFSET ${offset}`,
+        params
+      );
+    } else {
+      rows = await this.query<RowDataPacket[]>(
+        `SELECT u.id
+           FROM user u
+          ${whereSql}
+       ORDER BY u.${sortField} ${sortOrder}
+          LIMIT ${pageSize} OFFSET ${offset}`,
+        params
+      );
+    }
+
+    const users = await Promise.all(rows.map((row) => this.getUserById(Number(row.id))));
+    return {
+      users: users.filter((user): user is LegacyUserReadModel => user !== null),
+      page,
+      pageSize,
+      total,
+      totalPages: Math.ceil(total / pageSize)
+    };
   }
 
   async listRoles(): Promise<LegacyRole[]> {
