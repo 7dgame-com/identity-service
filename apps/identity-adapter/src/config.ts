@@ -135,6 +135,9 @@ export const configSchema = z.object({
     invitationRecordsNativeEnabled: boolFromEnv.default(false),
     invitationDiagnosticsEnabled: boolFromEnv.default(false)
   }),
+  pluginUserReadonly: z.object({
+    enabled: boolFromEnv.default(false)
+  }),
   invitationDiagnostics: z.object({
     redisUrl: optionalStringFromEnv,
     scanCount: numberFromEnv.default(100),
@@ -283,6 +286,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
       invitationCheckNativeEnabled: env.IDENTITY_ACCOUNT_INVITATION_CHECK_NATIVE_ENABLED,
       invitationRecordsNativeEnabled: env.IDENTITY_ACCOUNT_INVITATION_RECORDS_NATIVE_ENABLED,
       invitationDiagnosticsEnabled: env.IDENTITY_ACCOUNT_INVITATION_DIAGNOSTICS_ENABLED
+    },
+    pluginUserReadonly: {
+      enabled: env.IDENTITY_PLUGIN_USER_READONLY_ENABLED
     },
     invitationDiagnostics: {
       redisUrl: env.IDENTITY_INVITATION_REDIS_URL,
