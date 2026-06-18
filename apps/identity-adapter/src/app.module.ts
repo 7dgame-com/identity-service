@@ -38,6 +38,7 @@ import { OidcAuthorizationCodeRepository } from "./oidc-authorization-code.repos
 import { OidcController } from "./oidc.controller.js";
 import { OidcService } from "./oidc.service.js";
 import { PasswordResetChallengeRepository } from "./password-reset-challenge.repository.js";
+import { PluginUserReadonlyController } from "./plugin-user-readonly.controller.js";
 import { TelemetryInterceptor } from "./telemetry.interceptor.js";
 import { TokenIssuanceService } from "./token-issuance.service.js";
 import { UsageBillingController } from "./usage-billing.controller.js";
@@ -53,6 +54,7 @@ import { UsageBillingService } from "./usage-billing.service.js";
     AccountLifecycleController,
     InvitationDiagnosticsController,
     IamController,
+    PluginUserReadonlyController,
     UsageBillingController,
     OidcController
   ],
