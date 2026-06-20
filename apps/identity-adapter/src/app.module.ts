@@ -38,6 +38,7 @@ import { OidcAuthorizationCodeRepository } from "./oidc-authorization-code.repos
 import { OidcController } from "./oidc.controller.js";
 import { OidcService } from "./oidc.service.js";
 import { PasswordResetChallengeRepository } from "./password-reset-challenge.repository.js";
+import { PluginUserPrimaryReadService } from "./plugin-user-primary-read.service.js";
 import { PluginUserReadonlyController } from "./plugin-user-readonly.controller.js";
 import { TelemetryInterceptor } from "./telemetry.interceptor.js";
 import { TokenIssuanceService } from "./token-issuance.service.js";
@@ -107,6 +108,7 @@ import { UsageBillingService } from "./usage-billing.service.js";
     OidcService,
     UsageBillingRepository,
     UsageBillingService,
+    PluginUserPrimaryReadService,
     TokenIssuanceService,
     { provide: APP_INTERCEPTOR, useClass: TelemetryInterceptor }
   ]
