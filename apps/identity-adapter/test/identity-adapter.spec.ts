@@ -209,7 +209,13 @@ class FakeIamRepository {
         email: "ogre3d@163.com",
         status: "active",
         source: "legacy-shadow",
-        metadata: null,
+        metadata: {
+          legacyNickname: "babamama",
+          legacyEmailVerifiedAt: 1772210253,
+          legacyCreatedAt: 1558664856,
+          legacyUpdatedAt: 1763711034,
+          legacyUserInfo: { locale: "zh-CN" }
+        },
         createdAt: "2026-06-10T00:00:00.000Z",
         updatedAt: "2026-06-10T00:00:00.000Z"
       }
@@ -258,6 +264,12 @@ class FakeIamRepository {
           organizationRole: "member",
           source: "legacy-shadow",
           status: "shadow",
+          metadata: {
+            legacyName: "test-university",
+            legacyTitle: "测试大学",
+            legacyCreatedAt: 1,
+            legacyUpdatedAt: 1
+          },
           observedAt: "2026-06-10T00:00:00.000Z"
         }
       ]
@@ -295,6 +307,45 @@ class FakeIamRepository {
 
   async getIdentityUserByLegacyId(legacyUserId: number) {
     return this.identityUsers.get(legacyUserId) ?? null;
+  }
+
+  async listManagedUsers(input: {
+    page: number;
+    pageSize: number;
+    search?: string;
+    status?: number;
+    sort?: string;
+    order?: "asc" | "desc";
+  }) {
+    const search = input.search?.toLowerCase();
+    let users = [...this.identityUsers.values()].filter((user) => {
+      if (search && !`${user.username ?? ""} ${user.email ?? ""}`.toLowerCase().includes(search)) {
+        return false;
+      }
+      if (input.status !== undefined && (input.status === 10 ? "active" : "inactive") !== user.status) {
+        return false;
+      }
+      return user.legacyUserId !== null;
+    });
+
+    const direction = input.order === "asc" ? 1 : -1;
+    const sort = input.sort && ["id", "username", "nickname", "email", "created_at"].includes(input.sort) ? input.sort : "id";
+    users = users.sort((a, b) => {
+      const left = sort === "id" ? a.legacyUserId : sort === "created_at" ? a.createdAt : a[sort];
+      const right = sort === "id" ? b.legacyUserId : sort === "created_at" ? b.createdAt : b[sort];
+      return String(left ?? "").localeCompare(String(right ?? ""), undefined, { numeric: true }) * direction;
+    });
+
+    const page = Math.max(1, input.page);
+    const pageSize = Math.max(1, input.pageSize);
+    const total = users.length;
+    return {
+      users: users.slice((page - 1) * pageSize, page * pageSize),
+      page,
+      pageSize,
+      total,
+      totalPages: Math.ceil(total / pageSize)
+    };
   }
 
   async listSubjectMaps(identityUserId: string) {
@@ -389,6 +440,7 @@ class FakeIamRepository {
       organizationId: number;
       organizationRole: string | null;
       source: string;
+      metadata?: Record<string, unknown>;
     }>
   ) {
     this.organizationMemberships.set(
@@ -2651,6 +2703,7 @@ describe("identity-adapter plugin user readonly compatibility API", () => {
         totalPages: 1
       }
     });
+    expect(response.headers["x-identity-user-source"]).toBe("legacy");
   });
 
   it("returns the old user detail response shape when enabled", async () => {
@@ -2672,6 +2725,93 @@ describe("identity-adapter plugin user readonly compatibility API", () => {
         roles: ["user"]
       }
     });
+    expect(response.headers["x-identity-user-source"]).toBe("legacy");
+  });
+
+  it("keeps shadow-compare non-user-facing and returns the legacy response", async () => {
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_MODE = "shadow-compare";
+    const iamRepository = new FakeIamRepository();
+    app = await createPluginUserReadonlyTestApp(repository, iamRepository);
+    const login = await loginAs(app, "guanfei");
+
+    const response = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users?page=1&pageSize=1&search=guan&sort=id&order=asc")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(200);
+
+    expect(response.body).toMatchObject({
+      data: [
+        {
+          id: 24,
+          username: "guanfei",
+          nickname: "babamama",
+          roles: ["admin"]
+        }
+      ],
+      pagination: {
+        page: 1,
+        pageSize: 1,
+        total: 1,
+        totalPages: 1
+      }
+    });
+    expect(response.headers["x-identity-user-source"]).toBe("legacy");
+  });
+
+  it("uses identity-db for allowlisted plugin-user reads", async () => {
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_MODE = "allowlist";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ALLOWLIST = "uid:24";
+    const iamRepository = new FakeIamRepository();
+    app = await createPluginUserReadonlyTestApp(repository, iamRepository);
+    const login = await loginAs(app, "guanfei");
+
+    const response = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users?id=24")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(200);
+
+    expect(response.body).toMatchObject({
+      code: 0,
+      data: {
+        id: 24,
+        username: "guanfei",
+        nickname: "babamama",
+        roles: ["admin"],
+        organizations: [{ id: 1, name: "test-university", title: "测试大学" }]
+      }
+    });
+    expect(response.headers["x-identity-user-source"]).toBe("identity-db");
+  });
+
+  it("falls back to legacy when allowlisted identity-db reads miss the user", async () => {
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_MODE = "allowlist";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ALLOWLIST = "uid:24";
+    const iamRepository = new FakeIamRepository();
+    iamRepository.identityUsers.delete(24);
+    app = await createPluginUserReadonlyTestApp(repository, iamRepository);
+    const login = await loginAs(app, "guanfei");
+
+    const response = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users?id=24")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(200);
+
+    expect(response.body).toMatchObject({
+      code: 0,
+      data: {
+        id: 24,
+        username: "guanfei",
+        nickname: "babamama",
+        roles: ["admin"]
+      }
+    });
+    expect(response.headers["x-identity-user-source"]).toBe("legacy-fallback");
   });
 
   it("rejects non-elevated users without the legacy plugin permission", async () => {
@@ -4151,15 +4291,23 @@ async function createLifecycleTestApp(): Promise<INestApplication> {
   return lifecycleApp;
 }
 
-async function createPluginUserReadonlyTestApp(repository: FakeIdentitySessionRepository): Promise<INestApplication> {
-  const moduleRef = await Test.createTestingModule({
+async function createPluginUserReadonlyTestApp(
+  repository: FakeIdentitySessionRepository,
+  iamRepository?: FakeIamRepository
+): Promise<INestApplication> {
+  let builder = Test.createTestingModule({
     imports: [AppModule]
   })
     .overrideProvider(LegacyIdentityReader)
     .useClass(FakeLegacyIdentityReader)
     .overrideProvider(IdentitySessionRepository)
-    .useValue(repository)
-    .compile();
+    .useValue(repository);
+
+  if (iamRepository) {
+    builder = builder.overrideProvider(IamRepository).useValue(iamRepository);
+  }
+
+  const moduleRef = await builder.compile();
 
   const pluginUserApp = moduleRef.createNestApplication();
   await pluginUserApp.init();

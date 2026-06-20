@@ -44,6 +44,24 @@ export interface IdentityOrganizationShadowRow {
   source: string;
   status: string;
   observedAt: string | null;
+  metadata: unknown;
+}
+
+export interface IdentityManagedUserListInput {
+  page: number;
+  pageSize: number;
+  search?: string;
+  status?: number;
+  sort?: string;
+  order?: "asc" | "desc";
+}
+
+export interface IdentityManagedUserListResult {
+  users: IdentityUserRow[];
+  page: number;
+  pageSize: number;
+  total: number;
+  totalPages: number;
 }
 
 export interface IamReconciliationRunInput {
@@ -125,6 +143,7 @@ export interface OrganizationShadowInput {
   organizationId: number;
   organizationRole: string | null;
   source: string;
+  metadata?: Record<string, unknown>;
 }
 
 @Injectable()
@@ -201,6 +220,73 @@ export class IamRepository implements OnModuleDestroy {
     return rows.length > 0 ? normalizeIdentityUser(rows[0]) : null;
   }
 
+  async listManagedUsers(input: IdentityManagedUserListInput): Promise<IdentityManagedUserListResult> {
+    if (!(await this.tableExists("identity_users"))) {
+      return {
+        users: [],
+        page: input.page,
+        pageSize: input.pageSize,
+        total: 0,
+        totalPages: 0
+      };
+    }
+
+    const page = Math.max(1, input.page);
+    const pageSize = Math.max(1, Math.min(input.pageSize, 100));
+    const offset = (page - 1) * pageSize;
+    const where = ["legacy_user_id IS NOT NULL"];
+    const params: unknown[] = [];
+
+    if (input.search?.trim()) {
+      where.push("(username LIKE ? OR email LIKE ?)");
+      const pattern = `%${input.search.trim()}%`;
+      params.push(pattern, pattern);
+    }
+
+    const status = identityStatusForLegacyStatus(input.status);
+    if (status) {
+      where.push("status = ?");
+      params.push(status);
+    }
+
+    const whereSql = `WHERE ${where.join(" AND ")}`;
+    const totalRows = await this.query<RowDataPacket[]>(
+      `SELECT COUNT(*) AS total
+         FROM identity_users
+        ${whereSql}`,
+      params
+    );
+    const total = Number(totalRows[0]?.total ?? 0);
+    const sortOrder = input.order === "asc" ? "ASC" : "DESC";
+    const sortColumn = identityUserSortColumn(input.sort);
+
+    const rows = await this.query<RowDataPacket[]>(
+      `SELECT id,
+              legacy_user_id AS legacyUserId,
+              keycloak_subject AS keycloakSubject,
+              username,
+              email,
+              status,
+              source,
+              metadata,
+              created_at AS createdAt,
+              updated_at AS updatedAt
+         FROM identity_users
+        ${whereSql}
+        ORDER BY ${sortColumn} ${sortOrder}
+        LIMIT ${pageSize} OFFSET ${offset}`,
+      params
+    );
+
+    return {
+      users: rows.map(normalizeIdentityUser),
+      page,
+      pageSize,
+      total,
+      totalPages: Math.ceil(total / pageSize)
+    };
+  }
+
   async listSubjectMaps(identityUserId: string): Promise<IdentitySubjectMapRow[]> {
     if (!(await this.tableExists("identity_subject_maps"))) {
       return [];
@@ -258,7 +344,8 @@ export class IamRepository implements OnModuleDestroy {
               organization_role AS organizationRole,
               source,
               status,
-              observed_at AS observedAt
+              observed_at AS observedAt,
+              metadata
          FROM identity_organization_memberships_shadow
         WHERE legacy_user_id = ?
           AND status = 'shadow'
@@ -379,20 +466,22 @@ export class IamRepository implements OnModuleDestroy {
     for (const organization of organizations) {
       const [result] = await pool.execute<ResultSetHeader>(
         `INSERT INTO identity_organization_memberships_shadow
-          (identity_user_id, legacy_user_id, organization_id, organization_role, source, status, observed_at)
-         VALUES (?, ?, ?, ?, ?, 'shadow', ?)
+          (identity_user_id, legacy_user_id, organization_id, organization_role, source, status, observed_at, metadata)
+         VALUES (?, ?, ?, ?, ?, 'shadow', ?, ?)
          ON DUPLICATE KEY UPDATE
            identity_user_id = VALUES(identity_user_id),
            organization_role = VALUES(organization_role),
            status = 'shadow',
-           observed_at = VALUES(observed_at)`,
+           observed_at = VALUES(observed_at),
+           metadata = VALUES(metadata)`,
         [
           organization.identityUserId,
           organization.legacyUserId,
           organization.organizationId,
           organization.organizationRole,
           organization.source,
-          new Date()
+          new Date(),
+          JSON.stringify(organization.metadata ?? {})
         ]
       );
       affected += result.affectedRows > 0 ? 1 : 0;
@@ -825,8 +914,34 @@ function normalizeOrganizationShadow(row: RowDataPacket): IdentityOrganizationSh
     organizationRole: row.organizationRole ?? null,
     source: String(row.source),
     status: String(row.status),
-    observedAt: dateToIso(row.observedAt)
+    observedAt: dateToIso(row.observedAt),
+    metadata: parseJsonMaybe(row.metadata)
   };
+}
+
+function identityStatusForLegacyStatus(status: number | undefined): string | null {
+  if (status === undefined) {
+    return null;
+  }
+
+  return status === 10 ? "active" : "inactive";
+}
+
+function identityUserSortColumn(sort: string | undefined): string {
+  switch (sort) {
+    case "username":
+      return "username";
+    case "nickname":
+      return "username";
+    case "email":
+      return "email";
+    case "created_at":
+      return "created_at";
+    case "id":
+    case "roles":
+    default:
+      return "legacy_user_id";
+  }
 }
 
 function normalizeReconciliationRun(row: RowDataPacket): IamReconciliationRunRow {

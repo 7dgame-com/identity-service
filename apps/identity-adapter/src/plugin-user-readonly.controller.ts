@@ -1,9 +1,14 @@
-import { Controller, Get, Headers, HttpException, HttpStatus, Query } from "@nestjs/common";
+import { Controller, Get, Headers, HttpException, HttpStatus, Query, Res } from "@nestjs/common";
 import { loadConfig } from "./config.js";
 import { JwtIssuerService, VerifiedAccessToken } from "./jwt-issuer.service.js";
 import { LegacyIdentityReader, LegacyUserReadModel } from "./legacy-identity.reader.js";
+import { PluginUserPrimaryReadService, PluginUserReadSource } from "./plugin-user-primary-read.service.js";
 
 const ELEVATED_ROLES = new Set(["root", "admin", "manager"]);
+
+interface HeaderResponse {
+  setHeader(name: string, value: string): void;
+}
 
 @Controller()
 export class PluginUserReadonlyController {
@@ -11,18 +16,25 @@ export class PluginUserReadonlyController {
 
   constructor(
     private readonly legacyReader: LegacyIdentityReader,
-    private readonly jwtIssuer: JwtIssuerService
+    private readonly jwtIssuer: JwtIssuerService,
+    private readonly primaryRead: PluginUserPrimaryReadService
   ) {}
 
   @Get("v1/plugin-user/users")
-  async users(@Query() query: Record<string, unknown>, @Headers("authorization") authorization?: string) {
+  async users(
+    @Query() query: Record<string, unknown>,
+    @Res({ passthrough: true }) response: HeaderResponse,
+    @Headers("authorization") authorization?: string
+  ) {
     this.assertEnabled();
     const claims = this.currentUser(authorization);
     const id = positiveInt(query.id);
 
     if (id !== null) {
       await this.assertCan(claims, "user-management.view-user");
-      const user = await this.legacyReader.getUserById(id);
+      const result = await this.primaryRead.getUserById(id, claims);
+      this.setSourceHeader(response, result.source);
+      const user = result.data;
       if (!user) {
         throw new HttpException(
           {
@@ -43,22 +55,23 @@ export class PluginUserReadonlyController {
     const page = positiveInt(query.page) ?? 1;
     const pageSize = positiveInt(query.pageSize) ?? 20;
     const status = query.status === undefined || query.status === "" ? undefined : Number(query.status);
-    const result = await this.legacyReader.listManagedUsers({
+    const result = await this.primaryRead.listUsers({
       page,
       pageSize,
       search: typeof query.search === "string" ? query.search : undefined,
       status: Number.isInteger(status) ? status : undefined,
       sort: typeof query.sort === "string" ? query.sort : undefined,
       order: query.order === "asc" ? "asc" : "desc"
-    });
+    }, claims);
+    this.setSourceHeader(response, result.source);
 
     return {
-      data: result.users.map(serializeManagedUser),
+      data: result.data.users.map(serializeManagedUser),
       pagination: {
-        page: result.page,
-        pageSize: result.pageSize,
-        total: result.total,
-        totalPages: result.totalPages
+        page: result.data.page,
+        pageSize: result.data.pageSize,
+        total: result.data.total,
+        totalPages: result.data.totalPages
       }
     };
   }
@@ -117,6 +130,12 @@ export class PluginUserReadonlyController {
       },
       HttpStatus.FORBIDDEN
     );
+  }
+
+  private setSourceHeader(response: HeaderResponse, source: PluginUserReadSource): void {
+    if (this.config.pluginUserPrimaryRead.observeHeader) {
+      response.setHeader("X-Identity-User-Source", source);
+    }
   }
 }
 

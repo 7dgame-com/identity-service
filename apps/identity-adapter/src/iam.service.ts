@@ -543,8 +543,11 @@ export class IamService implements OnApplicationBootstrap {
           status: normalizeLegacyStatus(user.status),
           metadata: sanitizeMetadata({
             source: "iam-reconciliation",
+            legacyNickname: user.nickname,
+            legacyEmailVerifiedAt: user.emailVerifiedAt,
             legacyCreatedAt: user.createdAt,
-            legacyUpdatedAt: user.updatedAt
+            legacyUpdatedAt: user.updatedAt,
+            legacyUserInfo: user.userInfo
           })
         });
         writes += 1;
@@ -570,7 +573,13 @@ export class IamService implements OnApplicationBootstrap {
             legacyUserId: user.id,
             organizationId: organization.id,
             organizationRole: "member",
-            source: "legacy-shadow"
+            source: "legacy-shadow",
+            metadata: sanitizeMetadata({
+              legacyName: organization.name,
+              legacyTitle: organization.title,
+              legacyCreatedAt: organization.createdAt,
+              legacyUpdatedAt: organization.updatedAt
+            })
           }))
         );
       }
