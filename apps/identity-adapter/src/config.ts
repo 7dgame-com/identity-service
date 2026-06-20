@@ -138,6 +138,14 @@ export const configSchema = z.object({
   pluginUserReadonly: z.object({
     enabled: boolFromEnv.default(false)
   }),
+  pluginUserPrimaryRead: z.object({
+    enabled: boolFromEnv.default(false),
+    mode: z.enum(["disabled", "shadow-compare", "allowlist", "percentage", "full"]).default("disabled"),
+    fallbackEnabled: boolFromEnv.default(true),
+    allowlist: z.string().default(""),
+    observeHeader: boolFromEnv.default(true),
+    percentage: numberFromEnv.default(0)
+  }),
   invitationDiagnostics: z.object({
     redisUrl: optionalStringFromEnv,
     scanCount: numberFromEnv.default(100),
@@ -289,6 +297,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
     },
     pluginUserReadonly: {
       enabled: env.IDENTITY_PLUGIN_USER_READONLY_ENABLED
+    },
+    pluginUserPrimaryRead: {
+      enabled: env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ENABLED,
+      mode: env.IDENTITY_PLUGIN_USER_PRIMARY_READ_MODE,
+      fallbackEnabled: env.IDENTITY_PLUGIN_USER_PRIMARY_READ_FALLBACK_ENABLED,
+      allowlist: env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ALLOWLIST,
+      observeHeader: env.IDENTITY_PLUGIN_USER_PRIMARY_READ_OBSERVE_HEADER,
+      percentage: env.IDENTITY_PLUGIN_USER_PRIMARY_READ_PERCENTAGE
     },
     invitationDiagnostics: {
       redisUrl: env.IDENTITY_INVITATION_REDIS_URL,
