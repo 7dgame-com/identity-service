@@ -12,6 +12,7 @@ import {
 } from "./legacy-identity.reader.js";
 
 export type PluginUserReadSource = "legacy" | "identity-db" | "legacy-fallback";
+type FallbackControlMode = "off" | "canary" | "percentage";
 
 export interface PluginUserReadResult<T> {
   data: T;
@@ -182,6 +183,7 @@ export class PluginUserPrimaryReadService {
     loadLegacy: () => Promise<T>
   ): Promise<PluginUserReadResult<T>> {
     if (!this.config.pluginUserPrimaryRead.fallbackEnabled) {
+      this.logFallbackBlocked(scope, claims, reason, "global-disabled", "fallback_master_disabled");
       throw new ServiceUnavailableException({
         code: "PLUGIN_USER_PRIMARY_READ_UNAVAILABLE",
         message: "Plugin user primary read failed and fallback is disabled.",
@@ -189,7 +191,19 @@ export class PluginUserPrimaryReadService {
       });
     }
 
-    this.logRead(scope, claims, "legacy-fallback", reason);
+    const fallbackDecision = this.fallbackControlDecision(claims);
+    if (fallbackDecision.disableFallback) {
+      this.logFallbackBlocked(scope, claims, reason, fallbackDecision.mode, fallbackDecision.reason);
+      throw new ServiceUnavailableException({
+        code: "PLUGIN_USER_PRIMARY_READ_UNAVAILABLE",
+        message: "Plugin user primary read failed and fallback is disabled for this rollout subject.",
+        reason,
+        fallbackControlMode: fallbackDecision.mode,
+        fallbackControlReason: fallbackDecision.reason
+      });
+    }
+
+    this.logRead(scope, claims, "legacy-fallback", reason, fallbackDecision.mode, fallbackDecision.reason);
     return {
       data: await loadLegacy(),
       source: "legacy-fallback",
@@ -203,13 +217,37 @@ export class PluginUserPrimaryReadService {
       return false;
     }
 
-    const subjects = new Set([
-      String(claims.uid),
-      `uid:${claims.uid}`,
-      claims.username ?? "",
-      claims.username ? `username:${claims.username}` : ""
-    ]);
+    const subjects = subjectTokens(claims);
     return allowlist.some((item) => subjects.has(item));
+  }
+
+  private fallbackControlDecision(claims: VerifiedAccessToken): {
+    disableFallback: boolean;
+    mode: FallbackControlMode;
+    reason: string;
+  } {
+    const control = this.config.pluginUserFallbackControl;
+    if (!control.enabled || control.disableMode === "off") {
+      return { disableFallback: false, mode: "off", reason: "control_off" };
+    }
+
+    if (control.disableMode === "canary") {
+      const allowlist = splitCsv(control.disableAllowlist);
+      const subjects = subjectTokens(claims);
+      const matched = allowlist.some((item) => subjects.has(item));
+      return {
+        disableFallback: matched,
+        mode: "canary",
+        reason: matched ? "canary_subject_selected" : "canary_subject_not_selected"
+      };
+    }
+
+    const selected = this.isInPercentageWindow(claims, control.disablePercentage);
+    return {
+      disableFallback: selected,
+      mode: "percentage",
+      reason: selected ? "percentage_bucket_selected" : "percentage_bucket_not_selected"
+    };
   }
 
   private isInPercentageWindow(claims: VerifiedAccessToken, percentage: number | undefined): boolean {
@@ -246,18 +284,68 @@ export class PluginUserPrimaryReadService {
     );
   }
 
-  private logRead(scope: "detail" | "list", claims: VerifiedAccessToken, source: PluginUserReadSource, fallbackReason?: string): void {
+  private logRead(
+    scope: "detail" | "list",
+    claims: VerifiedAccessToken,
+    source: PluginUserReadSource,
+    fallbackReason?: string,
+    fallbackControlMode: FallbackControlMode = "off",
+    fallbackControlReason = "control_off"
+  ): void {
     this.logger.warn(
       JSON.stringify({
         event: "identity.plugin_user.primary_read.fallback",
         scope: `plugin-user.users.${scope}`,
         readMode: this.config.pluginUserPrimaryRead.mode,
         source,
+        fallbackAttempted: true,
+        fallbackUsed: true,
+        fallbackBlocked: false,
+        fallbackControlMode,
+        fallbackControlReason,
         fallbackReason: fallbackReason ?? null,
         subjectId: `uid:${claims.uid}`
       })
     );
   }
+
+  private logFallbackBlocked(
+    scope: "detail" | "list",
+    claims: VerifiedAccessToken,
+    fallbackReason: string,
+    fallbackControlMode: FallbackControlMode | "global-disabled",
+    fallbackControlReason: string
+  ): void {
+    if (!this.config.pluginUserFallbackControl.observeMetricsEnabled) {
+      return;
+    }
+
+    this.logger.warn(
+      JSON.stringify({
+        event: "identity.plugin_user.primary_read.fallback_blocked",
+        scope: `plugin-user.users.${scope}`,
+        readMode: this.config.pluginUserPrimaryRead.mode,
+        source: "identity-db",
+        fallbackAttempted: true,
+        fallbackUsed: false,
+        fallbackBlocked: true,
+        fallbackControlMode,
+        fallbackControlReason,
+        fallbackReason,
+        subjectId: `uid:${claims.uid}`
+      })
+    );
+  }
+}
+
+function subjectTokens(claims: VerifiedAccessToken): Set<string> {
+  return new Set([
+    String(claims.uid),
+    `uid:${claims.uid}`,
+    `subject:${claims.uid}`,
+    claims.username ?? "",
+    claims.username ? `username:${claims.username}` : ""
+  ]);
 }
 
 function emptyList(input: LegacyManagedUserListInput): LegacyManagedUserListResult {

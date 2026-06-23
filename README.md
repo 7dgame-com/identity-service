@@ -130,6 +130,61 @@ Safety rules:
 - `/api-auth` must not be captured by a broader `/api` reverse proxy route.
 - Phase 4 does not migrate registration, password reset, email, invitations, or billing.
 
+## Plugin User Readonly Primary Read
+
+`GET /v1/plugin-user/users` is a compatibility endpoint for the existing user
+management plugin. It is disabled by default and can be rolled out with
+identity DB primary reads while retaining legacy fallback.
+
+```bash
+IDENTITY_PLUGIN_USER_READONLY_ENABLED=true
+IDENTITY_PLUGIN_USER_PRIMARY_READ_ENABLED=true
+IDENTITY_PLUGIN_USER_PRIMARY_READ_MODE=percentage
+IDENTITY_PLUGIN_USER_PRIMARY_READ_PERCENTAGE=100
+IDENTITY_PLUGIN_USER_PRIMARY_READ_FALLBACK_ENABLED=true
+```
+
+The response may include `X-Identity-User-Source` when
+`IDENTITY_PLUGIN_USER_PRIMARY_READ_OBSERVE_HEADER=true`:
+
+- `legacy`
+- `identity-db`
+- `legacy-fallback`
+
+Fallback shrink is controlled separately from primary-read percentage. Keep the
+global fallback flag enabled during canary or percentage windows; it is the
+emergency master switch, not the gray rollout mechanism.
+
+Default-off fallback-control settings:
+
+```bash
+IDENTITY_PLUGIN_USER_FALLBACK_CONTROL_ENABLED=false
+IDENTITY_PLUGIN_USER_FALLBACK_DISABLE_MODE=off
+IDENTITY_PLUGIN_USER_FALLBACK_DISABLE_ALLOWLIST=
+IDENTITY_PLUGIN_USER_FALLBACK_DISABLE_PERCENTAGE=0
+IDENTITY_PLUGIN_USER_FALLBACK_OBSERVE_METRICS_ENABLED=true
+```
+
+Allowed fallback-control modes:
+
+- `off`: current behavior, legacy fallback remains available.
+- `canary`: disable fallback only for subjects listed in
+  `IDENTITY_PLUGIN_USER_FALLBACK_DISABLE_ALLOWLIST`.
+- `percentage`: disable fallback for a deterministic percentage bucket set by
+  `IDENTITY_PLUGIN_USER_FALLBACK_DISABLE_PERCENTAGE`.
+
+Supported allowlist entries:
+
+- `uid:24`
+- `24`
+- `subject:24`
+- `username:guanfei`
+- `guanfei`
+
+Rollback is config-only: set `IDENTITY_PLUGIN_USER_FALLBACK_DISABLE_MODE=off`
+or `IDENTITY_PLUGIN_USER_FALLBACK_CONTROL_ENABLED=false`, and keep
+`IDENTITY_PLUGIN_USER_PRIMARY_READ_FALLBACK_ENABLED=true`.
+
 ## Phase 5 Account Lifecycle
 
 Account lifecycle migration is optional and disabled by default. Phase 5 starts

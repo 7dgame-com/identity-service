@@ -1,6 +1,6 @@
 import "reflect-metadata";
 import { createHash, generateKeyPairSync } from "node:crypto";
-import { INestApplication } from "@nestjs/common";
+import { INestApplication, Logger } from "@nestjs/common";
 import { Test } from "@nestjs/testing";
 import bcrypt from "bcryptjs";
 import request from "supertest";
@@ -2792,6 +2792,124 @@ describe("identity-adapter plugin user readonly compatibility API", () => {
     process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ENABLED = "true";
     process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_MODE = "allowlist";
     process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ALLOWLIST = "uid:24";
+    const iamRepository = new FakeIamRepository();
+    iamRepository.identityUsers.delete(24);
+    app = await createPluginUserReadonlyTestApp(repository, iamRepository);
+    const login = await loginAs(app, "guanfei");
+
+    const response = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users?id=24")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(200);
+
+    expect(response.body).toMatchObject({
+      code: 0,
+      data: {
+        id: 24,
+        username: "guanfei",
+        nickname: "babamama",
+        roles: ["admin"]
+      }
+    });
+    expect(response.headers["x-identity-user-source"]).toBe("legacy-fallback");
+  });
+
+  it("blocks fallback only for selected canary subjects", async () => {
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_MODE = "allowlist";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ALLOWLIST = "uid:24";
+    process.env.IDENTITY_PLUGIN_USER_FALLBACK_CONTROL_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_FALLBACK_DISABLE_MODE = "canary";
+    process.env.IDENTITY_PLUGIN_USER_FALLBACK_DISABLE_ALLOWLIST = "username:guanfei";
+    const warnSpy = vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+    const iamRepository = new FakeIamRepository();
+    iamRepository.identityUsers.delete(24);
+    app = await createPluginUserReadonlyTestApp(repository, iamRepository);
+    const login = await loginAs(app, "guanfei");
+
+    try {
+      const response = await request(app.getHttpServer())
+        .get("/v1/plugin-user/users?id=24")
+        .set("Authorization", `Bearer ${login.accessToken}`)
+        .expect(503);
+
+      expect(response.body).toMatchObject({
+        code: "PLUGIN_USER_PRIMARY_READ_UNAVAILABLE",
+        fallbackControlMode: "canary",
+        fallbackControlReason: "canary_subject_selected"
+      });
+      expect(String(warnSpy.mock.calls.at(-1)?.[0] ?? "")).toContain("identity.plugin_user.primary_read.fallback_blocked");
+      expect(String(warnSpy.mock.calls.at(-1)?.[0] ?? "")).not.toContain(login.accessToken);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("keeps fallback for canary-control subjects that are not selected", async () => {
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_MODE = "allowlist";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ALLOWLIST = "uid:24";
+    process.env.IDENTITY_PLUGIN_USER_FALLBACK_CONTROL_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_FALLBACK_DISABLE_MODE = "canary";
+    process.env.IDENTITY_PLUGIN_USER_FALLBACK_DISABLE_ALLOWLIST = "username:not-guanfei";
+    const iamRepository = new FakeIamRepository();
+    iamRepository.identityUsers.delete(24);
+    app = await createPluginUserReadonlyTestApp(repository, iamRepository);
+    const login = await loginAs(app, "guanfei");
+
+    const response = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users?id=24")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(200);
+
+    expect(response.body).toMatchObject({
+      code: 0,
+      data: {
+        id: 24,
+        username: "guanfei",
+        nickname: "babamama",
+        roles: ["admin"]
+      }
+    });
+    expect(response.headers["x-identity-user-source"]).toBe("legacy-fallback");
+  });
+
+  it("blocks fallback for selected percentage buckets independently from primary-read percentage", async () => {
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_MODE = "allowlist";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ALLOWLIST = "uid:24";
+    process.env.IDENTITY_PLUGIN_USER_FALLBACK_CONTROL_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_FALLBACK_DISABLE_MODE = "percentage";
+    process.env.IDENTITY_PLUGIN_USER_FALLBACK_DISABLE_PERCENTAGE = "100";
+    const iamRepository = new FakeIamRepository();
+    iamRepository.identityUsers.delete(24);
+    app = await createPluginUserReadonlyTestApp(repository, iamRepository);
+    const login = await loginAs(app, "guanfei");
+
+    const response = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users?id=24")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(503);
+
+    expect(response.body).toMatchObject({
+      code: "PLUGIN_USER_PRIMARY_READ_UNAVAILABLE",
+      fallbackControlMode: "percentage",
+      fallbackControlReason: "percentage_bucket_selected"
+    });
+  });
+
+  it("restores fallback when fallback-control mode is off", async () => {
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_MODE = "allowlist";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ALLOWLIST = "uid:24";
+    process.env.IDENTITY_PLUGIN_USER_FALLBACK_CONTROL_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_FALLBACK_DISABLE_MODE = "off";
+    process.env.IDENTITY_PLUGIN_USER_FALLBACK_DISABLE_ALLOWLIST = "username:guanfei";
+    process.env.IDENTITY_PLUGIN_USER_FALLBACK_DISABLE_PERCENTAGE = "100";
     const iamRepository = new FakeIamRepository();
     iamRepository.identityUsers.delete(24);
     app = await createPluginUserReadonlyTestApp(repository, iamRepository);
