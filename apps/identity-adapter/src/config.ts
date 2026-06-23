@@ -146,6 +146,13 @@ export const configSchema = z.object({
     observeHeader: boolFromEnv.default(true),
     percentage: numberFromEnv.default(0)
   }),
+  pluginUserFallbackControl: z.object({
+    enabled: boolFromEnv.default(false),
+    disableMode: z.enum(["off", "canary", "percentage"]).default("off"),
+    disableAllowlist: z.string().default(""),
+    disablePercentage: numberFromEnv.default(0),
+    observeMetricsEnabled: boolFromEnv.default(true)
+  }),
   invitationDiagnostics: z.object({
     redisUrl: optionalStringFromEnv,
     scanCount: numberFromEnv.default(100),
@@ -305,6 +312,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
       allowlist: env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ALLOWLIST,
       observeHeader: env.IDENTITY_PLUGIN_USER_PRIMARY_READ_OBSERVE_HEADER,
       percentage: env.IDENTITY_PLUGIN_USER_PRIMARY_READ_PERCENTAGE
+    },
+    pluginUserFallbackControl: {
+      enabled: env.IDENTITY_PLUGIN_USER_FALLBACK_CONTROL_ENABLED,
+      disableMode: env.IDENTITY_PLUGIN_USER_FALLBACK_DISABLE_MODE,
+      disableAllowlist: env.IDENTITY_PLUGIN_USER_FALLBACK_DISABLE_ALLOWLIST,
+      disablePercentage: env.IDENTITY_PLUGIN_USER_FALLBACK_DISABLE_PERCENTAGE,
+      observeMetricsEnabled: env.IDENTITY_PLUGIN_USER_FALLBACK_OBSERVE_METRICS_ENABLED
     },
     invitationDiagnostics: {
       redisUrl: env.IDENTITY_INVITATION_REDIS_URL,
