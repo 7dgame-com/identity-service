@@ -2787,6 +2787,49 @@ describe("identity-adapter plugin user readonly compatibility API", () => {
     expect(response.headers["x-identity-user-source"]).toBe("identity-db");
   });
 
+  it("logs safe identity-db primary-read decisions for plugin-user reads", async () => {
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_MODE = "allowlist";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ALLOWLIST = "uid:24";
+    const logSpy = vi.spyOn(Logger.prototype, "log").mockImplementation(() => undefined);
+    const iamRepository = new FakeIamRepository();
+    app = await createPluginUserReadonlyTestApp(repository, iamRepository);
+    const login = await loginAs(app, "guanfei");
+
+    try {
+      await request(app.getHttpServer())
+        .get("/v1/plugin-user/users?page=1&pageSize=1&search=guan&sort=id&order=asc")
+        .set("Authorization", `Bearer ${login.accessToken}`)
+        .expect(200);
+
+      const message = logSpy.mock.calls
+        .map((call) => String(call[0] ?? ""))
+        .find((item) => item.includes("identity.plugin_user.primary_read.decision"));
+
+      expect(message).toBeTruthy();
+      expect(message).not.toContain(login.accessToken);
+      expect(message).not.toContain("Bearer ");
+
+      const payload = JSON.parse(message!);
+      expect(payload).toMatchObject({
+        event: "identity.plugin_user.primary_read.decision",
+        scope: "plugin-user.users.list",
+        readMode: "allowlist",
+        source: "identity-db",
+        fallbackAttempted: false,
+        fallbackUsed: false,
+        fallbackBlocked: false,
+        fallbackControlMode: "off",
+        fallbackControlReason: "control_off",
+        fallbackReason: null,
+        subjectId: "uid:24"
+      });
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
   it("falls back to legacy when allowlisted identity-db reads miss the user", async () => {
     process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
     process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ENABLED = "true";

@@ -34,6 +34,7 @@ export class PluginUserPrimaryReadService {
     const decision = this.readDecision(claims);
 
     if (decision === "legacy") {
+      this.logDecision("detail", claims, "legacy", false, false, false);
       return { data: await this.legacyReader.getUserById(id), source: "legacy" };
     }
 
@@ -46,6 +47,7 @@ export class PluginUserPrimaryReadService {
 
     const identity = await this.safeIdentityUserById(id);
     if (!identity.fallbackReason) {
+      this.logDecision("detail", claims, "identity-db", false, false, false);
       return { data: identity.data, source: "identity-db" };
     }
 
@@ -59,6 +61,7 @@ export class PluginUserPrimaryReadService {
     const decision = this.readDecision(claims);
 
     if (decision === "legacy") {
+      this.logDecision("list", claims, "legacy", false, false, false);
       return { data: await this.legacyReader.listManagedUsers(input), source: "legacy" };
     }
 
@@ -73,6 +76,7 @@ export class PluginUserPrimaryReadService {
 
     const identity = await this.safeIdentityUserList(input);
     if (!identity.fallbackReason) {
+      this.logDecision("list", claims, "identity-db", false, false, false);
       return { data: identity.data, source: "identity-db" };
     }
 
@@ -301,6 +305,38 @@ export class PluginUserPrimaryReadService {
         fallbackAttempted: true,
         fallbackUsed: true,
         fallbackBlocked: false,
+        fallbackControlMode,
+        fallbackControlReason,
+        fallbackReason: fallbackReason ?? null,
+        subjectId: `uid:${claims.uid}`
+      })
+    );
+  }
+
+  private logDecision(
+    scope: "detail" | "list",
+    claims: VerifiedAccessToken,
+    source: PluginUserReadSource,
+    fallbackAttempted: boolean,
+    fallbackUsed: boolean,
+    fallbackBlocked: boolean,
+    fallbackControlMode: FallbackControlMode = "off",
+    fallbackControlReason = "control_off",
+    fallbackReason?: string
+  ): void {
+    if (!this.config.pluginUserFallbackControl.observeMetricsEnabled) {
+      return;
+    }
+
+    this.logger.log(
+      JSON.stringify({
+        event: "identity.plugin_user.primary_read.decision",
+        scope: `plugin-user.users.${scope}`,
+        readMode: this.config.pluginUserPrimaryRead.mode,
+        source,
+        fallbackAttempted,
+        fallbackUsed,
+        fallbackBlocked,
         fallbackControlMode,
         fallbackControlReason,
         fallbackReason: fallbackReason ?? null,
