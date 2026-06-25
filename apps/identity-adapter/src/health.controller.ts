@@ -44,7 +44,8 @@ export class HealthController {
             passwordResetNative: this.config.accountLifecycle.passwordResetNativeEnabled ? "enabled" : "disabled",
             email: this.config.accountLifecycle.emailEnabled ? "enabled" : "disabled",
             invitation: this.config.accountLifecycle.invitationEnabled ? "enabled" : "disabled"
-          }
+          },
+          pluginUserWrite: this.config.iam.pluginUserWriteMode
         }
       };
     } finally {

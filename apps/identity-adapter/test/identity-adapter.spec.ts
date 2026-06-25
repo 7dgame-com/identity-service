@@ -2645,6 +2645,162 @@ describe("identity-adapter account lifecycle compatibility API", () => {
   });
 });
 
+describe("identity-adapter plugin user write legacy-proxy API", () => {
+  let app: INestApplication | null = null;
+  const originalEnv = { ...process.env };
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "legacy-proxy";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_LEGACY_API_BASE_URL = "http://legacy-api";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_TIMEOUT_MS = "5000";
+  });
+
+  afterEach(async () => {
+    vi.unstubAllGlobals();
+    process.env = { ...originalEnv };
+    await app?.close();
+    app = null;
+  });
+
+  it("keeps plugin-user write endpoints disabled by default", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "disabled";
+    app = await createLifecycleTestApp();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await request(app.getHttpServer())
+      .post("/v1/plugin-user/create-user")
+      .send({ username: "new-user", password: "Secret123!" })
+      .expect(404);
+
+    expect(response.body).toMatchObject({
+      code: "PLUGIN_USER_WRITE_DISABLED",
+      message: "Plugin user write migration is disabled."
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("reports the legacy-proxy posture without requiring public exposure", async () => {
+    app = await createLifecycleTestApp();
+
+    const response = await request(app.getHttpServer())
+      .get("/internal/plugin-user-write/readiness")
+      .expect(200);
+
+    expect(response.body).toMatchObject({
+      status: "ok",
+      service: "identity-adapter",
+      capability: "plugin-user-write",
+      data: {
+        enabled: true,
+        mode: "legacy-proxy",
+        legacyProxyConfigured: true,
+        sourceOfTruth: "legacy"
+      }
+    });
+    expect(response.body.data.routes).toEqual(
+      expect.arrayContaining(["create-user", "update-user", "delete-user", "change-role", "batch-create-users"])
+    );
+  });
+
+  it("does not execute unsupported write modes", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
+    app = await createLifecycleTestApp();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await request(app.getHttpServer())
+      .post("/v1/plugin-user/create-user")
+      .send({ username: "new-user", password: "Secret123!" })
+      .expect(404);
+
+    expect(response.body).toMatchObject({
+      code: "PLUGIN_USER_WRITE_UNSUPPORTED_MODE"
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("requires an explicit legacy API base URL before legacy-proxy writes", async () => {
+    delete process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_LEGACY_API_BASE_URL;
+    delete process.env.IDENTITY_ACCOUNT_LIFECYCLE_LEGACY_API_BASE_URL;
+    app = await createLifecycleTestApp();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await request(app.getHttpServer())
+      .post("/v1/plugin-user/create-user")
+      .send({ username: "new-user", password: "Secret123!" })
+      .expect(503);
+
+    expect(response.body).toMatchObject({
+      code: "PLUGIN_USER_WRITE_LEGACY_API_NOT_CONFIGURED"
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("proxies privileged user writes without changing status or response shape", async () => {
+    app = await createLifecycleTestApp();
+    const fetchMock = vi.fn(async () => {
+      return new Response(JSON.stringify({ code: 0, data: { id: 42, username: "new-user" } }), {
+        status: 201,
+        headers: { "Content-Type": "application/json" }
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await request(app.getHttpServer())
+      .post("/v1/plugin-user/create-user")
+      .set("Authorization", "Bearer operator-token")
+      .set("X-Forwarded-For", "10.0.0.2")
+      .set("User-Agent", "Vitest")
+      .send({
+        username: "new-user",
+        nickname: "New User",
+        password: "Secret123!",
+        organization_ids: [1, 2]
+      })
+      .expect(201);
+
+    expect(response.headers["x-identity-plugin-user-write"]).toBe("legacy-proxy");
+    expect(response.body).toEqual({ code: 0, data: { id: 42, username: "new-user" } });
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [URL, RequestInit];
+    expect(url.toString()).toBe("http://legacy-api/v1/plugin-user/create-user");
+    const headers = init.headers as Headers;
+    expect(headers.get("Authorization")).toBe("Bearer operator-token");
+    expect(headers.get("X-Forwarded-For")).toBe("10.0.0.2");
+    expect(headers.get("User-Agent")).toBe("Vitest");
+    expect(headers.get("X-Identity-Plugin-User-Write-Proxy")).toBe("1");
+    expect(JSON.parse(String(init.body))).toEqual({
+      username: "new-user",
+      nickname: "New User",
+      password: "Secret123!",
+      organization_ids: [1, 2]
+    });
+  });
+
+  it("preserves legacy validation errors so callers do not repeat writes", async () => {
+    app = await createLifecycleTestApp();
+    const fetchMock = vi.fn(async () => {
+      return new Response(JSON.stringify({ code: 4004, message: "用户不存在" }), {
+        status: 404,
+        headers: { "Content-Type": "application/json" }
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await request(app.getHttpServer())
+      .post("/v1/plugin-user/update-user")
+      .set("Authorization", "Bearer operator-token")
+      .send({ id: 404, nickname: "missing" })
+      .expect(404);
+
+    expect(response.headers["x-identity-plugin-user-write"]).toBe("legacy-proxy");
+    expect(response.body).toEqual({ code: 4004, message: "用户不存在" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("identity-adapter plugin user readonly compatibility API", () => {
   let app: INestApplication | null = null;
   let repository: FakeIdentitySessionRepository;
