@@ -2943,6 +2943,40 @@ describe("identity-adapter plugin user readonly compatibility API", () => {
     expect(response.headers["x-identity-user-source"]).toBe("identity-db");
   });
 
+  it("keeps plugin-user reads on legacy while plugin-user writes are legacy-proxy", async () => {
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_MODE = "allowlist";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ALLOWLIST = "uid:24";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "legacy-proxy";
+    const iamRepository = new FakeIamRepository();
+    app = await createPluginUserReadonlyTestApp(repository, iamRepository);
+    const login = await loginAs(app, "guanfei");
+
+    const response = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users?page=1&pageSize=1&search=guan&sort=id&order=asc")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(200);
+
+    expect(response.body).toMatchObject({
+      data: [
+        {
+          id: 24,
+          username: "guanfei",
+          nickname: "babamama",
+          roles: ["admin"]
+        }
+      ],
+      pagination: {
+        page: 1,
+        pageSize: 1,
+        total: 1,
+        totalPages: 1
+      }
+    });
+    expect(response.headers["x-identity-user-source"]).toBe("legacy");
+  });
+
   it("logs safe identity-db primary-read decisions for plugin-user reads", async () => {
     process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
     process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ENABLED = "true";
