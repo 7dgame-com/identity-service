@@ -84,6 +84,10 @@ export class PluginUserPrimaryReadService {
   }
 
   private readDecision(claims: VerifiedAccessToken): "legacy" | "shadow-compare" | "primary" {
+    if (this.config.iam.pluginUserWriteMode === "legacy-proxy") {
+      return "legacy";
+    }
+
     const primary = this.config.pluginUserPrimaryRead;
     if (!primary.enabled || primary.mode === "disabled") {
       return "legacy";

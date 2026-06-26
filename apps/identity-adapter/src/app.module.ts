@@ -40,6 +40,8 @@ import { OidcService } from "./oidc.service.js";
 import { PasswordResetChallengeRepository } from "./password-reset-challenge.repository.js";
 import { PluginUserPrimaryReadService } from "./plugin-user-primary-read.service.js";
 import { PluginUserReadonlyController } from "./plugin-user-readonly.controller.js";
+import { PluginUserWriteController } from "./plugin-user-write.controller.js";
+import { PluginUserWriteService } from "./plugin-user-write.service.js";
 import { TelemetryInterceptor } from "./telemetry.interceptor.js";
 import { TokenIssuanceService } from "./token-issuance.service.js";
 import { UsageBillingController } from "./usage-billing.controller.js";
@@ -56,6 +58,7 @@ import { UsageBillingService } from "./usage-billing.service.js";
     InvitationDiagnosticsController,
     IamController,
     PluginUserReadonlyController,
+    PluginUserWriteController,
     UsageBillingController,
     OidcController
   ],
@@ -109,6 +112,7 @@ import { UsageBillingService } from "./usage-billing.service.js";
     UsageBillingRepository,
     UsageBillingService,
     PluginUserPrimaryReadService,
+    PluginUserWriteService,
     TokenIssuanceService,
     { provide: APP_INTERCEPTOR, useClass: TelemetryInterceptor }
   ]
