@@ -2910,36 +2910,55 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
     expect(operations.inputs).toHaveLength(0);
   });
 
-  it("logs redacted plan-mode shadow evidence without writing the ledger", async () => {
+  it("logs redacted plan-mode shadow evidence for create, update, and delete without writing the ledger", async () => {
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_SHADOW_MODE = "plan";
     const logSpy = vi.spyOn(Logger.prototype, "log").mockImplementation(() => undefined);
     const operations = new FakePluginUserWriteOperationRepository();
     app = await createLifecycleTestApp(operations);
-    const fetchMock = vi.fn(async () => {
-      return new Response(JSON.stringify({ code: 0, data: { id: 42, username: "new-user" } }), {
-        status: 201,
+    const fetchMock = vi.fn(async (_url: URL | string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+      return new Response(JSON.stringify({ code: 0, data: { id: body.id ?? 42, username: body.username ?? "new-user" } }), {
+        status: body.id ? 200 : 201,
         headers: { "Content-Type": "application/json" }
       });
     });
     vi.stubGlobal("fetch", fetchMock);
 
     try {
-      const response = await request(app.getHttpServer())
+      const createResponse = await request(app.getHttpServer())
         .post("/v1/plugin-user/create-user")
         .set("Authorization", "Bearer test-token")
         .send({ username: "new-user", password: "Secret123!" })
         .expect(201);
 
-      expect(response.body).toEqual({ code: 0, data: { id: 42, username: "new-user" } });
+      await request(app.getHttpServer())
+        .post("/v1/plugin-user/update-user")
+        .set("Authorization", "Bearer test-token")
+        .send({ id: 42, nickname: "Updated User", password: "Secret456!" })
+        .expect(200);
+
+      await request(app.getHttpServer())
+        .post("/v1/plugin-user/delete-user")
+        .set("Authorization", "Bearer test-token")
+        .send({ id: 42 })
+        .expect(200);
+
+      expect(createResponse.body).toEqual({ code: 0, data: { id: 42, username: "new-user" } });
       expect(operations.inputs).toHaveLength(0);
-      expect(logSpy.mock.calls.some(([message]) => String(message).includes('"event":"identity.plugin_user.write.shadow"'))).toBe(
-        true
-      );
-      const logPayload = String(logSpy.mock.calls.find(([message]) => String(message).includes("identity.plugin_user.write.shadow"))?.[0]);
-      expect(logPayload).toContain('"mode":"plan"');
-      expect(logPayload).toContain('"sideEffect":"none"');
-      expect(logPayload).not.toContain("Secret123!");
-      expect(logPayload).not.toContain("test-token");
+      const logPayloads = logSpy.mock.calls
+        .map(([message]) => String(message))
+        .filter((message) => message.includes("identity.plugin_user.write.shadow"));
+      expect(logPayloads).toHaveLength(3);
+      expect(logPayloads.some((payload) => payload.includes('"route":"create-user"'))).toBe(true);
+      expect(logPayloads.some((payload) => payload.includes('"route":"update-user"'))).toBe(true);
+      expect(logPayloads.some((payload) => payload.includes('"route":"delete-user"'))).toBe(true);
+      for (const logPayload of logPayloads) {
+        expect(logPayload).toContain('"mode":"plan"');
+        expect(logPayload).toContain('"sideEffect":"none"');
+        expect(logPayload).not.toContain("Secret123!");
+        expect(logPayload).not.toContain("Secret456!");
+        expect(logPayload).not.toContain("test-token");
+      }
     } finally {
       logSpy.mockRestore();
     }
