@@ -1,33 +1,71 @@
 import { Injectable, NotFoundException, ServiceUnavailableException } from "@nestjs/common";
 import { loadConfig } from "./config.js";
+import { PluginUserWriteOperationRepository } from "./plugin-user-write-operation.repository.js";
+import { PluginUserWriteShadowService } from "./plugin-user-write-shadow.service.js";
 
 export interface PluginUserWriteProxyResponse {
   status: number;
   body: unknown;
 }
 
+const PLUGIN_USER_WRITE_EXECUTABLE_MODES = ["disabled", "legacy-proxy"] as const;
+const PLUGIN_USER_WRITE_ROUTES = [
+  "create-user",
+  "update-user",
+  "delete-user",
+  "change-role",
+  "batch-create-users"
+] as const;
+const REQUIRED_BEFORE_DUAL_WRITE = [
+  "operation-ledger",
+  "idempotency-keys",
+  "compensation-records",
+  "secret-redaction-gate",
+  "develop-rollback-drill",
+  "ordinary-user-negative-regression"
+] as const;
+const REQUIRED_BEFORE_IDENTITY_NATIVE = [
+  "clean-dual-write-production-evidence",
+  "profile-owner-closed-or-retained",
+  "role-permission-owner-closed-or-retained",
+  "organization-owner-closed-or-retained",
+  "legacy-proxy-rollback-window"
+] as const;
+
 @Injectable()
 export class PluginUserWriteService {
   private readonly config = loadConfig();
 
+  constructor(
+    private readonly operations: PluginUserWriteOperationRepository,
+    private readonly shadow: PluginUserWriteShadowService
+  ) {}
+
   readiness() {
     const { iam } = this.config;
+    const unsupportedModeBlocked = iam.pluginUserWriteMode === "dual-write" || iam.pluginUserWriteMode === "identity-native";
 
     return {
       enabled: iam.pluginUserWriteMode !== "disabled",
       mode: iam.pluginUserWriteMode,
       legacyProxyConfigured: Boolean(iam.pluginUserWriteLegacyApiBaseUrl),
       timeoutMs: iam.pluginUserWriteTimeoutMs,
+      operationLedgerConfigured: this.operations.isConfigured(),
+      operationLedgerSchemaAutoEnsure: false,
+      idempotencyKeyFormat: "plugin-user-write:v1:<route>:<sha256-48>",
+      redactionPolicy: "metadata-only-no-secret-payloads",
+      compensationRecordsRequired: true,
+      shadow: this.shadow.readiness(),
+      allowedExecutableModes: [...PLUGIN_USER_WRITE_EXECUTABLE_MODES],
+      unsupportedModeBlocked,
+      blockedReasons: blockedReasonsForMode(iam.pluginUserWriteMode),
       dualWriteSupported: false,
       identityNativeSupported: false,
-      sourceOfTruth: iam.pluginUserWriteMode === "legacy-proxy" ? "legacy" : "legacy-unproxied",
-      routes: [
-        "create-user",
-        "update-user",
-        "delete-user",
-        "change-role",
-        "batch-create-users"
-      ]
+      nextRequiredSpec: "identity-plugin-user-native-write",
+      sourceOfTruth: sourceOfTruthForMode(iam.pluginUserWriteMode),
+      routes: [...PLUGIN_USER_WRITE_ROUTES],
+      requiredBeforeDualWrite: [...REQUIRED_BEFORE_DUAL_WRITE],
+      requiredBeforeIdentityNative: [...REQUIRED_BEFORE_IDENTITY_NATIVE]
     };
   }
 
@@ -97,11 +135,50 @@ export class PluginUserWriteService {
       });
     }
 
+    const body = await parseUpstreamBody(upstream);
+    await this.shadow.observe({
+      method: request.method,
+      path,
+      headers: request.headers,
+      body: request.body,
+      legacyStatus: upstream.status
+    });
+
     return {
       status: upstream.status,
-      body: await parseUpstreamBody(upstream)
+      body
     };
   }
+}
+
+function blockedReasonsForMode(mode: string): string[] {
+  if (mode === "dual-write") {
+    return [
+      "identity-plugin-user-native-write closeout is required before dual-write execution.",
+      "Operation ledger, idempotency keys, compensation records, redaction gates, and rollback drills are not configured."
+    ];
+  }
+
+  if (mode === "identity-native") {
+    return [
+      "identity-native plugin-user writes require clean dual-write evidence first.",
+      "Profile, role, permission, organization, and rollback ownership gates must be closed or explicitly retained."
+    ];
+  }
+
+  return [];
+}
+
+function sourceOfTruthForMode(mode: string): string {
+  if (mode === "legacy-proxy") {
+    return "legacy";
+  }
+
+  if (mode === "disabled") {
+    return "legacy-unproxied";
+  }
+
+  return "unsupported";
 }
 
 export interface PluginUserWriteRequest {
