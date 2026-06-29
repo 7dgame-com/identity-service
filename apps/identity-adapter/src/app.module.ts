@@ -18,6 +18,7 @@ import { IamRepository } from "./iam.repository.js";
 import { IamService } from "./iam.service.js";
 import { IdentityController } from "./identity.controller.js";
 import { IdentitySessionRepository } from "./identity-session.repository.js";
+import { InternalAuthController } from "./internal-auth.controller.js";
 import { InvitationDiagnosticsController } from "./invitation-diagnostics.controller.js";
 import { InvitationDiagnosticsService } from "./invitation-diagnostics.service.js";
 import { InvitationIdentityRepository } from "./invitation-identity.repository.js";
@@ -39,8 +40,10 @@ import { OidcController } from "./oidc.controller.js";
 import { OidcService } from "./oidc.service.js";
 import { PasswordResetChallengeRepository } from "./password-reset-challenge.repository.js";
 import { PluginUserPrimaryReadService } from "./plugin-user-primary-read.service.js";
+import { PluginUserWriteOperationRepository } from "./plugin-user-write-operation.repository.js";
 import { PluginUserReadonlyController } from "./plugin-user-readonly.controller.js";
 import { PluginUserWriteController } from "./plugin-user-write.controller.js";
+import { PluginUserWriteShadowService } from "./plugin-user-write-shadow.service.js";
 import { PluginUserWriteService } from "./plugin-user-write.service.js";
 import { TelemetryInterceptor } from "./telemetry.interceptor.js";
 import { TokenIssuanceService } from "./token-issuance.service.js";
@@ -56,6 +59,7 @@ import { UsageBillingService } from "./usage-billing.service.js";
     AuthController,
     AccountLifecycleController,
     InvitationDiagnosticsController,
+    InternalAuthController,
     IamController,
     PluginUserReadonlyController,
     PluginUserWriteController,
@@ -112,6 +116,8 @@ import { UsageBillingService } from "./usage-billing.service.js";
     UsageBillingRepository,
     UsageBillingService,
     PluginUserPrimaryReadService,
+    PluginUserWriteOperationRepository,
+    PluginUserWriteShadowService,
     PluginUserWriteService,
     TokenIssuanceService,
     { provide: APP_INTERCEPTOR, useClass: TelemetryInterceptor }

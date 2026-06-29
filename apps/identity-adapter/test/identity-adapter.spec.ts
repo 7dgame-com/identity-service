@@ -31,6 +31,13 @@ import {
   OidcAuthorizationCodeRepository
 } from "../src/oidc-authorization-code.repository.js";
 import { PasswordResetChallengeError, PasswordResetChallengeRepository } from "../src/password-reset-challenge.repository.js";
+import {
+  PluginUserWriteOperationInput,
+  PluginUserWriteOperationRepository,
+  pluginUserWriteOperationKey,
+  pluginUserWriteRequestFingerprint,
+  redactPluginUserWriteMetadata
+} from "../src/plugin-user-write-operation.repository.js";
 import { sanitizeMetadata } from "../src/login-audit.service.js";
 import { assertReadonlySql } from "../src/readonly-write.guard.js";
 import { normalizeOtlpTraceEndpoint, startTelemetry } from "../src/telemetry.js";
@@ -192,6 +199,19 @@ class FakeLegacyIdentityReader {
       { name: "course.manage", description: "Manage courses", source: "role-child" as const },
       { name: "plugin.open", description: "Open plugins", source: "direct" as const }
     ];
+  }
+}
+
+class FakePluginUserWriteOperationRepository {
+  readonly inputs: PluginUserWriteOperationInput[] = [];
+
+  isConfigured() {
+    return true;
+  }
+
+  async begin(input: PluginUserWriteOperationInput) {
+    this.inputs.push(input);
+    return { duplicate: false };
   }
 }
 
@@ -2623,6 +2643,62 @@ describe("identity-adapter account lifecycle compatibility API", () => {
     });
   });
 
+  it("proxies WeChat QR login polling through the register lifecycle scope", async () => {
+    process.env.IDENTITY_ACCOUNT_REGISTER_ENABLED = "true";
+    app = await createLifecycleTestApp();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            qrcode: { url: "https://mp.weixin.qq.com/cgi-bin/showqrcode?ticket=ticket" },
+            token: "wechat-token",
+            lifetime: 518400
+          }),
+          {
+            status: 200,
+            headers: { "Content-Type": "application/json" }
+          }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            success: true,
+            message: "signin",
+            token: "wechat-token"
+          }),
+          {
+            status: 200,
+            headers: { "Content-Type": "application/json" }
+          }
+        )
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const qrcode = await request(app.getHttpServer()).get("/v1/wechat/qrcode").expect(200);
+    expect(qrcode.body).toEqual({
+      qrcode: { url: "https://mp.weixin.qq.com/cgi-bin/showqrcode?ticket=ticket" },
+      token: "wechat-token",
+      lifetime: 518400
+    });
+
+    const refresh = await request(app.getHttpServer()).get("/v1/wechat/refresh?token=wechat-token").expect(200);
+    expect(refresh.body).toEqual({
+      success: true,
+      message: "signin",
+      token: "wechat-token"
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const [qrcodeUrl, qrcodeInit] = fetchMock.mock.calls[0] as unknown as [URL, RequestInit];
+    const [refreshUrl, refreshInit] = fetchMock.mock.calls[1] as unknown as [URL, RequestInit];
+    expect(qrcodeUrl.toString()).toBe("http://legacy-api/v1/wechat/qrcode");
+    expect(refreshUrl.toString()).toBe("http://legacy-api/v1/wechat/refresh?token=wechat-token");
+    expect(qrcodeInit.body).toBeUndefined();
+    expect(refreshInit.body).toBeUndefined();
+  });
+
   it("preserves query strings for invitation compatibility endpoints", async () => {
     process.env.IDENTITY_ACCOUNT_INVITATION_ENABLED = "true";
     app = await createLifecycleTestApp();
@@ -2696,11 +2772,35 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
         enabled: true,
         mode: "legacy-proxy",
         legacyProxyConfigured: true,
+        operationLedgerSchemaAutoEnsure: false,
+        idempotencyKeyFormat: "plugin-user-write:v1:<route>:<sha256-48>",
+        redactionPolicy: "metadata-only-no-secret-payloads",
+        compensationRecordsRequired: true,
+        shadow: {
+          enabled: false,
+          mode: "off",
+          sideEffect: "none",
+          responseShapePreserved: true,
+          legacyProxyRequired: true
+        },
+        allowedExecutableModes: ["disabled", "legacy-proxy"],
+        unsupportedModeBlocked: false,
+        dualWriteSupported: false,
+        identityNativeSupported: false,
+        nextRequiredSpec: "identity-plugin-user-native-write",
         sourceOfTruth: "legacy"
       }
     });
+    expect(response.body.data.blockedReasons).toEqual([]);
     expect(response.body.data.routes).toEqual(
       expect.arrayContaining(["create-user", "update-user", "delete-user", "change-role", "batch-create-users"])
+    );
+    expect(typeof response.body.data.operationLedgerConfigured).toBe("boolean");
+    expect(response.body.data.requiredBeforeDualWrite).toEqual(
+      expect.arrayContaining(["operation-ledger", "idempotency-keys", "compensation-records"])
+    );
+    expect(response.body.data.requiredBeforeIdentityNative).toEqual(
+      expect.arrayContaining(["clean-dual-write-production-evidence", "legacy-proxy-rollback-window"])
     );
   });
 
@@ -2709,6 +2809,23 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
     app = await createLifecycleTestApp();
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
+
+    const readiness = await request(app.getHttpServer())
+      .get("/internal/plugin-user-write/readiness")
+      .expect(200);
+
+    expect(readiness.body.data).toMatchObject({
+      enabled: true,
+      mode: "dual-write",
+      sourceOfTruth: "unsupported",
+      unsupportedModeBlocked: true,
+      dualWriteSupported: false,
+      identityNativeSupported: false,
+      nextRequiredSpec: "identity-plugin-user-native-write"
+    });
+    expect(readiness.body.data.blockedReasons).toEqual(
+      expect.arrayContaining([expect.stringContaining("identity-plugin-user-native-write")])
+    );
 
     const response = await request(app.getHttpServer())
       .post("/v1/plugin-user/create-user")
@@ -2719,6 +2836,56 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
       code: "PLUGIN_USER_WRITE_UNSUPPORTED_MODE"
     });
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("prepares stable operation keys and redacts plugin-user write evidence", () => {
+    const leftFingerprint = pluginUserWriteRequestFingerprint("create-user", {
+      username: "stage-user",
+      email: "stage@example.com",
+      password: "Secret123!",
+      profile: {
+        token: "token-value",
+        nickname: "Stage"
+      }
+    });
+    const rightFingerprint = pluginUserWriteRequestFingerprint("create-user", {
+      profile: {
+        nickname: "Stage",
+        token: "another-token-value"
+      },
+      password: "AnotherSecret123!",
+      email: "stage@example.com",
+      username: "stage-user"
+    });
+
+    expect(leftFingerprint).toBe(rightFingerprint);
+
+    const key = pluginUserWriteOperationKey({
+      route: "create-user",
+      actorSubject: "legacy-user:24",
+      targetSubject: "username:stage-user",
+      requestFingerprint: leftFingerprint
+    });
+    expect(key).toMatch(/^plugin-user-write:v1:create-user:[a-f0-9]{48}$/);
+
+    const redacted = redactPluginUserWriteMetadata({
+      username: "stage-user",
+      password: "Secret123!",
+      nested: {
+        refreshToken: "secret-refresh-token",
+        authorization: "Bearer secret"
+      }
+    });
+    expect(redacted).toEqual({
+      username: "stage-user",
+      password: "[redacted]",
+      nested: {
+        refreshToken: "[redacted]",
+        authorization: "[redacted]"
+      }
+    });
+    expect(JSON.stringify(redacted)).not.toContain("Secret123!");
+    expect(JSON.stringify(redacted)).not.toContain("secret-refresh-token");
   });
 
   it("requires an explicit legacy API base URL before legacy-proxy writes", async () => {
@@ -2777,6 +2944,113 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
       password: "Secret123!",
       organization_ids: [1, 2]
     });
+  });
+
+  it("keeps shadow writer off by default during legacy-proxy writes", async () => {
+    const operations = new FakePluginUserWriteOperationRepository();
+    app = await createLifecycleTestApp(operations);
+    const fetchMock = vi.fn(async () => {
+      return new Response(JSON.stringify({ code: 0, data: { id: 42, username: "new-user" } }), {
+        status: 201,
+        headers: { "Content-Type": "application/json" }
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await request(app.getHttpServer())
+      .post("/v1/plugin-user/create-user")
+      .send({ username: "new-user", password: "Secret123!" })
+      .expect(201);
+
+    expect(response.body).toEqual({ code: 0, data: { id: 42, username: "new-user" } });
+    expect(operations.inputs).toHaveLength(0);
+  });
+
+  it("logs redacted plan-mode shadow evidence for create, update, and delete without writing the ledger", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_SHADOW_MODE = "plan";
+    const logSpy = vi.spyOn(Logger.prototype, "log").mockImplementation(() => undefined);
+    const operations = new FakePluginUserWriteOperationRepository();
+    app = await createLifecycleTestApp(operations);
+    const fetchMock = vi.fn(async (_url: URL | string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+      return new Response(JSON.stringify({ code: 0, data: { id: body.id ?? 42, username: body.username ?? "new-user" } }), {
+        status: body.id ? 200 : 201,
+        headers: { "Content-Type": "application/json" }
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      const createResponse = await request(app.getHttpServer())
+        .post("/v1/plugin-user/create-user")
+        .set("Authorization", "Bearer test-token")
+        .send({ username: "new-user", password: "Secret123!" })
+        .expect(201);
+
+      await request(app.getHttpServer())
+        .post("/v1/plugin-user/update-user")
+        .set("Authorization", "Bearer test-token")
+        .send({ id: 42, nickname: "Updated User", password: "Secret456!" })
+        .expect(200);
+
+      await request(app.getHttpServer())
+        .post("/v1/plugin-user/delete-user")
+        .set("Authorization", "Bearer test-token")
+        .send({ id: 42 })
+        .expect(200);
+
+      expect(createResponse.body).toEqual({ code: 0, data: { id: 42, username: "new-user" } });
+      expect(operations.inputs).toHaveLength(0);
+      const logPayloads = logSpy.mock.calls
+        .map(([message]) => String(message))
+        .filter((message) => message.includes("identity.plugin_user.write.shadow"));
+      expect(logPayloads).toHaveLength(3);
+      expect(logPayloads.some((payload) => payload.includes('"route":"create-user"'))).toBe(true);
+      expect(logPayloads.some((payload) => payload.includes('"route":"update-user"'))).toBe(true);
+      expect(logPayloads.some((payload) => payload.includes('"route":"delete-user"'))).toBe(true);
+      for (const logPayload of logPayloads) {
+        expect(logPayload).toContain('"mode":"plan"');
+        expect(logPayload).toContain('"sideEffect":"none"');
+        expect(logPayload).not.toContain("Secret123!");
+        expect(logPayload).not.toContain("Secret456!");
+        expect(logPayload).not.toContain("test-token");
+      }
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("records ledger-only shadow evidence without changing the legacy-proxy response", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_SHADOW_MODE = "ledger-only";
+    const operations = new FakePluginUserWriteOperationRepository();
+    app = await createLifecycleTestApp(operations);
+    const fetchMock = vi.fn(async () => {
+      return new Response(JSON.stringify({ code: 0, data: { id: 42, username: "new-user" } }), {
+        status: 201,
+        headers: { "Content-Type": "application/json" }
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await request(app.getHttpServer())
+      .post("/v1/plugin-user/create-user")
+      .set("Authorization", "Bearer test-token")
+      .send({ username: "new-user", password: "Secret123!" })
+      .expect(201);
+
+    expect(response.body).toEqual({ code: 0, data: { id: 42, username: "new-user" } });
+    expect(response.headers["x-identity-plugin-user-write"]).toBe("legacy-proxy");
+    expect(operations.inputs).toHaveLength(1);
+    expect(operations.inputs[0]).toMatchObject({
+      route: "create-user",
+      mode: "dual-write",
+      actorSubject: "authorization:present",
+      targetSubject: "username:new-user"
+    });
+    expect(operations.inputs[0].operationKey).toMatch(/^plugin-user-write:v1:create-user:[a-f0-9]{48}$/);
+    expect(operations.inputs[0].idempotencyKey).toBe(operations.inputs[0].operationKey);
+    expect(JSON.stringify(operations.inputs[0].metadata)).not.toContain("Secret123!");
+    expect(JSON.stringify(operations.inputs[0].metadata)).not.toContain("test-token");
   });
 
   it("preserves legacy validation errors so callers do not repeat writes", async () => {
@@ -4628,13 +4902,20 @@ describe("identity-adapter native email lifecycle API", () => {
   });
 });
 
-async function createLifecycleTestApp(): Promise<INestApplication> {
-  const moduleRef = await Test.createTestingModule({
+async function createLifecycleTestApp(
+  pluginUserOperations?: FakePluginUserWriteOperationRepository
+): Promise<INestApplication> {
+  let builder = Test.createTestingModule({
     imports: [AppModule]
   })
     .overrideProvider(LegacyIdentityReader)
-    .useClass(FakeLegacyIdentityReader)
-    .compile();
+    .useClass(FakeLegacyIdentityReader);
+
+  if (pluginUserOperations) {
+    builder = builder.overrideProvider(PluginUserWriteOperationRepository).useValue(pluginUserOperations);
+  }
+
+  const moduleRef = await builder.compile();
 
   const lifecycleApp = moduleRef.createNestApplication();
   await lifecycleApp.init();
@@ -4868,6 +5149,7 @@ describe("identity-adapter token issuance API", () => {
     process.env.IDENTITY_JWT_AUDIENCE = "xrugc-api";
     process.env.IDENTITY_ACCESS_TOKEN_TTL_SECONDS = "3600";
     process.env.IDENTITY_REFRESH_TOKEN_TTL_SECONDS = "604800";
+    process.env.IDENTITY_INTERNAL_API_TOKEN = "test-internal-token";
 
     repository = new FakeIdentitySessionRepository();
 
@@ -4941,6 +5223,42 @@ describe("identity-adapter token issuance API", () => {
     await request(app.getHttpServer())
       .post("/v1/auth/login")
       .send({ username: "guanfei", password: "wrong" })
+      .expect(401);
+
+    expect(repository.sessions.size).toBe(0);
+  });
+
+  it("issues an internal user token that can be refreshed by QR login clients", async () => {
+    const issued = await request(app.getHttpServer())
+      .post("/internal/auth/issue-user-token")
+      .set("X-Identity-Internal-Token", "test-internal-token")
+      .set("X-Forwarded-For", "203.0.113.7, 10.0.0.1")
+      .set("User-Agent", "UnityQRLogin/1.0")
+      .send({ legacyUserId: 24 })
+      .expect(201);
+
+    expect(issued.body).toMatchObject({
+      success: true,
+      message: "login",
+      token: {
+        tokenType: "Bearer",
+        refreshToken: "refresh-1"
+      }
+    });
+
+    const refresh = await request(app.getHttpServer())
+      .post("/v1/auth/refresh")
+      .send({ refreshToken: issued.body.token.refreshToken })
+      .expect(201);
+
+    expect(refresh.body.message).toBe("refresh");
+    expect(refresh.body.token.refreshToken).toBe("refresh-2");
+  });
+
+  it("rejects internal user token issuance without the internal token", async () => {
+    await request(app.getHttpServer())
+      .post("/internal/auth/issue-user-token")
+      .send({ legacyUserId: 24 })
       .expect(401);
 
     expect(repository.sessions.size).toBe(0);
