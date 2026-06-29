@@ -25,6 +25,16 @@ export class AccountLifecycleController {
     return this.forward("register", request, response, "/v1/wechat/register");
   }
 
+  @Get("v1/wechat/qrcode")
+  wechatQrcode(@Req() request: AccountLifecycleExpressRequest, @Res({ passthrough: true }) response: AccountLifecycleExpressResponse) {
+    return this.forward("register", request, response, "/v1/wechat/qrcode");
+  }
+
+  @Get("v1/wechat/refresh")
+  wechatRefresh(@Req() request: AccountLifecycleExpressRequest, @Res({ passthrough: true }) response: AccountLifecycleExpressResponse) {
+    return this.forward("register", request, response, "/v1/wechat/refresh");
+  }
+
   @Post("v1/password/request-reset")
   passwordRequestReset(@Req() request: AccountLifecycleExpressRequest, @Res({ passthrough: true }) response: AccountLifecycleExpressResponse) {
     return this.forward("password", request, response, "/v1/password/request-reset");
