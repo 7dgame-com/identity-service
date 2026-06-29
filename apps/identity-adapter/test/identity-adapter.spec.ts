@@ -2699,6 +2699,49 @@ describe("identity-adapter account lifecycle compatibility API", () => {
     expect(refreshInit.body).toBeUndefined();
   });
 
+  it("keeps WeChat QR polling on legacy proxy when register lifecycle runs in native mode", async () => {
+    process.env.IDENTITY_ACCOUNT_LIFECYCLE_MODE = "native";
+    process.env.IDENTITY_ACCOUNT_REGISTER_ENABLED = "true";
+    app = await createLifecycleTestApp();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            qrcode: { url: "https://mp.weixin.qq.com/cgi-bin/showqrcode?ticket=ticket" },
+            token: "wechat-token",
+            lifetime: 518400
+          }),
+          {
+            status: 200,
+            headers: { "Content-Type": "application/json" }
+          }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ success: false, message: "waiting" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        })
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const qrcode = await request(app.getHttpServer()).get("/v1/wechat/qrcode").expect(200);
+    expect(qrcode.body).toMatchObject({
+      token: "wechat-token",
+      lifetime: 518400
+    });
+
+    const refresh = await request(app.getHttpServer()).get("/v1/wechat/refresh?token=wechat-token").expect(200);
+    expect(refresh.body).toEqual({ success: false, message: "waiting" });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const [qrcodeUrl] = fetchMock.mock.calls[0] as unknown as [URL, RequestInit];
+    const [refreshUrl] = fetchMock.mock.calls[1] as unknown as [URL, RequestInit];
+    expect(qrcodeUrl.toString()).toBe("http://legacy-api/v1/wechat/qrcode");
+    expect(refreshUrl.toString()).toBe("http://legacy-api/v1/wechat/refresh?token=wechat-token");
+  });
+
   it("preserves query strings for invitation compatibility endpoints", async () => {
     process.env.IDENTITY_ACCOUNT_INVITATION_ENABLED = "true";
     app = await createLifecycleTestApp();
