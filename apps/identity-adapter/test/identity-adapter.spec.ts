@@ -2966,15 +2966,17 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
     expect(operations.inputs).toHaveLength(0);
   });
 
-  it("logs redacted plan-mode shadow evidence for create, update, and delete without writing the ledger", async () => {
+  it("logs redacted plan-mode shadow evidence for all plugin-user write routes without writing the ledger", async () => {
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_SHADOW_MODE = "plan";
     const logSpy = vi.spyOn(Logger.prototype, "log").mockImplementation(() => undefined);
     const operations = new FakePluginUserWriteOperationRepository();
     app = await createLifecycleTestApp(operations);
-    const fetchMock = vi.fn(async (_url: URL | string, init?: RequestInit) => {
+    const fetchMock = vi.fn(async (url: URL | string, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+      const pathname = typeof url === "string" ? new URL(url).pathname : url.pathname;
+      const status = body.id || pathname.endsWith("/batch-create-users") ? 200 : 201;
       return new Response(JSON.stringify({ code: 0, data: { id: body.id ?? 42, username: body.username ?? "new-user" } }), {
-        status: body.id ? 200 : 201,
+        status,
         headers: { "Content-Type": "application/json" }
       });
     });
@@ -2999,20 +3001,46 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
         .send({ id: 42 })
         .expect(200);
 
+      await request(app.getHttpServer())
+        .post("/v1/plugin-user/change-role")
+        .set("Authorization", "Bearer test-token")
+        .send({ id: 42, role: "admin" })
+        .expect(200);
+
+      await request(app.getHttpServer())
+        .post("/v1/plugin-user/batch-create-users")
+        .set("Authorization", "Bearer test-token")
+        .send({
+          users: [
+            {
+              username: "batch-user-001",
+              nickname: "Batch User 001",
+              password: "BatchSecret123!",
+              role: "user",
+              status: 10
+            }
+          ]
+        })
+        .expect(200);
+
       expect(createResponse.body).toEqual({ code: 0, data: { id: 42, username: "new-user" } });
       expect(operations.inputs).toHaveLength(0);
       const logPayloads = logSpy.mock.calls
         .map(([message]) => String(message))
         .filter((message) => message.includes("identity.plugin_user.write.shadow"));
-      expect(logPayloads).toHaveLength(3);
+      expect(logPayloads).toHaveLength(5);
       expect(logPayloads.some((payload) => payload.includes('"route":"create-user"'))).toBe(true);
       expect(logPayloads.some((payload) => payload.includes('"route":"update-user"'))).toBe(true);
       expect(logPayloads.some((payload) => payload.includes('"route":"delete-user"'))).toBe(true);
+      expect(logPayloads.some((payload) => payload.includes('"route":"change-role"'))).toBe(true);
+      expect(logPayloads.some((payload) => payload.includes('"route":"batch-create-users"'))).toBe(true);
       for (const logPayload of logPayloads) {
         expect(logPayload).toContain('"mode":"plan"');
         expect(logPayload).toContain('"sideEffect":"none"');
         expect(logPayload).not.toContain("Secret123!");
         expect(logPayload).not.toContain("Secret456!");
+        expect(logPayload).not.toContain("BatchSecret123!");
+        expect(logPayload).not.toContain("batch-user-001");
         expect(logPayload).not.toContain("test-token");
       }
     } finally {

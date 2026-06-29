@@ -15,7 +15,7 @@ describe("plugin user write shadow evidence", () => {
     vi.restoreAllMocks();
   });
 
-  it("logs create, update, and delete plan events with non-sensitive correlation evidence", async () => {
+  it("logs all plugin-user write plan events with non-sensitive correlation evidence", async () => {
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_SHADOW_MODE = "plan";
     const logSpy = vi.spyOn(Logger.prototype, "log").mockImplementation(() => undefined);
     const service = new PluginUserWriteShadowService(fakeOperationRepository());
@@ -41,11 +41,41 @@ describe("plugin user write shadow evidence", () => {
       body: { id: 588 },
       legacyStatus: 200
     });
+    await service.observe({
+      method: "POST",
+      path: "/v1/plugin-user/change-role",
+      headers: { authorization: "Bearer secret-token" },
+      body: { id: 588, role: "admin" },
+      legacyStatus: 200
+    });
+    await service.observe({
+      method: "POST",
+      path: "/v1/plugin-user/batch-create-users",
+      headers: { authorization: "Bearer secret-token" },
+      body: {
+        users: [
+          {
+            username: "q2retry_batch_001",
+            nickname: "Q2 plan batch temporary user",
+            password: "BatchSecret123!",
+            role: "user",
+            status: 10
+          }
+        ]
+      },
+      legacyStatus: 200
+    });
 
     const events = logSpy.mock.calls.map(([message]) => JSON.parse(String(message)) as Record<string, unknown>);
 
-    expect(events).toHaveLength(3);
-    expect(events.map((event) => event.route)).toEqual(["create-user", "update-user", "delete-user"]);
+    expect(events).toHaveLength(5);
+    expect(events.map((event) => event.route)).toEqual([
+      "create-user",
+      "update-user",
+      "delete-user",
+      "change-role",
+      "batch-create-users"
+    ]);
 
     for (const event of events) {
       expect(event.event).toBe("identity.plugin_user.write.shadow");
@@ -60,14 +90,19 @@ describe("plugin user write shadow evidence", () => {
       const serialized = JSON.stringify(event);
       expect(serialized).not.toContain("q2retry_202606291031_xsct");
       expect(serialized).not.toContain("Q2 plan shadow temporary user updated");
+      expect(serialized).not.toContain("q2retry_batch_001");
+      expect(serialized).not.toContain("Q2 plan batch temporary user");
       expect(serialized).not.toContain("Secret123!");
       expect(serialized).not.toContain("Secret456!");
+      expect(serialized).not.toContain("BatchSecret123!");
       expect(serialized).not.toContain("secret-token");
     }
 
     expect(events[0].targetSubjectKind).toBe("username");
     expect(events[1].targetSubjectKind).toBe("legacy-user");
     expect(events[2].targetSubjectKind).toBe("legacy-user");
+    expect(events[3].targetSubjectKind).toBe("legacy-user");
+    expect(events[4].targetSubjectKind).toBe("batch");
   });
 });
 
