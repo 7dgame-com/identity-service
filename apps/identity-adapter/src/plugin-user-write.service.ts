@@ -119,6 +119,26 @@ export class PluginUserWriteService {
     };
   }
 
+  async operationLedgerRecent(input: { sinceMinutes?: number; limit?: number }) {
+    const sinceMinutes = normalizeSinceMinutes(input.sinceMinutes);
+    const limit = normalizeRecentLimit(input.limit);
+    if (!this.operations.isConfigured()) {
+      return {
+        configured: false,
+        sinceMinutes,
+        limit,
+        operations: []
+      };
+    }
+
+    return {
+      configured: true,
+      sinceMinutes,
+      limit,
+      operations: await this.operations.listRecentSafe({ sinceMinutes, limit })
+    };
+  }
+
   async proxy(request: PluginUserWriteRequest, path: string): Promise<PluginUserWriteProxyResponse> {
     const { iam } = this.config;
 
@@ -208,6 +228,15 @@ function normalizeSinceMinutes(value: number | undefined): number {
   }
 
   return Math.max(1, Math.min(1440, Math.trunc(numeric)));
+}
+
+function normalizeRecentLimit(value: number | undefined): number {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return 50;
+  }
+
+  return Math.max(1, Math.min(200, Math.trunc(numeric)));
 }
 
 function dualWriteGateForReadiness(input: {

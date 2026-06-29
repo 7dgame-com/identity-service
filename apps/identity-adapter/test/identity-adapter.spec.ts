@@ -34,6 +34,7 @@ import {
 import { PasswordResetChallengeError, PasswordResetChallengeRepository } from "../src/password-reset-challenge.repository.js";
 import {
   PluginUserWriteOperationInput,
+  PluginUserWriteOperationRecentRow,
   PluginUserWriteOperationSummaryRow,
   PluginUserWriteOperationRepository,
   pluginUserWriteCompensationMetadata,
@@ -254,6 +255,20 @@ class FakePluginUserWriteOperationRepository {
       total,
       firstRequestedAt: "2026-06-30T00:00:00.000Z",
       lastRequestedAt: "2026-06-30T00:00:00.000Z"
+    }));
+  }
+
+  async listRecentSafe(input: { limit: number }): Promise<PluginUserWriteOperationRecentRow[]> {
+    return this.inputs.slice(-Math.max(1, input.limit)).reverse().map((operation) => ({
+      route: operation.route,
+      mode: operation.mode,
+      status: "pending",
+      compensationStatus: "none",
+      operationKeyDigest: createHash("sha256").update(operation.operationKey).digest("hex").slice(0, 16),
+      idempotencyKeyDigest: createHash("sha256").update(operation.idempotencyKey).digest("hex").slice(0, 16),
+      legacyUserId: operation.legacyUserId ?? null,
+      requestedAt: "2026-06-30T00:00:00.000Z",
+      completedAt: null
     }));
   }
 }
@@ -3639,6 +3654,99 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
     expect(JSON.stringify(summary.body)).not.toContain("test-token");
   });
 
+  it("reports recent plugin-user operations with stable safe digests for closeout evidence", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_SHADOW_MODE = "ledger-only";
+    const operations = new FakePluginUserWriteOperationRepository();
+    app = await createLifecycleTestApp(operations);
+    const fetchMock = vi.fn(async (url: URL | string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+      const pathname = typeof url === "string" ? new URL(url).pathname : url.pathname;
+      const status = body.id || pathname.endsWith("/batch-create-users") ? 200 : 201;
+      return new Response(JSON.stringify({ code: 0, data: { id: body.id ?? 42, username: body.username ?? "new-user" } }), {
+        status,
+        headers: { "Content-Type": "application/json" }
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/create-user")
+      .set("Authorization", "Bearer test-token")
+      .send({ username: "new-user", password: "Secret123!" })
+      .expect(201);
+
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/update-user")
+      .set("Authorization", "Bearer test-token")
+      .send({ id: 42, nickname: "Updated User", password: "Secret456!" })
+      .expect(200);
+
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/update-user")
+      .set("Authorization", "Bearer test-token")
+      .send({ id: 42, nickname: "Updated User", password: "Secret456!" })
+      .expect(200);
+
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/batch-create-users")
+      .set("Authorization", "Bearer test-token")
+      .send({
+        users: [
+          {
+            username: "batch-user-001",
+            password: "BatchSecret123!",
+            status: 10
+          }
+        ]
+      })
+      .expect(200);
+
+    const recent = await request(app.getHttpServer())
+      .get("/internal/plugin-user-write/operations/recent?sinceMinutes=99999&limit=500")
+      .expect(200);
+
+    expect(recent.body.data).toMatchObject({
+      configured: true,
+      sinceMinutes: 1440,
+      limit: 200
+    });
+    expect(recent.body.data.operations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          route: "create-user",
+          mode: "dual-write",
+          status: "pending",
+          compensationStatus: "none",
+          operationKeyDigest: expect.stringMatching(/^[a-f0-9]{16}$/),
+          idempotencyKeyDigest: expect.stringMatching(/^[a-f0-9]{16}$/)
+        }),
+        expect.objectContaining({
+          route: "update-user",
+          mode: "dual-write",
+          status: "pending",
+          compensationStatus: "none",
+          legacyUserId: 42,
+          operationKeyDigest: expect.stringMatching(/^[a-f0-9]{16}$/),
+          idempotencyKeyDigest: expect.stringMatching(/^[a-f0-9]{16}$/)
+        }),
+        expect.objectContaining({
+          route: "batch-create-users",
+          mode: "dual-write",
+          status: "pending",
+          compensationStatus: "none",
+          operationKeyDigest: expect.stringMatching(/^[a-f0-9]{16}$/),
+          idempotencyKeyDigest: expect.stringMatching(/^[a-f0-9]{16}$/)
+        })
+      ])
+    );
+    expect(recent.body.data.operations.filter((operation: { route: string }) => operation.route === "update-user")).toHaveLength(1);
+    expect(JSON.stringify(recent.body)).not.toContain("Secret123!");
+    expect(JSON.stringify(recent.body)).not.toContain("Secret456!");
+    expect(JSON.stringify(recent.body)).not.toContain("BatchSecret123!");
+    expect(JSON.stringify(recent.body)).not.toContain("batch-user-001");
+    expect(JSON.stringify(recent.body)).not.toContain("test-token");
+  });
+
   it("keeps the plugin-user operation ledger summary safe when the identity database is not configured", async () => {
     const operations = new FakePluginUserWriteOperationRepository();
     operations.configured = false;
@@ -3656,6 +3764,28 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
         configured: false,
         sinceMinutes: 1,
         routes: []
+      }
+    });
+  });
+
+  it("keeps recent plugin-user operations safe when the identity database is not configured", async () => {
+    const operations = new FakePluginUserWriteOperationRepository();
+    operations.configured = false;
+    app = await createLifecycleTestApp(operations);
+
+    const recent = await request(app.getHttpServer())
+      .get("/internal/plugin-user-write/operations/recent?sinceMinutes=0&limit=0")
+      .expect(200);
+
+    expect(recent.body).toEqual({
+      status: "ok",
+      service: "identity-adapter",
+      capability: "plugin-user-write-operation-ledger",
+      data: {
+        configured: false,
+        sinceMinutes: 1,
+        limit: 1,
+        operations: []
       }
     });
   });

@@ -25,6 +25,16 @@ export class PluginUserWriteController {
     };
   }
 
+  @Get("internal/plugin-user-write/operations/recent")
+  async operationLedgerRecent(@Query("sinceMinutes") sinceMinutes: string | undefined, @Query("limit") limit: string | undefined) {
+    return {
+      status: "ok",
+      service: "identity-adapter",
+      capability: "plugin-user-write-operation-ledger",
+      data: await this.pluginUserWrite.operationLedgerRecent({ sinceMinutes: Number(sinceMinutes), limit: Number(limit) })
+    };
+  }
+
   @Post("v1/plugin-user/create-user")
   createUser(@Req() request: PluginUserWriteExpressRequest, @Res({ passthrough: true }) response: PluginUserWriteExpressResponse) {
     return this.forward(request, response, "/v1/plugin-user/create-user");

@@ -62,6 +62,18 @@ export interface PluginUserWriteOperationSummaryRow {
   lastRequestedAt: string | null;
 }
 
+export interface PluginUserWriteOperationRecentRow {
+  route: PluginUserWriteRoute;
+  mode: PluginUserWriteMode;
+  status: PluginUserWriteOperationStatus;
+  compensationStatus: PluginUserWriteCompensationStatus;
+  operationKeyDigest: string;
+  idempotencyKeyDigest: string;
+  legacyUserId: number | null;
+  requestedAt: string | null;
+  completedAt: string | null;
+}
+
 @Injectable()
 export class PluginUserWriteOperationRepository implements OnModuleDestroy {
   private readonly config = loadConfig();
@@ -210,6 +222,42 @@ export class PluginUserWriteOperationRepository implements OnModuleDestroy {
       total: Number(row.total ?? 0),
       firstRequestedAt: dateString(row.firstRequestedAt),
       lastRequestedAt: dateString(row.lastRequestedAt)
+    }));
+  }
+
+  async listRecentSafe(input: { sinceMinutes: number; limit: number }): Promise<PluginUserWriteOperationRecentRow[]> {
+    const pool = this.requirePool();
+    await this.ensureSchema();
+
+    const since = new Date(Date.now() - Math.max(1, Math.min(1440, Math.trunc(input.sinceMinutes))) * 60_000);
+    const limit = Math.max(1, Math.min(200, Math.trunc(input.limit)));
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT operation_key AS operationKey,
+              idempotency_key AS idempotencyKey,
+              route,
+              mode,
+              status,
+              compensation_status AS compensationStatus,
+              legacy_user_id AS legacyUserId,
+              requested_at AS requestedAt,
+              completed_at AS completedAt
+         FROM plugin_user_write_operations
+        WHERE requested_at >= ?
+        ORDER BY requested_at DESC, id DESC
+        LIMIT ${limit}`,
+      [since]
+    );
+
+    return rows.map((row) => ({
+      route: row.route as PluginUserWriteRoute,
+      mode: row.mode as PluginUserWriteMode,
+      status: row.status as PluginUserWriteOperationStatus,
+      compensationStatus: row.compensationStatus as PluginUserWriteCompensationStatus,
+      operationKeyDigest: shortDigest(row.operationKey),
+      idempotencyKeyDigest: shortDigest(row.idempotencyKey),
+      legacyUserId: nullableNumber(row.legacyUserId),
+      requestedAt: dateString(row.requestedAt),
+      completedAt: dateString(row.completedAt)
     }));
   }
 
@@ -441,6 +489,10 @@ function dateString(value: unknown): string | null {
   }
 
   return typeof value === "string" && value.trim() !== "" ? value : null;
+}
+
+function shortDigest(value: unknown): string {
+  return createHash("sha256").update(String(value ?? "")).digest("hex").slice(0, 16);
 }
 
 function recordValue(value: unknown): Record<string, unknown> {
