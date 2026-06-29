@@ -1,5 +1,6 @@
 import { Injectable, NotFoundException, ServiceUnavailableException } from "@nestjs/common";
 import { loadConfig } from "./config.js";
+import { IamRepository } from "./iam.repository.js";
 import { PluginUserWriteOperationRepository } from "./plugin-user-write-operation.repository.js";
 import { PluginUserWriteShadowService } from "./plugin-user-write-shadow.service.js";
 
@@ -31,6 +32,20 @@ const REQUIRED_BEFORE_IDENTITY_NATIVE = [
   "organization-owner-closed-or-retained",
   "legacy-proxy-rollback-window"
 ] as const;
+const DUAL_WRITE_EXECUTION_BLOCKERS = [
+  "idempotent-response-replay",
+  "identity-write-executor",
+  "compensation-runner",
+  "develop-ledger-only-closeout",
+  "develop-dual-write-apply-closeout"
+] as const;
+const IDENTITY_NATIVE_EXECUTION_BLOCKERS = [
+  "production-dual-write-observation-closeout",
+  "profile-owner-closeout",
+  "role-permission-owner-closeout",
+  "organization-owner-closeout",
+  "identity-native-canary-runbook"
+] as const;
 
 @Injectable()
 export class PluginUserWriteService {
@@ -38,19 +53,35 @@ export class PluginUserWriteService {
 
   constructor(
     private readonly operations: PluginUserWriteOperationRepository,
-    private readonly shadow: PluginUserWriteShadowService
+    private readonly shadow: PluginUserWriteShadowService,
+    private readonly iamRepository: IamRepository
   ) {}
 
   readiness() {
     const { iam } = this.config;
     const unsupportedModeBlocked = iam.pluginUserWriteMode === "dual-write" || iam.pluginUserWriteMode === "identity-native";
+    const legacyProxyConfigured = Boolean(iam.pluginUserWriteLegacyApiBaseUrl);
+    const operationLedgerConfigured = this.operations.isConfigured();
+    const identityRepositoryConfigured = this.iamRepository.isConfigured();
+    const dualWriteGate = dualWriteGateForReadiness({
+      legacyProxyConfigured,
+      operationLedgerConfigured,
+      identityRepositoryConfigured,
+      executionFlagEnabled: iam.pluginUserWriteDualWriteExecutionEnabled
+    });
+    const identityNativeGate = identityNativeGateForReadiness({
+      dualWriteSupported: dualWriteGate.executable,
+      identityRepositoryConfigured
+    });
 
     return {
       enabled: iam.pluginUserWriteMode !== "disabled",
       mode: iam.pluginUserWriteMode,
-      legacyProxyConfigured: Boolean(iam.pluginUserWriteLegacyApiBaseUrl),
+      legacyProxyConfigured,
       timeoutMs: iam.pluginUserWriteTimeoutMs,
-      operationLedgerConfigured: this.operations.isConfigured(),
+      operationLedgerConfigured,
+      identityRepositoryConfigured,
+      dualWriteExecutionEnabled: iam.pluginUserWriteDualWriteExecutionEnabled,
       operationLedgerSchemaAutoEnsure: false,
       idempotencyKeyFormat: "plugin-user-write:v1:<route>:<sha256-48>",
       redactionPolicy: "metadata-only-no-secret-payloads",
@@ -61,11 +92,30 @@ export class PluginUserWriteService {
       blockedReasons: blockedReasonsForMode(iam.pluginUserWriteMode),
       dualWriteSupported: false,
       identityNativeSupported: false,
+      dualWriteGate,
+      identityNativeGate,
       nextRequiredSpec: "identity-plugin-user-native-write",
       sourceOfTruth: sourceOfTruthForMode(iam.pluginUserWriteMode),
       routes: [...PLUGIN_USER_WRITE_ROUTES],
       requiredBeforeDualWrite: [...REQUIRED_BEFORE_DUAL_WRITE],
       requiredBeforeIdentityNative: [...REQUIRED_BEFORE_IDENTITY_NATIVE]
+    };
+  }
+
+  async operationLedgerSummary(input: { sinceMinutes?: number }) {
+    const sinceMinutes = normalizeSinceMinutes(input.sinceMinutes);
+    if (!this.operations.isConfigured()) {
+      return {
+        configured: false,
+        sinceMinutes,
+        routes: []
+      };
+    }
+
+    return {
+      configured: true,
+      sinceMinutes,
+      routes: await this.operations.summarizeRecent({ sinceMinutes })
     };
   }
 
@@ -149,6 +199,79 @@ export class PluginUserWriteService {
       body
     };
   }
+}
+
+function normalizeSinceMinutes(value: number | undefined): number {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return 60;
+  }
+
+  return Math.max(1, Math.min(1440, Math.trunc(numeric)));
+}
+
+function dualWriteGateForReadiness(input: {
+  legacyProxyConfigured: boolean;
+  operationLedgerConfigured: boolean;
+  identityRepositoryConfigured: boolean;
+  executionFlagEnabled: boolean;
+}) {
+  const missingCapabilities: string[] = [...DUAL_WRITE_EXECUTION_BLOCKERS];
+  if (!input.executionFlagEnabled) {
+    missingCapabilities.unshift("operator-dual-write-execution-flag");
+  }
+  if (!input.legacyProxyConfigured) {
+    missingCapabilities.unshift("legacy-proxy-base-url");
+  }
+  if (!input.operationLedgerConfigured) {
+    missingCapabilities.unshift("operation-ledger");
+  }
+  if (!input.identityRepositoryConfigured) {
+    missingCapabilities.unshift("identity-repository");
+  }
+
+  return {
+    executable: false,
+    sourceOfTruthUntilCloseout: "legacy",
+    supportedRoutes: [],
+    blockedRoutes: [...PLUGIN_USER_WRITE_ROUTES],
+    routeOwners: {
+      "create-user": "dual-write-candidate",
+      "update-user": "dual-write-candidate",
+      "delete-user": "dual-write-candidate",
+      "batch-create-users": "dual-write-candidate",
+      "change-role": "legacy-proxy-until-role-permission-closeout"
+    },
+    configured: {
+      legacyProxy: input.legacyProxyConfigured,
+      operationLedger: input.operationLedgerConfigured,
+      identityRepository: input.identityRepositoryConfigured,
+      executionFlag: input.executionFlagEnabled
+    },
+    missingCapabilities
+  };
+}
+
+function identityNativeGateForReadiness(input: { dualWriteSupported: boolean; identityRepositoryConfigured: boolean }) {
+  const missingCapabilities: string[] = [...IDENTITY_NATIVE_EXECUTION_BLOCKERS];
+  if (!input.dualWriteSupported) {
+    missingCapabilities.unshift("dual-write-execution");
+  }
+  if (!input.identityRepositoryConfigured) {
+    missingCapabilities.unshift("identity-repository");
+  }
+
+  return {
+    executable: false,
+    supportedRoutes: [],
+    blockedRoutes: [...PLUGIN_USER_WRITE_ROUTES],
+    retainedLegacyRoutes: ["change-role"],
+    configured: {
+      dualWriteSupported: input.dualWriteSupported,
+      identityRepository: input.identityRepositoryConfigured
+    },
+    missingCapabilities
+  };
 }
 
 function blockedReasonsForMode(mode: string): string[] {

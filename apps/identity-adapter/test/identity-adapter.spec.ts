@@ -26,6 +26,7 @@ import { JwtIssuerService } from "../src/jwt-issuer.service.js";
 import { LegacyIdentityReader } from "../src/legacy-identity.reader.js";
 import { LegacySessionRevocationService } from "../src/legacy-session-revocation.service.js";
 import { LoginAuditRepository, PersistedLoginAuditEvent } from "../src/login-audit.repository.js";
+import { planPluginUserIdentityShadow } from "../src/plugin-user-write-identity-shadow.js";
 import {
   InvalidAuthorizationCodeError,
   OidcAuthorizationCodeRepository
@@ -33,9 +34,13 @@ import {
 import { PasswordResetChallengeError, PasswordResetChallengeRepository } from "../src/password-reset-challenge.repository.js";
 import {
   PluginUserWriteOperationInput,
+  PluginUserWriteOperationSummaryRow,
   PluginUserWriteOperationRepository,
+  pluginUserWriteCompensationMetadata,
   pluginUserWriteOperationKey,
+  pluginUserWriteReplayResponseFromOperation,
   pluginUserWriteRequestFingerprint,
+  pluginUserWriteResponseReplayMetadata,
   redactPluginUserWriteMetadata
 } from "../src/plugin-user-write-operation.repository.js";
 import { sanitizeMetadata } from "../src/login-audit.service.js";
@@ -203,15 +208,53 @@ class FakeLegacyIdentityReader {
 }
 
 class FakePluginUserWriteOperationRepository {
+  configured = true;
   readonly inputs: PluginUserWriteOperationInput[] = [];
+  readonly attempts: PluginUserWriteOperationInput[] = [];
+  failNextBegin = false;
+  private readonly seenOperationKeys = new Set<string>();
 
   isConfigured() {
-    return true;
+    return this.configured;
   }
 
   async begin(input: PluginUserWriteOperationInput) {
-    this.inputs.push(input);
-    return { duplicate: false };
+    this.attempts.push(input);
+    if (this.failNextBegin) {
+      this.failNextBegin = false;
+      throw new Error("InjectedPluginUserLedgerFailure");
+    }
+
+    const duplicate = this.seenOperationKeys.has(input.operationKey);
+    if (!duplicate) {
+      this.seenOperationKeys.add(input.operationKey);
+      this.inputs.push(input);
+    }
+
+    return { duplicate };
+  }
+
+  async summarizeRecent(_input: { sinceMinutes: number }): Promise<PluginUserWriteOperationSummaryRow[]> {
+    const counts = new Map<string, { input: PluginUserWriteOperationInput; total: number }>();
+    for (const input of this.inputs) {
+      const key = [input.route, input.mode, "pending", "none"].join("\u001f");
+      const current = counts.get(key);
+      if (current) {
+        current.total += 1;
+        continue;
+      }
+      counts.set(key, { input, total: 1 });
+    }
+
+    return [...counts.values()].map(({ input, total }) => ({
+      route: input.route,
+      mode: input.mode,
+      status: "pending",
+      compensationStatus: "none",
+      total,
+      firstRequestedAt: "2026-06-30T00:00:00.000Z",
+      lastRequestedAt: "2026-06-30T00:00:00.000Z"
+    }));
   }
 }
 
@@ -2815,6 +2858,7 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
         enabled: true,
         mode: "legacy-proxy",
         legacyProxyConfigured: true,
+        dualWriteExecutionEnabled: false,
         operationLedgerSchemaAutoEnsure: false,
         idempotencyKeyFormat: "plugin-user-write:v1:<route>:<sha256-48>",
         redactionPolicy: "metadata-only-no-secret-payloads",
@@ -2881,6 +2925,143 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("reports dual-write execution gates separately from configured repositories", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
+    const operations = new FakePluginUserWriteOperationRepository();
+    const iamRepository = new FakeIamRepository();
+    app = await createLifecycleTestApp(operations, iamRepository);
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const readiness = await request(app.getHttpServer())
+      .get("/internal/plugin-user-write/readiness")
+      .expect(200);
+
+    expect(readiness.body.data).toMatchObject({
+      enabled: true,
+      mode: "dual-write",
+      legacyProxyConfigured: true,
+      operationLedgerConfigured: true,
+      identityRepositoryConfigured: true,
+      dualWriteExecutionEnabled: false,
+      unsupportedModeBlocked: true,
+      dualWriteSupported: false,
+      identityNativeSupported: false,
+      dualWriteGate: {
+        executable: false,
+        sourceOfTruthUntilCloseout: "legacy",
+        supportedRoutes: [],
+        blockedRoutes: ["create-user", "update-user", "delete-user", "change-role", "batch-create-users"],
+        configured: {
+          legacyProxy: true,
+          operationLedger: true,
+          identityRepository: true,
+          executionFlag: false
+        }
+      },
+      identityNativeGate: {
+        executable: false,
+        supportedRoutes: [],
+        retainedLegacyRoutes: ["change-role"],
+        configured: {
+          dualWriteSupported: false,
+          identityRepository: true
+        }
+      }
+    });
+    expect(readiness.body.data.dualWriteGate.routeOwners).toMatchObject({
+      "create-user": "dual-write-candidate",
+      "batch-create-users": "dual-write-candidate",
+      "change-role": "legacy-proxy-until-role-permission-closeout"
+    });
+    expect(readiness.body.data.dualWriteGate.missingCapabilities).toEqual(
+      expect.arrayContaining([
+        "operator-dual-write-execution-flag",
+        "idempotent-response-replay",
+        "identity-write-executor",
+        "compensation-runner",
+        "develop-ledger-only-closeout",
+        "develop-dual-write-apply-closeout"
+      ])
+    );
+    expect(readiness.body.data.dualWriteGate.missingCapabilities).not.toEqual(
+      expect.arrayContaining(["operation-ledger", "identity-repository", "legacy-proxy-base-url"])
+    );
+    expect(readiness.body.data.identityNativeGate.missingCapabilities).toEqual(
+      expect.arrayContaining(["dual-write-execution", "production-dual-write-observation-closeout"])
+    );
+    expect(JSON.stringify(readiness.body.data)).not.toContain("ZHi");
+    expect(JSON.stringify(readiness.body.data)).not.toContain("token");
+
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/create-user")
+      .send({ username: "new-user", password: "Secret123!" })
+      .expect(404);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(operations.inputs).toHaveLength(0);
+  });
+
+  it("keeps dual-write blocked even when the operator execution flag is enabled before closeout", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    const operations = new FakePluginUserWriteOperationRepository();
+    const iamRepository = new FakeIamRepository();
+    app = await createLifecycleTestApp(operations, iamRepository);
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const readiness = await request(app.getHttpServer())
+      .get("/internal/plugin-user-write/readiness")
+      .expect(200);
+
+    expect(readiness.body.data).toMatchObject({
+      mode: "dual-write",
+      dualWriteExecutionEnabled: true,
+      dualWriteSupported: false,
+      dualWriteGate: {
+        executable: false,
+        configured: {
+          legacyProxy: true,
+          operationLedger: true,
+          identityRepository: true,
+          executionFlag: true
+        }
+      }
+    });
+    expect(readiness.body.data.dualWriteGate.missingCapabilities).not.toEqual(
+      expect.arrayContaining(["operator-dual-write-execution-flag"])
+    );
+    expect(readiness.body.data.dualWriteGate.missingCapabilities).toEqual(
+      expect.arrayContaining(["identity-write-executor", "compensation-runner", "develop-dual-write-apply-closeout"])
+    );
+
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/create-user")
+      .send({ username: "new-user", password: "Secret123!" })
+      .expect(404);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(operations.inputs).toHaveLength(0);
+  });
+
+  it("keeps change-role fail-closed in identity-native mode", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "identity-native";
+    app = await createLifecycleTestApp();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await request(app.getHttpServer())
+      .post("/v1/plugin-user/change-role")
+      .send({ id: 42, role: "admin" })
+      .expect(404);
+
+    expect(response.body).toMatchObject({
+      code: "PLUGIN_USER_WRITE_UNSUPPORTED_MODE"
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("prepares stable operation keys and redacts plugin-user write evidence", () => {
     const leftFingerprint = pluginUserWriteRequestFingerprint("create-user", {
       username: "stage-user",
@@ -2929,6 +3110,209 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
     });
     expect(JSON.stringify(redacted)).not.toContain("Secret123!");
     expect(JSON.stringify(redacted)).not.toContain("secret-refresh-token");
+  });
+
+  it("prepares redacted response replay and compensation metadata for future dual-write idempotency", () => {
+    const responseReplay = pluginUserWriteResponseReplayMetadata({
+      status: 201,
+      body: {
+        code: 0,
+        data: {
+          id: 42,
+          username: "new-user",
+          token: "should-not-persist",
+          nested: {
+            password: "Secret123!"
+          }
+        }
+      }
+    });
+
+    const replay = pluginUserWriteReplayResponseFromOperation({
+      status: "completed",
+      metadata: responseReplay
+    });
+    expect(replay).toEqual({
+      status: 201,
+      body: {
+        code: 0,
+        data: {
+          id: 42,
+          username: "new-user",
+          token: "[redacted]",
+          nested: {
+            password: "[redacted]"
+          }
+        }
+      }
+    });
+
+    expect(
+      pluginUserWriteReplayResponseFromOperation({
+        status: "legacy_completed",
+        metadata: responseReplay
+      })
+    ).toBeNull();
+    expect(
+      pluginUserWriteReplayResponseFromOperation({
+        status: "failed",
+        metadata: responseReplay
+      })
+    ).toBeNull();
+
+    const compensation = pluginUserWriteCompensationMetadata({
+      phase: "identity",
+      reason: "identity-shadow-write-failed",
+      errorCode: "InjectedIdentityFailure",
+      legacyStatus: 201,
+      identityStatus: "failed",
+      detail: {
+        username: "new-user",
+        password: "Secret123!",
+        authorization: "Bearer test-token"
+      }
+    });
+    expect(compensation).toEqual({
+      compensation: {
+        required: true,
+        phase: "identity",
+        reason: "identity-shadow-write-failed",
+        errorCode: "InjectedIdentityFailure",
+        legacyStatus: 201,
+        identityStatus: "failed",
+        detail: {
+          username: "new-user",
+          password: "[redacted]",
+          authorization: "[redacted]"
+        }
+      }
+    });
+    expect(JSON.stringify(responseReplay)).not.toContain("Secret123!");
+    expect(JSON.stringify(responseReplay)).not.toContain("should-not-persist");
+    expect(JSON.stringify(compensation)).not.toContain("Secret123!");
+    expect(JSON.stringify(compensation)).not.toContain("test-token");
+  });
+
+  it("plans identity shadow writes for plugin-user dual-write candidates without exposing secrets", () => {
+    const createPlan = planPluginUserIdentityShadow({
+      route: "create-user",
+      requestBody: {
+        username: "shadow-user",
+        email: "shadow@example.com",
+        password: "Secret123!"
+      },
+      legacyStatus: 201,
+      legacyBody: {
+        code: 0,
+        data: {
+          id: 42,
+          username: "shadow-user",
+          token: "legacy-token"
+        }
+      }
+    });
+    expect(createPlan).toEqual({
+      writes: [
+        {
+          identityUserId: "legacy:42",
+          legacyUserId: 42,
+          username: "shadow-user",
+          email: "shadow@example.com",
+          status: "active",
+          metadata: {
+            source: "plugin-user-dual-write",
+            route: "create-user",
+            legacyStatus: 201,
+            evidence: {
+              username: "shadow-user",
+              email: "shadow@example.com",
+              password: "[redacted]",
+              id: 42,
+              token: "[redacted]"
+            }
+          }
+        }
+      ],
+      skippedReason: undefined
+    });
+
+    const updatePlan = planPluginUserIdentityShadow({
+      route: "update-user",
+      requestBody: {
+        id: 42,
+        username: "shadow-user-renamed",
+        password: "Secret456!"
+      },
+      legacyStatus: 200,
+      legacyBody: { code: 0, data: { id: 42, email: "renamed@example.com" } }
+    });
+    expect(updatePlan.writes[0]).toMatchObject({
+      identityUserId: "legacy:42",
+      legacyUserId: 42,
+      username: "shadow-user-renamed",
+      email: "renamed@example.com",
+      status: "active"
+    });
+
+    const deletePlan = planPluginUserIdentityShadow({
+      route: "delete-user",
+      requestBody: { id: 42 },
+      legacyStatus: 200,
+      legacyBody: { code: 0 }
+    });
+    expect(deletePlan.writes[0]).toMatchObject({
+      identityUserId: "legacy:42",
+      legacyUserId: 42,
+      status: "inactive"
+    });
+
+    const batchPlan = planPluginUserIdentityShadow({
+      route: "batch-create-users",
+      requestBody: {
+        users: [
+          { username: "batch-a", password: "BatchSecret1!" },
+          { username: "batch-b", password: "BatchSecret2!" }
+        ]
+      },
+      legacyStatus: 200,
+      legacyBody: {
+        data: {
+          users: [
+            { id: 101, username: "batch-a" },
+            { id: 102, username: "batch-b", email: "batch-b@example.com" }
+          ]
+        }
+      }
+    });
+    expect(batchPlan.writes).toHaveLength(2);
+    expect(batchPlan.writes.map((write) => write.identityUserId)).toEqual(["legacy:101", "legacy:102"]);
+
+    const rolePlan = planPluginUserIdentityShadow({
+      route: "change-role",
+      requestBody: { id: 42, role: "admin" },
+      legacyStatus: 200,
+      legacyBody: { code: 0 }
+    });
+    expect(rolePlan).toEqual({
+      writes: [],
+      skippedReason: "role-permission-owner-retained"
+    });
+
+    const missingIdPlan = planPluginUserIdentityShadow({
+      route: "create-user",
+      requestBody: { username: "missing-id", password: "Secret123!" },
+      legacyStatus: 201,
+      legacyBody: { code: 0, data: { username: "missing-id" } }
+    });
+    expect(missingIdPlan).toEqual({
+      writes: [],
+      skippedReason: "legacy-user-id-missing"
+    });
+
+    expect(JSON.stringify([createPlan, updatePlan, deletePlan, batchPlan, rolePlan, missingIdPlan])).not.toContain("Secret123!");
+    expect(JSON.stringify([createPlan, updatePlan, deletePlan, batchPlan, rolePlan, missingIdPlan])).not.toContain("Secret456!");
+    expect(JSON.stringify([createPlan, updatePlan, deletePlan, batchPlan, rolePlan, missingIdPlan])).not.toContain("BatchSecret");
+    expect(JSON.stringify([createPlan, updatePlan, deletePlan, batchPlan, rolePlan, missingIdPlan])).not.toContain("legacy-token");
   });
 
   it("requires an explicit legacy API base URL before legacy-proxy writes", async () => {
@@ -3091,6 +3475,191 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
     }
   });
 
+  it("records ledger-only operation-ledger evidence for plugin-user write routes without changing proxy responses", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_SHADOW_MODE = "ledger-only";
+    const logSpy = vi.spyOn(Logger.prototype, "log").mockImplementation(() => undefined);
+    const operations = new FakePluginUserWriteOperationRepository();
+    app = await createLifecycleTestApp(operations);
+    const fetchMock = vi.fn(async (url: URL | string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+      const pathname = typeof url === "string" ? new URL(url).pathname : url.pathname;
+      const status = body.id || pathname.endsWith("/batch-create-users") ? 200 : 201;
+      return new Response(JSON.stringify({ code: 0, data: { id: body.id ?? 42, username: body.username ?? "new-user" } }), {
+        status,
+        headers: { "Content-Type": "application/json" }
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      await request(app.getHttpServer())
+        .post("/v1/plugin-user/create-user")
+        .set("Authorization", "Bearer test-token")
+        .send({ username: "new-user", password: "Secret123!" })
+        .expect(201)
+        .expect("X-Identity-Plugin-User-Write", "legacy-proxy");
+
+      await request(app.getHttpServer())
+        .post("/v1/plugin-user/update-user")
+        .set("Authorization", "Bearer test-token")
+        .send({ id: 42, nickname: "Updated User", password: "Secret456!" })
+        .expect(200)
+        .expect("X-Identity-Plugin-User-Write", "legacy-proxy");
+
+      await request(app.getHttpServer())
+        .post("/v1/plugin-user/delete-user")
+        .set("Authorization", "Bearer test-token")
+        .send({ id: 42 })
+        .expect(200)
+        .expect("X-Identity-Plugin-User-Write", "legacy-proxy");
+
+      await request(app.getHttpServer())
+        .post("/v1/plugin-user/batch-create-users")
+        .set("Authorization", "Bearer test-token")
+        .send({
+          users: [
+            {
+              username: "batch-user-001",
+              nickname: "Batch User 001",
+              password: "BatchSecret123!",
+              role: "user",
+              status: 10
+            }
+          ]
+        })
+        .expect(200)
+        .expect("X-Identity-Plugin-User-Write", "legacy-proxy");
+
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      expect(operations.inputs.map((input) => input.route)).toEqual([
+        "create-user",
+        "update-user",
+        "delete-user",
+        "batch-create-users"
+      ]);
+      for (const input of operations.inputs) {
+        expect(input.mode).toBe("dual-write");
+        expect(input.idempotencyKey).toBe(input.operationKey);
+        expect(input.operationKey).toMatch(new RegExp(`^plugin-user-write:v1:${input.route}:[a-f0-9]{48}$`));
+      }
+
+      const logPayloads = logSpy.mock.calls
+        .map(([message]) => String(message))
+        .filter((message) => message.includes("identity.plugin_user.write.shadow"))
+        .map((message) => JSON.parse(message) as Record<string, unknown>);
+
+      expect(logPayloads).toHaveLength(4);
+      expect(logPayloads.map((payload) => payload.route)).toEqual([
+        "create-user",
+        "update-user",
+        "delete-user",
+        "batch-create-users"
+      ]);
+      for (const payload of logPayloads) {
+        expect(payload).toMatchObject({
+          mode: "ledger-only",
+          sideEffect: "operation-ledger",
+          duplicate: false,
+          errorCode: null
+        });
+      }
+      expect(JSON.stringify(logPayloads)).not.toContain("Secret123!");
+      expect(JSON.stringify(logPayloads)).not.toContain("Secret456!");
+      expect(JSON.stringify(logPayloads)).not.toContain("BatchSecret123!");
+      expect(JSON.stringify(logPayloads)).not.toContain("batch-user-001");
+      expect(JSON.stringify(logPayloads)).not.toContain("test-token");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("reports a redacted plugin-user operation ledger summary for closeout evidence", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_SHADOW_MODE = "ledger-only";
+    const operations = new FakePluginUserWriteOperationRepository();
+    app = await createLifecycleTestApp(operations);
+    const fetchMock = vi.fn(async (url: URL | string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+      const pathname = typeof url === "string" ? new URL(url).pathname : url.pathname;
+      const status = body.id || pathname.endsWith("/batch-create-users") ? 200 : 201;
+      return new Response(JSON.stringify({ code: 0, data: { id: body.id ?? 42, username: body.username ?? "new-user" } }), {
+        status,
+        headers: { "Content-Type": "application/json" }
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/create-user")
+      .set("Authorization", "Bearer test-token")
+      .send({ username: "new-user", password: "Secret123!" })
+      .expect(201);
+
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/batch-create-users")
+      .set("Authorization", "Bearer test-token")
+      .send({
+        users: [
+          {
+            username: "batch-user-001",
+            password: "BatchSecret123!",
+            status: 10
+          }
+        ]
+      })
+      .expect(200);
+
+    const summary = await request(app.getHttpServer())
+      .get("/internal/plugin-user-write/operations/summary?sinceMinutes=99999")
+      .expect(200);
+
+    expect(summary.body.data).toMatchObject({
+      configured: true,
+      sinceMinutes: 1440
+    });
+    expect(summary.body.data.routes).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          route: "create-user",
+          mode: "dual-write",
+          status: "pending",
+          compensationStatus: "none",
+          total: 1
+        }),
+        expect.objectContaining({
+          route: "batch-create-users",
+          mode: "dual-write",
+          status: "pending",
+          compensationStatus: "none",
+          total: 1
+        })
+      ])
+    );
+    expect(JSON.stringify(summary.body)).not.toContain("Secret123!");
+    expect(JSON.stringify(summary.body)).not.toContain("BatchSecret123!");
+    expect(JSON.stringify(summary.body)).not.toContain("test-token");
+  });
+
+  it("keeps the plugin-user operation ledger summary safe when the identity database is not configured", async () => {
+    const operations = new FakePluginUserWriteOperationRepository();
+    operations.configured = false;
+    app = await createLifecycleTestApp(operations);
+
+    const summary = await request(app.getHttpServer())
+      .get("/internal/plugin-user-write/operations/summary?sinceMinutes=0")
+      .expect(200);
+
+    expect(summary.body).toEqual({
+      status: "ok",
+      service: "identity-adapter",
+      capability: "plugin-user-write-operation-ledger",
+      data: {
+        configured: false,
+        sinceMinutes: 1,
+        routes: []
+      }
+    });
+  });
+
   it("records ledger-only shadow evidence without changing the legacy-proxy response", async () => {
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_SHADOW_MODE = "ledger-only";
     const operations = new FakePluginUserWriteOperationRepository();
@@ -3122,6 +3691,139 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
     expect(operations.inputs[0].idempotencyKey).toBe(operations.inputs[0].operationKey);
     expect(JSON.stringify(operations.inputs[0].metadata)).not.toContain("Secret123!");
     expect(JSON.stringify(operations.inputs[0].metadata)).not.toContain("test-token");
+  });
+
+  it("keeps change-role proxied while ledger-only records non-native evidence", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_SHADOW_MODE = "ledger-only";
+    const operations = new FakePluginUserWriteOperationRepository();
+    app = await createLifecycleTestApp(operations);
+    const fetchMock = vi.fn(async () => {
+      return new Response(JSON.stringify({ code: 0, data: { id: 42, role: "admin" } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await request(app.getHttpServer())
+      .post("/v1/plugin-user/change-role")
+      .set("Authorization", "Bearer test-token")
+      .send({ id: 42, role: "admin" })
+      .expect(200);
+
+    expect(response.body).toEqual({ code: 0, data: { id: 42, role: "admin" } });
+    expect(response.headers["x-identity-plugin-user-write"]).toBe("legacy-proxy");
+
+    const [url] = fetchMock.mock.calls[0] as unknown as [URL, RequestInit];
+    expect(url.toString()).toBe("http://legacy-api/v1/plugin-user/change-role");
+
+    expect(operations.inputs).toHaveLength(1);
+    expect(operations.inputs[0]).toMatchObject({
+      route: "change-role",
+      mode: "dual-write",
+      actorSubject: "authorization:present",
+      targetSubject: "legacy-user:42"
+    });
+    expect(operations.inputs[0].operationKey).toMatch(/^plugin-user-write:v1:change-role:[a-f0-9]{48}$/);
+    expect(operations.inputs[0].idempotencyKey).toBe(operations.inputs[0].operationKey);
+    expect(JSON.stringify(operations.inputs[0].metadata)).not.toContain("test-token");
+  });
+
+  it("keeps ledger-only shadow retry idempotent while preserving the legacy response", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_SHADOW_MODE = "ledger-only";
+    const logSpy = vi.spyOn(Logger.prototype, "log").mockImplementation(() => undefined);
+    const operations = new FakePluginUserWriteOperationRepository();
+    app = await createLifecycleTestApp(operations);
+    const fetchMock = vi.fn(async () => {
+      return new Response(JSON.stringify({ code: 0, data: { id: 42, username: "retry-user" } }), {
+        status: 201,
+        headers: { "Content-Type": "application/json" }
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      for (const _ of [0, 1]) {
+        const response = await request(app.getHttpServer())
+          .post("/v1/plugin-user/create-user")
+          .set("Authorization", "Bearer test-token")
+          .send({ username: "retry-user", password: "Secret123!" })
+          .expect(201);
+
+        expect(response.body).toEqual({ code: 0, data: { id: 42, username: "retry-user" } });
+        expect(response.headers["x-identity-plugin-user-write"]).toBe("legacy-proxy");
+      }
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(operations.attempts).toHaveLength(2);
+      expect(operations.inputs).toHaveLength(1);
+      expect(operations.attempts[1].operationKey).toBe(operations.attempts[0].operationKey);
+
+      const logPayloads = logSpy.mock.calls
+        .map(([message]) => String(message))
+        .filter((message) => message.includes("identity.plugin_user.write.shadow"))
+        .map((message) => JSON.parse(message) as Record<string, unknown>);
+
+      expect(logPayloads).toHaveLength(2);
+      expect(logPayloads[0]).toMatchObject({
+        mode: "ledger-only",
+        sideEffect: "operation-ledger",
+        route: "create-user",
+        duplicate: false
+      });
+      expect(logPayloads[1]).toMatchObject({
+        mode: "ledger-only",
+        sideEffect: "operation-ledger",
+        route: "create-user",
+        duplicate: true
+      });
+      expect(JSON.stringify(logPayloads)).not.toContain("Secret123!");
+      expect(JSON.stringify(logPayloads)).not.toContain("test-token");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("keeps legacy-proxy responses stable when ledger-only evidence recording fails", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_SHADOW_MODE = "ledger-only";
+    const warnSpy = vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+    const operations = new FakePluginUserWriteOperationRepository();
+    operations.failNextBegin = true;
+    app = await createLifecycleTestApp(operations);
+    const fetchMock = vi.fn(async () => {
+      return new Response(JSON.stringify({ code: 0, data: { id: 42, username: "new-user" } }), {
+        status: 201,
+        headers: { "Content-Type": "application/json" }
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      const response = await request(app.getHttpServer())
+        .post("/v1/plugin-user/create-user")
+        .set("Authorization", "Bearer test-token")
+        .send({ username: "new-user", password: "Secret123!" })
+        .expect(201);
+
+      expect(response.body).toEqual({ code: 0, data: { id: 42, username: "new-user" } });
+      expect(response.headers["x-identity-plugin-user-write"]).toBe("legacy-proxy");
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(operations.attempts).toHaveLength(1);
+      expect(operations.inputs).toHaveLength(0);
+
+      const warningPayload = JSON.parse(String(warnSpy.mock.calls[0]?.[0] ?? "{}")) as Record<string, unknown>;
+      expect(warningPayload).toMatchObject({
+        event: "identity.plugin_user.write.shadow",
+        mode: "ledger-only",
+        sideEffect: "operation-ledger",
+        route: "create-user",
+        errorCode: "Error"
+      });
+      expect(JSON.stringify(warningPayload)).not.toContain("Secret123!");
+      expect(JSON.stringify(warningPayload)).not.toContain("test-token");
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 
   it("preserves legacy validation errors so callers do not repeat writes", async () => {
@@ -4974,7 +5676,8 @@ describe("identity-adapter native email lifecycle API", () => {
 });
 
 async function createLifecycleTestApp(
-  pluginUserOperations?: FakePluginUserWriteOperationRepository
+  pluginUserOperations?: FakePluginUserWriteOperationRepository,
+  iamRepository?: FakeIamRepository
 ): Promise<INestApplication> {
   let builder = Test.createTestingModule({
     imports: [AppModule]
@@ -4984,6 +5687,10 @@ async function createLifecycleTestApp(
 
   if (pluginUserOperations) {
     builder = builder.overrideProvider(PluginUserWriteOperationRepository).useValue(pluginUserOperations);
+  }
+
+  if (iamRepository) {
+    builder = builder.overrideProvider(IamRepository).useValue(iamRepository);
   }
 
   const moduleRef = await builder.compile();
