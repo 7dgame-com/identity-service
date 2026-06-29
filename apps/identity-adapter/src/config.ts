@@ -91,6 +91,7 @@ export const configSchema = z.object({
     roleWriteMode: z.enum(["disabled", "legacy-proxy", "dual-write", "identity-native"]).default("disabled"),
     organizationWriteMode: z.enum(["disabled", "legacy-proxy", "dual-write", "identity-native"]).default("disabled"),
     pluginUserWriteMode: z.enum(["disabled", "legacy-proxy", "dual-write", "identity-native"]).default("disabled"),
+    pluginUserWriteShadowMode: z.enum(["off", "plan", "ledger-only"]).default("off"),
     pluginUserWriteLegacyApiBaseUrl: optionalStringFromEnv,
     pluginUserWriteTimeoutMs: numberFromEnv.default(1500)
   }),
@@ -103,7 +104,8 @@ export const configSchema = z.object({
   tokenIssuance: z.object({
     enabled: boolFromEnv.default(false),
     accessTokenTtlSeconds: numberFromEnv.default(10800),
-    refreshTokenTtlSeconds: numberFromEnv.default(604800)
+    refreshTokenTtlSeconds: numberFromEnv.default(604800),
+    internalToken: optionalStringFromEnv
   }),
   oidc: z.object({
     enabled: boolFromEnv.default(false),
@@ -260,6 +262,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
       roleWriteMode: env.IDENTITY_IAM_ROLE_WRITE_MODE,
       organizationWriteMode: env.IDENTITY_IAM_ORG_WRITE_MODE,
       pluginUserWriteMode: env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE,
+      pluginUserWriteShadowMode: env.IDENTITY_IAM_PLUGIN_USER_WRITE_SHADOW_MODE,
       pluginUserWriteLegacyApiBaseUrl:
         env.IDENTITY_IAM_PLUGIN_USER_WRITE_LEGACY_API_BASE_URL ?? env.IDENTITY_ACCOUNT_LIFECYCLE_LEGACY_API_BASE_URL,
       pluginUserWriteTimeoutMs:
@@ -274,7 +277,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
     tokenIssuance: {
       enabled: env.IDENTITY_TOKEN_ISSUANCE_ENABLED,
       accessTokenTtlSeconds: env.IDENTITY_ACCESS_TOKEN_TTL_SECONDS,
-      refreshTokenTtlSeconds: env.IDENTITY_REFRESH_TOKEN_TTL_SECONDS
+      refreshTokenTtlSeconds: env.IDENTITY_REFRESH_TOKEN_TTL_SECONDS,
+      internalToken:
+        env.IDENTITY_TOKEN_ISSUANCE_INTERNAL_API_TOKEN ??
+        env.IDENTITY_ACCOUNT_INTERNAL_TOKEN ??
+        env.IDENTITY_INTERNAL_API_TOKEN
     },
     oidc: {
       enabled: env.IDENTITY_OIDC_ENABLED,
