@@ -5093,6 +5093,7 @@ describe("identity-adapter token issuance API", () => {
     process.env.IDENTITY_JWT_AUDIENCE = "xrugc-api";
     process.env.IDENTITY_ACCESS_TOKEN_TTL_SECONDS = "3600";
     process.env.IDENTITY_REFRESH_TOKEN_TTL_SECONDS = "604800";
+    process.env.IDENTITY_INTERNAL_API_TOKEN = "test-internal-token";
 
     repository = new FakeIdentitySessionRepository();
 
@@ -5166,6 +5167,42 @@ describe("identity-adapter token issuance API", () => {
     await request(app.getHttpServer())
       .post("/v1/auth/login")
       .send({ username: "guanfei", password: "wrong" })
+      .expect(401);
+
+    expect(repository.sessions.size).toBe(0);
+  });
+
+  it("issues an internal user token that can be refreshed by QR login clients", async () => {
+    const issued = await request(app.getHttpServer())
+      .post("/internal/auth/issue-user-token")
+      .set("X-Identity-Internal-Token", "test-internal-token")
+      .set("X-Forwarded-For", "203.0.113.7, 10.0.0.1")
+      .set("User-Agent", "UnityQRLogin/1.0")
+      .send({ legacyUserId: 24 })
+      .expect(201);
+
+    expect(issued.body).toMatchObject({
+      success: true,
+      message: "login",
+      token: {
+        tokenType: "Bearer",
+        refreshToken: "refresh-1"
+      }
+    });
+
+    const refresh = await request(app.getHttpServer())
+      .post("/v1/auth/refresh")
+      .send({ refreshToken: issued.body.token.refreshToken })
+      .expect(201);
+
+    expect(refresh.body.message).toBe("refresh");
+    expect(refresh.body.token.refreshToken).toBe("refresh-2");
+  });
+
+  it("rejects internal user token issuance without the internal token", async () => {
+    await request(app.getHttpServer())
+      .post("/internal/auth/issue-user-token")
+      .send({ legacyUserId: 24 })
       .expect(401);
 
     expect(repository.sessions.size).toBe(0);

@@ -18,6 +18,7 @@ import { IamRepository } from "./iam.repository.js";
 import { IamService } from "./iam.service.js";
 import { IdentityController } from "./identity.controller.js";
 import { IdentitySessionRepository } from "./identity-session.repository.js";
+import { InternalAuthController } from "./internal-auth.controller.js";
 import { InvitationDiagnosticsController } from "./invitation-diagnostics.controller.js";
 import { InvitationDiagnosticsService } from "./invitation-diagnostics.service.js";
 import { InvitationIdentityRepository } from "./invitation-identity.repository.js";
@@ -58,6 +59,7 @@ import { UsageBillingService } from "./usage-billing.service.js";
     AuthController,
     AccountLifecycleController,
     InvitationDiagnosticsController,
+    InternalAuthController,
     IamController,
     PluginUserReadonlyController,
     PluginUserWriteController,

@@ -104,7 +104,8 @@ export const configSchema = z.object({
   tokenIssuance: z.object({
     enabled: boolFromEnv.default(false),
     accessTokenTtlSeconds: numberFromEnv.default(10800),
-    refreshTokenTtlSeconds: numberFromEnv.default(604800)
+    refreshTokenTtlSeconds: numberFromEnv.default(604800),
+    internalToken: optionalStringFromEnv
   }),
   oidc: z.object({
     enabled: boolFromEnv.default(false),
@@ -276,7 +277,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
     tokenIssuance: {
       enabled: env.IDENTITY_TOKEN_ISSUANCE_ENABLED,
       accessTokenTtlSeconds: env.IDENTITY_ACCESS_TOKEN_TTL_SECONDS,
-      refreshTokenTtlSeconds: env.IDENTITY_REFRESH_TOKEN_TTL_SECONDS
+      refreshTokenTtlSeconds: env.IDENTITY_REFRESH_TOKEN_TTL_SECONDS,
+      internalToken:
+        env.IDENTITY_TOKEN_ISSUANCE_INTERNAL_API_TOKEN ??
+        env.IDENTITY_ACCOUNT_INTERNAL_TOKEN ??
+        env.IDENTITY_INTERNAL_API_TOKEN
     },
     oidc: {
       enabled: env.IDENTITY_OIDC_ENABLED,

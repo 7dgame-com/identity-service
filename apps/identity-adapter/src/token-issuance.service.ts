@@ -21,6 +21,10 @@ const logoutSchema = z.object({
   refreshToken: z.string().min(1).max(4096).optional().nullable()
 });
 
+const issueUserTokenSchema = z.object({
+  legacyUserId: z.coerce.number().int().positive()
+});
+
 export interface RequestContext {
   ip?: string | null;
   userAgent?: string | null;
@@ -114,6 +118,15 @@ export class TokenIssuanceService {
     const sessionId = randomId();
 
     return this.issueForUser(user, sessionId, context, "register");
+  }
+
+  async issueLegacyUserToken(payload: unknown, context: RequestContext = {}): Promise<AuthTokenResponse> {
+    this.assertEnabled();
+    const parsed = parseBody(issueUserTokenSchema, payload);
+    const user = await this.requireLegacyUser(parsed.legacyUserId);
+    const sessionId = randomId();
+
+    return this.issueForUser(user, sessionId, context, "login");
   }
 
   private async issueForUser(
