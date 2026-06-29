@@ -2742,6 +2742,43 @@ describe("identity-adapter account lifecycle compatibility API", () => {
     expect(refreshUrl.toString()).toBe("http://legacy-api/v1/wechat/refresh?token=wechat-token");
   });
 
+  it("routes WeChat QR polling to the dedicated WeChat proxy base when configured", async () => {
+    process.env.IDENTITY_ACCOUNT_LIFECYCLE_MODE = "native";
+    process.env.IDENTITY_ACCOUNT_REGISTER_ENABLED = "true";
+    process.env.IDENTITY_WECHAT_PROXY_BASE_URL = "https://auth.bujiaban.com";
+    app = await createLifecycleTestApp();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            qrcode: { url: "https://mp.weixin.qq.com/cgi-bin/showqrcode?ticket=ticket" },
+            token: "wechat-token",
+            lifetime: 518400
+          }),
+          {
+            status: 200,
+            headers: { "Content-Type": "application/json" }
+          }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ success: true, message: "signin", token: "wechat-token" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        })
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await request(app.getHttpServer()).get("/v1/wechat/qrcode").expect(200);
+    await request(app.getHttpServer()).get("/v1/wechat/refresh?token=wechat-token").expect(200);
+
+    const [qrcodeUrl] = fetchMock.mock.calls[0] as unknown as [URL, RequestInit];
+    const [refreshUrl] = fetchMock.mock.calls[1] as unknown as [URL, RequestInit];
+    expect(qrcodeUrl.toString()).toBe("https://auth.bujiaban.com/v1/wechat/qrcode");
+    expect(refreshUrl.toString()).toBe("https://auth.bujiaban.com/v1/wechat/refresh?token=wechat-token");
+  });
+
   it("preserves query strings for invitation compatibility endpoints", async () => {
     process.env.IDENTITY_ACCOUNT_INVITATION_ENABLED = "true";
     app = await createLifecycleTestApp();

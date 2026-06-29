@@ -63,6 +63,11 @@ export class AccountLifecycleService {
 
     const { accountLifecycle } = this.config;
     if (accountLifecycle.mode === "legacy-proxy") {
+      const proxyBaseUrl = this.proxyBaseUrlForPath(path);
+      if (proxyBaseUrl) {
+        return this.forwardToLegacy(request, path, proxyBaseUrl);
+      }
+
       if (!accountLifecycle.legacyApiBaseUrl) {
         throw new ServiceUnavailableException({
           code: "ACCOUNT_LIFECYCLE_LEGACY_API_NOT_CONFIGURED",
@@ -75,8 +80,9 @@ export class AccountLifecycleService {
 
     if (accountLifecycle.mode === "native") {
       if (scope === "register") {
-        if (LEGACY_REGISTER_PROXY_ONLY_PATHS.has(path) && accountLifecycle.legacyApiBaseUrl) {
-          return this.forwardToLegacy(request, path);
+        const proxyBaseUrl = this.proxyBaseUrlForPath(path);
+        if (LEGACY_REGISTER_PROXY_ONLY_PATHS.has(path) && proxyBaseUrl) {
+          return this.forwardToLegacy(request, path, proxyBaseUrl);
         }
 
         return this.accountRegistration.register(path, request.body, requestContext(request));
@@ -152,9 +158,23 @@ export class AccountLifecycleService {
     }
   }
 
-  private async forwardToLegacy(request: AccountLifecycleRequest, path: string): Promise<AccountLifecycleProxyResponse> {
+  private proxyBaseUrlForPath(path: string): string | undefined {
     const { accountLifecycle } = this.config;
-    const url = new URL(path, `${accountLifecycle.legacyApiBaseUrl!.replace(/\/+$/, "")}/`);
+    if (LEGACY_REGISTER_PROXY_ONLY_PATHS.has(path)) {
+      return accountLifecycle.wechatProxyBaseUrl ?? accountLifecycle.legacyApiBaseUrl;
+    }
+
+    return accountLifecycle.legacyApiBaseUrl;
+  }
+
+  private async forwardToLegacy(
+    request: AccountLifecycleRequest,
+    path: string,
+    baseUrl?: string
+  ): Promise<AccountLifecycleProxyResponse> {
+    const { accountLifecycle } = this.config;
+    const legacyBaseUrl = baseUrl ?? accountLifecycle.legacyApiBaseUrl;
+    const url = new URL(path, `${legacyBaseUrl!.replace(/\/+$/, "")}/`);
     const query = queryStringFromOriginalUrl(request.originalUrl);
     if (query) {
       url.search = query;
