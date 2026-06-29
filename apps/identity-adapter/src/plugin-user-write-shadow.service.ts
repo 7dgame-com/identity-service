@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { Injectable, Logger } from "@nestjs/common";
 import { loadConfig } from "./config.js";
 import {
@@ -30,6 +31,11 @@ export interface PluginUserWriteShadowResult {
   sideEffect: "none" | "operation-ledger";
   route?: PluginUserWriteRoute;
   operationKey?: string;
+  correlationId?: string;
+  actorSubjectKind?: string | null;
+  actorSubjectHash?: string | null;
+  targetSubjectKind?: string | null;
+  targetSubjectHash?: string | null;
   duplicate?: boolean;
   errorCode?: string;
 }
@@ -73,7 +79,12 @@ export class PluginUserWriteShadowService {
         mode,
         sideEffect: "none",
         route: plan.route,
-        operationKey: plan.operationKey
+        operationKey: plan.operationKey,
+        correlationId: plan.correlationId,
+        actorSubjectKind: subjectKind(plan.actorSubject),
+        actorSubjectHash: subjectHash(plan.actorSubject),
+        targetSubjectKind: subjectKind(plan.targetSubject),
+        targetSubjectHash: subjectHash(plan.targetSubject)
       };
       this.logShadowResult(result);
       return result;
@@ -96,6 +107,11 @@ export class PluginUserWriteShadowService {
         sideEffect: "operation-ledger",
         route: plan.route,
         operationKey: plan.operationKey,
+        correlationId: plan.correlationId,
+        actorSubjectKind: subjectKind(plan.actorSubject),
+        actorSubjectHash: subjectHash(plan.actorSubject),
+        targetSubjectKind: subjectKind(plan.targetSubject),
+        targetSubjectHash: subjectHash(plan.targetSubject),
         duplicate: result.duplicate
       };
       this.logShadowResult(shadowResult);
@@ -107,6 +123,11 @@ export class PluginUserWriteShadowService {
         sideEffect: "operation-ledger",
         route: plan.route,
         operationKey: plan.operationKey,
+        correlationId: plan.correlationId,
+        actorSubjectKind: subjectKind(plan.actorSubject),
+        actorSubjectHash: subjectHash(plan.actorSubject),
+        targetSubjectKind: subjectKind(plan.targetSubject),
+        targetSubjectHash: subjectHash(plan.targetSubject),
         errorCode: error instanceof Error ? error.name : "PluginUserWriteShadowError"
       };
       this.logShadowResult(shadowResult);
@@ -121,6 +142,11 @@ export class PluginUserWriteShadowService {
       sideEffect: result.sideEffect,
       route: result.route ?? null,
       operationKey: result.operationKey ?? null,
+      correlationId: result.correlationId ?? null,
+      actorSubjectKind: result.actorSubjectKind ?? null,
+      actorSubjectHash: result.actorSubjectHash ?? null,
+      targetSubjectKind: result.targetSubjectKind ?? null,
+      targetSubjectHash: result.targetSubjectHash ?? null,
       duplicate: result.duplicate ?? null,
       errorCode: result.errorCode ?? null
     };
@@ -146,9 +172,11 @@ export function planShadowOperation(input: PluginUserWriteShadowRequest) {
     targetSubject,
     requestFingerprint
   });
+  const correlationId = shadowCorrelationId(operationKey);
 
   return {
     operationKey,
+    correlationId,
     route,
     actorSubject,
     targetSubject,
@@ -161,6 +189,23 @@ export function planShadowOperation(input: PluginUserWriteShadowRequest) {
       redactedBody
     }
   };
+}
+
+function shadowCorrelationId(operationKey: string): string {
+  const digest = createHash("sha256").update(operationKey).digest("hex");
+  return `plugin-user-write:${digest.slice(0, 16)}`;
+}
+
+function subjectKind(subject: string | null): string | null {
+  return subject?.split(":")[0] ?? null;
+}
+
+function subjectHash(subject: string | null): string | null {
+  if (!subject) {
+    return null;
+  }
+
+  return createHash("sha256").update(subject).digest("hex").slice(0, 16);
 }
 
 function routeFromPath(path: string): PluginUserWriteRoute {
