@@ -76,13 +76,27 @@ function singleUserRecord(
 function batchCreateRecords(requestBody: Record<string, unknown>, legacyBody: Record<string, unknown>): Record<string, unknown>[] {
   const requestUsers = arrayValue(requestBody.users).map(recordValue);
   const legacyData = recordValue(legacyBody.data);
-  const legacyUsers = arrayValue(legacyData.users ?? legacyData.items ?? legacyData.list).map(recordValue);
+  const legacyUsers = arrayValue(
+    legacyData.users ??
+      legacyData.items ??
+      legacyData.list ??
+      legacyData.results ??
+      legacyBody.users ??
+      legacyBody.items ??
+      legacyBody.list ??
+      legacyBody.results
+  ).map(recordValue);
   const maxLength = Math.max(requestUsers.length, legacyUsers.length);
   const records: Record<string, unknown>[] = [];
   for (let index = 0; index < maxLength; index += 1) {
+    const legacyRecord = legacyUsers[index] ?? {};
+    if (legacyRecord.success === false) {
+      continue;
+    }
+    const requestIndex = integerField(legacyRecord, ["index"]);
     records.push({
-      ...(requestUsers[index] ?? {}),
-      ...(legacyUsers[index] ?? {})
+      ...(requestUsers[requestIndex ?? index] ?? requestUsers[index] ?? {}),
+      ...legacyRecord
     });
   }
 
@@ -122,6 +136,17 @@ function numericField(record: Record<string, unknown>, keys: string[]): number |
   for (const key of keys) {
     const numeric = Number(record[key]);
     if (Number.isInteger(numeric) && numeric > 0) {
+      return numeric;
+    }
+  }
+
+  return null;
+}
+
+function integerField(record: Record<string, unknown>, keys: string[]): number | null {
+  for (const key of keys) {
+    const numeric = Number(record[key]);
+    if (Number.isInteger(numeric) && numeric >= 0) {
       return numeric;
     }
   }

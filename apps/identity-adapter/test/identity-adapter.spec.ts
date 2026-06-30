@@ -3484,6 +3484,37 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
     expect(batchPlan.writes).toHaveLength(2);
     expect(batchPlan.writes.map((write) => write.identityUserId)).toEqual(["legacy:101", "legacy:102"]);
 
+    const batchResultsPlan = planPluginUserIdentityShadow({
+      route: "batch-create-users",
+      requestBody: {
+        users: [
+          { username: "batch-failed", password: "BatchSecret0!" },
+          { username: "batch-results", password: "BatchSecret3!", email: "batch-results@example.com" }
+        ]
+      },
+      legacyStatus: 200,
+      legacyBody: {
+        code: 0,
+        data: {
+          total: 2,
+          success: 1,
+          failed: 1,
+          results: [
+            { index: 0, username: "batch-failed", success: false, error: "用户名已存在" },
+            { index: 1, username: "batch-results", success: true, id: 103 }
+          ]
+        }
+      }
+    });
+    expect(batchResultsPlan.writes).toHaveLength(1);
+    expect(batchResultsPlan.writes[0]).toMatchObject({
+      identityUserId: "legacy:103",
+      legacyUserId: 103,
+      username: "batch-results",
+      email: "batch-results@example.com",
+      status: "active"
+    });
+
     const rolePlan = planPluginUserIdentityShadow({
       route: "change-role",
       requestBody: { id: 42, role: "admin" },
@@ -3506,10 +3537,18 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
       skippedReason: "legacy-user-id-missing"
     });
 
-    expect(JSON.stringify([createPlan, updatePlan, deletePlan, batchPlan, rolePlan, missingIdPlan])).not.toContain("Secret123!");
-    expect(JSON.stringify([createPlan, updatePlan, deletePlan, batchPlan, rolePlan, missingIdPlan])).not.toContain("Secret456!");
-    expect(JSON.stringify([createPlan, updatePlan, deletePlan, batchPlan, rolePlan, missingIdPlan])).not.toContain("BatchSecret");
-    expect(JSON.stringify([createPlan, updatePlan, deletePlan, batchPlan, rolePlan, missingIdPlan])).not.toContain("legacy-token");
+    expect(JSON.stringify([createPlan, updatePlan, deletePlan, batchPlan, batchResultsPlan, rolePlan, missingIdPlan])).not.toContain(
+      "Secret123!"
+    );
+    expect(JSON.stringify([createPlan, updatePlan, deletePlan, batchPlan, batchResultsPlan, rolePlan, missingIdPlan])).not.toContain(
+      "Secret456!"
+    );
+    expect(JSON.stringify([createPlan, updatePlan, deletePlan, batchPlan, batchResultsPlan, rolePlan, missingIdPlan])).not.toContain(
+      "BatchSecret"
+    );
+    expect(JSON.stringify([createPlan, updatePlan, deletePlan, batchPlan, batchResultsPlan, rolePlan, missingIdPlan])).not.toContain(
+      "legacy-token"
+    );
   });
 
   it("requires an explicit legacy API base URL before legacy-proxy writes", async () => {
