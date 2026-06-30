@@ -3031,7 +3031,8 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
           legacyProxy: true,
           operationLedger: true,
           identityRepository: true,
-          executionFlag: false
+          executionFlag: false,
+          rollout: false
         }
       },
       identityNativeGate: {
@@ -3060,16 +3061,14 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
         "operation-ledger",
         "identity-repository",
         "legacy-proxy-base-url",
-        "develop-dual-write-apply-closeout"
+        "single-target-rollout-selector"
       ])
     );
     expect(readiness.body.data.dualWriteGate.runtimeCapabilities).toEqual(
       expect.arrayContaining(["idempotent-response-replay", "identity-write-executor", "compensation-runner"])
     );
     expect(readiness.body.data.dualWriteGate.productionCanaryReady).toBe(false);
-    expect(readiness.body.data.dualWriteGate.productionCanaryBlockers).toEqual(
-      expect.arrayContaining(["develop-dual-write-apply-closeout"])
-    );
+    expect(readiness.body.data.dualWriteGate.productionCanaryBlockers).toEqual(["single-target-rollout-selector"]);
     expect(readiness.body.data.identityNativeGate.missingCapabilities).toEqual(
       expect.arrayContaining(["dual-write-execution", "production-dual-write-observation-closeout"])
     );
@@ -3085,7 +3084,7 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
     expect(operations.inputs).toHaveLength(0);
   });
 
-  it("executes default-closed dual-write when the operator flag and repositories are ready", async () => {
+  it("keeps dual-write default-closed until a rollout selector is configured", async () => {
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
     const operations = new FakePluginUserWriteOperationRepository();
@@ -3116,19 +3115,70 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
           legacyProxy: true,
           operationLedger: true,
           identityRepository: true,
-          executionFlag: true
+          executionFlag: true,
+          rollout: false
         }
       }
+    });
+    expect(readiness.body.data.rollout).toMatchObject({
+      mode: "canary",
+      allowlistConfigured: false,
+      percentage: 0,
+      selectionConfigured: false,
+      unselectedBehavior: "legacy-proxy"
     });
     expect(readiness.body.data.blockedReasons).toEqual([]);
     expect(readiness.body.data.dualWriteGate.missingCapabilities).not.toEqual(
       expect.arrayContaining(["operator-dual-write-execution-flag"])
     );
     expect(readiness.body.data.dualWriteGate.missingCapabilities).toEqual([]);
-    expect(readiness.body.data.dualWriteGate.productionCanaryBlockers).toEqual(
-      expect.arrayContaining(["develop-dual-write-apply-closeout"])
-    );
+    expect(readiness.body.data.dualWriteGate.productionCanaryBlockers).toEqual(["single-target-rollout-selector"]);
     expect(readiness.body.data.identityNativeGate.executable).toBe(false);
+
+    const response = await request(app.getHttpServer())
+      .post("/v1/plugin-user/create-user")
+      .send({ username: "new-user", password: "Secret123!" })
+      .expect(201);
+
+    expect(response.headers["x-identity-plugin-user-write"]).toBe("legacy-proxy");
+    expect(response.body).toEqual({ code: 0, data: { id: 42, username: "new-user", email: "new@example.com" } });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(operations.inputs).toHaveLength(0);
+    expect(iamRepository.identityShadowWrites).toHaveLength(0);
+  });
+
+  it("executes dual-write only for canary allowlisted plugin-user write subjects", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_MODE = "canary";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_ALLOWLIST = "username:new-user";
+    const operations = new FakePluginUserWriteOperationRepository();
+    const iamRepository = new FakeIamRepository();
+    app = await createLifecycleTestApp(operations, iamRepository);
+    const fetchMock = vi.fn(async () => {
+      return new Response(JSON.stringify({ code: 0, data: { id: 42, username: "new-user", email: "new@example.com" } }), {
+        status: 201,
+        headers: { "Content-Type": "application/json" }
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const readiness = await request(app.getHttpServer())
+      .get("/internal/plugin-user-write/readiness")
+      .expect(200);
+
+    expect(readiness.body.data.rollout).toMatchObject({
+      mode: "canary",
+      allowlistConfigured: true,
+      allowlistCount: 1,
+      selectionConfigured: true,
+      unselectedBehavior: "legacy-proxy"
+    });
+    expect(readiness.body.data.dualWriteGate).toMatchObject({
+      executable: true,
+      productionCanaryReady: true,
+      productionCanaryBlockers: []
+    });
 
     const response = await request(app.getHttpServer())
       .post("/v1/plugin-user/create-user")
@@ -3163,6 +3213,7 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
   it("records compensation when identity shadow write fails after legacy succeeds", async () => {
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_MODE = "full";
     const operations = new FakePluginUserWriteOperationRepository();
     const iamRepository = new FakeIamRepository();
     iamRepository.failNextUpsertIdentityUserShadow = true;
@@ -3212,6 +3263,7 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
   it("replays completed dual-write responses for duplicate requests without repeating legacy writes", async () => {
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_MODE = "full";
     const operations = new FakePluginUserWriteOperationRepository();
     const iamRepository = new FakeIamRepository();
     app = await createLifecycleTestApp(operations, iamRepository);

@@ -1,6 +1,8 @@
-import { Injectable, NotFoundException, ServiceUnavailableException } from "@nestjs/common";
+import { createHash } from "node:crypto";
+import { Injectable, Logger, NotFoundException, ServiceUnavailableException } from "@nestjs/common";
 import { loadConfig } from "./config.js";
 import { IamRepository } from "./iam.repository.js";
+import { JwtIssuerService, VerifiedAccessToken } from "./jwt-issuer.service.js";
 import { planPluginUserIdentityShadow } from "./plugin-user-write-identity-shadow.js";
 import { PluginUserWriteOperationRepository } from "./plugin-user-write-operation.repository.js";
 import {
@@ -52,11 +54,13 @@ const IDENTITY_NATIVE_EXECUTION_BLOCKERS = [
 @Injectable()
 export class PluginUserWriteService {
   private readonly config = loadConfig();
+  private readonly logger = new Logger(PluginUserWriteService.name);
 
   constructor(
     private readonly operations: PluginUserWriteOperationRepository,
     private readonly shadow: PluginUserWriteShadowService,
-    private readonly iamRepository: IamRepository
+    private readonly iamRepository: IamRepository,
+    private readonly jwtIssuer: JwtIssuerService
   ) {}
 
   readiness() {
@@ -65,11 +69,13 @@ export class PluginUserWriteService {
     const legacyProxyConfigured = Boolean(iam.pluginUserWriteLegacyApiBaseUrl);
     const operationLedgerConfigured = this.operations.isConfigured();
     const identityRepositoryConfigured = this.iamRepository.isConfigured();
+    const rollout = pluginUserWriteRolloutReadiness(iam);
     const dualWriteGate = dualWriteGateForReadiness({
       legacyProxyConfigured,
       operationLedgerConfigured,
       identityRepositoryConfigured,
-      executionFlagEnabled: iam.pluginUserWriteDualWriteExecutionEnabled
+      executionFlagEnabled: iam.pluginUserWriteDualWriteExecutionEnabled,
+      rollout
     });
     const identityNativeGate = identityNativeGateForReadiness({
       dualWriteSupported: dualWriteGate.executable && dualWriteGate.productionCanaryReady,
@@ -91,6 +97,7 @@ export class PluginUserWriteService {
       redactionPolicy: "metadata-only-no-secret-payloads",
       compensationRecordsRequired: true,
       shadow: this.shadow.readiness(),
+      rollout,
       allowedExecutableModes: [...PLUGIN_USER_WRITE_EXECUTABLE_MODES],
       unsupportedModeBlocked: unsupportedModeBlocked && !dualWriteGate.executable,
       blockedReasons,
@@ -162,7 +169,8 @@ export class PluginUserWriteService {
         legacyProxyConfigured: Boolean(iam.pluginUserWriteLegacyApiBaseUrl),
         operationLedgerConfigured: this.operations.isConfigured(),
         identityRepositoryConfigured: this.iamRepository.isConfigured(),
-        executionFlagEnabled: iam.pluginUserWriteDualWriteExecutionEnabled
+        executionFlagEnabled: iam.pluginUserWriteDualWriteExecutionEnabled,
+        rollout: pluginUserWriteRolloutReadiness(iam)
       });
       if (!dualWriteGate.executable) {
         throw new NotFoundException({
@@ -172,6 +180,13 @@ export class PluginUserWriteService {
         });
       }
 
+      const rolloutDecision = this.dualWriteRolloutDecision(request, path);
+      if (!rolloutDecision.selected) {
+        this.logRolloutDecision(rolloutDecision);
+        return this.legacyProxy(request, path, true);
+      }
+
+      this.logRolloutDecision(rolloutDecision);
       return this.dualWrite(request, path);
     }
 
@@ -179,6 +194,92 @@ export class PluginUserWriteService {
       code: "PLUGIN_USER_WRITE_UNSUPPORTED_MODE",
       message: `Plugin user write mode ${iam.pluginUserWriteMode} is not executable yet.`
     });
+  }
+
+  private dualWriteRolloutDecision(request: PluginUserWriteRequest, path: string): PluginUserWriteRolloutDecision {
+    const { iam } = this.config;
+    const plan = planShadowOperation({
+      method: request.method,
+      path,
+      headers: request.headers,
+      body: request.body,
+      legacyStatus: 0
+    });
+    const claims = this.claimsFromAuthorization(request.headers.authorization);
+    const actorTokens = pluginUserWriteActorTokens(plan.actorSubject, claims);
+    const targetTokens = pluginUserWriteTargetTokens(plan.targetSubject);
+    const tokens = new Set([...actorTokens, ...targetTokens].map(normalizeRolloutToken).filter(Boolean));
+    const allowlist = splitCsv(iam.pluginUserWriteRolloutAllowlist).map(normalizeRolloutToken).filter(Boolean);
+
+    if (iam.pluginUserWriteRolloutMode === "full") {
+      return {
+        selected: true,
+        mode: "full",
+        route: plan.route,
+        actorSubject: plan.actorSubject,
+        targetSubject: plan.targetSubject,
+        reason: "full_rollout"
+      };
+    }
+
+    if (iam.pluginUserWriteRolloutMode === "canary") {
+      const matchedToken = allowlist.find((item) => tokens.has(item));
+      return {
+        selected: Boolean(matchedToken),
+        mode: "canary",
+        route: plan.route,
+        actorSubject: plan.actorSubject,
+        targetSubject: plan.targetSubject,
+        reason: matchedToken ? "canary_subject_selected" : "canary_subject_not_selected",
+        matchedToken: matchedToken ?? null
+      };
+    }
+
+    const percentage = safeRolloutPercentage(iam.pluginUserWriteRolloutPercentage);
+    const bucketSubject = rolloutBucketSubject(claims, plan.actorSubject, plan.targetSubject);
+    const bucket = bucketSubject ? rolloutBucket(bucketSubject) : null;
+    const selected = percentage >= 100 || (percentage > 0 && bucket !== null && bucket < percentage);
+    return {
+      selected,
+      mode: "percentage",
+      route: plan.route,
+      actorSubject: plan.actorSubject,
+      targetSubject: plan.targetSubject,
+      reason: selected ? "percentage_bucket_selected" : "percentage_bucket_not_selected",
+      bucket,
+      percentage
+    };
+  }
+
+  private claimsFromAuthorization(authorization: string | string[] | undefined): VerifiedAccessToken | null {
+    const token = bearerToken(firstHeader(authorization));
+    if (!token) {
+      return null;
+    }
+
+    try {
+      return this.jwtIssuer.verifyAccessToken(token);
+    } catch {
+      return null;
+    }
+  }
+
+  private logRolloutDecision(decision: PluginUserWriteRolloutDecision): void {
+    this.logger.log(
+      JSON.stringify({
+        event: "identity.plugin_user.write.rollout",
+        mode: decision.mode,
+        selected: decision.selected,
+        reason: decision.reason,
+        route: decision.route,
+        actorSubject: decision.actorSubject,
+        targetSubject: decision.targetSubject,
+        matchedToken: decision.matchedToken ?? null,
+        bucket: decision.bucket ?? null,
+        percentage: decision.percentage ?? null,
+        unselectedBehavior: decision.selected ? "dual-write" : "legacy-proxy"
+      })
+    );
   }
 
   private async legacyProxy(request: PluginUserWriteRequest, path: string, observeShadow: boolean): Promise<PluginUserWriteProxyResponse> {
@@ -455,6 +556,7 @@ function dualWriteGateForReadiness(input: {
   operationLedgerConfigured: boolean;
   identityRepositoryConfigured: boolean;
   executionFlagEnabled: boolean;
+  rollout: PluginUserWriteRolloutReadiness;
 }) {
   const missingCapabilities: string[] = [...DUAL_WRITE_EXECUTION_BLOCKERS];
   if (!input.executionFlagEnabled) {
@@ -469,12 +571,11 @@ function dualWriteGateForReadiness(input: {
   if (!input.identityRepositoryConfigured) {
     missingCapabilities.unshift("identity-repository");
   }
-
   const executable = missingCapabilities.length === 0;
 
   return {
     executable,
-    productionCanaryReady: false,
+    productionCanaryReady: executable && input.rollout.selectionConfigured,
     sourceOfTruthUntilCloseout: "legacy",
     supportedRoutes: executable ? [...PLUGIN_USER_WRITE_ROUTES] : [],
     blockedRoutes: executable ? [] : [...PLUGIN_USER_WRITE_ROUTES],
@@ -489,11 +590,51 @@ function dualWriteGateForReadiness(input: {
       legacyProxy: input.legacyProxyConfigured,
       operationLedger: input.operationLedgerConfigured,
       identityRepository: input.identityRepositoryConfigured,
-      executionFlag: input.executionFlagEnabled
+      executionFlag: input.executionFlagEnabled,
+      rollout: input.rollout.selectionConfigured
     },
     runtimeCapabilities: [...DUAL_WRITE_RUNTIME_CAPABILITIES],
-    productionCanaryBlockers: ["develop-dual-write-apply-closeout"],
+    productionCanaryBlockers: input.rollout.selectionConfigured ? [] : ["single-target-rollout-selector"],
     missingCapabilities
+  };
+}
+
+interface PluginUserWriteRolloutReadiness {
+  mode: "canary" | "percentage" | "full";
+  allowlistConfigured: boolean;
+  allowlistCount: number;
+  percentage: number;
+  selectionConfigured: boolean;
+  unselectedBehavior: "legacy-proxy";
+}
+
+interface PluginUserWriteRolloutDecision {
+  selected: boolean;
+  mode: "canary" | "percentage" | "full";
+  route: string;
+  actorSubject: string | null;
+  targetSubject: string | null;
+  reason: string;
+  matchedToken?: string | null;
+  bucket?: number | null;
+  percentage?: number;
+}
+
+function pluginUserWriteRolloutReadiness(iam: ReturnType<typeof loadConfig>["iam"]): PluginUserWriteRolloutReadiness {
+  const allowlistCount = splitCsv(iam.pluginUserWriteRolloutAllowlist).length;
+  const percentage = safeRolloutPercentage(iam.pluginUserWriteRolloutPercentage);
+  const selectionConfigured =
+    iam.pluginUserWriteRolloutMode === "full" ||
+    (iam.pluginUserWriteRolloutMode === "canary" && allowlistCount > 0) ||
+    (iam.pluginUserWriteRolloutMode === "percentage" && percentage > 0);
+
+  return {
+    mode: iam.pluginUserWriteRolloutMode,
+    allowlistConfigured: allowlistCount > 0,
+    allowlistCount,
+    percentage,
+    selectionConfigured,
+    unselectedBehavior: "legacy-proxy"
   };
 }
 
@@ -551,6 +692,75 @@ function sourceOfTruthForMode(mode: string, dualWriteExecutable = false): string
   }
 
   return "unsupported";
+}
+
+function pluginUserWriteActorTokens(actorSubject: string | null, claims: VerifiedAccessToken | null): string[] {
+  const tokens = new Set<string>();
+  if (actorSubject) {
+    tokens.add(actorSubject);
+  }
+  if (claims) {
+    tokens.add(String(claims.uid));
+    tokens.add(`uid:${claims.uid}`);
+    tokens.add(`subject:${claims.uid}`);
+    tokens.add(`legacy-user:${claims.uid}`);
+    if (claims.username) {
+      tokens.add(claims.username);
+      tokens.add(`username:${claims.username}`);
+    }
+  }
+
+  return [...tokens];
+}
+
+function pluginUserWriteTargetTokens(targetSubject: string | null): string[] {
+  if (!targetSubject) {
+    return [];
+  }
+
+  return [targetSubject, `target:${targetSubject}`];
+}
+
+function normalizeRolloutToken(value: string | null | undefined): string {
+  return value?.trim().toLowerCase() ?? "";
+}
+
+function splitCsv(value: string | undefined): string[] {
+  return (value ?? "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function safeRolloutPercentage(value: number | undefined): number {
+  const numeric = Number(value ?? 0);
+  if (!Number.isFinite(numeric)) {
+    return 0;
+  }
+
+  return Math.max(0, Math.min(100, numeric));
+}
+
+function rolloutBucketSubject(
+  claims: VerifiedAccessToken | null,
+  actorSubject: string | null,
+  targetSubject: string | null
+): string | null {
+  if (claims) {
+    return `uid:${claims.uid}`;
+  }
+
+  return actorSubject ?? targetSubject;
+}
+
+function rolloutBucket(subject: string): number {
+  const hash = createHash("sha256").update(subject).digest("hex").slice(0, 8);
+  return Number.parseInt(hash, 16) % 100;
+}
+
+function bearerToken(authorization: string | null): string | null {
+  const [scheme, token] = authorization?.split(/\s+/, 2) ?? [];
+  return scheme?.toLowerCase() === "bearer" && token ? token : null;
 }
 
 export interface PluginUserWriteRequest {
