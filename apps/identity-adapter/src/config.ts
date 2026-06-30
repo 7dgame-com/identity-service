@@ -93,6 +93,9 @@ export const configSchema = z.object({
     pluginUserWriteMode: z.enum(["disabled", "legacy-proxy", "dual-write", "identity-native"]).default("disabled"),
     pluginUserWriteShadowMode: z.enum(["off", "plan", "ledger-only"]).default("off"),
     pluginUserWriteDualWriteExecutionEnabled: boolFromEnv.default(false),
+    pluginUserWriteRolloutMode: z.enum(["canary", "percentage", "full"]).default("canary"),
+    pluginUserWriteRolloutAllowlist: z.string().default(""),
+    pluginUserWriteRolloutPercentage: numberFromEnv.default(0),
     pluginUserWriteLegacyApiBaseUrl: optionalStringFromEnv,
     pluginUserWriteTimeoutMs: numberFromEnv.default(1500)
   }),
@@ -266,6 +269,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
       pluginUserWriteMode: env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE,
       pluginUserWriteShadowMode: env.IDENTITY_IAM_PLUGIN_USER_WRITE_SHADOW_MODE,
       pluginUserWriteDualWriteExecutionEnabled: env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED,
+      pluginUserWriteRolloutMode: env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_MODE,
+      pluginUserWriteRolloutAllowlist: env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_ALLOWLIST,
+      pluginUserWriteRolloutPercentage: env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_PERCENTAGE,
       pluginUserWriteLegacyApiBaseUrl:
         env.IDENTITY_IAM_PLUGIN_USER_WRITE_LEGACY_API_BASE_URL ?? env.IDENTITY_ACCOUNT_LIFECYCLE_LEGACY_API_BASE_URL,
       pluginUserWriteTimeoutMs:
