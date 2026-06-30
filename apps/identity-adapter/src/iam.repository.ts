@@ -247,6 +247,8 @@ export class IamRepository implements OnModuleDestroy {
     if (status) {
       where.push("status = ?");
       params.push(status);
+    } else {
+      where.push("status = 'active'");
     }
 
     const whereSql = `WHERE ${where.join(" AND ")}`;
@@ -366,11 +368,20 @@ export class IamRepository implements OnModuleDestroy {
        VALUES (?, ?, ?, ?, ?, 'legacy-shadow', ?)
        ON DUPLICATE KEY UPDATE
          legacy_user_id = VALUES(legacy_user_id),
-         username = VALUES(username),
-         email = VALUES(email),
+         username = CASE
+           WHEN VALUES(status) = 'inactive' AND VALUES(username) IS NULL THEN username
+           ELSE VALUES(username)
+         END,
+         email = CASE
+           WHEN VALUES(status) = 'inactive' AND VALUES(email) IS NULL THEN email
+           ELSE VALUES(email)
+         END,
          status = VALUES(status),
          source = VALUES(source),
-         metadata = VALUES(metadata)`,
+         metadata = CASE
+           WHEN VALUES(status) = 'inactive' AND VALUES(username) IS NULL AND VALUES(email) IS NULL THEN metadata
+           ELSE VALUES(metadata)
+         END`,
       [
         input.identityUserId,
         input.legacyUserId,
