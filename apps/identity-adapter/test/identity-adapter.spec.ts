@@ -458,6 +458,9 @@ class FakeIamRepository {
       if (input.status !== undefined && (input.status === 10 ? "active" : "inactive") !== user.status) {
         return false;
       }
+      if (input.status === undefined && user.status !== "active") {
+        return false;
+      }
       return user.legacyUserId !== null;
     });
 
@@ -506,16 +509,18 @@ class FakeIamRepository {
       throw new Error("InjectedIdentityShadowFailure");
     }
     this.identityShadowWrites.push(input);
+    const existing = this.identityUsers.get(input.legacyUserId);
+    const preservingDeleteTombstone = input.status === "inactive" && input.username === null && input.email === null;
     this.identityUsers.set(input.legacyUserId, {
       id: input.identityUserId,
       legacyUserId: input.legacyUserId,
       keycloakSubject: null,
-      username: input.username,
-      email: input.email,
+      username: preservingDeleteTombstone ? (existing?.username ?? input.username) : input.username,
+      email: preservingDeleteTombstone ? (existing?.email ?? input.email) : input.email,
       status: input.status,
       source: "legacy-shadow",
-      metadata: input.metadata,
-      createdAt: "2026-06-10T00:00:00.000Z",
+      metadata: preservingDeleteTombstone ? (existing?.metadata ?? input.metadata) : input.metadata,
+      createdAt: existing?.createdAt ?? "2026-06-10T00:00:00.000Z",
       updatedAt: "2026-06-10T00:00:00.000Z"
     });
     const current = this.subjectMaps.get(input.identityUserId) ?? [];
@@ -3245,6 +3250,71 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
       })
     ]);
     expect(JSON.stringify(operation)).not.toContain("Secret123!");
+  });
+
+  it("does not blank identity shadow user fields or list tombstones after dual-write delete", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_MODE = "full";
+    const operations = new FakePluginUserWriteOperationRepository();
+    const iamRepository = new FakeIamRepository();
+    app = await createLifecycleTestApp(operations, iamRepository);
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ code: 0, data: { id: 42, username: "stage53-user", email: "stage53@example.test" } }), {
+          status: 201,
+          headers: { "Content-Type": "application/json" }
+        })
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ code: 0, message: "删除成功" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        })
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/create-user")
+      .send({ username: "stage53-user", email: "stage53@example.test", password: "Secret123!" })
+      .expect(201);
+
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/delete-user")
+      .send({ id: 42 })
+      .expect(200);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(iamRepository.identityShadowWrites).toEqual([
+      expect.objectContaining({
+        legacyUserId: 42,
+        username: "stage53-user",
+        email: "stage53@example.test",
+        status: "active"
+      }),
+      expect.objectContaining({
+        legacyUserId: 42,
+        username: null,
+        email: null,
+        status: "inactive"
+      })
+    ]);
+    expect(iamRepository.identityUsers.get(42)).toMatchObject({
+      legacyUserId: 42,
+      username: "stage53-user",
+      email: "stage53@example.test",
+      status: "inactive"
+    });
+
+    await expect(iamRepository.listManagedUsers({ page: 1, pageSize: 20 })).resolves.toMatchObject({
+      users: expect.not.arrayContaining([expect.objectContaining({ legacyUserId: 42 })])
+    });
+    await expect(iamRepository.listManagedUsers({ page: 1, pageSize: 20, status: 0 })).resolves.toMatchObject({
+      users: expect.arrayContaining([expect.objectContaining({ legacyUserId: 42, username: "stage53-user" })])
+    });
+
+    expect(JSON.stringify(operations.inputs)).not.toContain("Secret123!");
   });
 
   it("records compensation when identity shadow write fails after legacy succeeds", async () => {
