@@ -8,6 +8,8 @@ import { loadConfig } from "./config.js";
 
 export type AccountLifecycleScope = "register" | "password" | "email" | "invitation";
 
+const LEGACY_REGISTER_PROXY_ONLY_PATHS = new Set(["/v1/wechat/qrcode", "/v1/wechat/refresh"]);
+
 export interface AccountLifecycleProxyResponse {
   status: number;
   body: unknown;
@@ -73,6 +75,10 @@ export class AccountLifecycleService {
 
     if (accountLifecycle.mode === "native") {
       if (scope === "register") {
+        if (LEGACY_REGISTER_PROXY_ONLY_PATHS.has(path) && accountLifecycle.legacyApiBaseUrl) {
+          return this.forwardToLegacy(request, path);
+        }
+
         return this.accountRegistration.register(path, request.body, requestContext(request));
       }
       if (scope === "password" && path === "/v1/password/change") {

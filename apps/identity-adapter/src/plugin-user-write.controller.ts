@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Req, Res } from "@nestjs/common";
+import { Controller, Get, Post, Query, Req, Res } from "@nestjs/common";
 import { PluginUserWriteService } from "./plugin-user-write.service.js";
 
 @Controller()
@@ -12,6 +12,26 @@ export class PluginUserWriteController {
       service: "identity-adapter",
       capability: "plugin-user-write",
       data: this.pluginUserWrite.readiness()
+    };
+  }
+
+  @Get("internal/plugin-user-write/operations/summary")
+  async operationLedgerSummary(@Query("sinceMinutes") sinceMinutes: string | undefined) {
+    return {
+      status: "ok",
+      service: "identity-adapter",
+      capability: "plugin-user-write-operation-ledger",
+      data: await this.pluginUserWrite.operationLedgerSummary({ sinceMinutes: Number(sinceMinutes) })
+    };
+  }
+
+  @Get("internal/plugin-user-write/operations/recent")
+  async operationLedgerRecent(@Query("sinceMinutes") sinceMinutes: string | undefined, @Query("limit") limit: string | undefined) {
+    return {
+      status: "ok",
+      service: "identity-adapter",
+      capability: "plugin-user-write-operation-ledger",
+      data: await this.pluginUserWrite.operationLedgerRecent({ sinceMinutes: Number(sinceMinutes), limit: Number(limit) })
     };
   }
 
@@ -50,7 +70,7 @@ export class PluginUserWriteController {
   ): Promise<unknown> {
     const upstream = await this.pluginUserWrite.proxy(request, path);
     response.status(upstream.status);
-    response.setHeader("X-Identity-Plugin-User-Write", "legacy-proxy");
+    response.setHeader("X-Identity-Plugin-User-Write", upstream.mode);
 
     return upstream.body;
   }
