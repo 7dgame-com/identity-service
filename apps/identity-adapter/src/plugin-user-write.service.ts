@@ -1,15 +1,22 @@
 import { Injectable, NotFoundException, ServiceUnavailableException } from "@nestjs/common";
 import { loadConfig } from "./config.js";
 import { IamRepository } from "./iam.repository.js";
+import { planPluginUserIdentityShadow } from "./plugin-user-write-identity-shadow.js";
 import { PluginUserWriteOperationRepository } from "./plugin-user-write-operation.repository.js";
-import { PluginUserWriteShadowService } from "./plugin-user-write-shadow.service.js";
+import {
+  pluginUserWriteCompensationMetadata,
+  pluginUserWriteReplayResponseFromOperation,
+  pluginUserWriteResponseReplayMetadata
+} from "./plugin-user-write-operation.repository.js";
+import { planShadowOperation, PluginUserWriteShadowService } from "./plugin-user-write-shadow.service.js";
 
 export interface PluginUserWriteProxyResponse {
   status: number;
   body: unknown;
+  mode: "legacy-proxy" | "dual-write";
 }
 
-const PLUGIN_USER_WRITE_EXECUTABLE_MODES = ["disabled", "legacy-proxy"] as const;
+const PLUGIN_USER_WRITE_EXECUTABLE_MODES = ["disabled", "legacy-proxy", "dual-write"] as const;
 const PLUGIN_USER_WRITE_ROUTES = [
   "create-user",
   "update-user",
@@ -32,13 +39,8 @@ const REQUIRED_BEFORE_IDENTITY_NATIVE = [
   "organization-owner-closed-or-retained",
   "legacy-proxy-rollback-window"
 ] as const;
-const DUAL_WRITE_EXECUTION_BLOCKERS = [
-  "idempotent-response-replay",
-  "identity-write-executor",
-  "compensation-runner",
-  "develop-ledger-only-closeout",
-  "develop-dual-write-apply-closeout"
-] as const;
+const DUAL_WRITE_EXECUTION_BLOCKERS: string[] = [];
+const DUAL_WRITE_RUNTIME_CAPABILITIES = ["idempotent-response-replay", "identity-write-executor", "compensation-runner"] as const;
 const IDENTITY_NATIVE_EXECUTION_BLOCKERS = [
   "production-dual-write-observation-closeout",
   "profile-owner-closeout",
@@ -70,9 +72,11 @@ export class PluginUserWriteService {
       executionFlagEnabled: iam.pluginUserWriteDualWriteExecutionEnabled
     });
     const identityNativeGate = identityNativeGateForReadiness({
-      dualWriteSupported: dualWriteGate.executable,
+      dualWriteSupported: dualWriteGate.executable && dualWriteGate.productionCanaryReady,
       identityRepositoryConfigured
     });
+    const blockedReasons =
+      iam.pluginUserWriteMode === "dual-write" && dualWriteGate.executable ? [] : blockedReasonsForMode(iam.pluginUserWriteMode);
 
     return {
       enabled: iam.pluginUserWriteMode !== "disabled",
@@ -88,14 +92,14 @@ export class PluginUserWriteService {
       compensationRecordsRequired: true,
       shadow: this.shadow.readiness(),
       allowedExecutableModes: [...PLUGIN_USER_WRITE_EXECUTABLE_MODES],
-      unsupportedModeBlocked,
-      blockedReasons: blockedReasonsForMode(iam.pluginUserWriteMode),
-      dualWriteSupported: false,
+      unsupportedModeBlocked: unsupportedModeBlocked && !dualWriteGate.executable,
+      blockedReasons,
+      dualWriteSupported: dualWriteGate.executable,
       identityNativeSupported: false,
       dualWriteGate,
       identityNativeGate,
       nextRequiredSpec: "identity-plugin-user-native-write",
-      sourceOfTruth: sourceOfTruthForMode(iam.pluginUserWriteMode),
+      sourceOfTruth: sourceOfTruthForMode(iam.pluginUserWriteMode, dualWriteGate.executable),
       routes: [...PLUGIN_USER_WRITE_ROUTES],
       requiredBeforeDualWrite: [...REQUIRED_BEFORE_DUAL_WRITE],
       requiredBeforeIdentityNative: [...REQUIRED_BEFORE_IDENTITY_NATIVE]
@@ -149,13 +153,234 @@ export class PluginUserWriteService {
       });
     }
 
-    if (iam.pluginUserWriteMode !== "legacy-proxy") {
-      throw new NotFoundException({
-        code: "PLUGIN_USER_WRITE_UNSUPPORTED_MODE",
-        message: `Plugin user write mode ${iam.pluginUserWriteMode} is not executable yet.`
+    if (iam.pluginUserWriteMode === "legacy-proxy") {
+      return this.legacyProxy(request, path, true);
+    }
+
+    if (iam.pluginUserWriteMode === "dual-write") {
+      const dualWriteGate = dualWriteGateForReadiness({
+        legacyProxyConfigured: Boolean(iam.pluginUserWriteLegacyApiBaseUrl),
+        operationLedgerConfigured: this.operations.isConfigured(),
+        identityRepositoryConfigured: this.iamRepository.isConfigured(),
+        executionFlagEnabled: iam.pluginUserWriteDualWriteExecutionEnabled
+      });
+      if (!dualWriteGate.executable) {
+        throw new NotFoundException({
+          code: "PLUGIN_USER_WRITE_UNSUPPORTED_MODE",
+          message: "Plugin user write dual-write mode is not executable yet.",
+          missingCapabilities: dualWriteGate.missingCapabilities
+        });
+      }
+
+      return this.dualWrite(request, path);
+    }
+
+    throw new NotFoundException({
+      code: "PLUGIN_USER_WRITE_UNSUPPORTED_MODE",
+      message: `Plugin user write mode ${iam.pluginUserWriteMode} is not executable yet.`
+    });
+  }
+
+  private async legacyProxy(request: PluginUserWriteRequest, path: string, observeShadow: boolean): Promise<PluginUserWriteProxyResponse> {
+    const upstream = await this.callLegacy(request, path);
+    const body = await parseUpstreamBody(upstream);
+
+    if (observeShadow) {
+      await this.shadow.observe({
+        method: request.method,
+        path,
+        headers: request.headers,
+        body: request.body,
+        legacyStatus: upstream.status
       });
     }
 
+    return {
+      status: upstream.status,
+      body,
+      mode: "legacy-proxy"
+    };
+  }
+
+  private async dualWrite(request: PluginUserWriteRequest, path: string): Promise<PluginUserWriteProxyResponse> {
+    const plan = planShadowOperation({
+      method: request.method,
+      path,
+      headers: request.headers,
+      body: request.body,
+      legacyStatus: 0
+    });
+    const begin = await this.operations.begin({
+      operationKey: plan.operationKey,
+      idempotencyKey: plan.operationKey,
+      route: plan.route,
+      mode: "dual-write",
+      actorSubject: plan.actorSubject,
+      targetSubject: plan.targetSubject,
+      legacyUserId: plan.legacyUserId,
+      metadata: {
+        route: plan.route,
+        method: request.method.toUpperCase(),
+        targetSubject: plan.targetSubject,
+        redactedBody: plan.metadata.redactedBody
+      }
+    });
+
+    if (begin.duplicate) {
+      const existing = await this.operations.findByOperationKey(plan.operationKey);
+      const replay = existing ? pluginUserWriteReplayResponseFromOperation(existing) : null;
+      if (replay) {
+        return {
+          ...replay,
+          mode: "dual-write"
+        };
+      }
+
+      throw new ServiceUnavailableException({
+        code: "PLUGIN_USER_WRITE_REPLAY_UNAVAILABLE",
+        message: "Plugin user write operation is already recorded but has no completed replay response."
+      });
+    }
+
+    let legacyResponse: PluginUserWriteProxyResponse;
+    try {
+      legacyResponse = await this.legacyProxy(request, path, false);
+    } catch (error) {
+      await this.operations.update({
+        operationKey: plan.operationKey,
+        status: "failed",
+        legacyStatus: "unavailable",
+        identityStatus: "skipped",
+        compensationStatus: "none",
+        errorCode: error instanceof Error ? error.name : "PluginUserWriteLegacyError",
+        metadata: {
+          phase: "legacy",
+          route: plan.route
+        }
+      });
+      throw error;
+    }
+
+    const responseReplay = pluginUserWriteResponseReplayMetadata({
+      status: legacyResponse.status,
+      body: legacyResponse.body
+    });
+    if (legacyResponse.status < 200 || legacyResponse.status >= 300) {
+      await this.operations.update({
+        operationKey: plan.operationKey,
+        status: "failed",
+        legacyStatus: String(legacyResponse.status),
+        identityStatus: "skipped",
+        compensationStatus: "none",
+        errorCode: "LegacyRejected",
+        metadata: responseReplay
+      });
+      return {
+        ...legacyResponse,
+        mode: "dual-write"
+      };
+    }
+
+    try {
+      const identityPlan = planPluginUserIdentityShadow({
+        route: plan.route,
+        requestBody: request.body,
+        legacyStatus: legacyResponse.status,
+        legacyBody: legacyResponse.body
+      });
+      if (identityPlan.writes.length === 0 && identityPlan.skippedReason !== "role-permission-owner-retained") {
+        await this.operations.update({
+          operationKey: plan.operationKey,
+          status: "legacy_completed",
+          legacyStatus: String(legacyResponse.status),
+          identityStatus: `skipped:${identityPlan.skippedReason ?? "identity-shadow-plan-empty"}`,
+          compensationStatus: "required",
+          errorCode: "IdentityShadowPlanSkipped",
+          metadata: {
+            ...responseReplay,
+            ...pluginUserWriteCompensationMetadata({
+              phase: "identity",
+              reason: identityPlan.skippedReason ?? "identity-shadow-plan-empty",
+              errorCode: "IdentityShadowPlanSkipped",
+              legacyStatus: legacyResponse.status,
+              identityStatus: "skipped",
+              detail: {
+                route: plan.route,
+                targetSubject: plan.targetSubject,
+                requestBody: request.body
+              }
+            })
+          }
+        });
+        return {
+          ...legacyResponse,
+          mode: "dual-write"
+        };
+      }
+
+      for (const write of identityPlan.writes) {
+        await this.iamRepository.upsertIdentityUserShadow(write);
+        await this.iamRepository.upsertPluginSubjectMap({
+          identityUserId: write.identityUserId,
+          legacyUserId: write.legacyUserId,
+          metadata: {
+            source: "plugin-user-dual-write",
+            route: plan.route
+          }
+        });
+      }
+
+      await this.operations.update({
+        operationKey: plan.operationKey,
+        status: "completed",
+        legacyStatus: String(legacyResponse.status),
+        identityStatus: identityPlan.skippedReason ? `skipped:${identityPlan.skippedReason}` : "completed",
+        compensationStatus: "none",
+        metadata: {
+          ...responseReplay,
+          identityShadow: {
+            writeCount: identityPlan.writes.length,
+            skippedReason: identityPlan.skippedReason ?? null
+          }
+        }
+      });
+      return {
+        ...legacyResponse,
+        mode: "dual-write"
+      };
+    } catch (error) {
+      await this.operations.update({
+        operationKey: plan.operationKey,
+        status: "legacy_completed",
+        legacyStatus: String(legacyResponse.status),
+        identityStatus: "failed",
+        compensationStatus: "required",
+        errorCode: error instanceof Error ? error.name : "PluginUserWriteIdentityError",
+        metadata: {
+          ...responseReplay,
+          ...pluginUserWriteCompensationMetadata({
+            phase: "identity",
+            reason: "identity-shadow-write-failed",
+            errorCode: error instanceof Error ? error.name : "PluginUserWriteIdentityError",
+            legacyStatus: legacyResponse.status,
+            identityStatus: "failed",
+            detail: {
+              route: plan.route,
+              targetSubject: plan.targetSubject,
+              requestBody: request.body
+            }
+          })
+        }
+      });
+      return {
+        ...legacyResponse,
+        mode: "dual-write"
+      };
+    }
+  }
+
+  private async callLegacy(request: PluginUserWriteRequest, path: string): Promise<Response> {
+    const { iam } = this.config;
     if (!iam.pluginUserWriteLegacyApiBaseUrl) {
       throw new ServiceUnavailableException({
         code: "PLUGIN_USER_WRITE_LEGACY_API_NOT_CONFIGURED",
@@ -196,7 +421,7 @@ export class PluginUserWriteService {
 
     let upstream: Response;
     try {
-      upstream = await fetch(url, init);
+      return await fetch(url, init);
     } catch (error) {
       throw new ServiceUnavailableException({
         code: "PLUGIN_USER_WRITE_LEGACY_API_UNAVAILABLE",
@@ -204,20 +429,6 @@ export class PluginUserWriteService {
         detail: error instanceof Error ? error.message : String(error)
       });
     }
-
-    const body = await parseUpstreamBody(upstream);
-    await this.shadow.observe({
-      method: request.method,
-      path,
-      headers: request.headers,
-      body: request.body,
-      legacyStatus: upstream.status
-    });
-
-    return {
-      status: upstream.status,
-      body
-    };
   }
 }
 
@@ -259,11 +470,14 @@ function dualWriteGateForReadiness(input: {
     missingCapabilities.unshift("identity-repository");
   }
 
+  const executable = missingCapabilities.length === 0;
+
   return {
-    executable: false,
+    executable,
+    productionCanaryReady: false,
     sourceOfTruthUntilCloseout: "legacy",
-    supportedRoutes: [],
-    blockedRoutes: [...PLUGIN_USER_WRITE_ROUTES],
+    supportedRoutes: executable ? [...PLUGIN_USER_WRITE_ROUTES] : [],
+    blockedRoutes: executable ? [] : [...PLUGIN_USER_WRITE_ROUTES],
     routeOwners: {
       "create-user": "dual-write-candidate",
       "update-user": "dual-write-candidate",
@@ -277,6 +491,8 @@ function dualWriteGateForReadiness(input: {
       identityRepository: input.identityRepositoryConfigured,
       executionFlag: input.executionFlagEnabled
     },
+    runtimeCapabilities: [...DUAL_WRITE_RUNTIME_CAPABILITIES],
+    productionCanaryBlockers: ["develop-dual-write-apply-closeout"],
     missingCapabilities
   };
 }
@@ -321,9 +537,13 @@ function blockedReasonsForMode(mode: string): string[] {
   return [];
 }
 
-function sourceOfTruthForMode(mode: string): string {
+function sourceOfTruthForMode(mode: string, dualWriteExecutable = false): string {
   if (mode === "legacy-proxy") {
     return "legacy";
+  }
+
+  if (mode === "dual-write") {
+    return dualWriteExecutable ? "legacy-during-dual-write" : "unsupported";
   }
 
   if (mode === "disabled") {

@@ -70,7 +70,7 @@ export class PluginUserWriteController {
   ): Promise<unknown> {
     const upstream = await this.pluginUserWrite.proxy(request, path);
     response.status(upstream.status);
-    response.setHeader("X-Identity-Plugin-User-Write", "legacy-proxy");
+    response.setHeader("X-Identity-Plugin-User-Write", upstream.mode);
 
     return upstream.body;
   }

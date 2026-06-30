@@ -34,6 +34,7 @@ import {
 import { PasswordResetChallengeError, PasswordResetChallengeRepository } from "../src/password-reset-challenge.repository.js";
 import {
   PluginUserWriteOperationInput,
+  PluginUserWriteOperationRecord,
   PluginUserWriteOperationRecentRow,
   PluginUserWriteOperationSummaryRow,
   PluginUserWriteOperationRepository,
@@ -214,6 +215,7 @@ class FakePluginUserWriteOperationRepository {
   readonly attempts: PluginUserWriteOperationInput[] = [];
   failNextBegin = false;
   private readonly seenOperationKeys = new Set<string>();
+  private readonly records = new Map<string, PluginUserWriteOperationRecord>();
 
   isConfigured() {
     return this.configured;
@@ -230,15 +232,59 @@ class FakePluginUserWriteOperationRepository {
     if (!duplicate) {
       this.seenOperationKeys.add(input.operationKey);
       this.inputs.push(input);
+      this.records.set(input.operationKey, {
+        operationKey: input.operationKey,
+        idempotencyKey: input.idempotencyKey,
+        route: input.route,
+        mode: input.mode,
+        actorSubject: input.actorSubject,
+        targetSubject: input.targetSubject,
+        legacyUserId: input.legacyUserId ?? null,
+        identityUserId: input.identityUserId ?? null,
+        status: "pending",
+        legacyStatus: null,
+        identityStatus: null,
+        compensationStatus: "none",
+        errorCode: null,
+        metadata: input.metadata ?? {}
+      });
     }
 
     return { duplicate };
   }
 
+  async findByOperationKey(operationKey: string) {
+    return this.records.get(operationKey) ?? null;
+  }
+
+  async update(input: {
+    operationKey: string;
+    status: PluginUserWriteOperationRecord["status"];
+    legacyStatus?: string | null;
+    identityStatus?: string | null;
+    compensationStatus?: PluginUserWriteOperationRecord["compensationStatus"];
+    errorCode?: string | null;
+    metadata?: Record<string, unknown> | null;
+  }) {
+    const current = this.records.get(input.operationKey);
+    if (!current) {
+      return;
+    }
+    this.records.set(input.operationKey, {
+      ...current,
+      status: input.status,
+      legacyStatus: input.legacyStatus ?? current.legacyStatus,
+      identityStatus: input.identityStatus ?? current.identityStatus,
+      compensationStatus: input.compensationStatus ?? current.compensationStatus,
+      errorCode: input.errorCode ?? null,
+      metadata: input.metadata ?? {}
+    });
+  }
+
   async summarizeRecent(_input: { sinceMinutes: number }): Promise<PluginUserWriteOperationSummaryRow[]> {
-    const counts = new Map<string, { input: PluginUserWriteOperationInput; total: number }>();
-    for (const input of this.inputs) {
-      const key = [input.route, input.mode, "pending", "none"].join("\u001f");
+    const counts = new Map<string, { input: PluginUserWriteOperationRecord; total: number }>();
+    for (const input of this.records.values()) {
+      const key = [input.route, input.mode, input.status, input.compensationStatus].join("\u001f");
       const current = counts.get(key);
       if (current) {
         current.total += 1;
@@ -250,8 +296,8 @@ class FakePluginUserWriteOperationRepository {
     return [...counts.values()].map(({ input, total }) => ({
       route: input.route,
       mode: input.mode,
-      status: "pending",
-      compensationStatus: "none",
+      status: input.status,
+      compensationStatus: input.compensationStatus,
       total,
       firstRequestedAt: "2026-06-30T00:00:00.000Z",
       lastRequestedAt: "2026-06-30T00:00:00.000Z"
@@ -259,11 +305,11 @@ class FakePluginUserWriteOperationRepository {
   }
 
   async listRecentSafe(input: { limit: number }): Promise<PluginUserWriteOperationRecentRow[]> {
-    return this.inputs.slice(-Math.max(1, input.limit)).reverse().map((operation) => ({
+    return [...this.records.values()].slice(-Math.max(1, input.limit)).reverse().map((operation) => ({
       route: operation.route,
       mode: operation.mode,
-      status: "pending",
-      compensationStatus: "none",
+      status: operation.status,
+      compensationStatus: operation.compensationStatus,
       operationKeyDigest: createHash("sha256").update(operation.operationKey).digest("hex").slice(0, 16),
       idempotencyKeyDigest: createHash("sha256").update(operation.idempotencyKey).digest("hex").slice(0, 16),
       legacyUserId: operation.legacyUserId ?? null,
@@ -276,6 +322,15 @@ class FakePluginUserWriteOperationRepository {
 class FakeIamRepository {
   schemaEnsureCount = 0;
   schemaTablesReady = true;
+  failNextUpsertIdentityUserShadow = false;
+  readonly identityShadowWrites: Array<{
+    identityUserId: string;
+    legacyUserId: number;
+    username: string | null;
+    email: string | null;
+    status: string;
+    metadata: Record<string, unknown>;
+  }> = [];
   readonly identityUsers = new Map<number, any>([
     [
       24,
@@ -446,6 +501,11 @@ class FakeIamRepository {
     status: string;
     metadata: Record<string, unknown>;
   }) {
+    if (this.failNextUpsertIdentityUserShadow) {
+      this.failNextUpsertIdentityUserShadow = false;
+      throw new Error("InjectedIdentityShadowFailure");
+    }
+    this.identityShadowWrites.push(input);
     this.identityUsers.set(input.legacyUserId, {
       id: input.identityUserId,
       legacyUserId: input.legacyUserId,
@@ -2885,7 +2945,7 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
           responseShapePreserved: true,
           legacyProxyRequired: true
         },
-        allowedExecutableModes: ["disabled", "legacy-proxy"],
+        allowedExecutableModes: ["disabled", "legacy-proxy", "dual-write"],
         unsupportedModeBlocked: false,
         dualWriteSupported: false,
         identityNativeSupported: false,
@@ -2990,17 +3050,25 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
       "change-role": "legacy-proxy-until-role-permission-closeout"
     });
     expect(readiness.body.data.dualWriteGate.missingCapabilities).toEqual(
+      expect.arrayContaining(["operator-dual-write-execution-flag"])
+    );
+    expect(readiness.body.data.dualWriteGate.missingCapabilities).not.toEqual(
       expect.arrayContaining([
-        "operator-dual-write-execution-flag",
         "idempotent-response-replay",
         "identity-write-executor",
         "compensation-runner",
-        "develop-ledger-only-closeout",
+        "operation-ledger",
+        "identity-repository",
+        "legacy-proxy-base-url",
         "develop-dual-write-apply-closeout"
       ])
     );
-    expect(readiness.body.data.dualWriteGate.missingCapabilities).not.toEqual(
-      expect.arrayContaining(["operation-ledger", "identity-repository", "legacy-proxy-base-url"])
+    expect(readiness.body.data.dualWriteGate.runtimeCapabilities).toEqual(
+      expect.arrayContaining(["idempotent-response-replay", "identity-write-executor", "compensation-runner"])
+    );
+    expect(readiness.body.data.dualWriteGate.productionCanaryReady).toBe(false);
+    expect(readiness.body.data.dualWriteGate.productionCanaryBlockers).toEqual(
+      expect.arrayContaining(["develop-dual-write-apply-closeout"])
     );
     expect(readiness.body.data.identityNativeGate.missingCapabilities).toEqual(
       expect.arrayContaining(["dual-write-execution", "production-dual-write-observation-closeout"])
@@ -3017,13 +3085,18 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
     expect(operations.inputs).toHaveLength(0);
   });
 
-  it("keeps dual-write blocked even when the operator execution flag is enabled before closeout", async () => {
+  it("executes default-closed dual-write when the operator flag and repositories are ready", async () => {
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
     const operations = new FakePluginUserWriteOperationRepository();
     const iamRepository = new FakeIamRepository();
     app = await createLifecycleTestApp(operations, iamRepository);
-    const fetchMock = vi.fn();
+    const fetchMock = vi.fn(async () => {
+      return new Response(JSON.stringify({ code: 0, data: { id: 42, username: "new-user", email: "new@example.com" } }), {
+        status: 201,
+        headers: { "Content-Type": "application/json" }
+      });
+    });
     vi.stubGlobal("fetch", fetchMock);
 
     const readiness = await request(app.getHttpServer())
@@ -3033,9 +3106,12 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
     expect(readiness.body.data).toMatchObject({
       mode: "dual-write",
       dualWriteExecutionEnabled: true,
-      dualWriteSupported: false,
+      dualWriteSupported: true,
+      sourceOfTruth: "legacy-during-dual-write",
+      unsupportedModeBlocked: false,
       dualWriteGate: {
-        executable: false,
+        executable: true,
+        productionCanaryReady: false,
         configured: {
           legacyProxy: true,
           operationLedger: true,
@@ -3044,20 +3120,126 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
         }
       }
     });
+    expect(readiness.body.data.blockedReasons).toEqual([]);
     expect(readiness.body.data.dualWriteGate.missingCapabilities).not.toEqual(
       expect.arrayContaining(["operator-dual-write-execution-flag"])
     );
-    expect(readiness.body.data.dualWriteGate.missingCapabilities).toEqual(
-      expect.arrayContaining(["identity-write-executor", "compensation-runner", "develop-dual-write-apply-closeout"])
+    expect(readiness.body.data.dualWriteGate.missingCapabilities).toEqual([]);
+    expect(readiness.body.data.dualWriteGate.productionCanaryBlockers).toEqual(
+      expect.arrayContaining(["develop-dual-write-apply-closeout"])
     );
+    expect(readiness.body.data.identityNativeGate.executable).toBe(false);
 
-    await request(app.getHttpServer())
+    const response = await request(app.getHttpServer())
       .post("/v1/plugin-user/create-user")
       .send({ username: "new-user", password: "Secret123!" })
-      .expect(404);
+      .expect(201);
 
-    expect(fetchMock).not.toHaveBeenCalled();
-    expect(operations.inputs).toHaveLength(0);
+    expect(response.headers["x-identity-plugin-user-write"]).toBe("dual-write");
+    expect(response.body).toEqual({ code: 0, data: { id: 42, username: "new-user", email: "new@example.com" } });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(operations.inputs).toHaveLength(1);
+    const operation = await operations.findByOperationKey(operations.inputs[0].operationKey);
+    expect(operation).toMatchObject({
+      route: "create-user",
+      mode: "dual-write",
+      status: "completed",
+      legacyStatus: "201",
+      identityStatus: "completed",
+      compensationStatus: "none"
+    });
+    expect(iamRepository.identityShadowWrites).toEqual([
+      expect.objectContaining({
+        identityUserId: "legacy:42",
+        legacyUserId: 42,
+        username: "new-user",
+        email: "new@example.com",
+        status: "active"
+      })
+    ]);
+    expect(JSON.stringify(operation)).not.toContain("Secret123!");
+  });
+
+  it("records compensation when identity shadow write fails after legacy succeeds", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    const operations = new FakePluginUserWriteOperationRepository();
+    const iamRepository = new FakeIamRepository();
+    iamRepository.failNextUpsertIdentityUserShadow = true;
+    app = await createLifecycleTestApp(operations, iamRepository);
+    const fetchMock = vi.fn(async () => {
+      return new Response(JSON.stringify({ code: 0, data: { id: 42, username: "new-user" } }), {
+        status: 201,
+        headers: { "Content-Type": "application/json" }
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await request(app.getHttpServer())
+      .post("/v1/plugin-user/create-user")
+      .set("Authorization", "Bearer operator-token")
+      .send({ username: "new-user", password: "Secret123!" })
+      .expect(201);
+
+    expect(response.headers["x-identity-plugin-user-write"]).toBe("dual-write");
+    expect(response.body).toEqual({ code: 0, data: { id: 42, username: "new-user" } });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(iamRepository.identityShadowWrites).toHaveLength(0);
+    const operation = await operations.findByOperationKey(operations.inputs[0].operationKey);
+    expect(operation).toMatchObject({
+      route: "create-user",
+      mode: "dual-write",
+      status: "legacy_completed",
+      legacyStatus: "201",
+      identityStatus: "failed",
+      compensationStatus: "required",
+      errorCode: "Error"
+    });
+    expect(operation?.metadata).toMatchObject({
+      compensation: {
+        required: true,
+        phase: "identity",
+        reason: "identity-shadow-write-failed",
+        errorCode: "Error",
+        legacyStatus: 201,
+        identityStatus: "failed"
+      }
+    });
+    expect(JSON.stringify(operation)).not.toContain("Secret123!");
+    expect(JSON.stringify(operation)).not.toContain("operator-token");
+  });
+
+  it("replays completed dual-write responses for duplicate requests without repeating legacy writes", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    const operations = new FakePluginUserWriteOperationRepository();
+    const iamRepository = new FakeIamRepository();
+    app = await createLifecycleTestApp(operations, iamRepository);
+    const fetchMock = vi.fn(async () => {
+      return new Response(JSON.stringify({ code: 0, data: { id: 42, username: "replay-user" } }), {
+        status: 201,
+        headers: { "Content-Type": "application/json" }
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    for (const _ of [0, 1]) {
+      const response = await request(app.getHttpServer())
+        .post("/v1/plugin-user/create-user")
+        .send({ username: "replay-user", password: "Secret123!" })
+        .expect(201);
+
+      expect(response.headers["x-identity-plugin-user-write"]).toBe("dual-write");
+      expect(response.body).toEqual({ code: 0, data: { id: 42, username: "replay-user" } });
+    }
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(operations.attempts).toHaveLength(2);
+    expect(operations.inputs).toHaveLength(1);
+    expect(iamRepository.identityShadowWrites).toHaveLength(1);
+    const operation = await operations.findByOperationKey(operations.inputs[0].operationKey);
+    expect(operation?.status).toBe("completed");
+    expect(JSON.stringify(operation)).not.toContain("Secret123!");
   });
 
   it("keeps change-role fail-closed in identity-native mode", async () => {
