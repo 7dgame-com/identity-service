@@ -1,7 +1,8 @@
-import { Controller, Get, Headers, HttpException, HttpStatus, Query, Res } from "@nestjs/common";
+import { Controller, Get, Headers, HttpException, HttpStatus, Param, Query, Res } from "@nestjs/common";
 import { loadConfig } from "./config.js";
 import { JwtIssuerService, VerifiedAccessToken } from "./jwt-issuer.service.js";
 import { LegacyIdentityReader, LegacyUserReadModel } from "./legacy-identity.reader.js";
+import { LoginAuditService } from "./login-audit.service.js";
 import { PluginUserPrimaryReadService, PluginUserReadSource } from "./plugin-user-primary-read.service.js";
 
 const ELEVATED_ROLES = new Set(["root", "admin", "manager"]);
@@ -17,7 +18,8 @@ export class PluginUserReadonlyController {
   constructor(
     private readonly legacyReader: LegacyIdentityReader,
     private readonly jwtIssuer: JwtIssuerService,
-    private readonly primaryRead: PluginUserPrimaryReadService
+    private readonly primaryRead: PluginUserPrimaryReadService,
+    private readonly loginAudit: LoginAuditService
   ) {}
 
   @Get("v1/plugin-user/users")
@@ -76,12 +78,59 @@ export class PluginUserReadonlyController {
     };
   }
 
+  @Get("v1/plugin-user/users/:legacyUserId/login-audit")
+  async userLoginAudit(@Headers("authorization") authorization: string | undefined, @Param("legacyUserId") legacyUserId: string) {
+    this.assertEnabled();
+    const claims = this.currentUser(authorization);
+    const parsedId = positiveInt(legacyUserId);
+    if (parsedId === null) {
+      throw new HttpException(
+        {
+          code: "INVALID_USER_ID",
+          message: "User id must be a positive integer."
+        },
+        HttpStatus.BAD_REQUEST
+      );
+    }
+
+    await this.assertCan(claims, "user-management.view-user");
+    const result = await this.primaryRead.getUserById(parsedId, claims);
+    if (!result.data) {
+      throw new HttpException(
+        {
+          code: 4004,
+          message: "用户不存在"
+        },
+        HttpStatus.NOT_FOUND
+      );
+    }
+
+    this.assertLoginAuditEnabled();
+
+    return {
+      code: 0,
+      data: await this.loginAudit.getUserAudit(parsedId)
+    };
+  }
+
   private assertEnabled(): void {
     if (!this.config.pluginUserReadonly.enabled) {
       throw new HttpException(
         {
           code: "PLUGIN_USER_READONLY_DISABLED",
           message: "Plugin user readonly compatibility endpoint is disabled."
+        },
+        HttpStatus.NOT_FOUND
+      );
+    }
+  }
+
+  private assertLoginAuditEnabled(): void {
+    if (!this.config.loginAudit.enabled) {
+      throw new HttpException(
+        {
+          code: "LOGIN_AUDIT_DISABLED",
+          message: "Login audit is disabled."
         },
         HttpStatus.NOT_FOUND
       );

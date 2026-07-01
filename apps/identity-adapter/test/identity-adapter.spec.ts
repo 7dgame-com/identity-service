@@ -4441,6 +4441,53 @@ describe("identity-adapter plugin user readonly compatibility API", () => {
     expect(response.headers["x-identity-user-source"]).toBe("legacy");
   });
 
+  it("returns login audit records for an authorized managed user", async () => {
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    process.env.IDENTITY_LOGIN_AUDIT_ENABLED = "true";
+    const loginAuditRepository = new FakeLoginAuditRepository();
+    app = await createPluginUserReadonlyTestApp(repository, undefined, loginAuditRepository);
+    const login = await loginAs(app, "guanfei");
+
+    const response = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users/24/login-audit")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(200);
+
+    expect(response.body).toMatchObject({
+      code: 0,
+      data: {
+        stats: {
+          legacyUserId: 24,
+          username: "guanfei",
+          loginCount: 1,
+          failedLoginCount: 0
+        },
+        recentEvents: [
+          {
+            eventType: "login",
+            success: true,
+            source: "identity-adapter"
+          }
+        ]
+      }
+    });
+  });
+
+  it("keeps login audit records unavailable when login audit is disabled", async () => {
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    app = await createPluginUserReadonlyTestApp(repository, undefined, new FakeLoginAuditRepository());
+    const login = await loginAs(app, "guanfei");
+
+    const response = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users/24/login-audit")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(404);
+
+    expect(response.body).toMatchObject({
+      code: "LOGIN_AUDIT_DISABLED"
+    });
+  });
+
   it("keeps shadow-compare non-user-facing and returns the legacy response", async () => {
     process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
     process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ENABLED = "true";
@@ -6213,7 +6260,8 @@ async function createLifecycleTestApp(
 
 async function createPluginUserReadonlyTestApp(
   repository: FakeIdentitySessionRepository,
-  iamRepository?: FakeIamRepository
+  iamRepository?: FakeIamRepository,
+  loginAuditRepository?: FakeLoginAuditRepository
 ): Promise<INestApplication> {
   let builder = Test.createTestingModule({
     imports: [AppModule]
@@ -6225,6 +6273,10 @@ async function createPluginUserReadonlyTestApp(
 
   if (iamRepository) {
     builder = builder.overrideProvider(IamRepository).useValue(iamRepository);
+  }
+
+  if (loginAuditRepository) {
+    builder = builder.overrideProvider(LoginAuditRepository).useValue(loginAuditRepository);
   }
 
   const moduleRef = await builder.compile();
