@@ -42,6 +42,9 @@ import { PasswordResetChallengeRepository } from "./password-reset-challenge.rep
 import { PluginUserPrimaryReadService } from "./plugin-user-primary-read.service.js";
 import { PluginUserWriteOperationRepository } from "./plugin-user-write-operation.repository.js";
 import { PluginUserReadonlyController } from "./plugin-user-readonly.controller.js";
+import { PluginUserTemporaryAuthorizationController } from "./plugin-user-temporary-authorization.controller.js";
+import { PluginUserTemporaryAuthorizationRepository } from "./plugin-user-temporary-authorization.repository.js";
+import { PluginUserTemporaryAuthorizationService } from "./plugin-user-temporary-authorization.service.js";
 import { PluginUserWriteController } from "./plugin-user-write.controller.js";
 import { PluginUserWriteShadowService } from "./plugin-user-write-shadow.service.js";
 import { PluginUserWriteService } from "./plugin-user-write.service.js";
@@ -62,6 +65,7 @@ import { UsageBillingService } from "./usage-billing.service.js";
     InternalAuthController,
     IamController,
     PluginUserReadonlyController,
+    PluginUserTemporaryAuthorizationController,
     PluginUserWriteController,
     UsageBillingController,
     OidcController
@@ -116,6 +120,8 @@ import { UsageBillingService } from "./usage-billing.service.js";
     UsageBillingRepository,
     UsageBillingService,
     PluginUserPrimaryReadService,
+    PluginUserTemporaryAuthorizationRepository,
+    PluginUserTemporaryAuthorizationService,
     PluginUserWriteOperationRepository,
     PluginUserWriteShadowService,
     PluginUserWriteService,
