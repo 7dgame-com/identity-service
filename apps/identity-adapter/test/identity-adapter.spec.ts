@@ -3415,6 +3415,138 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
     expect(JSON.stringify(operation)).not.toContain("Secret123!");
   });
 
+  it("resumes a ledger-only pending delete operation when dual-write needs to complete the identity shadow", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_MODE = "full";
+    const operations = new FakePluginUserWriteOperationRepository();
+    const iamRepository = new FakeIamRepository();
+    const requestBody = { id: 42 };
+    const operationKey = pluginUserWriteOperationKey({
+      route: "delete-user",
+      actorSubject: null,
+      targetSubject: "legacy-user:42",
+      requestFingerprint: pluginUserWriteRequestFingerprint("delete-user", requestBody)
+    });
+    await operations.begin({
+      operationKey,
+      idempotencyKey: operationKey,
+      route: "delete-user",
+      mode: "dual-write",
+      actorSubject: null,
+      targetSubject: "legacy-user:42",
+      legacyUserId: 42,
+      metadata: {
+        route: "delete-user",
+        method: "POST",
+        legacyStatus: 200,
+        targetSubject: "legacy-user:42",
+        redactedBody: requestBody
+      }
+    });
+    app = await createLifecycleTestApp(operations, iamRepository);
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    for (const _ of [0, 1]) {
+      const response = await request(app.getHttpServer())
+        .post("/v1/plugin-user/delete-user")
+        .send(requestBody)
+        .expect(200);
+
+      expect(response.headers["x-identity-plugin-user-write"]).toBe("dual-write");
+      expect(response.body).toEqual({ code: 0, data: { id: 42 }, message: "ok" });
+    }
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(operations.inputs).toHaveLength(1);
+    expect(operations.attempts).toHaveLength(3);
+    expect(iamRepository.identityShadowWrites).toEqual([
+      expect.objectContaining({
+        legacyUserId: 42,
+        status: "inactive"
+      })
+    ]);
+    const operation = await operations.findByOperationKey(operationKey);
+    expect(operation).toMatchObject({
+      route: "delete-user",
+      status: "completed",
+      legacyStatus: "200",
+      identityStatus: "completed",
+      compensationStatus: "none"
+    });
+  });
+
+  it("resumes a legacy-completed delete operation with replay metadata without repeating legacy writes", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_MODE = "full";
+    const operations = new FakePluginUserWriteOperationRepository();
+    const iamRepository = new FakeIamRepository();
+    const requestBody = { id: 42 };
+    const operationKey = pluginUserWriteOperationKey({
+      route: "delete-user",
+      actorSubject: null,
+      targetSubject: "legacy-user:42",
+      requestFingerprint: pluginUserWriteRequestFingerprint("delete-user", requestBody)
+    });
+    await operations.begin({
+      operationKey,
+      idempotencyKey: operationKey,
+      route: "delete-user",
+      mode: "dual-write",
+      actorSubject: null,
+      targetSubject: "legacy-user:42",
+      legacyUserId: 42,
+      metadata: {
+        route: "delete-user",
+        method: "POST",
+        targetSubject: "legacy-user:42",
+        redactedBody: requestBody
+      }
+    });
+    await operations.update({
+      operationKey,
+      status: "legacy_completed",
+      legacyStatus: "200",
+      identityStatus: "failed",
+      compensationStatus: "required",
+      errorCode: "IdentityShadowWriteFailed",
+      metadata: {
+        ...pluginUserWriteResponseReplayMetadata({
+          status: 200,
+          body: { code: 0, data: { id: 42 }, message: "删除成功" }
+        })
+      }
+    });
+    app = await createLifecycleTestApp(operations, iamRepository);
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await request(app.getHttpServer())
+      .post("/v1/plugin-user/delete-user")
+      .send(requestBody)
+      .expect(200);
+
+    expect(response.headers["x-identity-plugin-user-write"]).toBe("dual-write");
+    expect(response.body).toEqual({ code: 0, data: { id: 42 }, message: "删除成功" });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(iamRepository.identityShadowWrites).toEqual([
+      expect.objectContaining({
+        legacyUserId: 42,
+        status: "inactive"
+      })
+    ]);
+    const operation = await operations.findByOperationKey(operationKey);
+    expect(operation).toMatchObject({
+      route: "delete-user",
+      status: "completed",
+      legacyStatus: "200",
+      identityStatus: "completed",
+      compensationStatus: "none"
+    });
+  });
+
   it("keeps change-role fail-closed in identity-native mode", async () => {
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "identity-native";
     app = await createLifecycleTestApp();
