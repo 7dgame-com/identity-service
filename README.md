@@ -185,6 +185,39 @@ Rollback is config-only: set `IDENTITY_PLUGIN_USER_FALLBACK_DISABLE_MODE=off`
 or `IDENTITY_PLUGIN_USER_FALLBACK_CONTROL_ENABLED=false`, and keep
 `IDENTITY_PLUGIN_USER_PRIMARY_READ_FALLBACK_ENABLED=true`.
 
+## Plugin User Temporary Authorization
+
+Application-level temporary authorization is an internal-only safety valve for
+Stage 5.4 bucket-0 Route B canary windows. It is disabled by default and must
+not be exposed through public Traefik routes.
+
+```bash
+IDENTITY_PLUGIN_USER_TEMP_AUTH_ENABLED=false
+IDENTITY_PLUGIN_USER_TEMP_AUTH_ALLOWED_ROUTES=/v1/plugin-user/*
+IDENTITY_PLUGIN_USER_TEMP_AUTH_MAX_TTL_SECONDS=1800
+IDENTITY_PLUGIN_USER_TEMP_AUTH_INTERNAL_API_TOKEN=$IDENTITY_INTERNAL_API_TOKEN
+IDENTITY_PLUGIN_USER_TEMP_AUTH_SIGNING_SECRET=$IDENTITY_INTERNAL_API_TOKEN
+```
+
+Internal endpoints:
+
+- `GET /internal/plugin-user-temporary-authorization/readiness`
+- `POST /internal/plugin-user-temporary-authorization/grant`
+- `POST /internal/plugin-user-temporary-authorization/revoke`
+
+Grant/revoke rules:
+
+- Mutating calls require `X-Identity-Internal-Token`.
+- `grant` uses `LEGACY_WRITE_DB_*`, preflights DELETE privileges on
+  `auth_assignment` and `auth_item`, and can create an allowlisted route
+  permission plus an optional `admin` or `manager` assignment.
+- `grant` returns a signed `grantToken`; store it only in the private execution
+  context for the current window.
+- `revoke` requires the same `grantToken` and only removes assignments/items
+  that were created by that grant. Pre-existing roles and route permissions are
+  preserved.
+- Global wildcard routes such as `*` and `/*` are always rejected.
+
 ## Phase 5 Account Lifecycle
 
 Account lifecycle migration is optional and disabled by default. Phase 5 starts
