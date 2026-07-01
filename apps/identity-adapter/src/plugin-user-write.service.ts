@@ -6,6 +6,7 @@ import { JwtIssuerService, VerifiedAccessToken } from "./jwt-issuer.service.js";
 import { planPluginUserIdentityShadow } from "./plugin-user-write-identity-shadow.js";
 import { PluginUserWriteOperationRepository } from "./plugin-user-write-operation.repository.js";
 import {
+  PluginUserWriteOperationRecord,
   pluginUserWriteCompensationMetadata,
   pluginUserWriteReplayResponseFromOperation,
   pluginUserWriteResponseReplayMetadata
@@ -327,6 +328,7 @@ export class PluginUserWriteService {
       }
     });
 
+    let legacyResponse: PluginUserWriteProxyResponse | null = null;
     if (begin.duplicate) {
       const existing = await this.operations.findByOperationKey(plan.operationKey);
       const replay = existing ? pluginUserWriteReplayResponseFromOperation(existing) : null;
@@ -337,29 +339,33 @@ export class PluginUserWriteService {
         };
       }
 
-      throw new ServiceUnavailableException({
-        code: "PLUGIN_USER_WRITE_REPLAY_UNAVAILABLE",
-        message: "Plugin user write operation is already recorded but has no completed replay response."
-      });
+      legacyResponse = deleteReplayFromIncompleteOperation(existing, plan);
+      if (!legacyResponse) {
+        throw new ServiceUnavailableException({
+          code: "PLUGIN_USER_WRITE_REPLAY_UNAVAILABLE",
+          message: "Plugin user write operation is already recorded but has no completed replay response."
+        });
+      }
     }
 
-    let legacyResponse: PluginUserWriteProxyResponse;
-    try {
-      legacyResponse = await this.legacyProxy(request, path, false);
-    } catch (error) {
-      await this.operations.update({
-        operationKey: plan.operationKey,
-        status: "failed",
-        legacyStatus: "unavailable",
-        identityStatus: "skipped",
-        compensationStatus: "none",
-        errorCode: error instanceof Error ? error.name : "PluginUserWriteLegacyError",
-        metadata: {
-          phase: "legacy",
-          route: plan.route
-        }
-      });
-      throw error;
+    if (!legacyResponse) {
+      try {
+        legacyResponse = await this.legacyProxy(request, path, false);
+      } catch (error) {
+        await this.operations.update({
+          operationKey: plan.operationKey,
+          status: "failed",
+          legacyStatus: "unavailable",
+          identityStatus: "skipped",
+          compensationStatus: "none",
+          errorCode: error instanceof Error ? error.name : "PluginUserWriteLegacyError",
+          metadata: {
+            phase: "legacy",
+            route: plan.route
+          }
+        });
+        throw error;
+      }
     }
 
     const responseReplay = pluginUserWriteResponseReplayMetadata({
@@ -777,6 +783,69 @@ function firstHeader(value: string | string[] | undefined): string | null {
   }
 
   return value ?? null;
+}
+
+function deleteReplayFromIncompleteOperation(
+  operation: PluginUserWriteOperationRecord | null,
+  plan: ReturnType<typeof planShadowOperation>
+): PluginUserWriteProxyResponse | null {
+  if (
+    !operation ||
+    !["pending", "legacy_completed", "identity_completed"].includes(operation.status) ||
+    operation.mode !== "dual-write" ||
+    operation.route !== "delete-user" ||
+    plan.route !== "delete-user" ||
+    operation.actorSubject !== plan.actorSubject ||
+    operation.targetSubject !== plan.targetSubject ||
+    operation.legacyUserId !== plan.legacyUserId ||
+    plan.legacyUserId === null
+  ) {
+    return null;
+  }
+
+  const metadata = recordValue(operation.metadata);
+  const responseReplay = recordValue(metadata.responseReplay);
+  const responseReplayStatus = Number(responseReplay.httpStatus);
+  if (
+    Number.isInteger(responseReplayStatus) &&
+    responseReplayStatus >= 200 &&
+    responseReplayStatus < 300 &&
+    "body" in responseReplay
+  ) {
+    return {
+      status: responseReplayStatus,
+      body: responseReplay.body,
+      mode: "dual-write"
+    };
+  }
+
+  const method = typeof metadata.method === "string" ? metadata.method.toUpperCase() : null;
+  const legacyStatus = Number(metadata.legacyStatus);
+  if (
+    metadata.route !== plan.route ||
+    method !== plan.metadata.method ||
+    !Number.isInteger(legacyStatus) ||
+    legacyStatus < 200 ||
+    legacyStatus >= 300
+  ) {
+    return null;
+  }
+
+  return {
+    status: legacyStatus,
+    body: {
+      code: 0,
+      data: {
+        id: plan.legacyUserId
+      },
+      message: "ok"
+    },
+    mode: "dual-write"
+  };
+}
+
+function recordValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 }
 
 function queryStringFromOriginalUrl(originalUrl: string | undefined): string {
