@@ -33,6 +33,11 @@ import {
 } from "../src/oidc-authorization-code.repository.js";
 import { PasswordResetChallengeError, PasswordResetChallengeRepository } from "../src/password-reset-challenge.repository.js";
 import {
+  PluginUserTemporaryAuthorizationGrantInput,
+  PluginUserTemporaryAuthorizationGrantState,
+  PluginUserTemporaryAuthorizationRepository
+} from "../src/plugin-user-temporary-authorization.repository.js";
+import {
   PluginUserWriteOperationInput,
   PluginUserWriteOperationRecord,
   PluginUserWriteOperationRecentRow,
@@ -674,6 +679,110 @@ class FakeIamRepository {
       info: items.filter((item) => item.severity === "info").length
     };
   }
+}
+
+class FakePluginUserTemporaryAuthorizationRepository {
+  configured = true;
+  failGrant = false;
+  failRevoke = false;
+  readonly items = new Map<string, { type: 1 | 2; description: string | null }>([
+    ["admin", { type: 1, description: "Administrator" }],
+    ["manager", { type: 1, description: "Manager" }]
+  ]);
+  readonly assignments = new Set<string>();
+
+  isConfigured() {
+    return this.configured;
+  }
+
+  async grant(input: PluginUserTemporaryAuthorizationGrantInput): Promise<PluginUserTemporaryAuthorizationGrantState> {
+    if (this.failGrant) {
+      throw new Error("InjectedTemporaryAuthorizationGrantFailure");
+    }
+    const state: PluginUserTemporaryAuthorizationGrantState = {
+      legacyUserId: input.legacyUserId,
+      runKey: input.runKey,
+      grantedAt: input.grantedAt,
+      expiresAt: input.expiresAt,
+      routes: [],
+      role: null
+    };
+
+    for (const route of input.routes) {
+      const itemExisted = this.items.has(route);
+      const assignmentExisted = this.assignments.has(assignmentKey(route, input.legacyUserId));
+      if (!itemExisted) {
+        this.items.set(route, { type: 2, description: `identity-service temporary plugin-user authorization; run=${input.runKey}` });
+      }
+      if (!assignmentExisted) {
+        this.assignments.add(assignmentKey(route, input.legacyUserId));
+      }
+      state.routes.push({
+        route,
+        itemExisted,
+        assignmentExisted
+      });
+    }
+
+    if (input.role) {
+      const role = this.items.get(input.role);
+      if (!role || role.type !== 1) {
+        throw new Error(`legacy role ${input.role} does not exist`);
+      }
+      const assignmentExisted = this.assignments.has(assignmentKey(input.role, input.legacyUserId));
+      if (!assignmentExisted) {
+        this.assignments.add(assignmentKey(input.role, input.legacyUserId));
+      }
+      state.role = {
+        role: input.role,
+        assignmentExisted
+      };
+    }
+
+    return state;
+  }
+
+  async revoke(state: PluginUserTemporaryAuthorizationGrantState) {
+    if (this.failRevoke) {
+      throw new Error("InjectedTemporaryAuthorizationRevokeFailure");
+    }
+    let removedRouteAssignments = 0;
+    let removedRouteItems = 0;
+    let removedRoleAssignments = 0;
+
+    if (state.role && !state.role.assignmentExisted) {
+      removedRoleAssignments += this.deleteAssignment(state.role.role, state.legacyUserId);
+    }
+
+    for (const route of state.routes) {
+      if (!route.assignmentExisted) {
+        removedRouteAssignments += this.deleteAssignment(route.route, state.legacyUserId);
+      }
+      if (!route.itemExisted && !this.hasAssignmentsForItem(route.route)) {
+        this.items.delete(route.route);
+        removedRouteItems += 1;
+      }
+    }
+
+    return {
+      removedRouteAssignments,
+      removedRouteItems,
+      removedRoleAssignments
+    };
+  }
+
+  private deleteAssignment(itemName: string, legacyUserId: number): number {
+    return this.assignments.delete(assignmentKey(itemName, legacyUserId)) ? 1 : 0;
+  }
+
+  private hasAssignmentsForItem(itemName: string): boolean {
+    const prefix = `${itemName}\u001f`;
+    return [...this.assignments].some((assignment) => assignment.startsWith(prefix));
+  }
+}
+
+function assignmentKey(itemName: string, legacyUserId: number): string {
+  return `${itemName}\u001f${legacyUserId}`;
 }
 
 class FakeIdentitySessionRepository {
@@ -2889,6 +2998,182 @@ describe("identity-adapter account lifecycle compatibility API", () => {
     const [url, init] = fetchMock.mock.calls[0] as unknown as [URL, RequestInit];
     expect(url.toString()).toBe("http://legacy-api/v1/plugin-user/check-invitation?code=abc123");
     expect(init.body).toBeUndefined();
+  });
+});
+
+describe("identity-adapter plugin-user temporary authorization API", () => {
+  let app: INestApplication | null = null;
+  const originalEnv = { ...process.env };
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+    process.env.IDENTITY_INTERNAL_API_TOKEN = "temp-auth-token";
+  });
+
+  afterEach(async () => {
+    process.env = { ...originalEnv };
+    await app?.close();
+    app = null;
+  });
+
+  it("keeps temporary authorization disabled by default", async () => {
+    const repository = new FakePluginUserTemporaryAuthorizationRepository();
+    app = await createLifecycleTestApp(undefined, undefined, repository);
+
+    const readiness = await request(app.getHttpServer())
+      .get("/internal/plugin-user-temporary-authorization/readiness")
+      .expect(200);
+
+    expect(readiness.body).toMatchObject({
+      status: "ok",
+      service: "identity-adapter",
+      capability: "plugin-user-temporary-authorization",
+      data: {
+        enabled: false,
+        repositoryConfigured: true,
+        internalTokenConfigured: true,
+        grantTokenSigningConfigured: true,
+        allowedRoutes: ["/v1/plugin-user/*"],
+        defaultRoutes: ["/v1/plugin-user/*"],
+        safety: {
+          defaultClosed: true,
+          internalTokenRequired: true,
+          signedGrantTokenRequiredForRevoke: true,
+          revokesOnlyNewAssignments: true
+        }
+      }
+    });
+
+    await request(app.getHttpServer())
+      .post("/internal/plugin-user-temporary-authorization/grant")
+      .set("x-identity-internal-token", "temp-auth-token")
+      .send({ legacyUserId: 589, runKey: "stage54-test-disabled" })
+      .expect(404);
+    expect(repository.assignments.size).toBe(0);
+  });
+
+  it("requires the internal token before granting temporary authorization", async () => {
+    process.env.IDENTITY_PLUGIN_USER_TEMP_AUTH_ENABLED = "true";
+    const repository = new FakePluginUserTemporaryAuthorizationRepository();
+    app = await createLifecycleTestApp(undefined, undefined, repository);
+
+    await request(app.getHttpServer())
+      .post("/internal/plugin-user-temporary-authorization/grant")
+      .send({ legacyUserId: 589, runKey: "stage54-token-required" })
+      .expect(401);
+    expect(repository.assignments.size).toBe(0);
+  });
+
+  it("grants route and role authorization with a signed revoke token", async () => {
+    process.env.IDENTITY_PLUGIN_USER_TEMP_AUTH_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_TEMP_AUTH_MAX_TTL_SECONDS = "120";
+    const repository = new FakePluginUserTemporaryAuthorizationRepository();
+    app = await createLifecycleTestApp(undefined, undefined, repository);
+
+    const grant = await request(app.getHttpServer())
+      .post("/internal/plugin-user-temporary-authorization/grant")
+      .set("x-identity-internal-token", "temp-auth-token")
+      .send({
+        legacyUserId: 589,
+        routes: ["/v1/plugin-user/*"],
+        role: "admin",
+        runKey: "stage54-route-b-grant",
+        ttlSeconds: 60,
+        reason: "stage 5.4 route-b canary"
+      })
+      .expect(200);
+
+    expect(grant.body.data).toMatchObject({
+      granted: true,
+      legacyUserId: 589,
+      runKey: "stage54-route-b-grant",
+      routes: ["/v1/plugin-user/*"],
+      role: "admin",
+      createdRouteAssignments: 1,
+      createdRouteItems: 1,
+      createdRoleAssignments: 1
+    });
+    expect(typeof grant.body.data.grantToken).toBe("string");
+    expect(JSON.stringify(grant.body)).not.toContain("temp-auth-token");
+    expect(repository.assignments.has(assignmentKey("/v1/plugin-user/*", 589))).toBe(true);
+    expect(repository.assignments.has(assignmentKey("admin", 589))).toBe(true);
+
+    const revoke = await request(app.getHttpServer())
+      .post("/internal/plugin-user-temporary-authorization/revoke")
+      .set("x-identity-internal-token", "temp-auth-token")
+      .send({ grantToken: grant.body.data.grantToken })
+      .expect(200);
+
+    expect(revoke.body.data).toMatchObject({
+      revoked: true,
+      legacyUserId: 589,
+      runKey: "stage54-route-b-grant",
+      routes: ["/v1/plugin-user/*"],
+      role: "admin",
+      removedRouteAssignments: 1,
+      removedRouteItems: 1,
+      removedRoleAssignments: 1
+    });
+    expect(repository.assignments.has(assignmentKey("/v1/plugin-user/*", 589))).toBe(false);
+    expect(repository.assignments.has(assignmentKey("admin", 589))).toBe(false);
+    expect(repository.items.has("/v1/plugin-user/*")).toBe(false);
+  });
+
+  it("does not revoke assignments that existed before the temporary grant", async () => {
+    process.env.IDENTITY_PLUGIN_USER_TEMP_AUTH_ENABLED = "true";
+    const repository = new FakePluginUserTemporaryAuthorizationRepository();
+    repository.items.set("/v1/plugin-user/*", { type: 2, description: "preexisting route permission" });
+    repository.assignments.add(assignmentKey("/v1/plugin-user/*", 589));
+    repository.assignments.add(assignmentKey("admin", 589));
+    app = await createLifecycleTestApp(undefined, undefined, repository);
+
+    const grant = await request(app.getHttpServer())
+      .post("/internal/plugin-user-temporary-authorization/grant")
+      .set("x-identity-internal-token", "temp-auth-token")
+      .send({
+        legacyUserId: 589,
+        routes: ["/v1/plugin-user/*"],
+        role: "admin",
+        runKey: "stage54-preexisting-grant"
+      })
+      .expect(200);
+
+    expect(grant.body.data).toMatchObject({
+      createdRouteAssignments: 0,
+      createdRouteItems: 0,
+      createdRoleAssignments: 0
+    });
+
+    await request(app.getHttpServer())
+      .post("/internal/plugin-user-temporary-authorization/revoke")
+      .set("x-identity-internal-token", "temp-auth-token")
+      .send({ grantToken: grant.body.data.grantToken })
+      .expect(200);
+
+    expect(repository.assignments.has(assignmentKey("/v1/plugin-user/*", 589))).toBe(true);
+    expect(repository.assignments.has(assignmentKey("admin", 589))).toBe(true);
+    expect(repository.items.has("/v1/plugin-user/*")).toBe(true);
+  });
+
+  it("rejects non-allowlisted or global wildcard temporary routes", async () => {
+    process.env.IDENTITY_PLUGIN_USER_TEMP_AUTH_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_TEMP_AUTH_ALLOWED_ROUTES = "/v1/plugin-user/*";
+    const repository = new FakePluginUserTemporaryAuthorizationRepository();
+    app = await createLifecycleTestApp(undefined, undefined, repository);
+
+    await request(app.getHttpServer())
+      .post("/internal/plugin-user-temporary-authorization/grant")
+      .set("x-identity-internal-token", "temp-auth-token")
+      .send({ legacyUserId: 589, routes: ["/*"], runKey: "stage54-unsafe-route" })
+      .expect(400);
+
+    await request(app.getHttpServer())
+      .post("/internal/plugin-user-temporary-authorization/grant")
+      .set("x-identity-internal-token", "temp-auth-token")
+      .send({ legacyUserId: 589, routes: ["v1/plugin-user/*"], runKey: "stage54-not-allowlisted" })
+      .expect(400);
+
+    expect(repository.assignments.size).toBe(0);
   });
 });
 
@@ -6343,7 +6628,8 @@ describe("identity-adapter native email lifecycle API", () => {
 
 async function createLifecycleTestApp(
   pluginUserOperations?: FakePluginUserWriteOperationRepository,
-  iamRepository?: FakeIamRepository
+  iamRepository?: FakeIamRepository,
+  pluginUserTemporaryAuthorizationRepository?: FakePluginUserTemporaryAuthorizationRepository
 ): Promise<INestApplication> {
   let builder = Test.createTestingModule({
     imports: [AppModule]
@@ -6357,6 +6643,12 @@ async function createLifecycleTestApp(
 
   if (iamRepository) {
     builder = builder.overrideProvider(IamRepository).useValue(iamRepository);
+  }
+
+  if (pluginUserTemporaryAuthorizationRepository) {
+    builder = builder
+      .overrideProvider(PluginUserTemporaryAuthorizationRepository)
+      .useValue(pluginUserTemporaryAuthorizationRepository);
   }
 
   const moduleRef = await builder.compile();

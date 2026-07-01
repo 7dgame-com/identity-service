@@ -161,6 +161,13 @@ export const configSchema = z.object({
     disablePercentage: numberFromEnv.default(0),
     observeMetricsEnabled: boolFromEnv.default(true)
   }),
+  pluginUserTemporaryAuthorization: z.object({
+    enabled: boolFromEnv.default(false),
+    internalToken: optionalStringFromEnv,
+    signingSecret: optionalStringFromEnv,
+    allowedRoutes: z.string().default("/v1/plugin-user/*"),
+    maxTtlSeconds: numberFromEnv.default(1800)
+  }),
   invitationDiagnostics: z.object({
     redisUrl: optionalStringFromEnv,
     scanCount: numberFromEnv.default(100),
@@ -340,6 +347,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
       disableAllowlist: env.IDENTITY_PLUGIN_USER_FALLBACK_DISABLE_ALLOWLIST,
       disablePercentage: env.IDENTITY_PLUGIN_USER_FALLBACK_DISABLE_PERCENTAGE,
       observeMetricsEnabled: env.IDENTITY_PLUGIN_USER_FALLBACK_OBSERVE_METRICS_ENABLED
+    },
+    pluginUserTemporaryAuthorization: {
+      enabled: env.IDENTITY_PLUGIN_USER_TEMP_AUTH_ENABLED,
+      internalToken: env.IDENTITY_PLUGIN_USER_TEMP_AUTH_INTERNAL_API_TOKEN ?? env.IDENTITY_INTERNAL_API_TOKEN,
+      signingSecret: env.IDENTITY_PLUGIN_USER_TEMP_AUTH_SIGNING_SECRET ?? env.IDENTITY_INTERNAL_API_TOKEN,
+      allowedRoutes: env.IDENTITY_PLUGIN_USER_TEMP_AUTH_ALLOWED_ROUTES,
+      maxTtlSeconds: env.IDENTITY_PLUGIN_USER_TEMP_AUTH_MAX_TTL_SECONDS
     },
     invitationDiagnostics: {
       redisUrl: env.IDENTITY_INVITATION_REDIS_URL,
