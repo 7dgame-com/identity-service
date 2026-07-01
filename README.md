@@ -209,8 +209,13 @@ Grant/revoke rules:
 
 - Mutating calls require `X-Identity-Internal-Token`.
 - `grant` uses `LEGACY_WRITE_DB_*`, preflights DELETE privileges on
-  `auth_assignment` and `auth_item`, and can create an allowlisted route
-  permission plus an optional `admin` or `manager` assignment.
+  `auth_assignment` and `auth_item`, and can create allowlisted route
+  permissions plus an optional `admin` or `manager` assignment.
+- `/v1/plugin-user/*` is an application-level shorthand. The grant stores the
+  concrete legacy RBAC routes required by the write API:
+  `/v1/plugin-user/create-user`, `/v1/plugin-user/update-user`,
+  `/v1/plugin-user/delete-user`, `/v1/plugin-user/change-role`, and
+  `/v1/plugin-user/batch-create-users`.
 - `grant` returns a signed `grantToken`; store it only in the private execution
   context for the current window.
 - `revoke` requires the same `grantToken` and only removes assignments/items
