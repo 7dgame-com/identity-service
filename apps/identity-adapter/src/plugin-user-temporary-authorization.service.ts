@@ -44,7 +44,15 @@ interface GrantPayload {
   state: PluginUserTemporaryAuthorizationGrantState;
 }
 
-const DEFAULT_ROUTES = ["/v1/plugin-user/*"];
+const PLUGIN_USER_WRITE_ROUTE_PATTERN = "/v1/plugin-user/*";
+const PLUGIN_USER_WRITE_ROUTE_GRANTS = [
+  "/v1/plugin-user/create-user",
+  "/v1/plugin-user/update-user",
+  "/v1/plugin-user/delete-user",
+  "/v1/plugin-user/change-role",
+  "/v1/plugin-user/batch-create-users"
+] as const;
+const DEFAULT_ROUTES = [PLUGIN_USER_WRITE_ROUTE_PATTERN];
 const ALLOWED_ROLES = new Set(["admin", "manager"]);
 const MAX_REASON_LENGTH = 160;
 
@@ -57,15 +65,17 @@ export class PluginUserTemporaryAuthorizationService {
 
   readiness() {
     const settings = this.config.pluginUserTemporaryAuthorization;
+    const configuredAllowedRoutes = this.configuredAllowedRoutes();
     const allowedRoutes = this.allowedRoutes();
     return {
       enabled: settings.enabled,
       repositoryConfigured: this.repository.isConfigured(),
       internalTokenConfigured: Boolean(settings.internalToken),
       grantTokenSigningConfigured: Boolean(this.signingSecret()),
+      allowedRoutePatterns: configuredAllowedRoutes,
       allowedRoutes,
       maxTtlSeconds: this.maxTtlSeconds(),
-      defaultRoutes: DEFAULT_ROUTES.filter((route) => allowedRoutes.includes(route)),
+      defaultRoutes: this.defaultRoutes(),
       supportedRoles: [...ALLOWED_ROLES],
       safety: {
         defaultClosed: true,
@@ -232,25 +242,17 @@ export class PluginUserTemporaryAuthorizationService {
   }
 
   private parseRoutes(value: unknown): string[] {
-    const rawRoutes =
-      value === undefined
-        ? DEFAULT_ROUTES
-        : Array.isArray(value)
-          ? value
-          : typeof value === "string"
-            ? value.split(",")
-            : [];
+    const rawRoutes = routeInputValues(value);
+    const configuredAllowed = new Set(this.configuredAllowedRoutes());
     const allowed = new Set(this.allowedRoutes());
-    const routes = [...new Set(rawRoutes.map((route) => (typeof route === "string" ? route.trim() : "")).filter(Boolean))];
-
-    for (const route of routes) {
-      if (isUnsafeWildcard(route) || !allowed.has(route)) {
-        throw new BadRequestException({
-          code: "PLUGIN_USER_TEMP_AUTH_ROUTE_NOT_ALLOWED",
-          message: "Temporary authorization route is not allowlisted."
-        });
-      }
-    }
+    const routes = [
+      ...new Set(
+        rawRoutes
+          .map((route) => (typeof route === "string" ? route.trim() : ""))
+          .filter(Boolean)
+          .flatMap((route) => this.expandRouteGrant(route, configuredAllowed, allowed))
+      )
+    ];
 
     return routes;
   }
@@ -321,7 +323,52 @@ export class PluginUserTemporaryAuthorizationService {
   }
 
   private allowedRoutes(): string[] {
+    return [
+      ...new Set(
+        this.configuredAllowedRoutes().flatMap((route) =>
+          route === PLUGIN_USER_WRITE_ROUTE_PATTERN ? [...PLUGIN_USER_WRITE_ROUTE_GRANTS] : [route]
+        )
+      )
+    ];
+  }
+
+  private configuredAllowedRoutes(): string[] {
     return splitCsv(this.config.pluginUserTemporaryAuthorization.allowedRoutes).filter((route) => !isUnsafeWildcard(route));
+  }
+
+  private defaultRoutes(): string[] {
+    const configuredAllowed = new Set(this.configuredAllowedRoutes());
+    const allowed = new Set(this.allowedRoutes());
+    return [
+      ...new Set(
+        DEFAULT_ROUTES.flatMap((route) => this.expandRouteGrant(route, configuredAllowed, allowed, { allowEmpty: true }))
+      )
+    ];
+  }
+
+  private expandRouteGrant(
+    route: string,
+    configuredAllowed: Set<string>,
+    allowed: Set<string>,
+    options: { allowEmpty?: boolean } = {}
+  ): string[] {
+    if (isUnsafeWildcard(route)) {
+      throwTemporaryAuthorizationRouteNotAllowed();
+    }
+
+    if (route === PLUGIN_USER_WRITE_ROUTE_PATTERN && configuredAllowed.has(route)) {
+      return [...PLUGIN_USER_WRITE_ROUTE_GRANTS];
+    }
+
+    if (allowed.has(route)) {
+      return [route];
+    }
+
+    if (options.allowEmpty) {
+      return [];
+    }
+
+    throwTemporaryAuthorizationRouteNotAllowed();
   }
 
   private maxTtlSeconds(): number {
@@ -338,6 +385,19 @@ function objectBody(body: unknown): Record<string, unknown> {
     });
   }
   return body as Record<string, unknown>;
+}
+
+function routeInputValues(value: unknown): unknown[] {
+  if (value === undefined) {
+    return DEFAULT_ROUTES;
+  }
+  if (Array.isArray(value)) {
+    return value;
+  }
+  if (typeof value === "string") {
+    return value.split(",");
+  }
+  return [];
 }
 
 function positiveInteger(value: unknown, field: string): number {
@@ -408,6 +468,13 @@ function splitCsv(value: string): string[] {
 
 function isUnsafeWildcard(route: string): boolean {
   return route === "*" || route === "/*" || route === "/*/*";
+}
+
+function throwTemporaryAuthorizationRouteNotAllowed(): never {
+  throw new BadRequestException({
+    code: "PLUGIN_USER_TEMP_AUTH_ROUTE_NOT_ALLOWED",
+    message: "Temporary authorization route is not allowlisted."
+  });
 }
 
 function safeEqual(left: string, right: string): boolean {
