@@ -424,6 +424,7 @@ export class PluginUserWriteService {
         await this.iamRepository.upsertPluginSubjectMap({
           identityUserId: write.identityUserId,
           legacyUserId: write.legacyUserId,
+          status: write.status === "inactive" ? "inactive" : "active",
           metadata: {
             source: "plugin-user-dual-write",
             route: plan.route

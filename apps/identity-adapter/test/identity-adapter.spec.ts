@@ -540,7 +540,12 @@ class FakeIamRepository {
     ]);
   }
 
-  async upsertPluginSubjectMap(input: { identityUserId: string; legacyUserId: number; metadata: Record<string, unknown> }) {
+  async upsertPluginSubjectMap(input: {
+    identityUserId: string;
+    legacyUserId: number;
+    status?: "active" | "inactive";
+    metadata: Record<string, unknown>;
+  }) {
     const current = this.subjectMaps.get(input.identityUserId) ?? [];
     const withoutPlugin = current.filter(
       (subject) => !(subject.subjectType === "plugin_user" && subject.subjectId === `legacy:${input.legacyUserId}`)
@@ -552,7 +557,7 @@ class FakeIamRepository {
         subjectType: "plugin_user",
         subjectId: `legacy:${input.legacyUserId}`,
         source: "legacy-shadow",
-        status: "active",
+        status: input.status ?? "active",
         metadata: input.metadata,
         createdAt: null,
         updatedAt: null
@@ -3306,6 +3311,15 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
       email: "stage53@example.test",
       status: "inactive"
     });
+    await expect(iamRepository.listSubjectMaps("legacy:42")).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          subjectType: "plugin_user",
+          subjectId: "legacy:42",
+          status: "inactive"
+        })
+      ])
+    );
 
     await expect(iamRepository.listManagedUsers({ page: 1, pageSize: 20 })).resolves.toMatchObject({
       users: expect.not.arrayContaining([expect.objectContaining({ legacyUserId: 42 })])

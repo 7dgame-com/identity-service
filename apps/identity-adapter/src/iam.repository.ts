@@ -130,6 +130,13 @@ export interface IdentityUserShadowInput {
   metadata: Record<string, unknown>;
 }
 
+export interface PluginSubjectMapInput {
+  identityUserId: string;
+  legacyUserId: number;
+  status?: "active" | "inactive";
+  metadata: Record<string, unknown>;
+}
+
 export interface RoleShadowInput {
   identityUserId: string;
   legacyUserId: number;
@@ -411,19 +418,20 @@ export class IamRepository implements OnModuleDestroy {
     );
   }
 
-  async upsertPluginSubjectMap(input: { identityUserId: string; legacyUserId: number; metadata: Record<string, unknown> }): Promise<void> {
+  async upsertPluginSubjectMap(input: PluginSubjectMapInput): Promise<void> {
     const pool = this.requirePool();
     await this.ensureSchema();
+    const status = input.status ?? "active";
 
     await pool.execute(
       `INSERT INTO identity_subject_maps
         (identity_user_id, subject_type, subject_id, source, status, metadata)
-       VALUES (?, 'plugin_user', ?, 'legacy-shadow', 'active', ?)
+       VALUES (?, 'plugin_user', ?, 'legacy-shadow', ?, ?)
        ON DUPLICATE KEY UPDATE
-         status = 'active',
+         status = VALUES(status),
          source = VALUES(source),
          metadata = VALUES(metadata)`,
-      [input.identityUserId, `legacy:${input.legacyUserId}`, JSON.stringify(input.metadata ?? {})]
+      [input.identityUserId, `legacy:${input.legacyUserId}`, status, JSON.stringify(input.metadata ?? {})]
     );
   }
 
