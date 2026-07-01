@@ -3004,6 +3004,13 @@ describe("identity-adapter account lifecycle compatibility API", () => {
 describe("identity-adapter plugin-user temporary authorization API", () => {
   let app: INestApplication | null = null;
   const originalEnv = { ...process.env };
+  const pluginUserTemporaryAuthorizationRouteGrants = [
+    "/v1/plugin-user/create-user",
+    "/v1/plugin-user/update-user",
+    "/v1/plugin-user/delete-user",
+    "/v1/plugin-user/change-role",
+    "/v1/plugin-user/batch-create-users"
+  ];
 
   beforeEach(() => {
     process.env = { ...originalEnv };
@@ -3033,8 +3040,9 @@ describe("identity-adapter plugin-user temporary authorization API", () => {
         repositoryConfigured: true,
         internalTokenConfigured: true,
         grantTokenSigningConfigured: true,
-        allowedRoutes: ["/v1/plugin-user/*"],
-        defaultRoutes: ["/v1/plugin-user/*"],
+        allowedRoutePatterns: ["/v1/plugin-user/*"],
+        allowedRoutes: pluginUserTemporaryAuthorizationRouteGrants,
+        defaultRoutes: pluginUserTemporaryAuthorizationRouteGrants,
         safety: {
           defaultClosed: true,
           internalTokenRequired: true,
@@ -3087,15 +3095,17 @@ describe("identity-adapter plugin-user temporary authorization API", () => {
       granted: true,
       legacyUserId: 589,
       runKey: "stage54-route-b-grant",
-      routes: ["/v1/plugin-user/*"],
+      routes: pluginUserTemporaryAuthorizationRouteGrants,
       role: "admin",
-      createdRouteAssignments: 1,
-      createdRouteItems: 1,
+      createdRouteAssignments: pluginUserTemporaryAuthorizationRouteGrants.length,
+      createdRouteItems: pluginUserTemporaryAuthorizationRouteGrants.length,
       createdRoleAssignments: 1
     });
     expect(typeof grant.body.data.grantToken).toBe("string");
     expect(JSON.stringify(grant.body)).not.toContain("temp-auth-token");
-    expect(repository.assignments.has(assignmentKey("/v1/plugin-user/*", 589))).toBe(true);
+    for (const route of pluginUserTemporaryAuthorizationRouteGrants) {
+      expect(repository.assignments.has(assignmentKey(route, 589))).toBe(true);
+    }
     expect(repository.assignments.has(assignmentKey("admin", 589))).toBe(true);
 
     const revoke = await request(app.getHttpServer())
@@ -3108,22 +3118,26 @@ describe("identity-adapter plugin-user temporary authorization API", () => {
       revoked: true,
       legacyUserId: 589,
       runKey: "stage54-route-b-grant",
-      routes: ["/v1/plugin-user/*"],
+      routes: pluginUserTemporaryAuthorizationRouteGrants,
       role: "admin",
-      removedRouteAssignments: 1,
-      removedRouteItems: 1,
+      removedRouteAssignments: pluginUserTemporaryAuthorizationRouteGrants.length,
+      removedRouteItems: pluginUserTemporaryAuthorizationRouteGrants.length,
       removedRoleAssignments: 1
     });
-    expect(repository.assignments.has(assignmentKey("/v1/plugin-user/*", 589))).toBe(false);
+    for (const route of pluginUserTemporaryAuthorizationRouteGrants) {
+      expect(repository.assignments.has(assignmentKey(route, 589))).toBe(false);
+      expect(repository.items.has(route)).toBe(false);
+    }
     expect(repository.assignments.has(assignmentKey("admin", 589))).toBe(false);
-    expect(repository.items.has("/v1/plugin-user/*")).toBe(false);
   });
 
   it("does not revoke assignments that existed before the temporary grant", async () => {
     process.env.IDENTITY_PLUGIN_USER_TEMP_AUTH_ENABLED = "true";
     const repository = new FakePluginUserTemporaryAuthorizationRepository();
-    repository.items.set("/v1/plugin-user/*", { type: 2, description: "preexisting route permission" });
-    repository.assignments.add(assignmentKey("/v1/plugin-user/*", 589));
+    for (const route of pluginUserTemporaryAuthorizationRouteGrants) {
+      repository.items.set(route, { type: 2, description: "preexisting route permission" });
+      repository.assignments.add(assignmentKey(route, 589));
+    }
     repository.assignments.add(assignmentKey("admin", 589));
     app = await createLifecycleTestApp(undefined, undefined, repository);
 
@@ -3150,9 +3164,11 @@ describe("identity-adapter plugin-user temporary authorization API", () => {
       .send({ grantToken: grant.body.data.grantToken })
       .expect(200);
 
-    expect(repository.assignments.has(assignmentKey("/v1/plugin-user/*", 589))).toBe(true);
+    for (const route of pluginUserTemporaryAuthorizationRouteGrants) {
+      expect(repository.assignments.has(assignmentKey(route, 589))).toBe(true);
+      expect(repository.items.has(route)).toBe(true);
+    }
     expect(repository.assignments.has(assignmentKey("admin", 589))).toBe(true);
-    expect(repository.items.has("/v1/plugin-user/*")).toBe(true);
   });
 
   it("rejects non-allowlisted or global wildcard temporary routes", async () => {
