@@ -72,6 +72,7 @@ export class PluginUserTemporaryAuthorizationService {
       repositoryConfigured: this.repository.isConfigured(),
       internalTokenConfigured: Boolean(settings.internalToken),
       grantTokenSigningConfigured: Boolean(this.signingSecret()),
+      advancedRouteAppIds: this.advancedRouteAppIds(),
       allowedRoutePatterns: configuredAllowedRoutes,
       allowedRoutes,
       maxTtlSeconds: this.maxTtlSeconds(),
@@ -326,7 +327,9 @@ export class PluginUserTemporaryAuthorizationService {
     return [
       ...new Set(
         this.configuredAllowedRoutes().flatMap((route) =>
-          route === PLUGIN_USER_WRITE_ROUTE_PATTERN ? [...PLUGIN_USER_WRITE_ROUTE_GRANTS] : [route]
+          route === PLUGIN_USER_WRITE_ROUTE_PATTERN
+            ? pluginUserWriteRouteGrants(this.advancedRouteAppIds())
+            : [route]
         )
       )
     ];
@@ -357,7 +360,7 @@ export class PluginUserTemporaryAuthorizationService {
     }
 
     if (route === PLUGIN_USER_WRITE_ROUTE_PATTERN && configuredAllowed.has(route)) {
-      return [...PLUGIN_USER_WRITE_ROUTE_GRANTS];
+      return pluginUserWriteRouteGrants(this.advancedRouteAppIds());
     }
 
     if (allowed.has(route)) {
@@ -375,6 +378,23 @@ export class PluginUserTemporaryAuthorizationService {
     const configured = Number(this.config.pluginUserTemporaryAuthorization.maxTtlSeconds);
     return Number.isFinite(configured) && configured > 0 ? Math.min(Math.trunc(configured), 86400) : 1800;
   }
+
+  private advancedRouteAppIds(): string[] {
+    return [
+      ...new Set(
+        splitCsv(this.config.pluginUserTemporaryAuthorization.advancedAppIds)
+          .map((appId) => appId.replace(/^@+/, "").trim())
+          .filter((appId) => /^[a-zA-Z0-9_-]+$/.test(appId))
+      )
+    ];
+  }
+}
+
+function pluginUserWriteRouteGrants(advancedAppIds: string[]): string[] {
+  return [
+    ...PLUGIN_USER_WRITE_ROUTE_GRANTS,
+    ...advancedAppIds.flatMap((appId) => PLUGIN_USER_WRITE_ROUTE_GRANTS.map((route) => `@${appId}${route}`))
+  ];
 }
 
 function objectBody(body: unknown): Record<string, unknown> {
