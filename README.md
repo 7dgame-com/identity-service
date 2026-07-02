@@ -194,6 +194,7 @@ not be exposed through public Traefik routes.
 ```bash
 IDENTITY_PLUGIN_USER_TEMP_AUTH_ENABLED=false
 IDENTITY_PLUGIN_USER_TEMP_AUTH_ALLOWED_ROUTES=/v1/plugin-user/*
+IDENTITY_PLUGIN_USER_TEMP_AUTH_ADVANCED_APP_IDS=
 IDENTITY_PLUGIN_USER_TEMP_AUTH_MAX_TTL_SECONDS=1800
 IDENTITY_PLUGIN_USER_TEMP_AUTH_INTERNAL_API_TOKEN=$IDENTITY_INTERNAL_API_TOKEN
 IDENTITY_PLUGIN_USER_TEMP_AUTH_SIGNING_SECRET=$IDENTITY_INTERNAL_API_TOKEN
@@ -216,6 +217,10 @@ Grant/revoke rules:
   `/v1/plugin-user/create-user`, `/v1/plugin-user/update-user`,
   `/v1/plugin-user/delete-user`, `/v1/plugin-user/change-role`, and
   `/v1/plugin-user/batch-create-users`.
+- If the legacy Yii app uses mdm advanced route names, set
+  `IDENTITY_PLUGIN_USER_TEMP_AUTH_ADVANCED_APP_IDS=restful`. The same shorthand
+  then also stores exact `@restful/v1/plugin-user/...` route permissions for
+  the current grant window.
 - `grant` returns a signed `grantToken`; store it only in the private execution
   context for the current window.
 - `revoke` requires the same `grantToken` and only removes assignments/items
