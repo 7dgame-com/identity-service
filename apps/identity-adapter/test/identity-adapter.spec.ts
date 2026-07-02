@@ -3011,6 +3011,10 @@ describe("identity-adapter plugin-user temporary authorization API", () => {
     "/v1/plugin-user/change-role",
     "/v1/plugin-user/batch-create-users"
   ];
+  const pluginUserTemporaryAuthorizationAdvancedRouteGrants = [
+    ...pluginUserTemporaryAuthorizationRouteGrants,
+    ...pluginUserTemporaryAuthorizationRouteGrants.map((route) => `@restful${route}`)
+  ];
 
   beforeEach(() => {
     process.env = { ...originalEnv };
@@ -3129,6 +3133,61 @@ describe("identity-adapter plugin-user temporary authorization API", () => {
       expect(repository.items.has(route)).toBe(false);
     }
     expect(repository.assignments.has(assignmentKey("admin", 589))).toBe(false);
+  });
+
+  it("can grant advanced Yii application route aliases for legacy mdm access control", async () => {
+    process.env.IDENTITY_PLUGIN_USER_TEMP_AUTH_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_TEMP_AUTH_ADVANCED_APP_IDS = "restful";
+    const repository = new FakePluginUserTemporaryAuthorizationRepository();
+    app = await createLifecycleTestApp(undefined, undefined, repository);
+
+    const readiness = await request(app.getHttpServer())
+      .get("/internal/plugin-user-temporary-authorization/readiness")
+      .expect(200);
+
+    expect(readiness.body.data).toMatchObject({
+      advancedRouteAppIds: ["restful"],
+      allowedRoutePatterns: ["/v1/plugin-user/*"],
+      allowedRoutes: pluginUserTemporaryAuthorizationAdvancedRouteGrants,
+      defaultRoutes: pluginUserTemporaryAuthorizationAdvancedRouteGrants
+    });
+
+    const grant = await request(app.getHttpServer())
+      .post("/internal/plugin-user-temporary-authorization/grant")
+      .set("x-identity-internal-token", "temp-auth-token")
+      .send({
+        legacyUserId: 589,
+        routes: ["/v1/plugin-user/*"],
+        role: "admin",
+        runKey: "stage54-advanced-route-grant"
+      })
+      .expect(200);
+
+    expect(grant.body.data).toMatchObject({
+      granted: true,
+      routes: pluginUserTemporaryAuthorizationAdvancedRouteGrants,
+      createdRouteAssignments: pluginUserTemporaryAuthorizationAdvancedRouteGrants.length,
+      createdRouteItems: pluginUserTemporaryAuthorizationAdvancedRouteGrants.length
+    });
+    for (const route of pluginUserTemporaryAuthorizationAdvancedRouteGrants) {
+      expect(repository.assignments.has(assignmentKey(route, 589))).toBe(true);
+    }
+
+    const revoke = await request(app.getHttpServer())
+      .post("/internal/plugin-user-temporary-authorization/revoke")
+      .set("x-identity-internal-token", "temp-auth-token")
+      .send({ grantToken: grant.body.data.grantToken })
+      .expect(200);
+
+    expect(revoke.body.data).toMatchObject({
+      routes: pluginUserTemporaryAuthorizationAdvancedRouteGrants,
+      removedRouteAssignments: pluginUserTemporaryAuthorizationAdvancedRouteGrants.length,
+      removedRouteItems: pluginUserTemporaryAuthorizationAdvancedRouteGrants.length
+    });
+    for (const route of pluginUserTemporaryAuthorizationAdvancedRouteGrants) {
+      expect(repository.assignments.has(assignmentKey(route, 589))).toBe(false);
+      expect(repository.items.has(route)).toBe(false);
+    }
   });
 
   it("does not revoke assignments that existed before the temporary grant", async () => {

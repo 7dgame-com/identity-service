@@ -166,6 +166,7 @@ export const configSchema = z.object({
     internalToken: optionalStringFromEnv,
     signingSecret: optionalStringFromEnv,
     allowedRoutes: z.string().default("/v1/plugin-user/*"),
+    advancedAppIds: z.string().default(""),
     maxTtlSeconds: numberFromEnv.default(1800)
   }),
   invitationDiagnostics: z.object({
@@ -353,6 +354,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
       internalToken: env.IDENTITY_PLUGIN_USER_TEMP_AUTH_INTERNAL_API_TOKEN ?? env.IDENTITY_INTERNAL_API_TOKEN,
       signingSecret: env.IDENTITY_PLUGIN_USER_TEMP_AUTH_SIGNING_SECRET ?? env.IDENTITY_INTERNAL_API_TOKEN,
       allowedRoutes: env.IDENTITY_PLUGIN_USER_TEMP_AUTH_ALLOWED_ROUTES,
+      advancedAppIds: env.IDENTITY_PLUGIN_USER_TEMP_AUTH_ADVANCED_APP_IDS,
       maxTtlSeconds: env.IDENTITY_PLUGIN_USER_TEMP_AUTH_MAX_TTL_SECONDS
     },
     invitationDiagnostics: {
