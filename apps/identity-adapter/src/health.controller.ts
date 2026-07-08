@@ -45,6 +45,7 @@ export class HealthController {
             email: this.config.accountLifecycle.emailEnabled ? "enabled" : "disabled",
             invitation: this.config.accountLifecycle.invitationEnabled ? "enabled" : "disabled"
           },
+          profileWrite: this.config.iam.profileWriteMode,
           pluginUserWrite: this.config.iam.pluginUserWriteMode
         }
       };

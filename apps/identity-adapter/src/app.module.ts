@@ -48,6 +48,8 @@ import { PluginUserTemporaryAuthorizationService } from "./plugin-user-temporary
 import { PluginUserWriteController } from "./plugin-user-write.controller.js";
 import { PluginUserWriteShadowService } from "./plugin-user-write-shadow.service.js";
 import { PluginUserWriteService } from "./plugin-user-write.service.js";
+import { ProfileWriteController } from "./profile-write.controller.js";
+import { ProfileWriteService } from "./profile-write.service.js";
 import { TelemetryInterceptor } from "./telemetry.interceptor.js";
 import { TokenIssuanceService } from "./token-issuance.service.js";
 import { UsageBillingController } from "./usage-billing.controller.js";
@@ -67,6 +69,7 @@ import { UsageBillingService } from "./usage-billing.service.js";
     PluginUserReadonlyController,
     PluginUserTemporaryAuthorizationController,
     PluginUserWriteController,
+    ProfileWriteController,
     UsageBillingController,
     OidcController
   ],
@@ -125,6 +128,7 @@ import { UsageBillingService } from "./usage-billing.service.js";
     PluginUserWriteOperationRepository,
     PluginUserWriteShadowService,
     PluginUserWriteService,
+    ProfileWriteService,
     TokenIssuanceService,
     { provide: APP_INTERCEPTOR, useClass: TelemetryInterceptor }
   ]

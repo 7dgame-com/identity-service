@@ -3289,6 +3289,119 @@ describe("identity-adapter plugin-user temporary authorization API", () => {
   });
 });
 
+describe("identity-adapter profile write legacy-proxy API", () => {
+  let app: INestApplication | null = null;
+  const originalEnv = { ...process.env };
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+    process.env.IDENTITY_IAM_PROFILE_WRITE_MODE = "legacy-proxy";
+    process.env.IDENTITY_IAM_PROFILE_WRITE_LEGACY_API_BASE_URL = "http://legacy-api";
+    process.env.IDENTITY_IAM_PROFILE_WRITE_TIMEOUT_MS = "5000";
+  });
+
+  afterEach(async () => {
+    vi.unstubAllGlobals();
+    process.env = { ...originalEnv };
+    await app?.close();
+    app = null;
+  });
+
+  it("keeps profile write endpoint disabled by default", async () => {
+    process.env.IDENTITY_IAM_PROFILE_WRITE_MODE = "disabled";
+    app = await createLifecycleTestApp();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await request(app.getHttpServer())
+      .put("/v1/user/update")
+      .send({ nickname: "new-name" })
+      .expect(404);
+
+    expect(response.body).toMatchObject({
+      code: "PROFILE_WRITE_DISABLED",
+      message: "Profile write migration is disabled."
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("reports profile write legacy-proxy posture", async () => {
+    app = await createLifecycleTestApp();
+
+    const response = await request(app.getHttpServer())
+      .get("/internal/profile-write/readiness")
+      .expect(200);
+
+    expect(response.body).toMatchObject({
+      status: "ok",
+      service: "identity-adapter",
+      capability: "profile-write",
+      data: {
+        enabled: true,
+        mode: "legacy-proxy",
+        legacyProxyConfigured: true,
+        timeoutMs: 5000,
+        sourceOfTruth: "legacy",
+        routes: ["v1/user/update"],
+        allowedExecutableModes: ["disabled", "legacy-proxy"],
+        unsupportedModesBlocked: ["dual-write", "identity-native"],
+        responseShapePreserved: true,
+        redactionPolicy: "no-profile-payload-logging"
+      }
+    });
+  });
+
+  it("forwards current-user profile update to legacy API and preserves response shape", async () => {
+    app = await createLifecycleTestApp();
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          success: true,
+          message: "ok",
+          data: {
+            id: 24,
+            userData: { nickname: "new-name" },
+            userInfo: { info: { industry: "education" } },
+            roles: ["admin"],
+            perms: []
+          }
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        }
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await request(app.getHttpServer())
+      .put("/v1/user/update?lang=zh-CN")
+      .set("Authorization", "Bearer profile-token")
+      .set("User-Agent", "profile-write-test")
+      .send({ nickname: "new-name" })
+      .expect(200);
+
+    expect(response.headers["x-identity-profile-write"]).toBe("legacy-proxy");
+    expect(response.body).toMatchObject({
+      success: true,
+      message: "ok",
+      data: {
+        id: 24,
+        userData: { nickname: "new-name" },
+        roles: ["admin"]
+      }
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [URL, RequestInit];
+    expect(String(url)).toBe("http://legacy-api/v1/user/update?lang=zh-CN");
+    expect(init?.method).toBe("PUT");
+    expect((init?.headers as Headers).get("Authorization")).toBe("Bearer profile-token");
+    expect((init?.headers as Headers).get("X-Identity-Profile-Write-Proxy")).toBe("1");
+    expect(JSON.parse(init?.body as string)).toEqual({ nickname: "new-name" });
+  });
+});
+
 describe("identity-adapter plugin user write legacy-proxy API", () => {
   let app: INestApplication | null = null;
   const originalEnv = { ...process.env };
