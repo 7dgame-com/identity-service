@@ -88,6 +88,8 @@ export const configSchema = z.object({
     organizationViewEnabled: boolFromEnv.default(false),
     pluginViewEnabled: boolFromEnv.default(false),
     profileWriteMode: z.enum(["disabled", "legacy-proxy", "dual-write", "identity-native"]).default("disabled"),
+    profileWriteLegacyApiBaseUrl: optionalStringFromEnv,
+    profileWriteTimeoutMs: numberFromEnv.default(1500),
     roleWriteMode: z.enum(["disabled", "legacy-proxy", "dual-write", "identity-native"]).default("disabled"),
     organizationWriteMode: z.enum(["disabled", "legacy-proxy", "dual-write", "identity-native"]).default("disabled"),
     pluginUserWriteMode: z.enum(["disabled", "legacy-proxy", "dual-write", "identity-native"]).default("disabled"),
@@ -271,6 +273,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
       organizationViewEnabled: env.IDENTITY_IAM_ORGANIZATION_VIEW_ENABLED,
       pluginViewEnabled: env.IDENTITY_IAM_PLUGIN_VIEW_ENABLED,
       profileWriteMode: env.IDENTITY_IAM_PROFILE_WRITE_MODE,
+      profileWriteLegacyApiBaseUrl:
+        env.IDENTITY_IAM_PROFILE_WRITE_LEGACY_API_BASE_URL ?? env.IDENTITY_ACCOUNT_LIFECYCLE_LEGACY_API_BASE_URL,
+      profileWriteTimeoutMs:
+        env.IDENTITY_IAM_PROFILE_WRITE_TIMEOUT_MS ?? env.IDENTITY_ACCOUNT_LIFECYCLE_TIMEOUT_MS,
       roleWriteMode: env.IDENTITY_IAM_ROLE_WRITE_MODE,
       organizationWriteMode: env.IDENTITY_IAM_ORG_WRITE_MODE,
       pluginUserWriteMode: env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE,
