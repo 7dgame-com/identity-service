@@ -430,7 +430,10 @@ class FakeProfileWriteOperationRepository {
       route: operation.route,
       mode: operation.mode,
       status: operation.status,
+      legacyStatus: operation.legacyStatus,
+      identityStatus: operation.identityStatus,
       compensationStatus: operation.compensationStatus,
+      errorCode: operation.errorCode,
       operationKeyDigest: createHash("sha256").update(operation.operationKey).digest("hex").slice(0, 16),
       idempotencyKeyDigest: createHash("sha256").update(operation.idempotencyKey).digest("hex").slice(0, 16),
       legacyUserId: operation.legacyUserId ?? null,
@@ -2227,6 +2230,18 @@ describe("identity-adapter readonly API", () => {
     expect(normalizeOtlpTraceEndpoint(config.otel.exporterOtlpEndpoint!)).toBe("http://collector:4318/v1/traces");
   });
 
+  it("accepts profile write rollout off as a disabled window posture", () => {
+    const config = loadConfig({
+      IDENTITY_IAM_PROFILE_WRITE_ROLLOUT_MODE: "off",
+      IDENTITY_IAM_PROFILE_WRITE_ROLLOUT_PERCENTAGE: "0",
+      IDENTITY_IAM_PROFILE_WRITE_ROLLOUT_ALLOWLIST: ""
+    });
+
+    expect(config.iam.profileWriteRolloutMode).toBe("off");
+    expect(config.iam.profileWriteRolloutPercentage).toBe(0);
+    expect(config.iam.profileWriteRolloutAllowlist).toBe("");
+  });
+
   it("keeps telemetry disabled unless an OTLP endpoint is configured", () => {
     const config = loadConfig({});
 
@@ -3745,6 +3760,7 @@ describe("identity-adapter profile write legacy-proxy API", () => {
       const response = await request(app.getHttpServer())
         .put("/v1/user/update")
         .set("Authorization", `Bearer ${token}`)
+        .set("Idempotency-Key", "profile-write-replay-test")
         .send({ nickname: "replay-name" })
         .expect(200);
 
@@ -3756,6 +3772,168 @@ describe("identity-adapter profile write legacy-proxy API", () => {
     expect(operations.attempts).toHaveLength(2);
     expect(operations.inputs).toHaveLength(1);
     expect(iamRepository.profileShadowWrites).toHaveLength(1);
+  });
+
+  it("does not replay a repeated profile payload without an explicit idempotency key", async () => {
+    const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
+    process.env.IDENTITY_JWT_PRIVATE_KEY_PEM = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    process.env.IDENTITY_JWT_ISSUER = "https://api.xrugc.com";
+    process.env.IDENTITY_JWT_AUDIENCE = "https://xrugc.com";
+    process.env.IDENTITY_IAM_PROFILE_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_PROFILE_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_PROFILE_WRITE_ROLLOUT_MODE = "full";
+    const operations = new FakeProfileWriteOperationRepository();
+    const iamRepository = new FakeIamRepository();
+    app = await createLifecycleTestApp(undefined, iamRepository, undefined, operations);
+    const legacyUser = await new FakeLegacyIdentityReader().getUserById(24);
+    const token = new JwtIssuerService().issue(legacyUser!, "profile-session-24").accessToken;
+    const fetchMock = vi.fn(async (_url: URL, init: RequestInit) => {
+      const body = JSON.parse(String(init.body ?? "{}")) as { nickname?: string };
+      return new Response(JSON.stringify({ success: true, data: { id: 24, userData: { nickname: body.nickname } } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await request(app.getHttpServer())
+      .put("/v1/user/update")
+      .set("Authorization", `Bearer ${token}`)
+      .send({ nickname: "游戏开发极客" })
+      .expect(200);
+
+    await request(app.getHttpServer())
+      .put("/v1/user/update")
+      .set("Authorization", `Bearer ${token}`)
+      .send({ nickname: "stage9-marker" })
+      .expect(200);
+
+    const restore = await request(app.getHttpServer())
+      .put("/v1/user/update")
+      .set("Authorization", `Bearer ${token}`)
+      .send({ nickname: "游戏开发极客" })
+      .expect(200);
+
+    expect(restore.headers["x-identity-profile-write"]).toBe("dual-write");
+    expect(restore.body.data.userData.nickname).toBe("游戏开发极客");
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(operations.inputs).toHaveLength(3);
+    expect(new Set(operations.inputs.map((input) => input.operationKey)).size).toBe(3);
+    expect(iamRepository.profileShadowWrites).toHaveLength(3);
+    expect(iamRepository.identityUsers.get(24)?.metadata).toMatchObject({
+      profile: {
+        nickname: "游戏开发极客"
+      }
+    });
+  });
+
+  it("does not replay a later profile dual-write request with a different nickname", async () => {
+    const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
+    process.env.IDENTITY_JWT_PRIVATE_KEY_PEM = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    process.env.IDENTITY_JWT_ISSUER = "https://api.xrugc.com";
+    process.env.IDENTITY_JWT_AUDIENCE = "https://xrugc.com";
+    process.env.IDENTITY_IAM_PROFILE_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_PROFILE_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_PROFILE_WRITE_ROLLOUT_MODE = "full";
+    const operations = new FakeProfileWriteOperationRepository();
+    const iamRepository = new FakeIamRepository();
+    app = await createLifecycleTestApp(undefined, iamRepository, undefined, operations);
+    const legacyUser = await new FakeLegacyIdentityReader().getUserById(24);
+    const token = new JwtIssuerService().issue(legacyUser!, "profile-session-24").accessToken;
+    const fetchMock = vi.fn(async (_url: URL, init: RequestInit) => {
+      const body = JSON.parse(String(init.body ?? "{}")) as { nickname?: string };
+      return new Response(JSON.stringify({ success: true, data: { id: 24, userData: { nickname: body.nickname } } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const first = await request(app.getHttpServer())
+      .put("/v1/user/update")
+      .set("Authorization", `Bearer ${token}`)
+      .send({ nickname: "stage9-marker" })
+      .expect(200);
+
+    const restore = await request(app.getHttpServer())
+      .put("/v1/user/update")
+      .set("Authorization", `Bearer ${token}`)
+      .send({ nickname: "游戏开发极客" })
+      .expect(200);
+
+    expect(first.headers["x-identity-profile-write"]).toBe("dual-write");
+    expect(restore.headers["x-identity-profile-write"]).toBe("dual-write");
+    expect(first.body.data.userData.nickname).toBe("stage9-marker");
+    expect(restore.body.data.userData.nickname).toBe("游戏开发极客");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(operations.attempts).toHaveLength(2);
+    expect(operations.inputs).toHaveLength(2);
+    expect(operations.inputs[0].operationKey).not.toBe(operations.inputs[1].operationKey);
+    expect(iamRepository.profileShadowWrites).toHaveLength(2);
+    expect(iamRepository.identityUsers.get(24)?.metadata).toMatchObject({
+      profile: {
+        nickname: "游戏开发极客"
+      }
+    });
+  });
+
+  it("reports recent profile write operations with safe route-level statuses", async () => {
+    const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
+    process.env.IDENTITY_JWT_PRIVATE_KEY_PEM = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    process.env.IDENTITY_JWT_ISSUER = "https://api.xrugc.com";
+    process.env.IDENTITY_JWT_AUDIENCE = "https://xrugc.com";
+    process.env.IDENTITY_IAM_PROFILE_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_PROFILE_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_PROFILE_WRITE_ROLLOUT_MODE = "full";
+    const operations = new FakeProfileWriteOperationRepository();
+    const iamRepository = new FakeIamRepository();
+    app = await createLifecycleTestApp(undefined, iamRepository, undefined, operations);
+    const legacyUser = await new FakeLegacyIdentityReader().getUserById(24);
+    const token = new JwtIssuerService().issue(legacyUser!, "profile-session-24").accessToken;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: URL, init: RequestInit) => {
+        const body = JSON.parse(String(init.body ?? "{}")) as { nickname?: string };
+        return new Response(JSON.stringify({ success: true, data: { id: 24, userData: { nickname: body.nickname } } }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        });
+      })
+    );
+
+    await request(app.getHttpServer())
+      .put("/v1/user/update")
+      .set("Authorization", `Bearer ${token}`)
+      .send({ nickname: "stage9-marker" })
+      .expect(200);
+
+    const response = await request(app.getHttpServer())
+      .get("/internal/profile-write/operations/recent?sinceMinutes=99999&limit=10")
+      .expect(200);
+
+    expect(response.body).toMatchObject({
+      status: "ok",
+      service: "identity-adapter",
+      capability: "profile-write-operation-ledger",
+      data: {
+        configured: true,
+        operations: [
+          expect.objectContaining({
+            route: "update-profile",
+            mode: "dual-write",
+            status: "completed",
+            legacyStatus: "200",
+            identityStatus: "completed",
+            compensationStatus: "none",
+            errorCode: null,
+            operationKeyDigest: expect.stringMatching(/^[a-f0-9]{16}$/),
+            idempotencyKeyDigest: expect.stringMatching(/^[a-f0-9]{16}$/),
+            legacyUserId: 24
+          })
+        ]
+      }
+    });
+    expect(JSON.stringify(response.body)).not.toContain("stage9-marker");
   });
 
   it("records compensation when profile identity shadow write fails after legacy succeeds", async () => {

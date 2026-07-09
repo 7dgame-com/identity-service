@@ -91,7 +91,7 @@ export const configSchema = z.object({
     profileWriteLegacyApiBaseUrl: optionalStringFromEnv,
     profileWriteTimeoutMs: numberFromEnv.default(1500),
     profileWriteDualWriteExecutionEnabled: boolFromEnv.default(false),
-    profileWriteRolloutMode: z.enum(["canary", "percentage", "full"]).default("canary"),
+    profileWriteRolloutMode: z.enum(["off", "canary", "percentage", "full"]).default("canary"),
     profileWriteRolloutAllowlist: z.string().default(""),
     profileWriteRolloutPercentage: numberFromEnv.default(0),
     roleWriteMode: z.enum(["disabled", "legacy-proxy", "dual-write", "identity-native"]).default("disabled"),
