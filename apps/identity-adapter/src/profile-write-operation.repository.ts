@@ -338,9 +338,11 @@ export function profileWriteOperationKey(input: {
   subjectId: string | null;
   route: ProfileWriteRoute;
   requestFingerprint: string;
+  requestNonce?: string | null;
 }): string {
   const subject = input.subjectId ?? "anonymous";
-  return `profile-write:v1:${subject}:v1/user/update:${input.requestFingerprint.slice(0, 48)}`;
+  const nonce = input.requestNonce ? `:${input.requestNonce}` : "";
+  return `profile-write:v1:${subject}:v1/user/update:${input.requestFingerprint.slice(0, 48)}${nonce}`;
 }
 
 export function profileWriteRequestFingerprint(payload: unknown): string {

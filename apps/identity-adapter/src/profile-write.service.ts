@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { HttpException, Injectable, Logger, NotFoundException, ServiceUnavailableException } from "@nestjs/common";
 import { loadConfig } from "./config.js";
 import { IamRepository } from "./iam.repository.js";
@@ -82,7 +82,8 @@ export class ProfileWriteService {
       operationLedgerConfigured,
       identityRepositoryConfigured,
       dualWriteExecutionEnabled: iam.profileWriteDualWriteExecutionEnabled,
-      idempotencyKeyFormat: "profile-write:v1:<subject-id>:v1/user/update:<sha256-48>",
+      idempotencyKeyFormat:
+        "explicit Idempotency-Key replays; ordinary browser submits receive a unique operation key per request",
       sourceOfTruth: sourceOfTruthForMode(iam.profileWriteMode, dualWriteGate.executable),
       routes: [...PROFILE_WRITE_ROUTES],
       rollout,
@@ -537,7 +538,7 @@ export class ProfileWriteService {
     const plan = planProfileWriteOperation(request, claims);
     const begin = await this.operations.begin({
       operationKey: plan.operationKey,
-      idempotencyKey: plan.operationKey,
+      idempotencyKey: plan.idempotencyKey,
       route: "update-profile",
       mode: "dual-write",
       subjectId: plan.subjectId,
@@ -667,14 +668,17 @@ function planProfileWriteOperation(request: ProfileWriteRequest, claims: Verifie
   const subjectId = identityUserId;
   const profileMetadata = profileMetadataFromBody(request.body);
   const requestFingerprint = profileWriteRequestFingerprint(profileMetadata);
+  const clientIdempotencyKey = clientProfileWriteIdempotencyKey(request.headers);
   const operationKey = profileWriteOperationKey({
     route: "update-profile",
     subjectId,
-    requestFingerprint
+    requestFingerprint,
+    requestNonce: clientIdempotencyKey ? `idempotency:${shortHash(clientIdempotencyKey)}` : `request:${randomUUID()}`
   });
 
   return {
     operationKey,
+    idempotencyKey: operationKey,
     subjectId,
     legacyUserId,
     identityUserId,
@@ -684,9 +688,20 @@ function planProfileWriteOperation(request: ProfileWriteRequest, claims: Verifie
       route: "update-profile",
       method: request.method.toUpperCase(),
       subjectId,
+      idempotencySource: clientIdempotencyKey ? "client-header" : "per-request",
       redactedBody: redactProfileWriteMetadata(request.body ?? {})
     }
   };
+}
+
+function clientProfileWriteIdempotencyKey(headers: ProfileWriteRequest["headers"]): string | null {
+  const explicit = firstHeader(headers["idempotency-key"]) ?? firstHeader(headers["x-idempotency-key"]);
+  const trimmed = explicit?.trim();
+  return trimmed ? trimmed.slice(0, 180) : null;
+}
+
+function shortHash(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 24);
 }
 
 function profileMetadataFromBody(body: unknown): Record<string, unknown> {
