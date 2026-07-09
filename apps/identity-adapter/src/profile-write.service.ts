@@ -405,6 +405,16 @@ export class ProfileWriteService {
       };
     }
 
+    if (iam.profileWriteRolloutMode === "off") {
+      return {
+        selected: false,
+        mode: "off",
+        subjectId: claims ? `legacy:${claims.uid}` : null,
+        reason: "rollout_off",
+        claims
+      };
+    }
+
     const percentage = safeRolloutPercentage(iam.profileWriteRolloutPercentage);
     const bucketSubject = claims ? `legacy:${claims.uid}` : null;
     const bucket = bucketSubject ? rolloutBucket(bucketSubject) : null;
@@ -782,7 +792,7 @@ function identityNativeGateForReadiness(input: { dualWriteSupported: boolean; id
 }
 
 interface ProfileWriteRolloutReadiness {
-  mode: "canary" | "percentage" | "full";
+  mode: "off" | "canary" | "percentage" | "full";
   allowlistConfigured: boolean;
   allowlistCount: number;
   percentage: number;
@@ -792,7 +802,7 @@ interface ProfileWriteRolloutReadiness {
 
 interface ProfileWriteRolloutDecision {
   selected: boolean;
-  mode: "canary" | "percentage" | "full";
+  mode: "off" | "canary" | "percentage" | "full";
   subjectId: string | null;
   reason: string;
   matchedToken?: string | null;

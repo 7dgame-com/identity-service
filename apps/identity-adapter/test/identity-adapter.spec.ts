@@ -2230,6 +2230,18 @@ describe("identity-adapter readonly API", () => {
     expect(normalizeOtlpTraceEndpoint(config.otel.exporterOtlpEndpoint!)).toBe("http://collector:4318/v1/traces");
   });
 
+  it("accepts profile write rollout off as a disabled window posture", () => {
+    const config = loadConfig({
+      IDENTITY_IAM_PROFILE_WRITE_ROLLOUT_MODE: "off",
+      IDENTITY_IAM_PROFILE_WRITE_ROLLOUT_PERCENTAGE: "0",
+      IDENTITY_IAM_PROFILE_WRITE_ROLLOUT_ALLOWLIST: ""
+    });
+
+    expect(config.iam.profileWriteRolloutMode).toBe("off");
+    expect(config.iam.profileWriteRolloutPercentage).toBe(0);
+    expect(config.iam.profileWriteRolloutAllowlist).toBe("");
+  });
+
   it("keeps telemetry disabled unless an OTLP endpoint is configured", () => {
     const config = loadConfig({});
 
