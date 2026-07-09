@@ -134,6 +134,7 @@ export interface IdentityUserProfileShadowInput {
   identityUserId: string;
   legacyUserId: number;
   username: string | null;
+  status?: string;
   metadata: Record<string, unknown>;
 }
 
@@ -428,18 +429,19 @@ export class IamRepository implements OnModuleDestroy {
   async upsertIdentityUserProfileShadow(input: IdentityUserProfileShadowInput): Promise<void> {
     const pool = this.requirePool();
     await this.ensureSchema();
+    const status = input.status ?? "active";
 
     await pool.execute(
       `INSERT INTO identity_users
         (id, legacy_user_id, username, email, status, source, metadata)
-       VALUES (?, ?, ?, NULL, 'active', 'legacy-shadow', ?)
+       VALUES (?, ?, ?, NULL, ?, 'legacy-shadow', ?)
        ON DUPLICATE KEY UPDATE
          legacy_user_id = VALUES(legacy_user_id),
          username = COALESCE(VALUES(username), username),
-         status = 'active',
+         status = VALUES(status),
          source = VALUES(source),
          metadata = JSON_MERGE_PATCH(COALESCE(metadata, JSON_OBJECT()), VALUES(metadata))`,
-      [input.identityUserId, input.legacyUserId, input.username, JSON.stringify(input.metadata ?? {})]
+      [input.identityUserId, input.legacyUserId, input.username, status, JSON.stringify(input.metadata ?? {})]
     );
 
     await pool.execute(

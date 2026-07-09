@@ -236,6 +236,90 @@ export class ProfileWriteService {
     };
   }
 
+  async reconciliationBackfillShadow(rawInput: unknown) {
+    const input = parseProfileBackfillInput(rawInput);
+    if (!this.legacyReader.isConfigured()) {
+      throw new ServiceUnavailableException({
+        code: "PROFILE_RECONCILIATION_LEGACY_SOURCE_NOT_CONFIGURED",
+        message: "Legacy profile source is not configured."
+      });
+    }
+    if (!this.iamRepository.isConfigured()) {
+      throw new ServiceUnavailableException({
+        code: "PROFILE_RECONCILIATION_IDENTITY_DB_NOT_CONFIGURED",
+        message: "Identity database is not configured."
+      });
+    }
+
+    const users = await this.loadReconciliationUsers(input);
+    const plans: ProfileBackfillPlan[] = [];
+    for (const user of users) {
+      const identity = await this.iamRepository.getIdentityUserByLegacyId(user.id);
+      const profile = identity ? identityProfileMetadata(identity.metadata) : null;
+      const identityUserId = identity?.id ?? `legacy:${user.id}`;
+      const metadata = profileShadowMetadataFromLegacyUser(user, "profile-write-reconciliation-backfill");
+      const needsWrite =
+        !identity ||
+        !profile ||
+        !sameCanonical(profile.nickname ?? null, metadata.profile.nickname ?? null) ||
+        !sameCanonical(profile.info ?? null, metadata.profile.info ?? null);
+
+      plans.push({
+        legacyUserId: user.id,
+        identityUserId,
+        username: user.username,
+        status: identityStatusFromLegacyUser(user),
+        reason: !identity ? "missing-identity-user" : !profile ? "missing-profile-shadow" : needsWrite ? "profile-shadow-diff" : "already-aligned",
+        needsWrite,
+        metadata
+      });
+    }
+
+    const writePlans = plans.filter((plan) => plan.needsWrite);
+    const applyShadow = input.applyShadow && input.confirmApplyShadow;
+    if (applyShadow) {
+      for (const plan of writePlans) {
+        await this.iamRepository.upsertIdentityUserProfileShadow({
+          identityUserId: plan.identityUserId,
+          legacyUserId: plan.legacyUserId,
+          username: plan.username,
+          status: plan.status,
+          metadata: plan.metadata
+        });
+      }
+    }
+
+    return {
+      dryRun: !applyShadow,
+      applyShadow,
+      writeSideEffects: applyShadow ? "identity-profile-shadow" : "none",
+      sampleCount: users.length,
+      plannedWriteCount: writePlans.length,
+      shadowWriteCount: applyShadow ? writePlans.length : 0,
+      reasonCounts: countProfileBackfillReasons(plans),
+      cursor: {
+        afterLegacyUserId: input.afterLegacyUserId ?? 0,
+        limit: input.limit ?? 50,
+        nextAfterLegacyUserId: users.length > 0 ? users[users.length - 1]!.id : input.afterLegacyUserId ?? 0
+      },
+      evidence: {
+        rawProfileValuesRedacted: true,
+        plannedLegacyUserIds: writePlans.map((plan) => plan.legacyUserId).slice(0, 100)
+      },
+      safetyGate: {
+        readyForApply: writePlans.length > 0,
+        requiresExplicitConfirmApplyShadow: true,
+        p0BlocksDualWriteCloseout: true,
+        p1BlocksDualWriteCloseout: true
+      },
+      nextRecommendedAction: applyShadow
+        ? "rerun_profile_reconciliation_dry_run"
+        : writePlans.length > 0
+          ? "rerun_with_applyShadow_and_confirmApplyShadow"
+          : "rerun_profile_reconciliation_dry_run"
+    };
+  }
+
   async proxy(request: ProfileWriteRequest, path: string): Promise<ProfileWriteProxyResponse> {
     const { iam } = this.config;
 
@@ -723,6 +807,28 @@ interface ProfileReconciliationInput {
   limit?: number;
 }
 
+interface ProfileBackfillInput extends ProfileReconciliationInput {
+  applyShadow: boolean;
+  confirmApplyShadow: boolean;
+}
+
+interface ProfileBackfillPlan {
+  legacyUserId: number;
+  identityUserId: string;
+  username: string | null;
+  status: string;
+  reason: "missing-identity-user" | "missing-profile-shadow" | "profile-shadow-diff" | "already-aligned";
+  needsWrite: boolean;
+  metadata: {
+    source: string;
+    legacyUserId: number;
+    profile: {
+      nickname: string | null;
+      info: unknown;
+    };
+  };
+}
+
 interface ProfileReconciliationItem {
   severity: "p0" | "p1" | "p2" | "info";
   legacySubjectType: "legacy_user";
@@ -766,6 +872,43 @@ function parseProfileReconciliationInput(rawInput: unknown): ProfileReconciliati
     legacyUserIds: legacyUserIds && legacyUserIds.length > 0 ? legacyUserIds : undefined,
     afterLegacyUserId,
     limit
+  };
+}
+
+function parseProfileBackfillInput(rawInput: unknown): ProfileBackfillInput {
+  const object = rawInput && typeof rawInput === "object" && !Array.isArray(rawInput) ? (rawInput as Record<string, unknown>) : {};
+  const base = parseProfileReconciliationInput(rawInput);
+  return {
+    ...base,
+    applyShadow: object.applyShadow === true,
+    confirmApplyShadow: object.confirmApplyShadow === true
+  };
+}
+
+function profileShadowMetadataFromLegacyUser(
+  user: LegacyUserReadModel,
+  source: "profile-write-dual-write" | "profile-write-reconciliation-backfill"
+): ProfileBackfillPlan["metadata"] {
+  return {
+    source,
+    legacyUserId: user.id,
+    profile: {
+      nickname: user.nickname ?? null,
+      info: normalizeEmptyObject(user.userInfo)
+    }
+  };
+}
+
+function identityStatusFromLegacyUser(user: LegacyUserReadModel): string {
+  return user.status === 10 ? "active" : "inactive";
+}
+
+function countProfileBackfillReasons(plans: ProfileBackfillPlan[]): Record<ProfileBackfillPlan["reason"], number> {
+  return {
+    "missing-identity-user": plans.filter((plan) => plan.reason === "missing-identity-user").length,
+    "missing-profile-shadow": plans.filter((plan) => plan.reason === "missing-profile-shadow").length,
+    "profile-shadow-diff": plans.filter((plan) => plan.reason === "profile-shadow-diff").length,
+    "already-aligned": plans.filter((plan) => plan.reason === "already-aligned").length
   };
 }
 

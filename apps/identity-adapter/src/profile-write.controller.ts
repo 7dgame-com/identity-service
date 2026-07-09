@@ -45,6 +45,16 @@ export class ProfileWriteController {
     };
   }
 
+  @Post("internal/profile-write/reconciliation/backfill-shadow")
+  async reconciliationBackfillShadow(@Body() body: unknown) {
+    return {
+      status: "ok",
+      service: "identity-adapter",
+      capability: "profile-write-reconciliation-backfill-shadow",
+      data: await this.profileWrite.reconciliationBackfillShadow(body)
+    };
+  }
+
   @Put("v1/user/update")
   updateProfile(
     @Req() request: ProfileWriteExpressRequest,

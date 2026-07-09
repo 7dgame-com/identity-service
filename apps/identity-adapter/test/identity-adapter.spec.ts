@@ -785,6 +785,7 @@ class FakeIamRepository {
     identityUserId: string;
     legacyUserId: number;
     username: string | null;
+    status?: string;
     metadata: Record<string, unknown>;
   }) {
     if (this.failNextUpsertIdentityUserProfileShadow) {
@@ -798,7 +799,7 @@ class FakeIamRepository {
       keycloakSubject: null,
       username: input.username,
       email: null,
-      status: "active",
+      status: input.status ?? "active",
       source: "legacy-shadow",
       metadata: {},
       createdAt: "2026-07-09T00:00:00.000Z",
@@ -809,7 +810,7 @@ class FakeIamRepository {
       id: input.identityUserId,
       legacyUserId: input.legacyUserId,
       username: input.username ?? existing.username,
-      status: "active",
+      status: input.status ?? "active",
       metadata: {
         ...(existing.metadata ?? {}),
         ...(input.metadata ?? {})
@@ -3850,6 +3851,97 @@ describe("identity-adapter profile write legacy-proxy API", () => {
       })
     ]);
     expect(JSON.stringify(response.body)).not.toContain("babamama");
+  });
+
+  it("previews profile reconciliation shadow backfill without writing by default", async () => {
+    const operations = new FakeProfileWriteOperationRepository();
+    const iamRepository = new FakeIamRepository();
+    app = await createLifecycleTestApp(undefined, iamRepository, undefined, operations);
+
+    const response = await request(app.getHttpServer())
+      .post("/internal/profile-write/reconciliation/backfill-shadow")
+      .send({ legacyUserIds: [25] })
+      .expect(201);
+
+    expect(response.body).toMatchObject({
+      status: "ok",
+      service: "identity-adapter",
+      capability: "profile-write-reconciliation-backfill-shadow",
+      data: {
+        dryRun: true,
+        applyShadow: false,
+        writeSideEffects: "none",
+        sampleCount: 1,
+        plannedWriteCount: 1,
+        shadowWriteCount: 0,
+        reasonCounts: {
+          "missing-identity-user": 1
+        },
+        safetyGate: {
+          requiresExplicitConfirmApplyShadow: true
+        },
+        nextRecommendedAction: "rerun_with_applyShadow_and_confirmApplyShadow"
+      }
+    });
+    expect(iamRepository.profileShadowWrites).toHaveLength(0);
+    expect(iamRepository.identityUsers.has(25)).toBe(false);
+    expect(JSON.stringify(response.body)).not.toContain("unverified@example.com");
+  });
+
+  it("applies profile reconciliation shadow backfill and clears missing identity p1", async () => {
+    const operations = new FakeProfileWriteOperationRepository();
+    const iamRepository = new FakeIamRepository();
+    app = await createLifecycleTestApp(undefined, iamRepository, undefined, operations);
+
+    const applyResponse = await request(app.getHttpServer())
+      .post("/internal/profile-write/reconciliation/backfill-shadow")
+      .send({ legacyUserIds: [25], applyShadow: true, confirmApplyShadow: true })
+      .expect(201);
+
+    expect(applyResponse.body.data).toMatchObject({
+      dryRun: false,
+      applyShadow: true,
+      writeSideEffects: "identity-profile-shadow",
+      sampleCount: 1,
+      plannedWriteCount: 1,
+      shadowWriteCount: 1,
+      nextRecommendedAction: "rerun_profile_reconciliation_dry_run"
+    });
+    expect(iamRepository.profileShadowWrites).toEqual([
+      expect.objectContaining({
+        identityUserId: "legacy:25",
+        legacyUserId: 25,
+        username: "unverified",
+        status: "active",
+        metadata: {
+          source: "profile-write-reconciliation-backfill",
+          legacyUserId: 25,
+          profile: {
+            nickname: null,
+            info: null
+          }
+        }
+      })
+    ]);
+
+    const reconciliationResponse = await request(app.getHttpServer())
+      .post("/internal/profile-write/reconciliation/dry-run")
+      .send({ legacyUserIds: [25] })
+      .expect(201);
+
+    expect(reconciliationResponse.body.data).toMatchObject({
+      sampleCount: 1,
+      severity: {
+        p0: 0,
+        p1: 0,
+        p2: 0,
+        info: 0
+      },
+      safetyGate: {
+        passed: true
+      }
+    });
+    expect(reconciliationResponse.body.data.items).toEqual([]);
   });
 });
 
