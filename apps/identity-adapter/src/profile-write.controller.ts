@@ -1,4 +1,4 @@
-import { Controller, Get, Put, Req, Res } from "@nestjs/common";
+import { Body, Controller, Get, Post, Put, Query, Req, Res } from "@nestjs/common";
 import { ProfileWriteService } from "./profile-write.service.js";
 
 @Controller()
@@ -12,6 +12,36 @@ export class ProfileWriteController {
       service: "identity-adapter",
       capability: "profile-write",
       data: this.profileWrite.readiness()
+    };
+  }
+
+  @Get("internal/profile-write/operations/summary")
+  async operationLedgerSummary(@Query("sinceMinutes") sinceMinutes: string | undefined) {
+    return {
+      status: "ok",
+      service: "identity-adapter",
+      capability: "profile-write-operation-ledger",
+      data: await this.profileWrite.operationLedgerSummary({ sinceMinutes: Number(sinceMinutes) })
+    };
+  }
+
+  @Get("internal/profile-write/operations/recent")
+  async operationLedgerRecent(@Query("sinceMinutes") sinceMinutes: string | undefined, @Query("limit") limit: string | undefined) {
+    return {
+      status: "ok",
+      service: "identity-adapter",
+      capability: "profile-write-operation-ledger",
+      data: await this.profileWrite.operationLedgerRecent({ sinceMinutes: Number(sinceMinutes), limit: Number(limit) })
+    };
+  }
+
+  @Post("internal/profile-write/reconciliation/dry-run")
+  async reconciliationDryRun(@Body() body: unknown) {
+    return {
+      status: "ok",
+      service: "identity-adapter",
+      capability: "profile-write-reconciliation",
+      data: await this.profileWrite.reconciliationDryRun(body)
     };
   }
 
