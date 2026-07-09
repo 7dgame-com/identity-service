@@ -64,7 +64,10 @@ export interface ProfileWriteOperationRecentRow {
   route: ProfileWriteRoute;
   mode: ProfileWriteMode;
   status: ProfileWriteOperationStatus;
+  legacyStatus: string | null;
+  identityStatus: string | null;
   compensationStatus: ProfileWriteCompensationStatus;
+  errorCode: string | null;
   operationKeyDigest: string;
   idempotencyKeyDigest: string;
   legacyUserId: number | null;
@@ -232,7 +235,10 @@ export class ProfileWriteOperationRepository implements OnModuleDestroy {
               route,
               mode,
               status,
+              legacy_status AS legacyStatus,
+              identity_status AS identityStatus,
               compensation_status AS compensationStatus,
+              error_code AS errorCode,
               legacy_user_id AS legacyUserId,
               requested_at AS requestedAt,
               completed_at AS completedAt
@@ -247,7 +253,10 @@ export class ProfileWriteOperationRepository implements OnModuleDestroy {
       route: row.route as ProfileWriteRoute,
       mode: row.mode as ProfileWriteMode,
       status: row.status as ProfileWriteOperationStatus,
+      legacyStatus: nullableString(row.legacyStatus),
+      identityStatus: nullableString(row.identityStatus),
       compensationStatus: row.compensationStatus as ProfileWriteCompensationStatus,
+      errorCode: nullableString(row.errorCode),
       operationKeyDigest: shortDigest(row.operationKey),
       idempotencyKeyDigest: shortDigest(row.idempotencyKey),
       legacyUserId: nullableNumber(row.legacyUserId),
