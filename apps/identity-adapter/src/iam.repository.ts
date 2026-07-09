@@ -130,6 +130,14 @@ export interface IdentityUserShadowInput {
   metadata: Record<string, unknown>;
 }
 
+export interface IdentityUserProfileShadowInput {
+  identityUserId: string;
+  legacyUserId: number;
+  username: string | null;
+  status?: string;
+  metadata: Record<string, unknown>;
+}
+
 export interface PluginSubjectMapInput {
   identityUserId: string;
   legacyUserId: number;
@@ -413,6 +421,43 @@ export class IamRepository implements OnModuleDestroy {
         JSON.stringify({
           legacyUserId: input.legacyUserId,
           source: "legacy-shadow-reconciliation"
+        })
+      ]
+    );
+  }
+
+  async upsertIdentityUserProfileShadow(input: IdentityUserProfileShadowInput): Promise<void> {
+    const pool = this.requirePool();
+    await this.ensureSchema();
+    const status = input.status ?? "active";
+
+    await pool.execute(
+      `INSERT INTO identity_users
+        (id, legacy_user_id, username, email, status, source, metadata)
+       VALUES (?, ?, ?, NULL, ?, 'legacy-shadow', ?)
+       ON DUPLICATE KEY UPDATE
+         legacy_user_id = VALUES(legacy_user_id),
+         username = COALESCE(VALUES(username), username),
+         status = VALUES(status),
+         source = VALUES(source),
+         metadata = JSON_MERGE_PATCH(COALESCE(metadata, JSON_OBJECT()), VALUES(metadata))`,
+      [input.identityUserId, input.legacyUserId, input.username, status, JSON.stringify(input.metadata ?? {})]
+    );
+
+    await pool.execute(
+      `INSERT INTO identity_subject_maps
+        (identity_user_id, subject_type, subject_id, source, status, metadata)
+       VALUES (?, 'legacy_user', ?, 'legacy-shadow', 'active', ?)
+       ON DUPLICATE KEY UPDATE
+         status = 'active',
+         source = VALUES(source),
+         metadata = VALUES(metadata)`,
+      [
+        input.identityUserId,
+        String(input.legacyUserId),
+        JSON.stringify({
+          legacyUserId: input.legacyUserId,
+          source: "profile-write-dual-write"
         })
       ]
     );
