@@ -9,7 +9,7 @@ services:
       MYSQL_USER: ${IDENTITY_DB_USER:-identity}
       MYSQL_PASSWORD: ${IDENTITY_DB_PASSWORD:-identity_password}
     ports:
-      - "3317:3306"
+      - "127.0.0.1:3317:3306"
     volumes:
       - identity_mysql_data:/var/lib/mysql
       - ./deploy/mysql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
@@ -23,7 +23,7 @@ services:
     image: redis:7-alpine
     restart: unless-stopped
     ports:
-      - "6387:6379"
+      - "127.0.0.1:6387:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -43,7 +43,7 @@ services:
       KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:-admin}
       KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
     ports:
-      - "8087:8080"
+      - "127.0.0.1:8087:8080"
     volumes:
       - ./deploy/keycloak/realm-readonly.json:/opt/keycloak/data/import/realm-readonly.json:ro
     depends_on:
@@ -59,6 +59,7 @@ services:
     environment:
       PORT: 8086
       IDENTITY_READONLY_MODE: "true"
+      IDENTITY_CORS_ORIGINS: ${IDENTITY_CORS_ORIGINS:-http://localhost:3000,http://localhost:3001,http://localhost:3002,http://localhost:3004,http://localhost:3005,http://localhost:3008}
       LEGACY_DB_HOST: ${LEGACY_DB_HOST:-host.docker.internal}
       LEGACY_DB_PORT: ${LEGACY_DB_PORT:-3306}
       LEGACY_DB_NAME: ${LEGACY_DB_NAME:-bujiaban}
@@ -91,7 +92,7 @@ services:
       OTEL_EXPORTER_OTLP_HEADERS: ${OTEL_EXPORTER_OTLP_HEADERS:-}
       OTEL_EXPORTER_OTLP_TRACES_HEADERS: ${OTEL_EXPORTER_OTLP_TRACES_HEADERS:-}
     ports:
-      - "8086:8086"
+      - "127.0.0.1:8086:8086"
     depends_on:
       identity-redis:
         condition: service_healthy

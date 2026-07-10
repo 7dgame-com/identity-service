@@ -1,12 +1,16 @@
-import { Body, Controller, Get, Post, Put, Query, Req, Res } from "@nestjs/common";
+import { Body, Controller, Get, Headers, HttpException, HttpStatus, Post, Put, Query, Req, Res } from "@nestjs/common";
+import { loadConfig } from "./config.js";
 import { ProfileWriteService } from "./profile-write.service.js";
 
 @Controller()
 export class ProfileWriteController {
+  private readonly config = loadConfig();
+
   constructor(private readonly profileWrite: ProfileWriteService) {}
 
   @Get("internal/profile-write/readiness")
-  readiness() {
+  readiness(@Headers("x-identity-internal-token") token: string | undefined) {
+    this.assertInternalToken(token);
     return {
       status: "ok",
       service: "identity-adapter",
@@ -16,7 +20,8 @@ export class ProfileWriteController {
   }
 
   @Get("internal/profile-write/operations/summary")
-  async operationLedgerSummary(@Query("sinceMinutes") sinceMinutes: string | undefined) {
+  async operationLedgerSummary(@Headers("x-identity-internal-token") token: string | undefined, @Query("sinceMinutes") sinceMinutes: string | undefined) {
+    this.assertInternalToken(token);
     return {
       status: "ok",
       service: "identity-adapter",
@@ -26,7 +31,8 @@ export class ProfileWriteController {
   }
 
   @Get("internal/profile-write/operations/recent")
-  async operationLedgerRecent(@Query("sinceMinutes") sinceMinutes: string | undefined, @Query("limit") limit: string | undefined) {
+  async operationLedgerRecent(@Headers("x-identity-internal-token") token: string | undefined, @Query("sinceMinutes") sinceMinutes: string | undefined, @Query("limit") limit: string | undefined) {
+    this.assertInternalToken(token);
     return {
       status: "ok",
       service: "identity-adapter",
@@ -36,7 +42,8 @@ export class ProfileWriteController {
   }
 
   @Post("internal/profile-write/reconciliation/dry-run")
-  async reconciliationDryRun(@Body() body: unknown) {
+  async reconciliationDryRun(@Headers("x-identity-internal-token") token: string | undefined, @Body() body: unknown) {
+    this.assertInternalToken(token);
     return {
       status: "ok",
       service: "identity-adapter",
@@ -46,7 +53,8 @@ export class ProfileWriteController {
   }
 
   @Post("internal/profile-write/reconciliation/backfill-shadow")
-  async reconciliationBackfillShadow(@Body() body: unknown) {
+  async reconciliationBackfillShadow(@Headers("x-identity-internal-token") token: string | undefined, @Body() body: unknown) {
+    this.assertInternalToken(token);
     return {
       status: "ok",
       service: "identity-adapter",
@@ -73,6 +81,22 @@ export class ProfileWriteController {
     response.setHeader("X-Identity-Profile-Write", upstream.mode);
 
     return upstream.body;
+  }
+
+  private assertInternalToken(token: string | undefined): void {
+    const configuredToken = this.config.iam.internalToken;
+    if (!configuredToken) {
+      throw new HttpException(
+        { code: "IAM_INTERNAL_TOKEN_NOT_CONFIGURED", message: "Internal API token is required for profile-write operations." },
+        HttpStatus.SERVICE_UNAVAILABLE
+      );
+    }
+    if (token !== configuredToken) {
+      throw new HttpException(
+        { code: "INTERNAL_TOKEN_INVALID", message: "Internal service token is invalid." },
+        HttpStatus.UNAUTHORIZED
+      );
+    }
   }
 }
 
