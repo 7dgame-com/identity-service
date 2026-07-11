@@ -38,6 +38,7 @@ export const configSchema = z.object({
   nodeEnv: z.string().default("development"),
   port: numberFromEnv.default(8086),
   readonlyMode: boolFromEnv.default(true),
+  corsOrigins: z.string().default("http://localhost:3000,http://localhost:3001,http://localhost:3002,http://localhost:3004,http://localhost:3005,http://localhost:3008"),
   jwksPublicKeysJson: z.string().default('{"keys":[]}'),
   legacyDb: z.object({
     host: z.string().optional(),
@@ -228,6 +229,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
     nodeEnv: env.NODE_ENV,
     port: env.PORT,
     readonlyMode: env.IDENTITY_READONLY_MODE,
+    corsOrigins: env.IDENTITY_CORS_ORIGINS,
     jwksPublicKeysJson: env.JWKS_PUBLIC_KEYS_JSON,
     legacyDb: {
       host: env.LEGACY_DB_HOST,

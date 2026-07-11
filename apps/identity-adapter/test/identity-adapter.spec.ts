@@ -2230,6 +2230,12 @@ describe("identity-adapter readonly API", () => {
     expect(normalizeOtlpTraceEndpoint(config.otel.exporterOtlpEndpoint!)).toBe("http://collector:4318/v1/traces");
   });
 
+  it("loads explicit identity CORS origins without reflecting arbitrary origins", () => {
+    const config = loadConfig({ IDENTITY_CORS_ORIGINS: "https://app.example.test, https://admin.example.test" });
+
+    expect(config.corsOrigins).toBe("https://app.example.test, https://admin.example.test");
+  });
+
   it("accepts profile write rollout off as a disabled window posture", () => {
     const config = loadConfig({
       IDENTITY_IAM_PROFILE_WRITE_ROLLOUT_MODE: "off",
@@ -3473,6 +3479,7 @@ describe("identity-adapter profile write legacy-proxy API", () => {
     process.env.IDENTITY_IAM_PROFILE_WRITE_MODE = "legacy-proxy";
     process.env.IDENTITY_IAM_PROFILE_WRITE_LEGACY_API_BASE_URL = "http://legacy-api";
     process.env.IDENTITY_IAM_PROFILE_WRITE_TIMEOUT_MS = "5000";
+    process.env.IDENTITY_IAM_INTERNAL_API_TOKEN = "profile-write-test-token";
   });
 
   afterEach(async () => {
@@ -3500,11 +3507,25 @@ describe("identity-adapter profile write legacy-proxy API", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("rejects profile-write internal operations without the internal token", async () => {
+    app = await createLifecycleTestApp();
+
+    await request(app.getHttpServer())
+      .get("/internal/profile-write/readiness")
+      .expect(401);
+
+    await request(app.getHttpServer())
+      .post("/internal/profile-write/reconciliation/backfill-shadow")
+      .send({ legacyUserIds: [25], applyShadow: true, confirmApplyShadow: true })
+      .expect(401);
+  });
+
   it("reports profile write legacy-proxy posture", async () => {
     app = await createLifecycleTestApp();
 
     const response = await request(app.getHttpServer())
       .get("/internal/profile-write/readiness")
+      .set("x-identity-internal-token", "profile-write-test-token")
       .expect(200);
 
     expect(response.body).toMatchObject({
@@ -3587,6 +3608,7 @@ describe("identity-adapter profile write legacy-proxy API", () => {
 
     const readiness = await request(app.getHttpServer())
       .get("/internal/profile-write/readiness")
+      .set("x-identity-internal-token", "profile-write-test-token")
       .expect(200);
 
     expect(readiness.body.data).toMatchObject({
@@ -3668,6 +3690,7 @@ describe("identity-adapter profile write legacy-proxy API", () => {
 
     const readiness = await request(app.getHttpServer())
       .get("/internal/profile-write/readiness")
+      .set("x-identity-internal-token", "profile-write-test-token")
       .expect(200);
 
     expect(readiness.body.data).toMatchObject({
@@ -3909,6 +3932,7 @@ describe("identity-adapter profile write legacy-proxy API", () => {
 
     const response = await request(app.getHttpServer())
       .get("/internal/profile-write/operations/recent?sinceMinutes=99999&limit=10")
+      .set("x-identity-internal-token", "profile-write-test-token")
       .expect(200);
 
     expect(response.body).toMatchObject({
@@ -4003,6 +4027,7 @@ describe("identity-adapter profile write legacy-proxy API", () => {
 
     const response = await request(app.getHttpServer())
       .post("/internal/profile-write/reconciliation/dry-run")
+      .set("x-identity-internal-token", "profile-write-test-token")
       .send({ legacyUserIds: [24] })
       .expect(201);
 
@@ -4040,6 +4065,7 @@ describe("identity-adapter profile write legacy-proxy API", () => {
 
     const response = await request(app.getHttpServer())
       .post("/internal/profile-write/reconciliation/dry-run")
+      .set("x-identity-internal-token", "profile-write-test-token")
       .send({ legacyUserIds: [24] })
       .expect(201);
 
@@ -4075,6 +4101,7 @@ describe("identity-adapter profile write legacy-proxy API", () => {
 
     const response = await request(app.getHttpServer())
       .post("/internal/profile-write/reconciliation/backfill-shadow")
+      .set("x-identity-internal-token", "profile-write-test-token")
       .send({ legacyUserIds: [25] })
       .expect(201);
 
@@ -4110,6 +4137,7 @@ describe("identity-adapter profile write legacy-proxy API", () => {
 
     const applyResponse = await request(app.getHttpServer())
       .post("/internal/profile-write/reconciliation/backfill-shadow")
+      .set("x-identity-internal-token", "profile-write-test-token")
       .send({ legacyUserIds: [25], applyShadow: true, confirmApplyShadow: true })
       .expect(201);
 
@@ -4141,6 +4169,7 @@ describe("identity-adapter profile write legacy-proxy API", () => {
 
     const reconciliationResponse = await request(app.getHttpServer())
       .post("/internal/profile-write/reconciliation/dry-run")
+      .set("x-identity-internal-token", "profile-write-test-token")
       .send({ legacyUserIds: [25] })
       .expect(201);
 
