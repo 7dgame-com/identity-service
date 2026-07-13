@@ -1,6 +1,7 @@
 import { Controller, Get, Headers, HttpException, HttpStatus, Param, Query, Res } from "@nestjs/common";
 import { loadConfig } from "./config.js";
 import { JwtIssuerService, VerifiedAccessToken } from "./jwt-issuer.service.js";
+import { IamRepository, type IdentityOrganizationShadowRow } from "./iam.repository.js";
 import { LegacyIdentityReader, LegacyUserReadModel } from "./legacy-identity.reader.js";
 import { LoginAuditService } from "./login-audit.service.js";
 import { PluginUserPrimaryReadService, PluginUserReadSource } from "./plugin-user-primary-read.service.js";
@@ -19,7 +20,8 @@ export class PluginUserReadonlyController {
     private readonly legacyReader: LegacyIdentityReader,
     private readonly jwtIssuer: JwtIssuerService,
     private readonly primaryRead: PluginUserPrimaryReadService,
-    private readonly loginAudit: LoginAuditService
+    private readonly loginAudit: LoginAuditService,
+    private readonly iamRepository: IamRepository
   ) {}
 
   @Get("v1/plugin-user/users")
@@ -79,7 +81,11 @@ export class PluginUserReadonlyController {
   }
 
   @Get("v1/plugin-user/users/:legacyUserId/login-audit")
-  async userLoginAudit(@Headers("authorization") authorization: string | undefined, @Param("legacyUserId") legacyUserId: string) {
+  async userLoginAudit(
+    @Headers("authorization") authorization: string | undefined,
+    @Param("legacyUserId") legacyUserId: string,
+    @Query() query: Record<string, unknown>
+  ) {
     this.assertEnabled();
     const claims = this.currentUser(authorization);
     const parsedId = positiveInt(legacyUserId);
@@ -94,6 +100,9 @@ export class PluginUserReadonlyController {
     }
 
     await this.assertCan(claims, "user-management.view-user");
+    this.assertLoginAuditEnabled();
+    const organizationId = this.resolveAuditOrganizationScope(claims, query);
+
     const result = await this.primaryRead.getUserById(parsedId, claims);
     if (!result.data) {
       throw new HttpException(
@@ -105,12 +114,105 @@ export class PluginUserReadonlyController {
       );
     }
 
-    this.assertLoginAuditEnabled();
+    await this.assertOrganizationScopedAuditAccess(claims, result.data.id, organizationId);
 
     return {
       code: 0,
       data: await this.loginAudit.getUserAudit(parsedId)
     };
+  }
+
+  private async assertOrganizationScopedAuditAccess(
+    claims: VerifiedAccessToken,
+    targetUserId: number,
+    organizationId: number | null
+  ): Promise<void> {
+    if (organizationId === null) return;
+
+    const authoritativeTarget = await this.readAuthoritativeUser(targetUserId);
+    if (!authoritativeTarget || !belongsToOrganization(authoritativeTarget, organizationId)) {
+      throw this.organizationScopeDenied();
+    }
+    await this.assertShadowMembershipMatches(authoritativeTarget);
+
+    if (claims.roles.includes("root")) {
+      return;
+    }
+
+    const actorUser = claims.uid === authoritativeTarget.id
+      ? authoritativeTarget
+      : await this.readAuthoritativeUser(claims.uid);
+    if (!actorUser || !belongsToOrganization(actorUser, organizationId)) {
+      throw this.organizationScopeDenied();
+    }
+    await this.assertShadowMembershipMatches(actorUser);
+  }
+
+  private resolveAuditOrganizationScope(
+    claims: VerifiedAccessToken,
+    query: Record<string, unknown>
+  ): number | null {
+    const organizationId = query.organization_id;
+    const parsedOrganizationId = organizationId === undefined ? null : strictPositiveInt(organizationId);
+    if (hasMalformedOrganizationScope(query) || (organizationId !== undefined && parsedOrganizationId === null)) {
+      throw new HttpException(
+        {
+          code: "INVALID_ORGANIZATION_ID",
+          message: "Organization id must be a positive integer."
+        },
+        HttpStatus.BAD_REQUEST
+      );
+    }
+
+    if (organizationId === undefined) {
+      if (claims.roles.includes("root")) {
+        return null;
+      }
+
+      throw new HttpException(
+        {
+          code: "ORGANIZATION_SCOPE_REQUIRED",
+          message: "Organization scope is required for non-root login audit access."
+        },
+        HttpStatus.FORBIDDEN
+      );
+    }
+
+    return parsedOrganizationId!;
+  }
+
+  private async readAuthoritativeUser(userId: number): Promise<LegacyUserReadModel | null> {
+    try {
+      return await this.legacyReader.getUserById(userId);
+    } catch {
+      throw this.organizationScopeDenied();
+    }
+  }
+
+  private async assertShadowMembershipMatches(user: LegacyUserReadModel): Promise<void> {
+    if (!this.iamRepository.isConfigured()) {
+      throw this.organizationScopeDenied();
+    }
+
+    try {
+      const shadowMemberships = await this.iamRepository.listOrganizationMembershipsShadow(user.id);
+      if (!sameOrganizationMemberships(user, shadowMemberships)) {
+        throw this.organizationScopeDenied();
+      }
+    } catch (error) {
+      if (error instanceof HttpException) throw error;
+      throw this.organizationScopeDenied();
+    }
+  }
+
+  private organizationScopeDenied(): HttpException {
+    return new HttpException(
+      {
+        code: "ORGANIZATION_SCOPE_DENIED",
+        message: "该账号不属于当前组织"
+      },
+      HttpStatus.FORBIDDEN
+    );
   }
 
   private assertEnabled(): void {
@@ -188,6 +290,10 @@ export class PluginUserReadonlyController {
   }
 }
 
+function belongsToOrganization(user: LegacyUserReadModel, organizationId: number): boolean {
+  return user.organizations.some((organization) => Number(organization.id) === organizationId);
+}
+
 function serializeManagedUser(user: LegacyUserReadModel) {
   return {
     id: user.id,
@@ -208,6 +314,47 @@ function positiveInt(value: unknown): number | null {
     return null;
   }
   return parsed;
+}
+
+function strictPositiveInt(value: unknown): number | null {
+  if (typeof value === "number") {
+    return Number.isSafeInteger(value) && value > 0 ? value : null;
+  }
+  if (typeof value !== "string" || !/^[1-9]\d*$/.test(value)) {
+    return null;
+  }
+
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+function hasMalformedOrganizationScope(query: Record<string, unknown>): boolean {
+  return Object.keys(query).some((key) => key.startsWith("organization_id["));
+}
+
+function sameOrganizationMemberships(
+  legacyUser: LegacyUserReadModel,
+  shadowMemberships: IdentityOrganizationShadowRow[]
+): boolean {
+  const legacyOrganizationIds = new Set(legacyUser.organizations.map((organization) => organization.id));
+  const shadowOrganizationIds = new Set<number>();
+
+  for (const membership of shadowMemberships) {
+    if (
+      (membership.legacyUserId !== null && membership.legacyUserId !== legacyUser.id)
+      || !Number.isSafeInteger(membership.organizationId)
+      || membership.organizationId <= 0
+    ) {
+      return false;
+    }
+    shadowOrganizationIds.add(membership.organizationId);
+  }
+
+  if (legacyOrganizationIds.size !== shadowOrganizationIds.size) {
+    return false;
+  }
+
+  return [...legacyOrganizationIds].every((organizationId) => shadowOrganizationIds.has(organizationId));
 }
 
 function bearerToken(authorization?: string): string | null {
