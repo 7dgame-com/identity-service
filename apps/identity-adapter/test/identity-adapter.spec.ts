@@ -23,7 +23,7 @@ import { InvitationLegacyRedisRepository } from "../src/invitation-legacy-redis.
 import { InvitationRecordRepository } from "../src/invitation-record.repository.js";
 import { InvitationRedisReader, LegacyRedisInvitation } from "../src/invitation-redis.reader.js";
 import { JwtIssuerService } from "../src/jwt-issuer.service.js";
-import { LegacyIdentityReader } from "../src/legacy-identity.reader.js";
+import { LegacyIdentityReader, type LegacyUserReadModel } from "../src/legacy-identity.reader.js";
 import { LegacySessionRevocationService } from "../src/legacy-session-revocation.service.js";
 import { LoginAuditRepository, PersistedLoginAuditEvent } from "../src/login-audit.repository.js";
 import { planPluginUserIdentityShadow } from "../src/plugin-user-write-identity-shadow.js";
@@ -92,7 +92,7 @@ class FakeLegacyIdentityReader {
     };
   }
 
-  async getUserById(id: number) {
+  async getUserById(id: number): Promise<LegacyUserReadModel | null> {
     if (id === 25) {
       return {
         id: 25,
@@ -444,6 +444,7 @@ class FakeProfileWriteOperationRepository {
 }
 
 class FakeIamRepository {
+  configured = true;
   schemaEnsureCount = 0;
   schemaTablesReady = true;
   failNextUpsertIdentityUserShadow = false;
@@ -543,7 +544,7 @@ class FakeIamRepository {
   readonly items = new Map<string, any[]>();
 
   isConfigured() {
-    return true;
+    return this.configured;
   }
 
   async health() {
@@ -5847,7 +5848,7 @@ describe("identity-adapter plugin user readonly compatibility API", () => {
     expect(response.headers["x-identity-user-source"]).toBe("legacy");
   });
 
-  it("returns login audit records for an authorized managed user", async () => {
+  it("requires organization scope for a non-root login audit reader", async () => {
     process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
     process.env.IDENTITY_LOGIN_AUDIT_ENABLED = "true";
     const loginAuditRepository = new FakeLoginAuditRepository();
@@ -5857,26 +5858,315 @@ describe("identity-adapter plugin user readonly compatibility API", () => {
     const response = await request(app.getHttpServer())
       .get("/v1/plugin-user/users/24/login-audit")
       .set("Authorization", `Bearer ${login.accessToken}`)
-      .expect(200);
+      .expect(403);
 
     expect(response.body).toMatchObject({
-      code: 0,
-      data: {
-        stats: {
-          legacyUserId: 24,
-          username: "guanfei",
-          loginCount: 1,
-          failedLoginCount: 0
-        },
-        recentEvents: [
-          {
-            eventType: "login",
-            success: true,
-            source: "identity-adapter"
-          }
-        ]
-      }
+      code: "ORGANIZATION_SCOPE_REQUIRED"
     });
+  });
+
+  it("validates login audit scope before looking up the target account", async () => {
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    process.env.IDENTITY_LOGIN_AUDIT_ENABLED = "true";
+    app = await createPluginUserReadonlyTestApp(repository, undefined, new FakeLoginAuditRepository());
+    const login = await loginAs(app, "guanfei");
+
+    const missingScope = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users/999/login-audit")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(403);
+    expect(missingScope.body).toMatchObject({
+      code: "ORGANIZATION_SCOPE_REQUIRED"
+    });
+
+    const invalidScope = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users/999/login-audit?organization_id=invalid")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(400);
+    expect(invalidScope.body).toMatchObject({
+      code: "INVALID_ORGANIZATION_ID"
+    });
+  });
+
+  it("returns organization-scoped login audit records for a campus administrator", async () => {
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    process.env.IDENTITY_LOGIN_AUDIT_ENABLED = "true";
+    const loginAuditRepository = new FakeLoginAuditRepository();
+    app = await createPluginUserReadonlyTestApp(repository, new FakeIamRepository(), loginAuditRepository);
+    const login = await loginAs(app, "guanfei");
+
+    const response = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users/24/login-audit?organization_id=1")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(200);
+
+    expect(response.body.data.stats).toMatchObject({
+      legacyUserId: 24,
+      username: "guanfei",
+      loginCount: 1
+    });
+  });
+
+  it("rejects organization-scoped login audit records for an account outside the campus", async () => {
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    process.env.IDENTITY_LOGIN_AUDIT_ENABLED = "true";
+    app = await createPluginUserReadonlyTestApp(repository, undefined, new FakeLoginAuditRepository());
+    const login = await loginAs(app, "guanfei");
+
+    const response = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users/25/login-audit?organization_id=1")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(403);
+
+    expect(response.body).toMatchObject({
+      code: "ORGANIZATION_SCOPE_DENIED"
+    });
+  });
+
+  it("rejects invalid, empty, ambiguous and non-canonical organization ids", async () => {
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    process.env.IDENTITY_LOGIN_AUDIT_ENABLED = "true";
+    app = await createPluginUserReadonlyTestApp(repository, undefined, new FakeLoginAuditRepository());
+    const login = await loginAs(app, "guanfei");
+
+    for (const query of [
+      "organization_id=invalid",
+      "organization_id=",
+      "organization_id=1&organization_id=2",
+      "organization_id=01",
+      "organization_id[]=1",
+      "organization_id=1&organization_id[]=2"
+    ]) {
+      const response = await request(app.getHttpServer())
+        .get(`/v1/plugin-user/users/24/login-audit?${query}`)
+        .set("Authorization", `Bearer ${login.accessToken}`)
+        .expect(400);
+
+      expect(response.body).toMatchObject({
+        code: "INVALID_ORGANIZATION_ID"
+      });
+    }
+  });
+
+  it("rejects a campus administrator outside the requested organization", async () => {
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    process.env.IDENTITY_LOGIN_AUDIT_ENABLED = "true";
+    const legacyReader = new FakeLegacyIdentityReader();
+    const getUserById = legacyReader.getUserById.bind(legacyReader);
+    vi.spyOn(legacyReader, "getUserById").mockImplementation(async (id: number) => {
+      const user = await getUserById(id);
+      if (id !== 25 || !user) return user;
+      return {
+        ...user,
+        organizations: [{ id: 2, name: "other-campus", title: "其他校园", createdAt: 1, updatedAt: 1 }]
+      };
+    });
+    const iamRepository = new FakeIamRepository();
+    iamRepository.organizationMemberships.set(25, [
+      {
+        identityUserId: "id-user-25",
+        legacyUserId: 25,
+        organizationId: 2,
+        organizationRole: "member",
+        source: "legacy-shadow",
+        status: "shadow",
+        metadata: {},
+        observedAt: "2026-06-10T00:00:00.000Z"
+      }
+    ]);
+    app = await createPluginUserReadonlyTestApp(
+      repository,
+      iamRepository,
+      new FakeLoginAuditRepository(),
+      legacyReader
+    );
+    const login = await loginAs(app, "guanfei");
+
+    const response = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users/25/login-audit?organization_id=2")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(403);
+
+    expect(response.body).toMatchObject({
+      code: "ORGANIZATION_SCOPE_DENIED"
+    });
+  });
+
+  it("fails closed when legacy membership is stale even if identity shadow retains it", async () => {
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    process.env.IDENTITY_LOGIN_AUDIT_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_MODE = "allowlist";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ALLOWLIST = "uid:24";
+    const legacyReader = new FakeLegacyIdentityReader();
+    const getUserById = legacyReader.getUserById.bind(legacyReader);
+    vi.spyOn(legacyReader, "getUserById").mockImplementation(async (id: number) => {
+      const user = await getUserById(id);
+      return id === 24 && user ? { ...user, organizations: [] } : user;
+    });
+    const iamRepository = new FakeIamRepository();
+    app = await createPluginUserReadonlyTestApp(
+      repository,
+      iamRepository,
+      new FakeLoginAuditRepository(),
+      legacyReader
+    );
+    const login = await loginAs(app, "guanfei");
+
+    const response = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users/24/login-audit?organization_id=1")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(403);
+
+    expect(response.body).toMatchObject({
+      code: "ORGANIZATION_SCOPE_DENIED"
+    });
+  });
+
+  it("fails closed when target identity shadow membership is stale", async () => {
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    process.env.IDENTITY_LOGIN_AUDIT_ENABLED = "true";
+    const iamRepository = new FakeIamRepository();
+    iamRepository.organizationMemberships.set(24, []);
+    app = await createPluginUserReadonlyTestApp(
+      repository,
+      iamRepository,
+      new FakeLoginAuditRepository()
+    );
+    const login = await loginAs(app, "guanfei");
+
+    const response = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users/24/login-audit?organization_id=1")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(403);
+
+    expect(response.body).toMatchObject({
+      code: "ORGANIZATION_SCOPE_DENIED"
+    });
+  });
+
+  it("fails closed when the actor identity shadow membership is stale", async () => {
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    process.env.IDENTITY_LOGIN_AUDIT_ENABLED = "true";
+    const legacyReader = new FakeLegacyIdentityReader();
+    const getUserById = legacyReader.getUserById.bind(legacyReader);
+    vi.spyOn(legacyReader, "getUserById").mockImplementation(async (id: number) => {
+      const user = await getUserById(id);
+      if (id !== 25 || !user) return user;
+      return {
+        ...user,
+        organizations: [{ id: 1, name: "test-university", title: "测试大学", createdAt: 1, updatedAt: 1 }]
+      };
+    });
+    const iamRepository = new FakeIamRepository();
+    iamRepository.organizationMemberships.set(24, []);
+    iamRepository.organizationMemberships.set(25, [
+      {
+        identityUserId: "id-user-25",
+        legacyUserId: 25,
+        organizationId: 1,
+        organizationRole: "member",
+        source: "legacy-shadow",
+        status: "shadow",
+        metadata: {},
+        observedAt: "2026-06-10T00:00:00.000Z"
+      }
+    ]);
+    app = await createPluginUserReadonlyTestApp(
+      repository,
+      iamRepository,
+      new FakeLoginAuditRepository(),
+      legacyReader
+    );
+    const login = await loginAs(app, "guanfei");
+
+    const response = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users/25/login-audit?organization_id=1")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(403);
+
+    expect(response.body).toMatchObject({
+      code: "ORGANIZATION_SCOPE_DENIED"
+    });
+  });
+
+  it("fails closed when the identity shadow source is unavailable", async () => {
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    process.env.IDENTITY_LOGIN_AUDIT_ENABLED = "true";
+    const iamRepository = new FakeIamRepository();
+    iamRepository.configured = false;
+    app = await createPluginUserReadonlyTestApp(
+      repository,
+      iamRepository,
+      new FakeLoginAuditRepository()
+    );
+    const login = await loginAs(app, "guanfei");
+
+    const response = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users/24/login-audit?organization_id=1")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(403);
+
+    expect(response.body).toMatchObject({
+      code: "ORGANIZATION_SCOPE_DENIED"
+    });
+  });
+
+  it("keeps root login audit access compatible and allows a scoped target organization", async () => {
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    process.env.IDENTITY_LOGIN_AUDIT_ENABLED = "true";
+    const legacyReader = new FakeLegacyIdentityReader();
+    const getUserById = legacyReader.getUserById.bind(legacyReader);
+    vi.spyOn(legacyReader, "getUserById").mockImplementation(async (id: number) => {
+      const user = await getUserById(id);
+      if (!user) return user;
+      if (id === 24) return { ...user, roles: ["root"] };
+      if (id === 25) {
+        return {
+          ...user,
+          organizations: [{ id: 2, name: "other-campus", title: "其他校园", createdAt: 1, updatedAt: 1 }]
+        };
+      }
+      return user;
+    });
+    const iamRepository = new FakeIamRepository();
+    iamRepository.organizationMemberships.set(25, [
+      {
+        identityUserId: "id-user-25",
+        legacyUserId: 25,
+        organizationId: 2,
+        organizationRole: "member",
+        source: "legacy-shadow",
+        status: "shadow",
+        metadata: {},
+        observedAt: "2026-06-10T00:00:00.000Z"
+      }
+    ]);
+    app = await createPluginUserReadonlyTestApp(
+      repository,
+      iamRepository,
+      new FakeLoginAuditRepository(),
+      legacyReader
+    );
+    const login = await loginAs(app, "guanfei");
+
+    await request(app.getHttpServer())
+      .get("/v1/plugin-user/users/24/login-audit")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(200);
+
+    const malformedScope = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users/24/login-audit?organization_id[]=1")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(400);
+    expect(malformedScope.body).toMatchObject({
+      code: "INVALID_ORGANIZATION_ID"
+    });
+
+    await request(app.getHttpServer())
+      .get("/v1/plugin-user/users/25/login-audit?organization_id=2")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(200);
   });
 
   it("keeps login audit records unavailable when login audit is disabled", async () => {
@@ -7679,13 +7969,14 @@ async function createLifecycleTestApp(
 async function createPluginUserReadonlyTestApp(
   repository: FakeIdentitySessionRepository,
   iamRepository?: FakeIamRepository,
-  loginAuditRepository?: FakeLoginAuditRepository
+  loginAuditRepository?: FakeLoginAuditRepository,
+  legacyReader: FakeLegacyIdentityReader = new FakeLegacyIdentityReader()
 ): Promise<INestApplication> {
   let builder = Test.createTestingModule({
     imports: [AppModule]
   })
     .overrideProvider(LegacyIdentityReader)
-    .useClass(FakeLegacyIdentityReader)
+    .useValue(legacyReader)
     .overrideProvider(IdentitySessionRepository)
     .useValue(repository);
 
