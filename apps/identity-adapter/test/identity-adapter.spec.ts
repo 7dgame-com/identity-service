@@ -9237,8 +9237,104 @@ describe("identity-adapter IAM reconciliation API", () => {
     expect(iamRepository.runs.size).toBe(0);
   });
 
-  it("applies IAM shadow snapshots idempotently and reports the safety gate", async () => {
-    await createApp({ IDENTITY_IAM_RECONCILIATION_ENABLED: "true" });
+  it("refuses role and organization shadow materialization unless its dedicated control is enabled", async () => {
+    await createApp({ IDENTITY_IAM_RECONCILIATION_ENABLED: "true", IDENTITY_IAM_MODE: "readonly" });
+
+    const response = await request(app.getHttpServer())
+      .post("/internal/iam/reconciliation/run")
+      .set("x-identity-internal-token", "iam-test-token")
+      .send({ dryRun: false, runKey: "iam-role-materialization-disabled", scopes: ["role"], legacyUserIds: [25] })
+      .expect(404);
+
+    expect(response.body.code).toBe("IDENTITY_IAM_ROLE_PERMISSION_MATERIALIZATION_DISABLED");
+    expect(iamRepository.identityUsers.has(25)).toBe(false);
+    expect(iamRepository.runs.size).toBe(0);
+  });
+
+  it("keeps role and organization materialization scoped while unrelated write tracks remain legacy-proxy", async () => {
+    await createApp({
+      IDENTITY_IAM_RECONCILIATION_ENABLED: "true",
+      IDENTITY_IAM_ROLE_PERMISSION_MATERIALIZATION_ENABLED: "true",
+      IDENTITY_IAM_MODE: "readonly",
+      IDENTITY_IAM_PROFILE_WRITE_MODE: "legacy-proxy",
+      IDENTITY_IAM_PLUGIN_USER_WRITE_MODE: "legacy-proxy"
+    });
+
+    const readiness = await request(app.getHttpServer())
+      .get("/internal/iam/reconciliation/status")
+      .set("x-identity-internal-token", "iam-test-token")
+      .expect(200);
+
+    expect(readiness.body.data).toMatchObject({
+      readiness: {
+        writeModes: {
+          profile: "legacy-proxy",
+          role: "disabled",
+          organization: "disabled",
+          pluginUser: "legacy-proxy"
+        }
+      },
+      rolePermissionMaterialization: {
+        enabled: true,
+        maxBatchSize: 50,
+        allowedScopes: ["role", "organization"],
+        canApply: true,
+        blockers: []
+      },
+      safetyGate: {
+        canApplyShadow: false
+      }
+    });
+
+    const response = await request(app.getHttpServer())
+      .post("/internal/iam/reconciliation/run")
+      .set("x-identity-internal-token", "iam-test-token")
+      .send({
+        dryRun: false,
+        runKey: "iam-role-organization-materialization-25",
+        scopes: ["role", "organization"],
+        legacyUserIds: [25]
+      })
+      .expect(201);
+
+    expect(response.body.data).toMatchObject({
+      dryRun: false,
+      applyShadow: true,
+      scopes: ["role", "organization"],
+      summary: {
+        sampledUsers: 1,
+        p0Count: 0,
+        p1Count: 0
+      }
+    });
+    expect(iamRepository.roleAssignments.get(25)).toHaveLength(1);
+    expect((iamRepository.subjectMaps.get("legacy:25") ?? []).filter((subject) => subject.subjectType === "plugin_user")).toHaveLength(0);
+  });
+
+  it("refuses role materialization requests that include unsupported scopes", async () => {
+    await createApp({
+      IDENTITY_IAM_RECONCILIATION_ENABLED: "true",
+      IDENTITY_IAM_ROLE_PERMISSION_MATERIALIZATION_ENABLED: "true",
+      IDENTITY_IAM_MODE: "readonly"
+    });
+
+    const response = await request(app.getHttpServer())
+      .post("/internal/iam/reconciliation/run")
+      .set("x-identity-internal-token", "iam-test-token")
+      .send({ dryRun: false, runKey: "iam-role-materialization-unsupported-scope", scopes: ["role", "plugin"], legacyUserIds: [25] })
+      .expect(400);
+
+    expect(response.body.code).toBe("IDENTITY_IAM_ROLE_PERMISSION_MATERIALIZATION_SCOPE_FORBIDDEN");
+    expect(iamRepository.identityUsers.has(25)).toBe(false);
+    expect(iamRepository.runs.size).toBe(0);
+  });
+
+  it("applies IAM role and organization shadow snapshots idempotently and reports the safety gate", async () => {
+    await createApp({
+      IDENTITY_IAM_RECONCILIATION_ENABLED: "true",
+      IDENTITY_IAM_ROLE_PERMISSION_MATERIALIZATION_ENABLED: "true",
+      IDENTITY_IAM_MODE: "readonly"
+    });
 
     const first = await request(app.getHttpServer())
       .post("/internal/iam/reconciliation/run")
@@ -9246,7 +9342,7 @@ describe("identity-adapter IAM reconciliation API", () => {
       .send({
         dryRun: false,
         runKey: "iam-apply-25",
-        scopes: ["user", "role", "organization", "plugin"],
+        scopes: ["role", "organization"],
         legacyUserIds: [25]
       })
       .expect(201);
@@ -9276,7 +9372,7 @@ describe("identity-adapter IAM reconciliation API", () => {
       status: "active"
     });
     expect(iamRepository.roleAssignments.get(25)).toHaveLength(1);
-    expect(iamRepository.subjectMaps.get("legacy:25")?.filter((subject) => subject.subjectType === "plugin_user")).toHaveLength(1);
+    expect((iamRepository.subjectMaps.get("legacy:25") ?? []).filter((subject) => subject.subjectType === "plugin_user")).toHaveLength(0);
 
     const second = await request(app.getHttpServer())
       .post("/internal/iam/reconciliation/run")
@@ -9284,7 +9380,7 @@ describe("identity-adapter IAM reconciliation API", () => {
       .send({
         dryRun: false,
         runKey: "iam-apply-25-repeat",
-        scopes: ["user", "role", "organization", "plugin"],
+        scopes: ["role", "organization"],
         legacyUserIds: [25]
       })
       .expect(201);
@@ -9295,7 +9391,7 @@ describe("identity-adapter IAM reconciliation API", () => {
       p1Count: 0
     });
     expect(iamRepository.roleAssignments.get(25)).toHaveLength(1);
-    expect(iamRepository.subjectMaps.get("legacy:25")?.filter((subject) => subject.subjectType === "plugin_user")).toHaveLength(1);
+    expect((iamRepository.subjectMaps.get("legacy:25") ?? []).filter((subject) => subject.subjectType === "plugin_user")).toHaveLength(0);
 
     const report = await request(app.getHttpServer())
       .get("/internal/iam/reconciliation/runs/iam-apply-25")

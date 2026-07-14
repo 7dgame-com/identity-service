@@ -82,6 +82,10 @@ export const configSchema = z.object({
     schemaAutoEnsureEnabled: boolFromEnv.default(false),
     reconciliationEnabled: boolFromEnv.default(false),
     reconciliationBatchSize: numberFromEnv.default(500),
+    rolePermissionMaterializationEnabled: boolFromEnv.default(false),
+    rolePermissionMaterializationMaxBatchSize: numberFromEnv
+      .transform((value) => value ?? 50)
+      .pipe(z.number().int().min(1).max(50)),
     permissionModelImportEnabled: boolFromEnv.default(false),
     internalToken: optionalStringFromEnv,
     userViewEnabled: boolFromEnv.default(false),
@@ -280,6 +284,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
       schemaAutoEnsureEnabled: env.IDENTITY_IAM_AUTO_ENSURE_SCHEMA,
       reconciliationEnabled: env.IDENTITY_IAM_RECONCILIATION_ENABLED,
       reconciliationBatchSize: env.IDENTITY_IAM_RECONCILIATION_BATCH_SIZE,
+      rolePermissionMaterializationEnabled: env.IDENTITY_IAM_ROLE_PERMISSION_MATERIALIZATION_ENABLED,
+      rolePermissionMaterializationMaxBatchSize: env.IDENTITY_IAM_ROLE_PERMISSION_MATERIALIZATION_MAX_BATCH,
       permissionModelImportEnabled: env.IDENTITY_IAM_PERMISSION_MODEL_IMPORT_ENABLED,
       internalToken: env.IDENTITY_IAM_INTERNAL_API_TOKEN ?? env.IDENTITY_INTERNAL_API_TOKEN,
       userViewEnabled: env.IDENTITY_IAM_USER_VIEW_ENABLED,

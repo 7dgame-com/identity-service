@@ -19,6 +19,7 @@ type IamViewScope = "user" | "role" | "permission" | "organization" | "plugin";
 type IamReconciliationScope = IamViewScope;
 
 const reconciliationScopes = ["user", "role", "permission", "organization", "plugin"] as const;
+const rolePermissionMaterializationScopes = ["role", "organization"] as const;
 const reconciliationSchema = z.object({
   dryRun: z.boolean().optional(),
   runKey: z.string().min(8).max(160).optional(),
@@ -65,6 +66,11 @@ export class IamService implements OnApplicationBootstrap {
       schemaAutoEnsureEnabled: iam.schemaAutoEnsureEnabled,
       reconciliationEnabled: iam.reconciliationEnabled,
       reconciliationBatchSize: iam.reconciliationBatchSize,
+      rolePermissionMaterialization: {
+        enabled: iam.rolePermissionMaterializationEnabled,
+        maxBatchSize: iam.rolePermissionMaterializationMaxBatchSize,
+        allowedScopes: rolePermissionMaterializationScopes
+      },
       permissionModelImportEnabled: iam.permissionModelImportEnabled,
       identityRepositoryConfigured: this.repository.isConfigured(),
       legacyReaderConfigured: this.legacyReader.isConfigured(),
@@ -425,6 +431,9 @@ export class IamService implements OnApplicationBootstrap {
 
     const scopes = input.scopes ?? [...reconciliationScopes];
     const limit = input.limit ?? this.config.iam.reconciliationBatchSize;
+    if (!dryRun && scopes.some((scope) => rolePermissionMaterializationScopes.includes(scope as "role" | "organization"))) {
+      this.assertRolePermissionMaterializationAllowed(input, scopes, limit, applyShadow);
+    }
     const runKey = input.runKey ?? `iam-reconciliation:${randomUUID()}`;
     const users = await this.loadReconciliationUsers(input, limit);
     const batch = this.reconciliationBatchMetadata(input, users, limit);
@@ -635,6 +644,7 @@ export class IamService implements OnApplicationBootstrap {
         writeModesDisabled,
         usageBillingDryRun: usageBilling.dryRun
       },
+      rolePermissionMaterialization: this.rolePermissionMaterializationReadiness(canRunDryRun),
       safetyGate: {
         passed: blockers.length === 0 && baselinePassed,
         baselinePassed,
@@ -708,6 +718,76 @@ export class IamService implements OnApplicationBootstrap {
     }
 
     return parsed.data;
+  }
+
+  private assertRolePermissionMaterializationAllowed(
+    input: IamReconciliationInput,
+    scopes: IamReconciliationScope[],
+    limit: number,
+    applyShadow: boolean
+  ): void {
+    const { iam } = this.config;
+    if (!iam.rolePermissionMaterializationEnabled) {
+      throw new NotFoundException({
+        code: "IDENTITY_IAM_ROLE_PERMISSION_MATERIALIZATION_DISABLED",
+        message: "Role and organization shadow materialization is disabled."
+      });
+    }
+    if (iam.mode !== "readonly") {
+      throw new BadRequestException({
+        code: "IDENTITY_IAM_ROLE_PERMISSION_MATERIALIZATION_REQUIRES_READONLY",
+        message: "Role and organization shadow materialization requires IAM readonly mode."
+      });
+    }
+    if (iam.roleWriteMode !== "disabled" || iam.organizationWriteMode !== "disabled") {
+      throw new BadRequestException({
+        code: "IDENTITY_IAM_ROLE_PERMISSION_MATERIALIZATION_REQUIRES_WRITES_DISABLED",
+        message: "Role and organization write modes must be disabled during shadow materialization."
+      });
+    }
+    if (!applyShadow || scopes.some((scope) => !rolePermissionMaterializationScopes.includes(scope as "role" | "organization"))) {
+      throw new BadRequestException({
+        code: "IDENTITY_IAM_ROLE_PERMISSION_MATERIALIZATION_SCOPE_FORBIDDEN",
+        message: "Role and organization shadow materialization only supports apply-shadow for role and organization scopes."
+      });
+    }
+    if (limit > iam.rolePermissionMaterializationMaxBatchSize || (input.legacyUserIds?.length ?? 0) > iam.rolePermissionMaterializationMaxBatchSize) {
+      throw new BadRequestException({
+        code: "IDENTITY_IAM_ROLE_PERMISSION_MATERIALIZATION_BATCH_TOO_LARGE",
+        message: "Role and organization shadow materialization exceeds the configured maximum batch size."
+      });
+    }
+  }
+
+  private rolePermissionMaterializationReadiness(canRunDryRun: boolean) {
+    const { iam } = this.config;
+    const blockers: string[] = [];
+    if (!canRunDryRun) {
+      blockers.push("iam_or_data_sources_not_ready");
+    }
+    if (!iam.reconciliationEnabled) {
+      blockers.push("reconciliation_disabled");
+    }
+    if (!iam.rolePermissionMaterializationEnabled) {
+      blockers.push("role_permission_materialization_disabled");
+    }
+    if (iam.mode !== "readonly") {
+      blockers.push("iam_must_stay_readonly");
+    }
+    if (iam.roleWriteMode !== "disabled") {
+      blockers.push("role_write_must_stay_disabled");
+    }
+    if (iam.organizationWriteMode !== "disabled") {
+      blockers.push("organization_write_must_stay_disabled");
+    }
+
+    return {
+      enabled: iam.rolePermissionMaterializationEnabled,
+      maxBatchSize: iam.rolePermissionMaterializationMaxBatchSize,
+      allowedScopes: rolePermissionMaterializationScopes,
+      canApply: blockers.length === 0,
+      blockers
+    };
   }
 
   private parsePermissionModelImportInput(rawInput: unknown): IamPermissionModelImportInput {
