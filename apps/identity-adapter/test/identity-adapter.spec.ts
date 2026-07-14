@@ -480,6 +480,7 @@ class FakeIamRepository {
   schemaTablesReady = true;
   failNextUpsertIdentityUserShadow = false;
   failNextUpsertIdentityUserProfileShadow = false;
+  failNextReplaceSubjectAssignments = false;
   readonly identityShadowWrites: Array<{
     identityUserId: string;
     legacyUserId: number;
@@ -788,6 +789,10 @@ class FakeIamRepository {
     assignments: Array<{ itemName: string; itemType: "role" | "permission" }>;
     source: string;
   }) {
+    if (this.failNextReplaceSubjectAssignments) {
+      this.failNextReplaceSubjectAssignments = false;
+      throw new Error("InjectedRoleAssignmentSyncFailure");
+    }
     if (input.legacyUserId !== null) {
       this.subjectAssignments.set(input.legacyUserId, input.assignments);
     }
@@ -4388,6 +4393,194 @@ describe("identity-adapter profile write legacy-proxy API", () => {
     });
     expect(reconciliationResponse.body.data.items).toEqual([]);
   });
+});
+
+describe("identity-adapter IAM role write API", () => {
+  let app: INestApplication | null = null;
+  const originalEnv = { ...process.env };
+  const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
+  const privateKeyPem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "legacy-proxy";
+    process.env.IDENTITY_IAM_ROLE_WRITE_LEGACY_API_BASE_URL = "http://legacy-api";
+    process.env.IDENTITY_IAM_ROLE_WRITE_TIMEOUT_MS = "5000";
+    process.env.IDENTITY_IAM_INTERNAL_API_TOKEN = "role-write-test-token";
+    process.env.IDENTITY_JWT_PRIVATE_KEY_PEM = privateKeyPem;
+    process.env.IDENTITY_JWT_KEY_ID = "role-write-test-key";
+    process.env.IDENTITY_JWT_ISSUER = "identity-role-write-test";
+    process.env.IDENTITY_JWT_AUDIENCE = "xrugc-api";
+  });
+
+  afterEach(async () => {
+    vi.unstubAllGlobals();
+    process.env = { ...originalEnv };
+    await app?.close();
+    app = null;
+  });
+
+  it("keeps people/auth disabled by default without changing plugin-user ownership", async () => {
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "disabled";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "legacy-proxy";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_LEGACY_API_BASE_URL = "http://legacy-api";
+    app = await createLifecycleTestApp();
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ code: 0 }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await request(app.getHttpServer()).put("/v1/people/auth").send({ id: 25, auth: "user" }).expect(404);
+    await request(app.getHttpServer()).post("/v1/plugin-user/change-role").send({ id: 25, role: "user" }).expect(200);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url] = fetchMock.mock.calls[0] as unknown as [URL, RequestInit];
+    expect(url.toString()).toBe("http://legacy-api/v1/plugin-user/change-role");
+  });
+
+  it("preserves the old people/auth method, body and response in legacy-proxy mode", async () => {
+    app = await createLifecycleTestApp();
+    const legacyBody = { success: true, data: { id: 25, auth: "user" } };
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify(legacyBody), { status: 201, headers: { "Content-Type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await request(app.getHttpServer()).put("/v1/people/auth?source=legacy").send({ id: 25, auth: "user" }).expect(201);
+
+    expect(response.body).toEqual(legacyBody);
+    expect(response.headers["x-identity-iam-role-write"]).toBe("legacy-proxy");
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [URL, RequestInit];
+    expect(url.toString()).toBe("http://legacy-api/v1/people/auth?source=legacy");
+    expect(init.method).toBe("PUT");
+    expect(JSON.parse(String(init.body))).toEqual({ id: 25, auth: "user" });
+  });
+
+  it("dual-writes only an allowlisted operator and replays an explicit idempotency key", async () => {
+    const iamRepository = new FakeIamRepository();
+    const checksum = await seedRoleWritePolicy(iamRepository);
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_ROLE_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE = "canary";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_ALLOWLIST = "username:guanfei";
+    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = checksum;
+    const operations = new FakePluginUserWriteOperationRepository();
+    app = await createLifecycleTestApp(operations, iamRepository);
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ code: 0, data: { id: 24, role: "admin" } }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const accessToken = roleWriteAccessToken();
+
+    for (const _ of [0, 1]) {
+      const response = await request(app.getHttpServer())
+        .post("/v1/plugin-user/change-role")
+        .set("Authorization", `Bearer ${accessToken}`)
+        .set("Idempotency-Key", "role-write-test-idempotency")
+        .send({ id: 24, role: "admin" })
+        .expect(200);
+      expect(response.headers["x-identity-plugin-user-write"]).toBe("dual-write");
+      expect(response.body).toEqual({ code: 0, data: { id: 24, role: "admin" } });
+    }
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(operations.inputs).toHaveLength(1);
+    expect(operations.inputs[0]).toMatchObject({ route: "change-role", mode: "dual-write", legacyUserId: 24 });
+    expect(iamRepository.subjectAssignments.get(24)).toEqual([
+      { itemName: "admin", itemType: "role" },
+      { itemName: "plugin.open", itemType: "permission" }
+    ]);
+    const operation = await operations.findByOperationKey(operations.inputs[0]!.operationKey);
+    expect(operation).toMatchObject({ status: "completed", legacyStatus: "200", identityStatus: "completed", compensationStatus: "none" });
+  });
+
+  it("records a recoverable legacy-first result and resyncs from current legacy assignments", async () => {
+    const iamRepository = new FakeIamRepository();
+    const checksum = await seedRoleWritePolicy(iamRepository);
+    iamRepository.failNextReplaceSubjectAssignments = true;
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_ROLE_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE = "canary";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_ALLOWLIST = "username:guanfei";
+    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = checksum;
+    const operations = new FakePluginUserWriteOperationRepository();
+    app = await createLifecycleTestApp(operations, iamRepository);
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ code: 0, data: { id: 24, role: "admin" } }), { status: 200 })));
+
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/change-role")
+      .set("Authorization", `Bearer ${roleWriteAccessToken()}`)
+      .set("Idempotency-Key", "role-write-recovery")
+      .send({ id: 24, role: "admin" })
+      .expect(200);
+
+    const operationKey = operations.inputs[0]!.operationKey;
+    expect(await operations.findByOperationKey(operationKey)).toMatchObject({ status: "legacy_completed", compensationStatus: "required" });
+
+    const recovery = await request(app.getHttpServer())
+      .post(`/internal/iam/role-write/operations/${encodeURIComponent(operationKey)}/retry-identity-shadow`)
+      .set("x-identity-internal-token", "role-write-test-token")
+      .expect(201);
+
+    expect(recovery.body.data).toMatchObject({ recovered: true, assignmentCount: 2 });
+    expect(await operations.findByOperationKey(operationKey)).toMatchObject({ status: "completed", identityStatus: "recovered", compensationStatus: "completed" });
+  });
+
+  it("never materializes a root assignment into the identity candidate path", async () => {
+    const iamRepository = new FakeIamRepository();
+    const checksum = await seedRoleWritePolicy(iamRepository);
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_ROLE_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE = "canary";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_ALLOWLIST = "username:guanfei";
+    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = checksum;
+    const operations = new FakePluginUserWriteOperationRepository();
+    app = await createLifecycleTestApp(operations, iamRepository);
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ code: 0, data: { id: 24, role: "root" } }), { status: 200 })));
+
+    const response = await request(app.getHttpServer())
+      .post("/v1/plugin-user/change-role")
+      .set("Authorization", `Bearer ${roleWriteAccessToken()}`)
+      .send({ id: 24, role: "root" })
+      .expect(200);
+
+    expect(response.body).toEqual({ code: 0, data: { id: 24, role: "root" } });
+    expect(iamRepository.subjectAssignments.get(24)).toBeUndefined();
+    expect(await operations.findByOperationKey(operations.inputs[0]!.operationKey)).toMatchObject({
+      status: "legacy_completed",
+      identityStatus: "skipped:IAM_ROLE_WRITE_ROOT_PROTECTED",
+      compensationStatus: "required",
+      errorCode: "IAM_ROLE_WRITE_ROOT_PROTECTED"
+    });
+  });
+
+  async function seedRoleWritePolicy(repository: FakeIamRepository): Promise<string> {
+    const policy = createIamPermissionPolicySnapshot({
+      items: [
+        { name: "admin", type: "role" },
+        { name: "manager", type: "role" },
+        { name: "user", type: "role" },
+        { name: "plugin.open", type: "permission" }
+      ],
+      relations: [{ parent: "admin", child: "plugin.open" }]
+    });
+    await repository.upsertPermissionPolicyCandidate(policy, "role-write-test");
+    return policy.checksum;
+  }
+
+  function roleWriteAccessToken(): string {
+    return new JwtIssuerService().issue(
+      {
+        id: 24,
+        username: "guanfei",
+        email: "ogre3d@163.com",
+        status: 10,
+        nickname: "babamama",
+        emailVerifiedAt: null,
+        createdAt: null,
+        updatedAt: null,
+        userInfo: {},
+        roles: ["admin"],
+        organizations: [],
+        source: "legacy"
+      },
+      "role-write-test-session"
+    ).accessToken;
+  }
 });
 
 describe("identity-adapter plugin user write legacy-proxy API", () => {

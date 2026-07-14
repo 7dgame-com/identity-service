@@ -3,7 +3,13 @@ import { Injectable, OnModuleDestroy } from "@nestjs/common";
 import mysql, { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { loadConfig } from "./config.js";
 
-export type PluginUserWriteRoute = "create-user" | "update-user" | "delete-user" | "change-role" | "batch-create-users";
+export type PluginUserWriteRoute =
+  | "create-user"
+  | "update-user"
+  | "delete-user"
+  | "change-role"
+  | "batch-create-users"
+  | "people-auth";
 export type PluginUserWriteMode = "legacy-proxy" | "dual-write" | "identity-native";
 export type PluginUserWriteOperationStatus = "pending" | "legacy_completed" | "identity_completed" | "completed" | "failed";
 export type PluginUserWriteCompensationStatus = "none" | "required" | "in_progress" | "completed" | "failed";
