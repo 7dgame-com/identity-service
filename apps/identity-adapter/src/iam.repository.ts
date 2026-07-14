@@ -2,6 +2,7 @@ import { Injectable, OnModuleDestroy } from "@nestjs/common";
 import mysql, { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { loadConfig } from "./config.js";
 import { assertReadonlySql } from "./readonly-write.guard.js";
+import { createIamPermissionPolicySnapshot, type IamPermissionPolicySnapshot } from "./iam-permission-model.js";
 
 export interface IdentityUserRow {
   id: string;
@@ -161,6 +162,35 @@ export interface OrganizationShadowInput {
   metadata?: Record<string, unknown>;
 }
 
+export interface IamPermissionPolicyVersionRow {
+  checksum: string;
+  source: string;
+  status: string;
+  roleCount: number;
+  permissionCount: number;
+  relationCount: number;
+  createdAt: string | null;
+}
+
+export interface IamSubjectAssignmentInput {
+  identityUserId: string;
+  legacyUserId: number | null;
+  itemName: string;
+  itemType: "role" | "permission";
+  policyChecksum: string;
+  source: string;
+}
+
+export interface IamSubjectAssignmentRow {
+  identityUserId: string;
+  legacyUserId: number | null;
+  itemName: string;
+  itemType: "role" | "permission";
+  policyChecksum: string;
+  source: string;
+  status: string;
+}
+
 @Injectable()
 export class IamRepository implements OnModuleDestroy {
   private readonly config = loadConfig();
@@ -199,6 +229,11 @@ export class IamRepository implements OnModuleDestroy {
         "identity_subject_maps",
         "identity_role_assignments_shadow",
         "identity_organization_memberships_shadow",
+        "identity_iam_policy_versions",
+        "identity_iam_roles",
+        "identity_iam_permissions",
+        "identity_iam_item_relations",
+        "identity_iam_subject_assignments",
         "iam_reconciliation_runs",
         "iam_reconciliation_items"
       ].map(async (table) => [table, this.pool ? await this.tableExists(table) : false] as const)
@@ -554,6 +589,212 @@ export class IamRepository implements OnModuleDestroy {
     return affected;
   }
 
+  async upsertPermissionPolicyCandidate(policy: IamPermissionPolicySnapshot, source = "legacy-import"): Promise<IamPermissionPolicyVersionRow> {
+    const pool = this.requirePool();
+    await this.ensureSchema();
+    const connection = await pool.getConnection();
+
+    try {
+      await connection.beginTransaction();
+      await connection.execute(
+        `INSERT INTO identity_iam_policy_versions
+          (checksum, source, status, role_count, permission_count, relation_count)
+         VALUES (?, ?, 'candidate', ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           source = VALUES(source),
+           status = 'candidate',
+           role_count = VALUES(role_count),
+           permission_count = VALUES(permission_count),
+           relation_count = VALUES(relation_count)`,
+        [policy.checksum, source, policy.roles.length, policy.permissions.length, policy.relations.length]
+      );
+
+      for (const role of policy.roles) {
+        await connection.execute(
+          `INSERT INTO identity_iam_roles (policy_checksum, role_name, description, source, status)
+           VALUES (?, ?, ?, ?, 'candidate')
+           ON DUPLICATE KEY UPDATE description = VALUES(description), source = VALUES(source), status = 'candidate'`,
+          [policy.checksum, role.name, role.description ?? null, source]
+        );
+      }
+      for (const permission of policy.permissions) {
+        await connection.execute(
+          `INSERT INTO identity_iam_permissions (policy_checksum, permission_name, description, source, status)
+           VALUES (?, ?, ?, ?, 'candidate')
+           ON DUPLICATE KEY UPDATE description = VALUES(description), source = VALUES(source), status = 'candidate'`,
+          [policy.checksum, permission.name, permission.description ?? null, source]
+        );
+      }
+      for (const relation of policy.relations) {
+        const parentType = policy.roles.some((item) => item.name === relation.parent) ? "role" : "permission";
+        const childType = policy.roles.some((item) => item.name === relation.child) ? "role" : "permission";
+        await connection.execute(
+          `INSERT INTO identity_iam_item_relations
+            (policy_checksum, parent_name, parent_type, child_name, child_type, source, status)
+           VALUES (?, ?, ?, ?, ?, ?, 'candidate')
+           ON DUPLICATE KEY UPDATE source = VALUES(source), status = 'candidate'`,
+          [policy.checksum, relation.parent, parentType, relation.child, childType, source]
+        );
+      }
+      await connection.commit();
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
+
+    return {
+      checksum: policy.checksum,
+      source,
+      status: "candidate",
+      roleCount: policy.roles.length,
+      permissionCount: policy.permissions.length,
+      relationCount: policy.relations.length,
+      createdAt: null
+    };
+  }
+
+  async replaceSubjectAssignments(input: {
+    identityUserId: string;
+    legacyUserId: number | null;
+    policyChecksum: string;
+    assignments: Array<Pick<IamSubjectAssignmentInput, "itemName" | "itemType">>;
+    source: string;
+  }): Promise<number> {
+    const pool = this.requirePool();
+    await this.ensureSchema();
+    const connection = await pool.getConnection();
+
+    try {
+      await connection.beginTransaction();
+      await connection.execute(
+        `UPDATE identity_iam_subject_assignments
+            SET status = 'inactive'
+          WHERE identity_user_id = ?
+            AND policy_checksum = ?
+            AND status = 'candidate'`,
+        [input.identityUserId, input.policyChecksum]
+      );
+      for (const assignment of input.assignments) {
+        await connection.execute(
+          `INSERT INTO identity_iam_subject_assignments
+            (identity_user_id, legacy_user_id, item_name, item_type, policy_checksum, source, status)
+           VALUES (?, ?, ?, ?, ?, ?, 'candidate')
+           ON DUPLICATE KEY UPDATE
+             legacy_user_id = VALUES(legacy_user_id),
+             source = VALUES(source),
+             status = 'candidate'`,
+          [
+            input.identityUserId,
+            input.legacyUserId,
+            assignment.itemName,
+            assignment.itemType,
+            input.policyChecksum,
+            input.source
+          ]
+        );
+      }
+      await connection.commit();
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
+
+    return input.assignments.length;
+  }
+
+  async getPermissionPolicyCandidate(checksum: string): Promise<IamPermissionPolicySnapshot | null> {
+    if (!(await this.tableExists("identity_iam_policy_versions"))) {
+      return null;
+    }
+
+    const versions = await this.query<RowDataPacket[]>(
+      `SELECT checksum
+         FROM identity_iam_policy_versions
+        WHERE checksum = ?
+          AND status = 'candidate'
+        LIMIT 1`,
+      [checksum]
+    );
+    if (versions.length === 0) {
+      return null;
+    }
+
+    const [roles, permissions, relations] = await Promise.all([
+      this.query<RowDataPacket[]>(
+        `SELECT role_name AS name, description
+           FROM identity_iam_roles
+          WHERE policy_checksum = ?
+            AND status = 'candidate'
+          ORDER BY role_name ASC`,
+        [checksum]
+      ),
+      this.query<RowDataPacket[]>(
+        `SELECT permission_name AS name, description
+           FROM identity_iam_permissions
+          WHERE policy_checksum = ?
+            AND status = 'candidate'
+          ORDER BY permission_name ASC`,
+        [checksum]
+      ),
+      this.query<RowDataPacket[]>(
+        `SELECT parent_name AS parent, child_name AS child
+           FROM identity_iam_item_relations
+          WHERE policy_checksum = ?
+            AND status = 'candidate'
+          ORDER BY parent_name ASC, child_name ASC`,
+        [checksum]
+      )
+    ]);
+
+    const policy = createIamPermissionPolicySnapshot({
+      items: [
+        ...roles.map((row) => ({ name: String(row.name), type: "role" as const, description: row.description ?? null })),
+        ...permissions.map((row) => ({ name: String(row.name), type: "permission" as const, description: row.description ?? null }))
+      ],
+      relations: relations.map((row) => ({ parent: String(row.parent), child: String(row.child) }))
+    });
+    if (policy.checksum !== checksum) {
+      throw new Error("IAM permission candidate checksum does not match stored policy data");
+    }
+    return policy;
+  }
+
+  async listSubjectAssignments(identityUserId: string, policyChecksum: string): Promise<IamSubjectAssignmentRow[]> {
+    if (!(await this.tableExists("identity_iam_subject_assignments"))) {
+      return [];
+    }
+
+    const rows = await this.query<RowDataPacket[]>(
+      `SELECT identity_user_id AS identityUserId,
+              legacy_user_id AS legacyUserId,
+              item_name AS itemName,
+              item_type AS itemType,
+              policy_checksum AS policyChecksum,
+              source,
+              status
+         FROM identity_iam_subject_assignments
+        WHERE identity_user_id = ?
+          AND policy_checksum = ?
+          AND status = 'candidate'
+        ORDER BY item_name ASC`,
+      [identityUserId, policyChecksum]
+    );
+
+    return rows.map((row) => ({
+      identityUserId: String(row.identityUserId),
+      legacyUserId: row.legacyUserId === null || row.legacyUserId === undefined ? null : Number(row.legacyUserId),
+      itemName: String(row.itemName),
+      itemType: row.itemType === "role" ? "role" : "permission",
+      policyChecksum: String(row.policyChecksum),
+      source: String(row.source),
+      status: String(row.status)
+    }));
+  }
+
   async createReconciliationRun(input: IamReconciliationRunInput): Promise<void> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -834,6 +1075,85 @@ export class IamRepository implements OnModuleDestroy {
         KEY idx_identity_org_shadow_identity_user (identity_user_id, status),
         KEY idx_identity_org_shadow_org (organization_id, status),
         KEY idx_identity_org_shadow_observed (observed_at)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS identity_iam_policy_versions (
+        checksum CHAR(64) NOT NULL,
+        source VARCHAR(64) NOT NULL,
+        status VARCHAR(32) NOT NULL DEFAULT 'candidate',
+        role_count INT UNSIGNED NOT NULL DEFAULT 0,
+        permission_count INT UNSIGNED NOT NULL DEFAULT 0,
+        relation_count INT UNSIGNED NOT NULL DEFAULT 0,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (checksum),
+        KEY idx_identity_iam_policy_versions_status (status, created_at)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS identity_iam_roles (
+        policy_checksum CHAR(64) NOT NULL,
+        role_name VARCHAR(255) NOT NULL,
+        description TEXT NULL,
+        source VARCHAR(64) NOT NULL,
+        status VARCHAR(32) NOT NULL DEFAULT 'candidate',
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (policy_checksum, role_name),
+        KEY idx_identity_iam_roles_name (role_name, status)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS identity_iam_permissions (
+        policy_checksum CHAR(64) NOT NULL,
+        permission_name VARCHAR(255) NOT NULL,
+        description TEXT NULL,
+        source VARCHAR(64) NOT NULL,
+        status VARCHAR(32) NOT NULL DEFAULT 'candidate',
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (policy_checksum, permission_name),
+        KEY idx_identity_iam_permissions_name (permission_name, status)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS identity_iam_item_relations (
+        policy_checksum CHAR(64) NOT NULL,
+        parent_name VARCHAR(255) NOT NULL,
+        parent_type VARCHAR(16) NOT NULL,
+        child_name VARCHAR(255) NOT NULL,
+        child_type VARCHAR(16) NOT NULL,
+        source VARCHAR(64) NOT NULL,
+        status VARCHAR(32) NOT NULL DEFAULT 'candidate',
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (policy_checksum, parent_name, child_name),
+        KEY idx_identity_iam_item_relations_parent (policy_checksum, parent_name, status),
+        KEY idx_identity_iam_item_relations_child (policy_checksum, child_name, status)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS identity_iam_subject_assignments (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        identity_user_id VARCHAR(64) NOT NULL,
+        legacy_user_id INT UNSIGNED NULL,
+        item_name VARCHAR(255) NOT NULL,
+        item_type VARCHAR(16) NOT NULL,
+        policy_checksum CHAR(64) NOT NULL,
+        source VARCHAR(64) NOT NULL,
+        status VARCHAR(32) NOT NULL DEFAULT 'candidate',
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY idx_identity_iam_subject_assignment (identity_user_id, item_name, policy_checksum, source),
+        KEY idx_identity_iam_subject_assignments_legacy (legacy_user_id, status),
+        KEY idx_identity_iam_subject_assignments_policy (policy_checksum, status)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `);
 
