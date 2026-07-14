@@ -15,6 +15,7 @@ import { EmailChangeTokenError, EmailChangeTokenRepository } from "../src/email-
 import { EmailDeliveryService } from "../src/email-delivery.service.js";
 import { EmailVerificationChallengeError, EmailVerificationChallengeRepository } from "../src/email-verification-challenge.repository.js";
 import { IamRepository } from "../src/iam.repository.js";
+import { createIamPermissionPolicySnapshot } from "../src/iam-permission-model.js";
 import { loadConfig } from "../src/config.js";
 import { IdentitySessionRepository, InvalidRefreshTokenError } from "../src/identity-session.repository.js";
 import { IdentityInvitation, InvitationIdentityRepository } from "../src/invitation-identity.repository.js";
@@ -218,6 +219,36 @@ class FakeLegacyIdentityReader {
       { name: "course.manage", description: "Manage courses", source: "role-child" as const },
       { name: "plugin.open", description: "Open plugins", source: "direct" as const }
     ];
+  }
+
+  async readRbacPolicySnapshot() {
+    return {
+      items: [
+        { name: "admin", type: "role" as const, description: "Administrator" },
+        { name: "manager", type: "role" as const, description: "Manager" },
+        { name: "user", type: "role" as const, description: "User" },
+        { name: "course.manage", type: "permission" as const, description: "Manage courses" },
+        { name: "plugin.open", type: "permission" as const, description: "Open plugins" }
+      ],
+      relations: [
+        { parent: "admin", child: "manager" },
+        { parent: "manager", child: "course.manage" },
+        { parent: "admin", child: "plugin.open" }
+      ]
+    };
+  }
+
+  async listUserRbacAssignments(userId: number) {
+    if (userId === 24) {
+      return [
+        { name: "admin", type: "role" as const },
+        { name: "plugin.open", type: "permission" as const }
+      ];
+    }
+    if (userId === 25) {
+      return [{ name: "user", type: "role" as const }];
+    }
+    return [];
   }
 }
 
@@ -542,6 +573,8 @@ class FakeIamRepository {
   ]);
   readonly runs = new Map<string, any>();
   readonly items = new Map<string, any[]>();
+  readonly permissionPolicyCandidates = new Map<string, any>();
+  readonly subjectAssignments = new Map<number, any[]>();
 
   isConfigured() {
     return this.configured;
@@ -732,6 +765,50 @@ class FakeIamRepository {
       }))
     );
     return organizations.length;
+  }
+
+  async upsertPermissionPolicyCandidate(policy: any, source = "legacy-import") {
+    const row = {
+      checksum: policy.checksum,
+      source,
+      status: "candidate",
+      roleCount: policy.roles.length,
+      permissionCount: policy.permissions.length,
+      relationCount: policy.relations.length,
+      createdAt: null
+    };
+    this.permissionPolicyCandidates.set(policy.checksum, { ...row, policy });
+    return row;
+  }
+
+  async replaceSubjectAssignments(input: {
+    identityUserId: string;
+    legacyUserId: number | null;
+    policyChecksum: string;
+    assignments: Array<{ itemName: string; itemType: "role" | "permission" }>;
+    source: string;
+  }) {
+    if (input.legacyUserId !== null) {
+      this.subjectAssignments.set(input.legacyUserId, input.assignments);
+    }
+    return input.assignments.length;
+  }
+
+  async getPermissionPolicyCandidate(checksum: string) {
+    return this.permissionPolicyCandidates.get(checksum)?.policy ?? null;
+  }
+
+  async listSubjectAssignments(identityUserId: string, policyChecksum: string) {
+    const legacyUserId = Number(identityUserId.replace(/^legacy:/, ""));
+    return (this.subjectAssignments.get(legacyUserId) ?? []).map((assignment) => ({
+      identityUserId,
+      legacyUserId,
+      itemName: assignment.itemName,
+      itemType: assignment.itemType,
+      policyChecksum,
+      source: "legacy-import-candidate",
+      status: "candidate"
+    }));
   }
 
   async createReconciliationRun(input: { runKey: string; scope: string; mode: string; metadata: Record<string, unknown> }) {
@@ -2851,20 +2928,23 @@ describe("identity-adapter IAM readonly API", () => {
   const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
   const privateKeyPem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
 
-  beforeEach(async () => {
-    process.env = { ...originalEnv };
-    process.env.IDENTITY_IAM_ENABLED = "true";
-    process.env.IDENTITY_IAM_MODE = "readonly";
-    process.env.IDENTITY_IAM_INTERNAL_API_TOKEN = "iam-test-token";
-    process.env.IDENTITY_IAM_USER_VIEW_ENABLED = "true";
-    process.env.IDENTITY_IAM_ROLE_VIEW_ENABLED = "true";
-    process.env.IDENTITY_IAM_PERMISSION_VIEW_ENABLED = "true";
-    process.env.IDENTITY_IAM_ORGANIZATION_VIEW_ENABLED = "true";
-    process.env.IDENTITY_IAM_PLUGIN_VIEW_ENABLED = "true";
-    process.env.IDENTITY_JWT_PRIVATE_KEY_PEM = privateKeyPem;
-    process.env.IDENTITY_JWT_KEY_ID = "iam-readonly-test-key";
-    process.env.IDENTITY_JWT_ISSUER = "identity-iam-test";
-    process.env.IDENTITY_JWT_AUDIENCE = "xrugc-iam";
+  async function createApp(env: Record<string, string | undefined> = {}) {
+    process.env = {
+      ...originalEnv,
+      IDENTITY_IAM_ENABLED: "true",
+      IDENTITY_IAM_MODE: "readonly",
+      IDENTITY_IAM_INTERNAL_API_TOKEN: "iam-test-token",
+      IDENTITY_IAM_USER_VIEW_ENABLED: "true",
+      IDENTITY_IAM_ROLE_VIEW_ENABLED: "true",
+      IDENTITY_IAM_PERMISSION_VIEW_ENABLED: "true",
+      IDENTITY_IAM_ORGANIZATION_VIEW_ENABLED: "true",
+      IDENTITY_IAM_PLUGIN_VIEW_ENABLED: "true",
+      IDENTITY_JWT_PRIVATE_KEY_PEM: privateKeyPem,
+      IDENTITY_JWT_KEY_ID: "iam-readonly-test-key",
+      IDENTITY_JWT_ISSUER: "identity-iam-test",
+      IDENTITY_JWT_AUDIENCE: "xrugc-iam",
+      ...env
+    };
     iamRepository = new FakeIamRepository();
 
     const moduleRef = await Test.createTestingModule({
@@ -2878,6 +2958,10 @@ describe("identity-adapter IAM readonly API", () => {
 
     app = moduleRef.createNestApplication();
     await app.init();
+  }
+
+  beforeEach(async () => {
+    await createApp();
   });
 
   afterEach(async () => {
@@ -2948,6 +3032,159 @@ describe("identity-adapter IAM readonly API", () => {
       }
     ]);
     expect(organizations.body.data.shadow).toHaveLength(1);
+  });
+
+  it("previews a deterministic permission candidate without writing or changing legacy reads", async () => {
+    const response = await request(app.getHttpServer())
+      .get("/internal/iam/permission-model/preview")
+      .set("x-identity-internal-token", "iam-test-token")
+      .expect(200);
+
+    expect(response.body.data).toMatchObject({
+      source: "legacy-yii-rbac",
+      mode: "preview",
+      writesApplied: false,
+      candidate: {
+        roleCount: 3,
+        permissionCount: 2,
+        relationCount: 3
+      },
+      safety: {
+        legacyRemainsAuthoritative: true,
+        identityPrimaryAuthorizationEnabled: false,
+        importApplyEnabled: false
+      }
+    });
+    expect(response.body.data.candidate.checksum).toMatch(/^[a-f0-9]{64}$/);
+    expect(iamRepository.identityShadowWrites).toHaveLength(0);
+  });
+
+  it("dry-runs a permission candidate import without storing a policy or subject assignments", async () => {
+    const response = await request(app.getHttpServer())
+      .post("/internal/iam/permission-model/import")
+      .set("x-identity-internal-token", "iam-test-token")
+      .send({ afterLegacyUserId: 23, limit: 2 })
+      .expect(201);
+
+    expect(response.body.data).toMatchObject({
+      mode: "dry-run",
+      writesApplied: false,
+      summary: {
+        sampledUsers: 2,
+        mismatchCount: 0,
+        unknownAssignmentCount: 0,
+        subjectAssignmentWriteCount: 0
+      },
+      safety: {
+        candidateOnly: true,
+        legacyRemainsAuthoritative: true,
+        identityPrimaryAuthorizationEnabled: false,
+        rootMutationAllowed: false
+      }
+    });
+    expect(iamRepository.permissionPolicyCandidates.size).toBe(0);
+    expect(iamRepository.subjectAssignments.size).toBe(0);
+  });
+
+  it("keeps candidate import disabled even with a reviewed checksum", async () => {
+    const preview = await request(app.getHttpServer())
+      .get("/internal/iam/permission-model/preview")
+      .set("x-identity-internal-token", "iam-test-token")
+      .expect(200);
+
+    await request(app.getHttpServer())
+      .post("/internal/iam/permission-model/import")
+      .set("x-identity-internal-token", "iam-test-token")
+      .send({ apply: true, expectedChecksum: preview.body.data.candidate.checksum })
+      .expect(404);
+
+    expect(iamRepository.permissionPolicyCandidates.size).toBe(0);
+    expect(iamRepository.subjectAssignments.size).toBe(0);
+  });
+
+  it("imports only a reviewed candidate when the dedicated import gate is explicitly enabled", async () => {
+    await app.close();
+    await createApp({ IDENTITY_IAM_PERMISSION_MODEL_IMPORT_ENABLED: "true" });
+    const preview = await request(app.getHttpServer())
+      .get("/internal/iam/permission-model/preview")
+      .set("x-identity-internal-token", "iam-test-token")
+      .expect(200);
+
+    const response = await request(app.getHttpServer())
+      .post("/internal/iam/permission-model/import")
+      .set("x-identity-internal-token", "iam-test-token")
+      .send({ apply: true, expectedChecksum: preview.body.data.candidate.checksum, afterLegacyUserId: 23, limit: 2 })
+      .expect(201);
+
+    expect(response.body.data).toMatchObject({
+      mode: "candidate-import",
+      writesApplied: true,
+      summary: {
+        sampledUsers: 2,
+        mismatchCount: 0,
+        unknownAssignmentCount: 0,
+        subjectAssignmentWriteCount: 3
+      },
+      safety: {
+        candidateOnly: true,
+        legacyRemainsAuthoritative: true,
+        identityPrimaryAuthorizationEnabled: false,
+        rootMutationAllowed: false
+      }
+    });
+    expect(iamRepository.permissionPolicyCandidates.size).toBe(1);
+    expect(iamRepository.subjectAssignments.get(24)).toEqual([
+      { itemName: "admin", itemType: "role" },
+      { itemName: "plugin.open", itemType: "permission" }
+    ]);
+    expect(iamRepository.subjectAssignments.get(25)).toEqual([{ itemName: "user", itemType: "role" }]);
+  });
+
+  it("reads a candidate effective-permission graph from Identity data without legacy reads", async () => {
+    const policy = createIamPermissionPolicySnapshot({
+      items: [
+        { name: "admin", type: "role" },
+        { name: "course.manage", type: "permission" },
+        { name: "plugin.open", type: "permission" }
+      ],
+      relations: [
+        { parent: "admin", child: "course.manage" },
+        { parent: "admin", child: "plugin.open" }
+      ]
+    });
+    await iamRepository.upsertPermissionPolicyCandidate(policy);
+    await iamRepository.replaceSubjectAssignments({
+      identityUserId: "legacy:24",
+      legacyUserId: 24,
+      policyChecksum: policy.checksum,
+      assignments: [{ itemName: "admin", itemType: "role" }],
+      source: "test"
+    });
+
+    const response = await request(app.getHttpServer())
+      .get(`/internal/iam/permission-model/candidates/24/permissions?checksum=${policy.checksum}`)
+      .set("x-identity-internal-token", "iam-test-token")
+      .expect(200);
+
+    expect(response.body.data).toMatchObject({
+      legacyUserId: 24,
+      identityUserId: "legacy:24",
+      policyChecksum: policy.checksum,
+      permissions: [
+        { name: "course.manage", source: "identity-db-candidate" },
+        { name: "plugin.open", source: "identity-db-candidate" }
+      ],
+      source: {
+        policy: "identity-db-candidate",
+        assignments: "identity-db-candidate",
+        legacyRead: false
+      },
+      safety: {
+        candidateOnly: true,
+        legacyRemainsAuthoritative: true,
+        authorizationDecisionChanged: false
+      }
+    });
   });
 
   it("returns plugin identity views from identity JWT and legacy profile", async () => {

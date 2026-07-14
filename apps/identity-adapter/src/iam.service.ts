@@ -10,6 +10,7 @@ import {
 import { z } from "zod";
 import { loadConfig } from "./config.js";
 import { IamReconciliationItemInput, IamReconciliationRunRow, IamRepository } from "./iam.repository.js";
+import { calculateEffectivePermissions, createIamPermissionPolicySnapshot } from "./iam-permission-model.js";
 import { JwtIssuerService, VerifiedAccessToken } from "./jwt-issuer.service.js";
 import { LegacyIdentityReader, LegacyUserReadModel } from "./legacy-identity.reader.js";
 import { sanitizeMetadata } from "./login-audit.service.js";
@@ -28,7 +29,15 @@ const reconciliationSchema = z.object({
   applyShadow: z.boolean().optional()
 });
 
+const permissionModelImportSchema = z.object({
+  apply: z.boolean().optional().default(false),
+  expectedChecksum: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  afterLegacyUserId: z.number().int().min(0).optional(),
+  limit: z.number().int().min(1).max(5000).optional()
+});
+
 type IamReconciliationInput = z.infer<typeof reconciliationSchema>;
+type IamPermissionModelImportInput = z.infer<typeof permissionModelImportSchema>;
 
 @Injectable()
 export class IamService implements OnApplicationBootstrap {
@@ -56,6 +65,7 @@ export class IamService implements OnApplicationBootstrap {
       schemaAutoEnsureEnabled: iam.schemaAutoEnsureEnabled,
       reconciliationEnabled: iam.reconciliationEnabled,
       reconciliationBatchSize: iam.reconciliationBatchSize,
+      permissionModelImportEnabled: iam.permissionModelImportEnabled,
       identityRepositoryConfigured: this.repository.isConfigured(),
       legacyReaderConfigured: this.legacyReader.isConfigured(),
       identityDatabase: await this.repository.health(),
@@ -163,6 +173,189 @@ export class IamService implements OnApplicationBootstrap {
       })),
       source: {
         permissions: "legacy"
+      }
+    };
+  }
+
+  async permissionModelPreview() {
+    if (!this.legacyReader.isConfigured()) {
+      throw new ServiceUnavailableException({
+        code: "LEGACY_IAM_SOURCE_NOT_CONFIGURED",
+        message: "Legacy IAM source is not configured for permission model preview."
+      });
+    }
+
+    const legacyPolicy = await this.legacyReader.readRbacPolicySnapshot();
+    const candidate = createIamPermissionPolicySnapshot(legacyPolicy);
+
+    return {
+      source: "legacy-yii-rbac",
+      mode: "preview",
+      writesApplied: false,
+      candidate: {
+        checksum: candidate.checksum,
+        roleCount: candidate.roles.length,
+        permissionCount: candidate.permissions.length,
+        relationCount: candidate.relations.length
+      },
+      safety: {
+        legacyRemainsAuthoritative: true,
+        identityPrimaryAuthorizationEnabled: false,
+        importApplyEnabled: false
+      },
+      nextRecommendedAction: "review_candidate_then_prepare_develop_import_operator_packet"
+    };
+  }
+
+  async importPermissionModel(rawInput: unknown) {
+    if (!this.legacyReader.isConfigured()) {
+      throw new ServiceUnavailableException({
+        code: "LEGACY_IAM_SOURCE_NOT_CONFIGURED",
+        message: "Legacy IAM source is not configured for permission model import."
+      });
+    }
+    if (!this.repository.isConfigured()) {
+      throw new ServiceUnavailableException({
+        code: "IDENTITY_DB_NOT_CONFIGURED",
+        message: "Identity database is not configured for permission model import."
+      });
+    }
+
+    const input = this.parsePermissionModelImportInput(rawInput);
+    const policy = createIamPermissionPolicySnapshot(await this.legacyReader.readRbacPolicySnapshot());
+    if (input.apply && !input.expectedChecksum) {
+      throw new BadRequestException({
+        code: "IAM_PERMISSION_MODEL_CHECKSUM_REQUIRED",
+        message: "expectedChecksum is required before applying an IAM permission model candidate."
+      });
+    }
+    if (input.expectedChecksum && input.expectedChecksum !== policy.checksum) {
+      throw new BadRequestException({
+        code: "IAM_PERMISSION_MODEL_CHECKSUM_MISMATCH",
+        message: "The IAM permission model changed since the expected checksum was recorded."
+      });
+    }
+    if (input.apply && !this.config.iam.permissionModelImportEnabled) {
+      throw new NotFoundException({
+        code: "IDENTITY_IAM_PERMISSION_MODEL_IMPORT_DISABLED",
+        message: "IAM permission model candidate import is disabled."
+      });
+    }
+
+    const limit = input.limit ?? this.config.iam.reconciliationBatchSize;
+    const users = await this.legacyReader.listUsers({ afterId: input.afterLegacyUserId ?? 0, limit });
+    const comparisons = await Promise.all(
+      users.map(async (user) => {
+        const assignments = await this.legacyReader.listUserRbacAssignments(user.id);
+        const candidate = calculateEffectivePermissions(policy, assignments.map((assignment) => assignment.name));
+        const legacy = await this.legacyReader.listUserPermissions(user.id);
+        const legacyPermissions = normalizeSet(legacy.map((permission) => permission.name));
+        const candidatePermissions = normalizeSet(candidate.permissions);
+        return {
+          user,
+          assignments,
+          unknownAssignments: candidate.unknownAssignments,
+          matchesLegacy: JSON.stringify(legacyPermissions) === JSON.stringify(candidatePermissions)
+        };
+      })
+    );
+
+    if (input.apply) {
+      await this.repository.upsertPermissionPolicyCandidate(policy, "legacy-import-candidate");
+      for (const comparison of comparisons) {
+        await this.repository.replaceSubjectAssignments({
+          identityUserId: identityUserIdForLegacy(comparison.user.id),
+          legacyUserId: comparison.user.id,
+          policyChecksum: policy.checksum,
+          assignments: comparison.assignments.map((assignment) => ({
+            itemName: assignment.name,
+            itemType: assignment.type
+          })),
+          source: "legacy-import-candidate"
+        });
+      }
+    }
+
+    const mismatchCount = comparisons.filter((comparison) => !comparison.matchesLegacy).length;
+    const unknownAssignmentCount = comparisons.reduce((count, comparison) => count + comparison.unknownAssignments.length, 0);
+    return {
+      mode: input.apply ? "candidate-import" : "dry-run",
+      writesApplied: input.apply,
+      candidate: {
+        checksum: policy.checksum,
+        roleCount: policy.roles.length,
+        permissionCount: policy.permissions.length,
+        relationCount: policy.relations.length
+      },
+      batch: {
+        requestedLimit: limit,
+        afterLegacyUserId: input.afterLegacyUserId ?? 0,
+        sampledLegacyUserIds: comparisons.map((comparison) => comparison.user.id),
+        nextAfterLegacyUserId: comparisons.length === limit ? comparisons.at(-1)?.user.id ?? null : null
+      },
+      summary: {
+        sampledUsers: comparisons.length,
+        mismatchCount,
+        unknownAssignmentCount,
+        subjectAssignmentWriteCount: input.apply
+          ? comparisons.reduce((count, comparison) => count + comparison.assignments.length, 0)
+          : 0
+      },
+      safety: {
+        candidateOnly: true,
+        legacyRemainsAuthoritative: true,
+        identityPrimaryAuthorizationEnabled: false,
+        rootMutationAllowed: false
+      },
+      nextRecommendedAction: input.apply
+        ? "run_develop_permission_candidate_shadow_compare"
+        : "review_checksum_then_request_candidate_import_window"
+    };
+  }
+
+  async permissionCandidateView(legacyUserId: number, checksum: string) {
+    if (!this.repository.isConfigured()) {
+      throw new ServiceUnavailableException({
+        code: "IDENTITY_DB_NOT_CONFIGURED",
+        message: "Identity database is not configured for permission candidate view."
+      });
+    }
+
+    const policy = await this.repository.getPermissionPolicyCandidate(checksum);
+    if (!policy) {
+      throw new NotFoundException({
+        code: "IAM_PERMISSION_CANDIDATE_NOT_FOUND",
+        message: "IAM permission candidate is not available for the requested checksum."
+      });
+    }
+
+    const identityUserId = identityUserIdForLegacy(legacyUserId);
+    const assignments = await this.repository.listSubjectAssignments(identityUserId, checksum);
+    const effective = calculateEffectivePermissions(
+      policy,
+      assignments.map((assignment) => assignment.itemName)
+    );
+    if (effective.unknownAssignments.length > 0) {
+      throw new ServiceUnavailableException({
+        code: "IAM_PERMISSION_CANDIDATE_INVALID_ASSIGNMENT",
+        message: "IAM permission candidate contains an unknown assignment and cannot be used."
+      });
+    }
+
+    return {
+      legacyUserId,
+      identityUserId,
+      policyChecksum: checksum,
+      permissions: effective.permissions.map((name) => ({ name, source: "identity-db-candidate" })),
+      source: {
+        policy: "identity-db-candidate",
+        assignments: "identity-db-candidate",
+        legacyRead: false
+      },
+      safety: {
+        candidateOnly: true,
+        legacyRemainsAuthoritative: true,
+        authorizationDecisionChanged: false
       }
     };
   }
@@ -514,6 +707,18 @@ export class IamService implements OnApplicationBootstrap {
       });
     }
 
+    return parsed.data;
+  }
+
+  private parsePermissionModelImportInput(rawInput: unknown): IamPermissionModelImportInput {
+    const parsed = permissionModelImportSchema.safeParse(rawInput ?? {});
+    if (!parsed.success) {
+      throw new BadRequestException({
+        code: "INVALID_IAM_PERMISSION_MODEL_IMPORT_PAYLOAD",
+        message: "IAM permission model import payload is invalid.",
+        details: parsed.error.flatten()
+      });
+    }
     return parsed.data;
   }
 
