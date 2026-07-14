@@ -97,6 +97,13 @@ export const configSchema = z.object({
     profileWriteRolloutAllowlist: z.string().default(""),
     profileWriteRolloutPercentage: numberFromEnv.default(0),
     roleWriteMode: z.enum(["disabled", "legacy-proxy", "dual-write", "identity-native"]).default("disabled"),
+    roleWriteLegacyApiBaseUrl: optionalStringFromEnv,
+    roleWriteTimeoutMs: numberFromEnv.default(1500),
+    roleWriteDualWriteExecutionEnabled: boolFromEnv.default(false),
+    roleWriteRolloutMode: z.enum(["off", "canary", "percentage", "full"]).default("off"),
+    roleWriteRolloutAllowlist: z.string().default(""),
+    roleWriteRolloutPercentage: numberFromEnv.default(0),
+    roleWritePolicyChecksum: optionalStringFromEnv,
     organizationWriteMode: z.enum(["disabled", "legacy-proxy", "dual-write", "identity-native"]).default("disabled"),
     pluginUserWriteMode: z.enum(["disabled", "legacy-proxy", "dual-write", "identity-native"]).default("disabled"),
     pluginUserWriteShadowMode: z.enum(["off", "plan", "ledger-only"]).default("off"),
@@ -290,6 +297,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
       profileWriteRolloutAllowlist: env.IDENTITY_IAM_PROFILE_WRITE_ROLLOUT_ALLOWLIST,
       profileWriteRolloutPercentage: env.IDENTITY_IAM_PROFILE_WRITE_ROLLOUT_PERCENTAGE,
       roleWriteMode: env.IDENTITY_IAM_ROLE_WRITE_MODE,
+      roleWriteLegacyApiBaseUrl:
+        env.IDENTITY_IAM_ROLE_WRITE_LEGACY_API_BASE_URL ??
+        env.IDENTITY_IAM_PLUGIN_USER_WRITE_LEGACY_API_BASE_URL ??
+        env.IDENTITY_ACCOUNT_LIFECYCLE_LEGACY_API_BASE_URL,
+      roleWriteTimeoutMs:
+        env.IDENTITY_IAM_ROLE_WRITE_TIMEOUT_MS ??
+        env.IDENTITY_IAM_PLUGIN_USER_WRITE_TIMEOUT_MS ??
+        env.IDENTITY_ACCOUNT_LIFECYCLE_TIMEOUT_MS,
+      roleWriteDualWriteExecutionEnabled: env.IDENTITY_IAM_ROLE_WRITE_DUAL_WRITE_EXECUTION_ENABLED,
+      roleWriteRolloutMode: env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE,
+      roleWriteRolloutAllowlist: env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_ALLOWLIST,
+      roleWriteRolloutPercentage: env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_PERCENTAGE,
+      roleWritePolicyChecksum: env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM,
       organizationWriteMode: env.IDENTITY_IAM_ORG_WRITE_MODE,
       pluginUserWriteMode: env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE,
       pluginUserWriteShadowMode: env.IDENTITY_IAM_PLUGIN_USER_WRITE_SHADOW_MODE,
