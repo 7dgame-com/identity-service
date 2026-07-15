@@ -195,6 +195,21 @@ export class IamRoleWriteService {
       });
     }
 
+    const unsupportedScopeField = unsupportedRoleWriteScopeField(request.body);
+    if (unsupportedScopeField) {
+      const claims = this.claimsFromAuthorization(request.headers.authorization);
+      const decision: RoleWriteRolloutDecision = {
+        selected: false,
+        mode: iam.roleWriteRolloutMode,
+        route: routeForContract(contract),
+        subjectId: claims ? `legacy:${claims.uid}` : null,
+        reason: "unsupported_scope_legacy_only",
+        scopeField: unsupportedScopeField
+      };
+      this.logRolloutDecision(decision);
+      return this.legacyProxy(request, contract);
+    }
+
     const rollout = roleWriteRolloutReadiness(iam);
     const gate = await this.dualWriteGate(rollout);
     if (!gate.executable) {
@@ -204,6 +219,7 @@ export class IamRoleWriteService {
         missingCapabilities: gate.missingCapabilities
       });
     }
+
     const decision = this.dualWriteRolloutDecision(request, contract);
     this.logRolloutDecision(decision);
     return decision.selected ? this.dualWrite(request, contract) : this.legacyProxy(request, contract);
@@ -525,6 +541,39 @@ interface RoleWriteRolloutDecision {
   matchedToken?: string | null;
   bucket?: number | null;
   percentage?: number;
+  scopeField?: string | null;
+}
+
+function unsupportedRoleWriteScopeField(body: unknown): string | null {
+  const record = asRecord(body);
+  const scopeFields = [
+    "organization_id",
+    "organizationId",
+    "organization_ids",
+    "organizationIds",
+    "campus_id",
+    "campusId",
+    "scope",
+    "scope_id",
+    "scopeId",
+    "scope_type",
+    "scopeType"
+  ];
+
+  return scopeFields.find((field) => hasScopedValue(record[field])) ?? null;
+}
+
+function hasScopedValue(value: unknown): boolean {
+  if (value === null || value === undefined) {
+    return false;
+  }
+  if (typeof value === "string") {
+    return value.trim().length > 0;
+  }
+  if (Array.isArray(value)) {
+    return value.length > 0;
+  }
+  return true;
 }
 
 function roleWriteRolloutReadiness(iam: ReturnType<typeof loadConfig>["iam"]): RoleWriteRolloutReadiness {

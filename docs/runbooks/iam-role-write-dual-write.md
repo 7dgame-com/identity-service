@@ -13,6 +13,20 @@
 不得在本手册的窗口中更改 profile、organization、plugin-user create/update/delete、billing 或
 IAM read mode。不得以本手册授权 `identity-primary`。
 
+## 全局角色范围边界
+
+Phase 3 与 Phase 4 只支持全局系统角色的兼容契约：`people/auth` 和
+`plugin-user/change-role`。它们不实现 organization、campus 或其他业务 scope 的成员关系语义。
+
+即使请求发起者命中 dual-write canary，只要请求体携带以下任一非空字段，identity-service 都必须
+直接维持 legacy-only：`organization_id`、`organizationId`、`organization_ids`、
+`organizationIds`、`campus_id`、`campusId`、`scope`、`scope_id`、`scopeId`、`scope_type`、
+`scopeType`。该请求不会写入 Identity candidate assignment，也不会创建 role-write operation
+ledger。日志决策原因应为 `unsupported_scope_legacy_only`，且不得记录原始请求体。
+
+这是一项防串写措施，不代表 organization/campus scope 已迁移。此类语义必须在独立的
+organization native-write 工作包中定义模型、授权计算、回滚与回归后，才能申请新的窗口。
+
 ## 默认安全姿态
 
 以下值必须保持默认，除非单独批准某个 develop 窗口：

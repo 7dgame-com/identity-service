@@ -4488,6 +4488,32 @@ describe("identity-adapter IAM role write API", () => {
     expect(operation).toMatchObject({ status: "completed", legacyStatus: "200", identityStatus: "completed", compensationStatus: "none" });
   });
 
+  it("keeps organization-scoped role changes legacy-only even when the actor hits the dual-write canary", async () => {
+    const iamRepository = new FakeIamRepository();
+    const checksum = await seedRoleWritePolicy(iamRepository);
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_ROLE_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE = "canary";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_ALLOWLIST = "username:guanfei";
+    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = checksum;
+    const operations = new FakePluginUserWriteOperationRepository();
+    app = await createLifecycleTestApp(operations, iamRepository);
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ code: 0, data: { id: 24, role: "admin" } }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await request(app.getHttpServer())
+      .post("/v1/plugin-user/change-role")
+      .set("Authorization", `Bearer ${roleWriteAccessToken()}`)
+      .send({ id: 24, role: "admin", organization_id: 7 })
+      .expect(200);
+
+    expect(response.headers["x-identity-plugin-user-write"]).toBe("legacy-proxy");
+    expect(response.body).toEqual({ code: 0, data: { id: 24, role: "admin" } });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(operations.inputs).toHaveLength(0);
+    expect(iamRepository.subjectAssignments.get(24)).toBeUndefined();
+  });
+
   it("records a recoverable legacy-first result and resyncs from current legacy assignments", async () => {
     const iamRepository = new FakeIamRepository();
     const checksum = await seedRoleWritePolicy(iamRepository);
