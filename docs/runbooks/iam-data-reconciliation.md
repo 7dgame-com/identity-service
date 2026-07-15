@@ -15,6 +15,8 @@ IDENTITY_IAM_ENABLED=true
 IDENTITY_IAM_MODE=readonly
 IDENTITY_IAM_AUTO_ENSURE_SCHEMA=true
 IDENTITY_IAM_RECONCILIATION_ENABLED=false
+IDENTITY_IAM_ROLE_PERMISSION_MATERIALIZATION_ENABLED=false
+IDENTITY_IAM_ROLE_PERMISSION_MATERIALIZATION_MAX_BATCH=50
 IDENTITY_IAM_PROFILE_WRITE_MODE=disabled
 IDENTITY_IAM_ROLE_WRITE_MODE=disabled
 IDENTITY_IAM_ORG_WRITE_MODE=disabled
@@ -23,7 +25,9 @@ IDENTITY_USAGE_BILLING_DRY_RUN=true
 ```
 
 Only set `IDENTITY_IAM_RECONCILIATION_ENABLED=true` for a bounded shadow apply
-window. Set it back to `false` immediately after the apply batch.
+window. Set it back to `false` immediately after the apply batch. The dedicated
+role/organization materialization control is also default-off and must never be
+enabled as part of a generic reconciliation command.
 
 ## Public Checks
 
@@ -117,57 +121,90 @@ Expected:
 - `shadowWriteCount=0`
 - P0/P1 mismatches are either zero or recorded for repair
 
-## Shadow Apply Small Sample
+## Role and Organization Shadow Materialization
 
-Before this step, temporarily set:
+Use this path only to repair role/organization shadow baseline P1 findings
+while profile and plugin-user can continue on their independently approved
+`legacy-proxy` tracks. It writes only the Identity shadow/read-model rows, the
+base legacy subject mapping required for that shadow, and the reconciliation
+ledger. It never writes legacy RBAC tables, changes authorization responses, or
+enables any IAM write mode.
+
+This path is intentionally separate from the global reconciliation safety gate:
+that gate can remain unable to apply while unrelated profile/plugin write tracks
+are not `disabled`. Do not disable those tracks merely to make the global gate
+green. Instead, require the scoped readiness block
+`rolePermissionMaterialization.canApply=true` with no blockers.
+
+### Small Apply Sample
+
+Before this step, use a separately approved Develop-only window and temporarily
+set exactly:
 
 ```env
 IDENTITY_IAM_RECONCILIATION_ENABLED=true
+IDENTITY_IAM_ROLE_PERMISSION_MATERIALIZATION_ENABLED=true
+IDENTITY_IAM_ROLE_PERMISSION_MATERIALIZATION_MAX_BATCH=50
+IDENTITY_IAM_MODE=readonly
+IDENTITY_IAM_ROLE_WRITE_MODE=disabled
+IDENTITY_IAM_ORG_WRITE_MODE=disabled
 ```
 
-Then run:
+Confirm the scoped readiness before applying. The global
+`safetyGate.canApplyShadow` may still be `false` and is not the criterion for
+this materialization path.
+
+Then run only the allowed scopes, starting with one known safe test account:
 
 ```sh
 node dist/scripts/iam-reconciliation-smoke.js \
   --apply-shadow \
   --confirm-apply-shadow \
   --legacy-user-id=25 \
-  --run-key=stage7-dev-apply-25
+  --scopes=role,organization \
+  --limit=1 \
+  --run-key=iam-role-org-materialization-dev-25
 ```
 
 Immediately after the batch, restore:
 
 ```env
 IDENTITY_IAM_RECONCILIATION_ENABLED=false
+IDENTITY_IAM_ROLE_PERMISSION_MATERIALIZATION_ENABLED=false
 ```
 
-Then rerun dry-run:
+Then rerun a scoped dry-run:
 
 ```sh
 node dist/scripts/iam-reconciliation-smoke.js \
   --dry-run \
   --legacy-user-id=25 \
-  --run-key=stage7-dev-dry-run-25-after-apply \
-  --require-gate
+  --scopes=role,organization \
+  --limit=1 \
+  --run-key=iam-role-org-materialization-dev-25-after
 ```
 
-If `--require-gate` fails, do not expand the batch.
+Expected: no P0/P1 results for the materialized scopes, and no unexpected
+profile/plugin write evidence. Stop immediately on any P0/P1 result, an
+unexpected scope, or a failed restore.
 
 ## Cursor Expansion
 
-After the small sample passes, expand with cursor batches:
+After the small sample passes and has a separately approved expansion window,
+expand only role/organization with bounded cursor batches:
 
 ```sh
 node dist/scripts/iam-reconciliation-smoke.js \
-  --dry-run \
+  --apply-shadow \
+  --confirm-apply-shadow \
   --after=0 \
-  --limit=100 \
-  --run-key=stage7-dev-dry-run-after-0-limit-100
+  --limit=50 \
+  --scopes=role,organization \
+  --run-key=iam-role-org-materialization-dev-after-0-limit-50
 ```
 
 Use `data.batch.nextAfterLegacyUserId` from the run output as the next `--after`
-value. Apply shadow only for a bounded batch and only while reconciliation is
-temporarily enabled.
+value. Never raise the materialization batch cap above `50` in this path.
 
 ## Rollback
 
@@ -175,6 +212,7 @@ Rollback is configuration-only:
 
 ```env
 IDENTITY_IAM_RECONCILIATION_ENABLED=false
+IDENTITY_IAM_ROLE_PERMISSION_MATERIALIZATION_ENABLED=false
 IDENTITY_IAM_MODE=readonly
 IDENTITY_IAM_PROFILE_WRITE_MODE=disabled
 IDENTITY_IAM_ROLE_WRITE_MODE=disabled

@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Headers, HttpException, HttpStatus, NotFoundException, Param, Post } from "@nestjs/common";
+import { Body, Controller, Get, Headers, HttpException, HttpStatus, NotFoundException, Param, Post, Query } from "@nestjs/common";
 import { loadConfig } from "./config.js";
 import { IamService } from "./iam.service.js";
 
@@ -47,6 +47,43 @@ export class IamController {
     this.assertEnabledAndAuthorized(token);
     return {
       data: await this.iam.permissionsView(parseLegacyUserId(legacyUserId))
+    };
+  }
+
+  @Get("permission-model/preview")
+  async permissionModelPreview(@Headers("x-identity-internal-token") token: string | undefined) {
+    this.assertEnabledAndAuthorized(token);
+    return {
+      data: await this.iam.permissionModelPreview()
+    };
+  }
+
+  @Post("permission-model/import")
+  async importPermissionModel(@Headers("x-identity-internal-token") token: string | undefined, @Body() body: unknown) {
+    this.assertEnabledAndAuthorized(token);
+    return {
+      data: await this.iam.importPermissionModel(body)
+    };
+  }
+
+  @Get("permission-model/candidates/:legacyUserId/permissions")
+  async permissionCandidateView(
+    @Headers("x-identity-internal-token") token: string | undefined,
+    @Param("legacyUserId") legacyUserId: string,
+    @Query("checksum") checksum: string | undefined
+  ) {
+    this.assertEnabledAndAuthorized(token);
+    if (!checksum || !/^[a-f0-9]{64}$/.test(checksum)) {
+      throw new HttpException(
+        {
+          code: "INVALID_IAM_PERMISSION_CANDIDATE_CHECKSUM",
+          message: "A 64-character candidate checksum is required."
+        },
+        HttpStatus.BAD_REQUEST
+      );
+    }
+    return {
+      data: await this.iam.permissionCandidateView(parseLegacyUserId(legacyUserId), checksum)
     };
   }
 

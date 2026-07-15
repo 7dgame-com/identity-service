@@ -15,6 +15,8 @@ import { AuthController } from "./auth.controller.js";
 import { HealthController } from "./health.controller.js";
 import { IamController } from "./iam.controller.js";
 import { IamRepository } from "./iam.repository.js";
+import { IamRoleWriteController } from "./iam-role-write.controller.js";
+import { IamRoleWriteService } from "./iam-role-write.service.js";
 import { IamService } from "./iam.service.js";
 import { IdentityController } from "./identity.controller.js";
 import { IdentitySessionRepository } from "./identity-session.repository.js";
@@ -67,6 +69,7 @@ import { UsageBillingService } from "./usage-billing.service.js";
     InvitationDiagnosticsController,
     InternalAuthController,
     IamController,
+    IamRoleWriteController,
     PluginUserReadonlyController,
     PluginUserTemporaryAuthorizationController,
     PluginUserWriteController,
@@ -118,6 +121,7 @@ import { UsageBillingService } from "./usage-billing.service.js";
     LoginAuditRepository,
     LoginAuditService,
     IamRepository,
+    IamRoleWriteService,
     IamService,
     OidcAuthorizationCodeRepository,
     OidcService,

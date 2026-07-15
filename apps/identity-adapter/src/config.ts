@@ -82,6 +82,11 @@ export const configSchema = z.object({
     schemaAutoEnsureEnabled: boolFromEnv.default(false),
     reconciliationEnabled: boolFromEnv.default(false),
     reconciliationBatchSize: numberFromEnv.default(500),
+    rolePermissionMaterializationEnabled: boolFromEnv.default(false),
+    rolePermissionMaterializationMaxBatchSize: numberFromEnv
+      .transform((value) => value ?? 50)
+      .pipe(z.number().int().min(1).max(50)),
+    permissionModelImportEnabled: boolFromEnv.default(false),
     internalToken: optionalStringFromEnv,
     userViewEnabled: boolFromEnv.default(false),
     roleViewEnabled: boolFromEnv.default(false),
@@ -96,6 +101,13 @@ export const configSchema = z.object({
     profileWriteRolloutAllowlist: z.string().default(""),
     profileWriteRolloutPercentage: numberFromEnv.default(0),
     roleWriteMode: z.enum(["disabled", "legacy-proxy", "dual-write", "identity-native"]).default("disabled"),
+    roleWriteLegacyApiBaseUrl: optionalStringFromEnv,
+    roleWriteTimeoutMs: numberFromEnv.default(1500),
+    roleWriteDualWriteExecutionEnabled: boolFromEnv.default(false),
+    roleWriteRolloutMode: z.enum(["off", "canary", "percentage", "full"]).default("off"),
+    roleWriteRolloutAllowlist: z.string().default(""),
+    roleWriteRolloutPercentage: numberFromEnv.default(0),
+    roleWritePolicyChecksum: optionalStringFromEnv,
     organizationWriteMode: z.enum(["disabled", "legacy-proxy", "dual-write", "identity-native"]).default("disabled"),
     pluginUserWriteMode: z.enum(["disabled", "legacy-proxy", "dual-write", "identity-native"]).default("disabled"),
     pluginUserWriteShadowMode: z.enum(["off", "plan", "ledger-only"]).default("off"),
@@ -272,6 +284,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
       schemaAutoEnsureEnabled: env.IDENTITY_IAM_AUTO_ENSURE_SCHEMA,
       reconciliationEnabled: env.IDENTITY_IAM_RECONCILIATION_ENABLED,
       reconciliationBatchSize: env.IDENTITY_IAM_RECONCILIATION_BATCH_SIZE,
+      rolePermissionMaterializationEnabled: env.IDENTITY_IAM_ROLE_PERMISSION_MATERIALIZATION_ENABLED,
+      rolePermissionMaterializationMaxBatchSize: env.IDENTITY_IAM_ROLE_PERMISSION_MATERIALIZATION_MAX_BATCH,
+      permissionModelImportEnabled: env.IDENTITY_IAM_PERMISSION_MODEL_IMPORT_ENABLED,
       internalToken: env.IDENTITY_IAM_INTERNAL_API_TOKEN ?? env.IDENTITY_INTERNAL_API_TOKEN,
       userViewEnabled: env.IDENTITY_IAM_USER_VIEW_ENABLED,
       roleViewEnabled: env.IDENTITY_IAM_ROLE_VIEW_ENABLED,
@@ -288,6 +303,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
       profileWriteRolloutAllowlist: env.IDENTITY_IAM_PROFILE_WRITE_ROLLOUT_ALLOWLIST,
       profileWriteRolloutPercentage: env.IDENTITY_IAM_PROFILE_WRITE_ROLLOUT_PERCENTAGE,
       roleWriteMode: env.IDENTITY_IAM_ROLE_WRITE_MODE,
+      roleWriteLegacyApiBaseUrl:
+        env.IDENTITY_IAM_ROLE_WRITE_LEGACY_API_BASE_URL ??
+        env.IDENTITY_IAM_PLUGIN_USER_WRITE_LEGACY_API_BASE_URL ??
+        env.IDENTITY_ACCOUNT_LIFECYCLE_LEGACY_API_BASE_URL,
+      roleWriteTimeoutMs:
+        env.IDENTITY_IAM_ROLE_WRITE_TIMEOUT_MS ??
+        env.IDENTITY_IAM_PLUGIN_USER_WRITE_TIMEOUT_MS ??
+        env.IDENTITY_ACCOUNT_LIFECYCLE_TIMEOUT_MS,
+      roleWriteDualWriteExecutionEnabled: env.IDENTITY_IAM_ROLE_WRITE_DUAL_WRITE_EXECUTION_ENABLED,
+      roleWriteRolloutMode: env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE,
+      roleWriteRolloutAllowlist: env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_ALLOWLIST,
+      roleWriteRolloutPercentage: env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_PERCENTAGE,
+      roleWritePolicyChecksum: env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM,
       organizationWriteMode: env.IDENTITY_IAM_ORG_WRITE_MODE,
       pluginUserWriteMode: env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE,
       pluginUserWriteShadowMode: env.IDENTITY_IAM_PLUGIN_USER_WRITE_SHADOW_MODE,
