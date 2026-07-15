@@ -1,9 +1,13 @@
 import { Controller, Get, Post, Query, Req, Res } from "@nestjs/common";
+import { IamRoleWriteService } from "./iam-role-write.service.js";
 import { PluginUserWriteService } from "./plugin-user-write.service.js";
 
 @Controller()
 export class PluginUserWriteController {
-  constructor(private readonly pluginUserWrite: PluginUserWriteService) {}
+  constructor(
+    private readonly pluginUserWrite: PluginUserWriteService,
+    private readonly iamRoleWrite: IamRoleWriteService
+  ) {}
 
   @Get("internal/plugin-user-write/readiness")
   readiness() {
@@ -52,7 +56,7 @@ export class PluginUserWriteController {
 
   @Post("v1/plugin-user/change-role")
   changeRole(@Req() request: PluginUserWriteExpressRequest, @Res({ passthrough: true }) response: PluginUserWriteExpressResponse) {
-    return this.forward(request, response, "/v1/plugin-user/change-role");
+    return this.forwardRole(request, response);
   }
 
   @Post("v1/plugin-user/batch-create-users")
@@ -72,6 +76,16 @@ export class PluginUserWriteController {
     response.status(upstream.status);
     response.setHeader("X-Identity-Plugin-User-Write", upstream.mode);
 
+    return upstream.body;
+  }
+
+  private async forwardRole(
+    request: PluginUserWriteExpressRequest,
+    response: PluginUserWriteExpressResponse
+  ): Promise<unknown> {
+    const upstream = await this.iamRoleWrite.proxyPluginUser(request);
+    response.status(upstream.status);
+    response.setHeader("X-Identity-Plugin-User-Write", upstream.mode);
     return upstream.body;
   }
 }

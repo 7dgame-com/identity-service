@@ -16,6 +16,27 @@ export interface LegacyPermission {
   source: "direct" | "role-child";
 }
 
+export interface LegacyRbacPolicyItem {
+  name: string;
+  type: "role" | "permission";
+  description: string | null;
+}
+
+export interface LegacyRbacPolicyRelation {
+  parent: string;
+  child: string;
+}
+
+export interface LegacyRbacPolicySnapshot {
+  items: LegacyRbacPolicyItem[];
+  relations: LegacyRbacPolicyRelation[];
+}
+
+export interface LegacyRbacAssignment {
+  name: string;
+  type: "role" | "permission";
+}
+
 export interface LegacyOrganization {
   id: number;
   name: string;
@@ -365,6 +386,59 @@ export class LegacyIdentityReader implements OnModuleDestroy {
     }
 
     return [...permissions.values()].sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  async readRbacPolicySnapshot(): Promise<LegacyRbacPolicySnapshot> {
+    if (!this.pool) {
+      return { items: [], relations: [] };
+    }
+
+    const [items, relations] = await Promise.all([
+      this.query<RowDataPacket[]>(
+        `SELECT name, description, type
+           FROM auth_item
+          WHERE type IN (1, 2)
+          ORDER BY name ASC`
+      ),
+      this.query<RowDataPacket[]>(
+        `SELECT parent, child
+           FROM auth_item_child
+          ORDER BY parent ASC, child ASC`
+      )
+    ]);
+
+    return {
+      items: items.map((row) => ({
+        name: String(row.name),
+        type: Number(row.type) === 1 ? "role" : "permission",
+        description: row.description ?? null
+      })),
+      relations: relations.map((row) => ({
+        parent: String(row.parent),
+        child: String(row.child)
+      }))
+    };
+  }
+
+  async listUserRbacAssignments(userId: number): Promise<LegacyRbacAssignment[]> {
+    if (!this.pool) {
+      return [];
+    }
+
+    const rows = await this.query<RowDataPacket[]>(
+      `SELECT aa.item_name AS name, ai.type
+         FROM auth_assignment aa
+         JOIN auth_item ai ON ai.name = aa.item_name
+        WHERE aa.user_id = ?
+          AND ai.type IN (1, 2)
+        ORDER BY aa.item_name ASC`,
+      [String(userId)]
+    );
+
+    return rows.map((row) => ({
+      name: String(row.name),
+      type: Number(row.type) === 1 ? "role" : "permission"
+    }));
   }
 
   async diagnostics(): Promise<Record<string, unknown>> {
