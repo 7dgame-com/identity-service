@@ -24,7 +24,11 @@ import { InvitationLegacyRedisRepository } from "../src/invitation-legacy-redis.
 import { InvitationRecordRepository } from "../src/invitation-record.repository.js";
 import { InvitationRedisReader, LegacyRedisInvitation } from "../src/invitation-redis.reader.js";
 import { JwtIssuerService } from "../src/jwt-issuer.service.js";
-import { LegacyIdentityReader, type LegacyUserReadModel } from "../src/legacy-identity.reader.js";
+import {
+  LegacyIdentityReader,
+  legacyRoleNamesFromAssignments,
+  type LegacyUserReadModel
+} from "../src/legacy-identity.reader.js";
 import { LegacySessionRevocationService } from "../src/legacy-session-revocation.service.js";
 import { LoginAuditRepository, PersistedLoginAuditEvent } from "../src/login-audit.repository.js";
 import { planPluginUserIdentityShadow } from "../src/plugin-user-write-identity-shadow.js";
@@ -2274,6 +2278,16 @@ describe("identity-adapter readonly API", () => {
       organizations: [{ name: "test-university", title: "测试大学" }],
       source: "legacy"
     });
+  });
+
+  it("keeps direct permissions out of legacy role reads", () => {
+    expect(
+      legacyRoleNamesFromAssignments([
+        { role: "root", type: 1 },
+        { role: "plugin.open", type: 2 },
+        { role: "manager", type: "1" }
+      ])
+    ).toEqual(["root", "manager"]);
   });
 
   it("returns roles and organizations", async () => {
