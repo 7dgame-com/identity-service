@@ -87,6 +87,13 @@ export const configSchema = z.object({
       .transform((value) => value ?? 50)
       .pipe(z.number().int().min(1).max(50)),
     permissionModelImportEnabled: boolFromEnv.default(false),
+    authzReadMode: z.enum(["legacy", "shadow", "identity-primary"]).default("legacy"),
+    authzFallbackEnabled: boolFromEnv.default(true),
+    authzRolloutMode: z.enum(["off", "allowlist", "percentage", "full"]).default("off"),
+    authzRolloutAllowlist: z.string().default(""),
+    authzRolloutPercentage: numberFromEnv
+      .transform((value) => value ?? 0)
+      .pipe(z.number().int().min(0).max(100)),
     internalToken: optionalStringFromEnv,
     userViewEnabled: boolFromEnv.default(false),
     roleViewEnabled: boolFromEnv.default(false),
@@ -287,6 +294,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
       rolePermissionMaterializationEnabled: env.IDENTITY_IAM_ROLE_PERMISSION_MATERIALIZATION_ENABLED,
       rolePermissionMaterializationMaxBatchSize: env.IDENTITY_IAM_ROLE_PERMISSION_MATERIALIZATION_MAX_BATCH,
       permissionModelImportEnabled: env.IDENTITY_IAM_PERMISSION_MODEL_IMPORT_ENABLED,
+      authzReadMode: env.IDENTITY_IAM_AUTHZ_READ_MODE,
+      authzFallbackEnabled: env.IDENTITY_IAM_AUTHZ_FALLBACK_ENABLED,
+      authzRolloutMode: env.IDENTITY_IAM_AUTHZ_ROLLOUT_MODE,
+      authzRolloutAllowlist: env.IDENTITY_IAM_AUTHZ_ROLLOUT_ALLOWLIST,
+      authzRolloutPercentage: env.IDENTITY_IAM_AUTHZ_ROLLOUT_PERCENTAGE,
       internalToken: env.IDENTITY_IAM_INTERNAL_API_TOKEN ?? env.IDENTITY_INTERNAL_API_TOKEN,
       userViewEnabled: env.IDENTITY_IAM_USER_VIEW_ENABLED,
       roleViewEnabled: env.IDENTITY_IAM_ROLE_VIEW_ENABLED,

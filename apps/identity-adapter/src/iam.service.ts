@@ -9,6 +9,7 @@ import {
 } from "@nestjs/common";
 import { z } from "zod";
 import { loadConfig } from "./config.js";
+import { decideIamAuthorization, iamAuthzReadiness } from "./iam-authz-read-control.js";
 import { IamReconciliationItemInput, IamReconciliationRunRow, IamRepository } from "./iam.repository.js";
 import { calculateEffectivePermissions, createIamPermissionPolicySnapshot } from "./iam-permission-model.js";
 import { JwtIssuerService, VerifiedAccessToken } from "./jwt-issuer.service.js";
@@ -37,8 +38,35 @@ const permissionModelImportSchema = z.object({
   limit: z.number().int().min(1).max(5000).optional()
 });
 
+const iamAuthzDecisionSchema = z.object({
+  requestKey: z.string().trim().min(1).max(160).optional(),
+  permission: z.string().trim().min(1).max(256),
+  resourceType: z.enum(["api", "route", "plugin"]).optional(),
+  subject: z
+    .object({
+      legacyUserId: z.number().int().positive().optional(),
+      username: z.string().trim().min(1).max(128).optional(),
+      identityUserId: z.string().trim().min(1).max(160).optional(),
+      subject: z.string().trim().min(1).max(160).optional()
+    })
+    .refine(
+      (subject) =>
+        subject.legacyUserId !== undefined ||
+        subject.username !== undefined ||
+        subject.identityUserId !== undefined ||
+        subject.subject !== undefined,
+      "At least one stable IAM subject identifier is required."
+    ),
+  legacyDecision: z.enum(["allow", "deny"]),
+  legacyPolicyVersion: z.string().trim().min(1).max(160).optional(),
+  identityDecision: z.enum(["allow", "deny"]).optional(),
+  identityPolicyVersion: z.string().trim().min(1).max(160).optional(),
+  identityErrorCode: z.string().trim().min(1).max(160).optional()
+});
+
 type IamReconciliationInput = z.infer<typeof reconciliationSchema>;
 type IamPermissionModelImportInput = z.infer<typeof permissionModelImportSchema>;
+type IamAuthzDecisionInput = z.infer<typeof iamAuthzDecisionSchema>;
 
 @Injectable()
 export class IamService implements OnApplicationBootstrap {
@@ -72,6 +100,7 @@ export class IamService implements OnApplicationBootstrap {
         allowedScopes: rolePermissionMaterializationScopes
       },
       permissionModelImportEnabled: iam.permissionModelImportEnabled,
+      authzRead: iamAuthzReadiness(iam),
       identityRepositoryConfigured: this.repository.isConfigured(),
       legacyReaderConfigured: this.legacyReader.isConfigured(),
       identityDatabase: await this.repository.health(),
@@ -95,6 +124,23 @@ export class IamService implements OnApplicationBootstrap {
         requiredBeforeIdentityPrimary: true,
         supportedScopes: reconciliationScopes
       }
+    };
+  }
+
+  authzReadiness() {
+    return {
+      capability: "iam-authz-read",
+      nonUserFacing: true,
+      ...iamAuthzReadiness(this.config.iam)
+    };
+  }
+
+  authzReadDecision(rawInput: unknown) {
+    const input = this.parseAuthzDecisionInput(rawInput);
+    return {
+      capability: "iam-authz-read",
+      nonUserFacing: true,
+      ...decideIamAuthorization(this.config.iam, input)
     };
   }
 
@@ -713,6 +759,19 @@ export class IamService implements OnApplicationBootstrap {
       throw new BadRequestException({
         code: "INVALID_IAM_RECONCILIATION_PAYLOAD",
         message: "IAM reconciliation payload is invalid.",
+        details: parsed.error.flatten()
+      });
+    }
+
+    return parsed.data;
+  }
+
+  private parseAuthzDecisionInput(rawInput: unknown): IamAuthzDecisionInput {
+    const parsed = iamAuthzDecisionSchema.safeParse(rawInput ?? {});
+    if (!parsed.success) {
+      throw new BadRequestException({
+        code: "INVALID_IAM_AUTHZ_DECISION_PAYLOAD",
+        message: "IAM authorization read decision payload is invalid.",
         details: parsed.error.flatten()
       });
     }

@@ -2995,8 +2995,92 @@ describe("identity-adapter IAM readonly API", () => {
         role: "disabled",
         organization: "disabled",
         pluginUser: "disabled"
+      },
+      authzRead: {
+        readMode: "legacy",
+        fallbackEnabled: true,
+        rollout: {
+          mode: "off",
+          percentage: 0,
+          allowlistEntryCount: 0,
+          selectionConfigured: false,
+          unselectedBehavior: "legacy"
+        },
+        safety: {
+          rejectsPermissionUnion: true,
+          semanticMismatchFallbackAllowed: false,
+          runtimeRouteIntegrationEnabled: false
+        }
       }
     });
+  });
+
+  it("protects IAM authz diagnostics with the internal token and keeps default decisions on legacy", async () => {
+    await request(app.getHttpServer()).get("/internal/iam/authz/readiness").expect(401);
+
+    const readiness = await request(app.getHttpServer())
+      .get("/internal/iam/authz/readiness")
+      .set("x-identity-internal-token", "iam-test-token")
+      .expect(200);
+    expect(readiness.body.data).toMatchObject({
+      capability: "iam-authz-read",
+      nonUserFacing: true,
+      readMode: "legacy",
+      rollout: { mode: "off", percentage: 0 },
+      safety: { rejectsPermissionUnion: true, runtimeRouteIntegrationEnabled: false }
+    });
+
+    const decision = await request(app.getHttpServer())
+      .post("/internal/iam/authz/read-decision")
+      .set("x-identity-internal-token", "iam-test-token")
+      .send({
+        requestKey: "plugin-open-24",
+        permission: "plugin.open",
+        resourceType: "plugin",
+        subject: { legacyUserId: 24 },
+        legacyDecision: "deny",
+        legacyPolicyVersion: "legacy-rbac-v1",
+        identityDecision: "allow",
+        identityPolicyVersion: "candidate-checksum-v2"
+      })
+      .expect(201);
+
+    expect(decision.body.data).toMatchObject({
+      capability: "iam-authz-read",
+      nonUserFacing: true,
+      selection: {
+        configuredMode: "legacy",
+        effectiveMode: "legacy",
+        sourceOfTruth: "legacy",
+        selectedForIdentityPrimary: false
+      },
+      outcome: {
+        decision: "deny",
+        responseSource: "legacy",
+        fallbackUsed: false
+      },
+      evidence: {
+        severity: "p0",
+        classification: "legacy_deny_identity_allow",
+        resourceType: "plugin"
+      },
+      safety: {
+        permissionUnionApplied: false,
+        semanticMismatchFallbackAllowed: false
+      }
+    });
+    expect(decision.body.data.evidence.permissionHash).toMatch(/^[a-f0-9]{16}$/);
+    expect(decision.body.data.evidence.requestKeyHash).toMatch(/^[a-f0-9]{16}$/);
+    expect(JSON.stringify(decision.body)).not.toContain("plugin.open");
+    expect(JSON.stringify(decision.body)).not.toContain("plugin-open-24");
+  });
+
+  it("rejects incomplete IAM authz diagnostic subjects", async () => {
+    await request(app.getHttpServer())
+      .post("/internal/iam/authz/read-decision")
+      .set("x-identity-internal-token", "iam-test-token")
+      .send({ permission: "plugin.open", subject: {}, legacyDecision: "deny" })
+      .expect(400);
   });
 
   it("requires the internal token for IAM data views", async () => {

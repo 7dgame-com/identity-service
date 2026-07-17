@@ -26,6 +26,25 @@ export class IamController {
     };
   }
 
+  @Get("authz/readiness")
+  authzReadiness(@Headers("x-identity-internal-token") token: string | undefined) {
+    this.assertEnabledAndAuthorized(token);
+    return {
+      status: "ok",
+      service: "identity-adapter",
+      capability: "iam-authz-read",
+      data: this.iam.authzReadiness()
+    };
+  }
+
+  @Post("authz/read-decision")
+  authzReadDecision(@Headers("x-identity-internal-token") token: string | undefined, @Body() body: unknown) {
+    this.assertEnabledAndAuthorized(token);
+    return {
+      data: this.iam.authzReadDecision(body)
+    };
+  }
+
   @Get("users/:legacyUserId")
   async user(@Headers("x-identity-internal-token") token: string | undefined, @Param("legacyUserId") legacyUserId: string) {
     this.assertEnabledAndAuthorized(token);
