@@ -45,6 +45,14 @@ export class IamController {
     };
   }
 
+  @Post("authz/resolve")
+  async authzResolve(@Headers("x-identity-internal-token") token: string | undefined, @Body() body: unknown) {
+    this.assertEnabledAndAuthorized(token);
+    return {
+      data: await this.iam.authzResolve(body)
+    };
+  }
+
   @Get("users/:legacyUserId")
   async user(@Headers("x-identity-internal-token") token: string | undefined, @Param("legacyUserId") legacyUserId: string) {
     this.assertEnabledAndAuthorized(token);

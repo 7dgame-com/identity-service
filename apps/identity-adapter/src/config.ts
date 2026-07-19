@@ -94,6 +94,7 @@ export const configSchema = z.object({
     authzRolloutPercentage: numberFromEnv
       .transform((value) => value ?? 0)
       .pipe(z.number().int().min(0).max(100)),
+    authzPolicyChecksum: optionalStringFromEnv,
     internalToken: optionalStringFromEnv,
     userViewEnabled: boolFromEnv.default(false),
     roleViewEnabled: boolFromEnv.default(false),
@@ -299,6 +300,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
       authzRolloutMode: env.IDENTITY_IAM_AUTHZ_ROLLOUT_MODE,
       authzRolloutAllowlist: env.IDENTITY_IAM_AUTHZ_ROLLOUT_ALLOWLIST,
       authzRolloutPercentage: env.IDENTITY_IAM_AUTHZ_ROLLOUT_PERCENTAGE,
+      authzPolicyChecksum: env.IDENTITY_IAM_AUTHZ_POLICY_CHECKSUM,
       internalToken: env.IDENTITY_IAM_INTERNAL_API_TOKEN ?? env.IDENTITY_INTERNAL_API_TOKEN,
       userViewEnabled: env.IDENTITY_IAM_USER_VIEW_ENABLED,
       roleViewEnabled: env.IDENTITY_IAM_ROLE_VIEW_ENABLED,

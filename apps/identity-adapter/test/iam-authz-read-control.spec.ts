@@ -21,10 +21,15 @@ describe("IAM authz read controls", () => {
         selectionConfigured: false,
         unselectedBehavior: "legacy"
       },
+      policy: {
+        candidateChecksumConfigured: false
+      },
       safety: {
         rejectsPermissionUnion: true,
         semanticMismatchFallbackAllowed: false,
-        runtimeRouteIntegrationEnabled: false
+        runtimeDecisionEndpointAvailable: true,
+        runtimeRouteIntegrationEnabled: false,
+        runtimeRouteIntegrationRequiresMainBackendOptIn: true
       }
     });
     expect(decideIamAuthzRead(iam, { legacyUserId: 24 })).toMatchObject({
@@ -34,6 +39,17 @@ describe("IAM authz read controls", () => {
       compareIdentity: false,
       sourceOfTruth: "legacy",
       reason: "legacy_mode"
+    });
+    expect(
+      decideIamAuthorization(iam, {
+        permission: "organization.list",
+        subject: { legacyUserId: 24 },
+        legacyDecision: "allow",
+        legacyPolicyVersion: "legacy-rbac-v1"
+      })
+    ).toMatchObject({
+      outcome: { decision: "allow", responseSource: "legacy" },
+      evidence: { severity: "none", classification: "not_compared", identityDecision: null }
     });
   });
 

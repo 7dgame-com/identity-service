@@ -9,7 +9,7 @@ import {
 } from "@nestjs/common";
 import { z } from "zod";
 import { loadConfig } from "./config.js";
-import { decideIamAuthorization, iamAuthzReadiness } from "./iam-authz-read-control.js";
+import { decideIamAuthorization, decideIamAuthzRead, iamAuthzReadiness } from "./iam-authz-read-control.js";
 import { IamReconciliationItemInput, IamReconciliationRunRow, IamRepository } from "./iam.repository.js";
 import { calculateEffectivePermissions, createIamPermissionPolicySnapshot } from "./iam-permission-model.js";
 import { JwtIssuerService, VerifiedAccessToken } from "./jwt-issuer.service.js";
@@ -64,9 +64,16 @@ const iamAuthzDecisionSchema = z.object({
   identityErrorCode: z.string().trim().min(1).max(160).optional()
 });
 
+const iamAuthzResolveSchema = iamAuthzDecisionSchema
+  .omit({ identityDecision: true, identityPolicyVersion: true, identityErrorCode: true })
+  .extend({
+    legacyPolicyVersion: z.string().trim().min(1).max(160)
+  });
+
 type IamReconciliationInput = z.infer<typeof reconciliationSchema>;
 type IamPermissionModelImportInput = z.infer<typeof permissionModelImportSchema>;
 type IamAuthzDecisionInput = z.infer<typeof iamAuthzDecisionSchema>;
+type IamAuthzResolveInput = z.infer<typeof iamAuthzResolveSchema>;
 
 @Injectable()
 export class IamService implements OnApplicationBootstrap {
@@ -142,6 +149,45 @@ export class IamService implements OnApplicationBootstrap {
       nonUserFacing: true,
       ...decideIamAuthorization(this.config.iam, input)
     };
+  }
+
+  async authzResolve(rawInput: unknown) {
+    const input = this.parseAuthzResolveInput(rawInput);
+    const selection = decideIamAuthzRead(this.config.iam, input.subject);
+
+    if (selection.sourceOfTruth === "legacy" && !selection.compareIdentity) {
+      return {
+        capability: "iam-authz-read",
+        nonUserFacing: true,
+        runtimeRouteDecision: true,
+        ...decideIamAuthorization(this.config.iam, input)
+      };
+    }
+
+    const checksum = this.config.iam.authzPolicyChecksum;
+    if (!checksum || !/^[a-f0-9]{64}$/.test(checksum)) {
+      return this.authzResolveWithReadError(input, "IAM_AUTHZ_POLICY_CHECKSUM_NOT_CONFIGURED");
+    }
+    if (!input.subject.legacyUserId) {
+      return this.authzResolveWithReadError(input, "IAM_AUTHZ_LEGACY_USER_ID_REQUIRED");
+    }
+
+    try {
+      const candidate = await this.permissionCandidateView(input.subject.legacyUserId, checksum);
+      const permissionNames = candidate.permissions.map((permission) => permission.name);
+      return {
+        capability: "iam-authz-read",
+        nonUserFacing: true,
+        runtimeRouteDecision: true,
+        ...decideIamAuthorization(this.config.iam, {
+          ...input,
+          identityDecision: permissionNames.includes(input.permission) ? "allow" : "deny",
+          identityPolicyVersion: candidate.policyChecksum
+        })
+      };
+    } catch (error) {
+      return this.authzResolveWithReadError(input, safeIamAuthzReadErrorCode(error));
+    }
   }
 
   async ensureSchema() {
@@ -779,6 +825,31 @@ export class IamService implements OnApplicationBootstrap {
     return parsed.data;
   }
 
+  private parseAuthzResolveInput(rawInput: unknown): IamAuthzResolveInput {
+    const parsed = iamAuthzResolveSchema.safeParse(rawInput ?? {});
+    if (!parsed.success) {
+      throw new BadRequestException({
+        code: "INVALID_IAM_AUTHZ_RESOLVE_PAYLOAD",
+        message: "IAM authorization runtime resolve payload is invalid.",
+        details: parsed.error.flatten()
+      });
+    }
+
+    return parsed.data;
+  }
+
+  private authzResolveWithReadError(input: IamAuthzResolveInput, identityErrorCode: string) {
+    return {
+      capability: "iam-authz-read",
+      nonUserFacing: true,
+      runtimeRouteDecision: true,
+      ...decideIamAuthorization(this.config.iam, {
+        ...input,
+        identityErrorCode
+      })
+    };
+  }
+
   private assertRolePermissionMaterializationAllowed(
     input: IamReconciliationInput,
     scopes: IamReconciliationScope[],
@@ -1192,6 +1263,18 @@ export class IamService implements OnApplicationBootstrap {
       });
     }
   }
+}
+
+function safeIamAuthzReadErrorCode(error: unknown): string {
+  if (error && typeof error === "object") {
+    const response = "getResponse" in error && typeof error.getResponse === "function" ? error.getResponse() : null;
+    if (response && typeof response === "object" && "code" in response && typeof response.code === "string") {
+      const code = response.code.slice(0, 160);
+      return /^[A-Z0-9_]+$/.test(code) ? code : "IDENTITY_AUTHZ_READ_FAILED";
+    }
+  }
+
+  return "IDENTITY_AUTHZ_READ_FAILED";
 }
 
 function normalizeLegacyStatus(status: number): "active" | "inactive" {

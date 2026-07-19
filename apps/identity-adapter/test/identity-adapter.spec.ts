@@ -3020,10 +3020,15 @@ describe("identity-adapter IAM readonly API", () => {
           selectionConfigured: false,
           unselectedBehavior: "legacy"
         },
+        policy: {
+          candidateChecksumConfigured: false
+        },
         safety: {
           rejectsPermissionUnion: true,
           semanticMismatchFallbackAllowed: false,
-          runtimeRouteIntegrationEnabled: false
+          runtimeDecisionEndpointAvailable: true,
+          runtimeRouteIntegrationEnabled: false,
+          runtimeRouteIntegrationRequiresMainBackendOptIn: true
         }
       }
     });
@@ -3041,7 +3046,12 @@ describe("identity-adapter IAM readonly API", () => {
       nonUserFacing: true,
       readMode: "legacy",
       rollout: { mode: "off", percentage: 0 },
-      safety: { rejectsPermissionUnion: true, runtimeRouteIntegrationEnabled: false }
+      safety: {
+        rejectsPermissionUnion: true,
+        runtimeDecisionEndpointAvailable: true,
+        runtimeRouteIntegrationEnabled: false,
+        runtimeRouteIntegrationRequiresMainBackendOptIn: true
+      }
     });
 
     const decision = await request(app.getHttpServer())
@@ -3095,6 +3105,153 @@ describe("identity-adapter IAM readonly API", () => {
       .set("x-identity-internal-token", "iam-test-token")
       .send({ permission: "plugin.open", subject: {}, legacyDecision: "deny" })
       .expect(400);
+  });
+
+  it("keeps runtime route decisions on legacy without reading an Identity candidate by default", async () => {
+    await request(app.getHttpServer())
+      .post("/internal/iam/authz/resolve")
+      .send({
+        permission: "organization.list",
+        subject: { legacyUserId: 24 },
+        legacyDecision: "allow"
+      })
+      .expect(401);
+
+    const response = await request(app.getHttpServer())
+      .post("/internal/iam/authz/resolve")
+      .set("x-identity-internal-token", "iam-test-token")
+      .send({
+        requestKey: "organization-list-24",
+        permission: "organization.list",
+        resourceType: "route",
+        subject: { legacyUserId: 24, username: "guanfei" },
+        legacyDecision: "allow",
+        legacyPolicyVersion: "legacy-rbac-v1"
+      })
+      .expect(201);
+
+    expect(response.body.data).toMatchObject({
+      runtimeRouteDecision: true,
+      selection: {
+        configuredMode: "legacy",
+        sourceOfTruth: "legacy",
+        selectedForIdentityPrimary: false
+      },
+      outcome: {
+        decision: "allow",
+        responseSource: "legacy",
+        fallbackUsed: false,
+        failClosed: false
+      },
+      evidence: {
+        severity: "none",
+        classification: "not_compared",
+        identityDecision: null
+      }
+    });
+    expect(iamRepository.permissionPolicyCandidates.size).toBe(0);
+    expect(JSON.stringify(response.body)).not.toContain("organization.list");
+    expect(JSON.stringify(response.body)).not.toContain("organization-list-24");
+    expect(JSON.stringify(response.body)).not.toContain("guanfei");
+  });
+
+  it("resolves an allowlisted runtime route from the reviewed Identity candidate without permission union", async () => {
+    const policy = createIamPermissionPolicySnapshot({
+      items: [
+        { name: "manager", type: "role" },
+        { name: "organization.list", type: "permission" },
+        { name: "organization.update", type: "permission" }
+      ],
+      relations: [{ parent: "manager", child: "organization.list" }]
+    });
+    await iamRepository.upsertPermissionPolicyCandidate(policy);
+    await iamRepository.replaceSubjectAssignments({
+      identityUserId: "legacy:24",
+      legacyUserId: 24,
+      policyChecksum: policy.checksum,
+      assignments: [{ itemName: "manager", itemType: "role" }],
+      source: "test"
+    });
+
+    await app.close();
+    await createApp({
+      IDENTITY_IAM_AUTHZ_READ_MODE: "identity-primary",
+      IDENTITY_IAM_AUTHZ_ROLLOUT_MODE: "allowlist",
+      IDENTITY_IAM_AUTHZ_ROLLOUT_ALLOWLIST: "legacy:24",
+      IDENTITY_IAM_AUTHZ_POLICY_CHECKSUM: policy.checksum
+    });
+    await iamRepository.upsertPermissionPolicyCandidate(policy);
+    await iamRepository.replaceSubjectAssignments({
+      identityUserId: "legacy:24",
+      legacyUserId: 24,
+      policyChecksum: policy.checksum,
+      assignments: [{ itemName: "manager", itemType: "role" }],
+      source: "test"
+    });
+
+    const allowed = await request(app.getHttpServer())
+      .post("/internal/iam/authz/resolve")
+      .set("x-identity-internal-token", "iam-test-token")
+      .send({
+        permission: "organization.list",
+        resourceType: "route",
+        subject: { legacyUserId: 24 },
+        legacyDecision: "allow",
+        legacyPolicyVersion: "legacy-rbac-v1"
+      })
+      .expect(201);
+    expect(allowed.body.data).toMatchObject({
+      selection: { selectedForIdentityPrimary: true, sourceOfTruth: "identity" },
+      outcome: { decision: "allow", responseSource: "identity", fallbackUsed: false },
+      evidence: { severity: "none", classification: "match", identityPolicyVersion: policy.checksum },
+      safety: { permissionUnionApplied: false }
+    });
+
+    const denied = await request(app.getHttpServer())
+      .post("/internal/iam/authz/resolve")
+      .set("x-identity-internal-token", "iam-test-token")
+      .send({
+        permission: "organization.update",
+        resourceType: "route",
+        subject: { legacyUserId: 24 },
+        legacyDecision: "allow",
+        legacyPolicyVersion: "legacy-rbac-v1"
+      })
+      .expect(201);
+    expect(denied.body.data).toMatchObject({
+      outcome: { decision: "deny", responseSource: "identity", fallbackUsed: false },
+      evidence: { severity: "p1", classification: "legacy_allow_identity_deny" },
+      safety: { permissionUnionApplied: false, semanticMismatchFallbackAllowed: false }
+    });
+  });
+
+  it("uses explicit fallback when a selected route has no reviewed candidate checksum", async () => {
+    await app.close();
+    await createApp({
+      IDENTITY_IAM_AUTHZ_READ_MODE: "identity-primary",
+      IDENTITY_IAM_AUTHZ_ROLLOUT_MODE: "full",
+      IDENTITY_IAM_AUTHZ_FALLBACK_ENABLED: "true"
+    });
+
+    const response = await request(app.getHttpServer())
+      .post("/internal/iam/authz/resolve")
+      .set("x-identity-internal-token", "iam-test-token")
+      .send({
+        permission: "organization.list",
+        subject: { legacyUserId: 24 },
+        legacyDecision: "allow",
+        legacyPolicyVersion: "legacy-rbac-v1"
+      })
+      .expect(201);
+
+    expect(response.body.data).toMatchObject({
+      outcome: { decision: "allow", responseSource: "legacy-fallback", fallbackUsed: true },
+      evidence: {
+        severity: "info",
+        classification: "identity_read_error",
+        identityErrorCode: "IAM_AUTHZ_POLICY_CHECKSUM_NOT_CONFIGURED"
+      }
+    });
   });
 
   it("requires the internal token for IAM data views", async () => {

@@ -53,6 +53,7 @@ export interface IamAuthzDecisionEvidenceInput {
 export interface IamAuthzDecisionEvidence {
   severity: IamAuthzEvidenceSeverity;
   classification:
+    | "not_compared"
     | "match"
     | "legacy_deny_identity_allow"
     | "legacy_allow_identity_deny"
@@ -102,11 +103,16 @@ export function iamAuthzReadiness(iam: IamConfig) {
           (iam.authzRolloutMode === "percentage" && boundedPercentage(iam.authzRolloutPercentage) > 0)),
       unselectedBehavior: "legacy"
     },
+    policy: {
+      candidateChecksumConfigured: /^[a-f0-9]{64}$/.test(iam.authzPolicyChecksum ?? "")
+    },
     safety: {
       rejectsPermissionUnion: true,
       semanticMismatchFallbackAllowed: false,
       identityReadErrorFallbackOnly: true,
-      runtimeRouteIntegrationEnabled: false
+      runtimeDecisionEndpointAvailable: true,
+      runtimeRouteIntegrationEnabled: false,
+      runtimeRouteIntegrationRequiresMainBackendOptIn: true
     }
   };
 }
@@ -162,7 +168,13 @@ export function decideIamAuthzRead(iam: IamConfig, subject: IamAuthzSubject): Ia
 
 export function decideIamAuthorization(iam: IamConfig, input: IamAuthzDecisionEvidenceInput): IamAuthzDecisionResult {
   const selectionResult = decideIamAuthzRead(iam, input.subject);
-  const evidence = classifyIamAuthzEvidence(input);
+  const evidence =
+    selectionResult.sourceOfTruth === "legacy" &&
+    !selectionResult.compareIdentity &&
+    !input.identityDecision &&
+    !input.identityErrorCode
+      ? notComparedIamAuthzEvidence(input)
+      : classifyIamAuthzEvidence(input);
   let decision = input.legacyDecision;
   let responseSource: IamAuthzResponseSource = "legacy";
   let fallbackUsed = false;
@@ -206,6 +218,22 @@ export function decideIamAuthorization(iam: IamConfig, input: IamAuthzDecisionEv
       semanticMismatchFallbackAllowed: false,
       legacyAuthoritativeByDefault: true
     }
+  };
+}
+
+function notComparedIamAuthzEvidence(input: IamAuthzDecisionEvidenceInput): IamAuthzDecisionEvidence {
+  return {
+    severity: "none",
+    classification: "not_compared",
+    decisionsMatch: null,
+    legacyDecision: input.legacyDecision,
+    identityDecision: null,
+    identityErrorCode: null,
+    legacyPolicyVersion: input.legacyPolicyVersion ?? null,
+    identityPolicyVersion: null,
+    permissionHash: hashValue(input.permission.trim().toLowerCase()),
+    requestKeyHash: input.requestKey ? hashValue(input.requestKey.trim()) : null,
+    resourceType: input.resourceType ?? "api"
   };
 }
 
