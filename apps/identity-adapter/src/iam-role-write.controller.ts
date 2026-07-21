@@ -1,5 +1,6 @@
 import { Body, Controller, Get, Headers, HttpException, HttpStatus, Param, Post, Put, Query, Req, Res } from "@nestjs/common";
 import { loadConfig } from "./config.js";
+import { roleWriteEvidenceHeaders } from "./iam-role-write-evidence.js";
 import { IamRoleWriteService } from "./iam-role-write.service.js";
 
 @Controller()
@@ -71,6 +72,11 @@ export class IamRoleWriteController {
     const upstream = await this.roleWrite.proxyPeopleAuth(request);
     response.status(upstream.status);
     response.setHeader("X-Identity-IAM-Role-Write", upstream.mode);
+    if (upstream.evidence) {
+      for (const [name, value] of Object.entries(roleWriteEvidenceHeaders(upstream.evidence))) {
+        response.setHeader(name, value);
+      }
+    }
     return upstream.body;
   }
 

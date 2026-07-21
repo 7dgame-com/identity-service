@@ -1,6 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
-import { Injectable, Logger, NotFoundException, ServiceUnavailableException } from "@nestjs/common";
+import { Injectable, Logger, NotFoundException, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
 import { loadConfig } from "./config.js";
+import {
+  type IamRoleWriteEvidence,
+  normalizeRoleWriteSelector,
+  roleWriteActorFingerprint,
+  roleWriteActorTokens,
+  roleWriteCorrelationId,
+  roleWriteSelectorKind
+} from "./iam-role-write-evidence.js";
 import { IamRepository } from "./iam.repository.js";
 import { JwtIssuerService, type VerifiedAccessToken } from "./jwt-issuer.service.js";
 import { LegacyIdentityReader } from "./legacy-identity.reader.js";
@@ -27,6 +35,7 @@ export interface IamRoleWriteProxyResponse {
   status: number;
   body: unknown;
   mode: "legacy-proxy" | "dual-write";
+  evidence?: IamRoleWriteEvidence;
 }
 
 type RoleWriteContract = "plugin-user-change-role" | "people-auth";
@@ -126,6 +135,26 @@ export class IamRoleWriteService {
     return this.proxy(request, "people-auth");
   }
 
+  previewPluginUserRollout(request: IamRoleWriteRequest) {
+    const claims = this.requireClaims(request.headers.authorization);
+    const correlationId = roleWriteCorrelationId(request.headers);
+    const decision = this.config.iam.roleWriteMode === "dual-write"
+      ? this.dualWriteRolloutDecision(request, "plugin-user-change-role", correlationId, claims)
+      : this.inactiveRolloutDecision(request, "plugin-user-change-role", correlationId, claims);
+    const evidence = evidenceFromDecision(decision);
+
+    this.logRolloutDecision(decision, true);
+    return {
+      writePerformed: false,
+      sourceOfTruth: "legacy",
+      roleWriteMode: this.config.iam.roleWriteMode,
+      rolloutMode: decision.mode,
+      selected: decision.selected,
+      reason: decision.reason,
+      ...evidence
+    };
+  }
+
   async retryIdentityShadow(operationKey: string) {
     if (!operationKey.startsWith("plugin-user-write:v1:")) {
       throw new NotFoundException({ code: "IAM_ROLE_WRITE_OPERATION_NOT_FOUND", message: "Role-write operation was not found." });
@@ -182,11 +211,15 @@ export class IamRoleWriteService {
 
   private async proxy(request: IamRoleWriteRequest, contract: RoleWriteContract): Promise<IamRoleWriteProxyResponse> {
     const { iam } = this.config;
+    const correlationId = roleWriteCorrelationId(request.headers);
+    const claims = this.claimsFromAuthorization(request.headers.authorization);
     if (iam.roleWriteMode === "disabled") {
       throw new NotFoundException({ code: "IAM_ROLE_WRITE_DISABLED", message: "IAM role write migration is disabled." });
     }
     if (iam.roleWriteMode === "legacy-proxy") {
-      return this.legacyProxy(request, contract);
+      const decision = this.inactiveRolloutDecision(request, contract, correlationId, claims, "legacy_proxy_mode");
+      this.logRolloutDecision(decision);
+      return this.legacyProxy(request, contract, evidenceFromDecision(decision));
     }
     if (iam.roleWriteMode !== "dual-write") {
       throw new NotFoundException({
@@ -197,17 +230,19 @@ export class IamRoleWriteService {
 
     const unsupportedScopeField = unsupportedRoleWriteScopeField(request.body);
     if (unsupportedScopeField) {
-      const claims = this.claimsFromAuthorization(request.headers.authorization);
       const decision: RoleWriteRolloutDecision = {
         selected: false,
         mode: iam.roleWriteRolloutMode,
         route: routeForContract(contract),
         subjectId: claims ? `legacy:${claims.uid}` : null,
         reason: "unsupported_scope_legacy_only",
-        scopeField: unsupportedScopeField
+        scopeField: unsupportedScopeField,
+        correlationId,
+        actorFingerprint: roleWriteActorFingerprint(claims),
+        matchedSelectorKind: null
       };
       this.logRolloutDecision(decision);
-      return this.legacyProxy(request, contract);
+      return this.legacyProxy(request, contract, evidenceFromDecision(decision));
     }
 
     const rollout = roleWriteRolloutReadiness(iam);
@@ -220,13 +255,18 @@ export class IamRoleWriteService {
       });
     }
 
-    const decision = this.dualWriteRolloutDecision(request, contract);
+    const decision = this.dualWriteRolloutDecision(request, contract, correlationId, claims);
     this.logRolloutDecision(decision);
-    return decision.selected ? this.dualWrite(request, contract) : this.legacyProxy(request, contract);
+    const evidence = evidenceFromDecision(decision);
+    return decision.selected ? this.dualWrite(request, contract, evidence) : this.legacyProxy(request, contract, evidence);
   }
 
-  private async dualWrite(request: IamRoleWriteRequest, contract: RoleWriteContract): Promise<IamRoleWriteProxyResponse> {
-    const plan = this.planOperation(request, contract);
+  private async dualWrite(
+    request: IamRoleWriteRequest,
+    contract: RoleWriteContract,
+    evidence: IamRoleWriteEvidence
+  ): Promise<IamRoleWriteProxyResponse> {
+    const plan = this.planOperation(request, contract, evidence);
     const begun = await this.operations.begin({
       operationKey: plan.operationKey,
       idempotencyKey: plan.idempotencyKey,
@@ -243,7 +283,7 @@ export class IamRoleWriteService {
       const existing = await this.operations.findByOperationKey(plan.operationKey);
       const replay = existing ? pluginUserWriteReplayResponseFromOperation(existing) : null;
       if (replay) {
-        return { ...replay, mode: "dual-write" };
+        return { ...replay, mode: "dual-write", evidence };
       }
       throw new ServiceUnavailableException({
         code: "IAM_ROLE_WRITE_REPLAY_UNAVAILABLE",
@@ -253,7 +293,7 @@ export class IamRoleWriteService {
 
     let legacyResponse: IamRoleWriteProxyResponse;
     try {
-      legacyResponse = await this.legacyProxy(request, contract);
+      legacyResponse = await this.legacyProxy(request, contract, evidence);
     } catch (error) {
       await this.operations.update({
         operationKey: plan.operationKey,
@@ -278,7 +318,7 @@ export class IamRoleWriteService {
         errorCode: "LegacyRejected",
         metadata: { ...plan.metadata, ...responseReplay }
       });
-      return { ...legacyResponse, mode: "dual-write" };
+      return { ...legacyResponse, mode: "dual-write", evidence };
     }
 
     try {
@@ -318,7 +358,7 @@ export class IamRoleWriteService {
       });
     }
 
-    return { ...legacyResponse, mode: "dual-write" };
+    return { ...legacyResponse, mode: "dual-write", evidence };
   }
 
   private async syncIdentityAssignments(input: {
@@ -364,12 +404,20 @@ export class IamRoleWriteService {
     return { assignmentCount, policyChecksum: policy.checksum };
   }
 
-  private async legacyProxy(request: IamRoleWriteRequest, contract: RoleWriteContract): Promise<IamRoleWriteProxyResponse> {
-    const upstream = await this.callLegacy(request, contract);
-    return { status: upstream.status, body: await parseUpstreamBody(upstream), mode: "legacy-proxy" };
+  private async legacyProxy(
+    request: IamRoleWriteRequest,
+    contract: RoleWriteContract,
+    evidence?: IamRoleWriteEvidence
+  ): Promise<IamRoleWriteProxyResponse> {
+    const upstream = await this.callLegacy(request, contract, evidence);
+    return { status: upstream.status, body: await parseUpstreamBody(upstream), mode: "legacy-proxy", evidence };
   }
 
-  private async callLegacy(request: IamRoleWriteRequest, contract: RoleWriteContract): Promise<Response> {
+  private async callLegacy(
+    request: IamRoleWriteRequest,
+    contract: RoleWriteContract,
+    evidence?: IamRoleWriteEvidence
+  ): Promise<Response> {
     const baseUrl = this.config.iam.roleWriteLegacyApiBaseUrl;
     if (!baseUrl) {
       throw new ServiceUnavailableException({
@@ -387,6 +435,11 @@ export class IamRoleWriteService {
     copyHeader(request.headers, headers, "authorization", "Authorization");
     copyHeader(request.headers, headers, "x-forwarded-for", "X-Forwarded-For");
     copyHeader(request.headers, headers, "user-agent", "User-Agent");
+    if (evidence) {
+      headers.set("X-Identity-IAM-Role-Write-Correlation", evidence.correlationId);
+    } else {
+      copyHeader(request.headers, headers, "x-identity-iam-role-write-correlation", "X-Identity-IAM-Role-Write-Correlation");
+    }
     try {
       return await fetch(url, {
         method: request.method.toUpperCase(),
@@ -403,7 +456,7 @@ export class IamRoleWriteService {
     }
   }
 
-  private planOperation(request: IamRoleWriteRequest, contract: RoleWriteContract) {
+  private planOperation(request: IamRoleWriteRequest, contract: RoleWriteContract, evidence: IamRoleWriteEvidence) {
     const route: RoleWriteRoute = contract === "people-auth" ? "people-auth" : "change-role";
     const body = asRecord(request.body);
     const claims = this.claimsFromAuthorization(request.headers.authorization);
@@ -433,50 +486,98 @@ export class IamRoleWriteService {
         targetSubject,
         requestedRole,
         policyChecksum: this.config.iam.roleWritePolicyChecksum ?? null,
+        correlationId: evidence.correlationId,
+        rolloutDecision: evidence.decision,
+        actorFingerprint: evidence.actorFingerprint,
+        matchedSelectorKind: evidence.matchedSelectorKind,
         idempotencySource: explicitIdempotency ? "client-header" : "per-request",
         redactedBody: redactPluginUserWriteMetadata(body)
       }
     };
   }
 
-  private dualWriteRolloutDecision(request: IamRoleWriteRequest, contract: RoleWriteContract): RoleWriteRolloutDecision {
+  private dualWriteRolloutDecision(
+    request: IamRoleWriteRequest,
+    contract: RoleWriteContract,
+    correlationId: string,
+    verifiedClaims?: VerifiedAccessToken | null
+  ): RoleWriteRolloutDecision {
     const { iam } = this.config;
-    const claims = this.claimsFromAuthorization(request.headers.authorization);
+    const claims = verifiedClaims === undefined ? this.claimsFromAuthorization(request.headers.authorization) : verifiedClaims;
     const subjectId = claims ? `legacy:${claims.uid}` : null;
+    const base = {
+      route: routeForContract(contract),
+      subjectId,
+      correlationId,
+      actorFingerprint: roleWriteActorFingerprint(claims)
+    };
     if (iam.roleWriteRolloutMode === "full") {
-      return { selected: true, mode: "full", route: routeForContract(contract), subjectId, reason: "full_rollout" };
+      return { ...base, selected: true, mode: "full", reason: "full_rollout", matchedSelectorKind: "full" };
     }
     if (iam.roleWriteRolloutMode === "off") {
-      return { selected: false, mode: "off", route: routeForContract(contract), subjectId, reason: "rollout_off" };
+      return { ...base, selected: false, mode: "off", reason: "rollout_off", matchedSelectorKind: null };
     }
     if (iam.roleWriteRolloutMode === "canary") {
       const tokens = roleWriteActorTokens(claims);
-      const matchedToken = splitCsv(iam.roleWriteRolloutAllowlist).map(normalizeRolloutToken).find((item) => tokens.has(item));
+      const matchedToken = splitCsv(iam.roleWriteRolloutAllowlist).map(normalizeRoleWriteSelector).find((item) => tokens.has(item));
       return {
+        ...base,
         selected: Boolean(matchedToken),
         mode: "canary",
-        route: routeForContract(contract),
-        subjectId,
         reason: matchedToken ? "canary_actor_selected" : "canary_actor_not_selected",
-        matchedToken: matchedToken ?? null
+        matchedSelectorKind: roleWriteSelectorKind(matchedToken)
       };
     }
     const percentage = safeRolloutPercentage(iam.roleWriteRolloutPercentage);
     const bucket = subjectId ? rolloutBucket(subjectId) : null;
     const selected = percentage > 0 && bucket !== null && (percentage >= 100 || bucket < percentage);
     return {
+      ...base,
       selected,
       mode: "percentage",
-      route: routeForContract(contract),
-      subjectId,
       reason: selected ? "percentage_bucket_selected" : "percentage_bucket_not_selected",
       bucket,
-      percentage
+      percentage,
+      matchedSelectorKind: selected ? "percentage" : null
     };
   }
 
-  private logRolloutDecision(decision: RoleWriteRolloutDecision): void {
-    this.logger.log(JSON.stringify({ event: "identity.iam.role_write.rollout", ...decision, unselectedBehavior: "legacy-proxy" }));
+  private inactiveRolloutDecision(
+    request: IamRoleWriteRequest,
+    contract: RoleWriteContract,
+    correlationId: string,
+    verifiedClaims?: VerifiedAccessToken | null,
+    reason = "role_write_disabled"
+  ): RoleWriteRolloutDecision {
+    const claims = verifiedClaims === undefined ? this.claimsFromAuthorization(request.headers.authorization) : verifiedClaims;
+    return {
+      selected: false,
+      mode: "off",
+      route: routeForContract(contract),
+      subjectId: claims ? `legacy:${claims.uid}` : null,
+      reason,
+      correlationId,
+      actorFingerprint: roleWriteActorFingerprint(claims),
+      matchedSelectorKind: null
+    };
+  }
+
+  private logRolloutDecision(decision: RoleWriteRolloutDecision, preview = false): void {
+    this.logger.log(JSON.stringify({
+      event: "identity.iam.role_write.rollout",
+      preview,
+      correlationId: decision.correlationId,
+      mode: decision.mode,
+      selected: decision.selected,
+      reason: decision.reason,
+      route: decision.route,
+      actorFingerprint: decision.actorFingerprint,
+      matchedSelectorKind: decision.matchedSelectorKind,
+      bucket: decision.bucket ?? null,
+      percentage: decision.percentage ?? null,
+      scopeField: decision.scopeField ?? null,
+      unselectedBehavior: "legacy-proxy"
+    }));
   }
 
   private claimsFromAuthorization(authorization: string | string[] | undefined): VerifiedAccessToken | null {
@@ -489,6 +590,17 @@ export class IamRoleWriteService {
     } catch {
       return null;
     }
+  }
+
+  private requireClaims(authorization: string | string[] | undefined): VerifiedAccessToken {
+    const claims = this.claimsFromAuthorization(authorization);
+    if (!claims) {
+      throw new UnauthorizedException({
+        code: "IAM_ROLE_WRITE_OPERATOR_TOKEN_INVALID",
+        message: "A valid Identity operator token is required for role-write rollout preview."
+      });
+    }
+    return claims;
   }
 
   private async dualWriteGate(rollout: RoleWriteRolloutReadiness) {
@@ -538,10 +650,22 @@ interface RoleWriteRolloutDecision {
   route: RoleWriteRoute;
   subjectId: string | null;
   reason: string;
-  matchedToken?: string | null;
+  correlationId: string;
+  actorFingerprint: string | null;
+  matchedSelectorKind: string | null;
   bucket?: number | null;
   percentage?: number;
   scopeField?: string | null;
+}
+
+function evidenceFromDecision(decision: RoleWriteRolloutDecision): IamRoleWriteEvidence {
+  return {
+    correlationId: decision.correlationId,
+    decision: decision.reason,
+    route: decision.route,
+    actorFingerprint: decision.actorFingerprint,
+    matchedSelectorKind: decision.matchedSelectorKind
+  };
 }
 
 function unsupportedRoleWriteScopeField(body: unknown): string | null {
@@ -595,13 +719,6 @@ function routeForContract(contract: RoleWriteContract): RoleWriteRoute {
   return contract === "people-auth" ? "people-auth" : "change-role";
 }
 
-function roleWriteActorTokens(claims: VerifiedAccessToken | null): Set<string> {
-  if (!claims) {
-    return new Set();
-  }
-  return new Set([`legacy:${claims.uid}`, `uid:${claims.uid}`, `username:${claims.username}`].map(normalizeRolloutToken).filter(Boolean));
-}
-
 function validatedPolicyChecksum(value: string | null | undefined): string {
   if (!value || !/^[a-f0-9]{64}$/.test(value)) {
     throw new RoleWriteSyncError("IAM_ROLE_WRITE_POLICY_CHECKSUM_REQUIRED", "A 64-character IAM role policy checksum is required.");
@@ -637,10 +754,6 @@ function rolloutBucket(subject: string): number {
 
 function splitCsv(value: string): string[] {
   return value.split(",").map((item) => item.trim()).filter(Boolean);
-}
-
-function normalizeRolloutToken(value: string): string {
-  return value.trim().toLowerCase();
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

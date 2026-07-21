@@ -78,6 +78,10 @@ export interface PluginUserWriteOperationRecentRow {
   legacyUserId: number | null;
   requestedAt: string | null;
   completedAt: string | null;
+  correlationId?: string | null;
+  rolloutDecision?: string | null;
+  actorFingerprint?: string | null;
+  matchedSelectorKind?: string | null;
 }
 
 @Injectable()
@@ -246,7 +250,8 @@ export class PluginUserWriteOperationRepository implements OnModuleDestroy {
               compensation_status AS compensationStatus,
               legacy_user_id AS legacyUserId,
               requested_at AS requestedAt,
-              completed_at AS completedAt
+              completed_at AS completedAt,
+              metadata
          FROM plugin_user_write_operations
         WHERE requested_at >= ?
         ORDER BY requested_at DESC, id DESC
@@ -254,17 +259,24 @@ export class PluginUserWriteOperationRepository implements OnModuleDestroy {
       [since]
     );
 
-    return rows.map((row) => ({
-      route: row.route as PluginUserWriteRoute,
-      mode: row.mode as PluginUserWriteMode,
-      status: row.status as PluginUserWriteOperationStatus,
-      compensationStatus: row.compensationStatus as PluginUserWriteCompensationStatus,
-      operationKeyDigest: shortDigest(row.operationKey),
-      idempotencyKeyDigest: shortDigest(row.idempotencyKey),
-      legacyUserId: nullableNumber(row.legacyUserId),
-      requestedAt: dateString(row.requestedAt),
-      completedAt: dateString(row.completedAt)
-    }));
+    return rows.map((row) => {
+      const metadata = parseMetadata(row.metadata);
+      return {
+        route: row.route as PluginUserWriteRoute,
+        mode: row.mode as PluginUserWriteMode,
+        status: row.status as PluginUserWriteOperationStatus,
+        compensationStatus: row.compensationStatus as PluginUserWriteCompensationStatus,
+        operationKeyDigest: shortDigest(row.operationKey),
+        idempotencyKeyDigest: shortDigest(row.idempotencyKey),
+        legacyUserId: nullableNumber(row.legacyUserId),
+        requestedAt: dateString(row.requestedAt),
+        completedAt: dateString(row.completedAt),
+        correlationId: nullableString(metadata.correlationId),
+        rolloutDecision: nullableString(metadata.rolloutDecision),
+        actorFingerprint: nullableString(metadata.actorFingerprint),
+        matchedSelectorKind: nullableString(metadata.matchedSelectorKind)
+      };
+    });
   }
 
   async ensureSchema(): Promise<void> {

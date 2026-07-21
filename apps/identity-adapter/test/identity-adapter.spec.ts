@@ -4726,9 +4726,16 @@ describe("identity-adapter IAM role write API", () => {
         .post("/v1/plugin-user/change-role")
         .set("Authorization", `Bearer ${accessToken}`)
         .set("Idempotency-Key", "role-write-test-idempotency")
+        .set("X-Identity-IAM-Role-Write-Correlation", "phase4-role-write-test-correlation")
         .send({ id: 24, role: "admin" })
         .expect(200);
       expect(response.headers["x-identity-plugin-user-write"]).toBe("dual-write");
+      expect(response.headers["x-identity-iam-role-write"]).toBe("dual-write");
+      expect(response.headers["x-identity-iam-role-write-decision"]).toBe("canary_actor_selected");
+      expect(response.headers["x-identity-iam-role-write-correlation"]).toBe("phase4-role-write-test-correlation");
+      expect(response.headers["x-identity-iam-role-write-route"]).toBe("change-role");
+      expect(response.headers["x-identity-iam-role-write-selector-kind"]).toBe("username");
+      expect(response.headers["x-identity-iam-role-write-actor"]).toMatch(/^[a-f0-9]{16}$/);
       expect(response.body).toEqual({ code: 0, data: { id: 24, role: "admin" } });
     }
 
@@ -4741,6 +4748,61 @@ describe("identity-adapter IAM role write API", () => {
     ]);
     const operation = await operations.findByOperationKey(operations.inputs[0]!.operationKey);
     expect(operation).toMatchObject({ status: "completed", legacyStatus: "200", identityStatus: "completed", compensationStatus: "none" });
+    expect(operation?.metadata).toMatchObject({
+      correlationId: "phase4-role-write-test-correlation",
+      rolloutDecision: "canary_actor_selected",
+      matchedSelectorKind: "username"
+    });
+    expect(JSON.stringify(operation?.metadata)).not.toContain("guanfei");
+  });
+
+  it("previews the actual operator with a stable uid selector without writing", async () => {
+    const iamRepository = new FakeIamRepository();
+    const checksum = await seedRoleWritePolicy(iamRepository);
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_ROLE_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE = "canary";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_ALLOWLIST = "subject:24";
+    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = checksum;
+    const operations = new FakePluginUserWriteOperationRepository();
+    app = await createLifecycleTestApp(operations, iamRepository);
+
+    const selected = await request(app.getHttpServer())
+      .get("/v1/plugin-user/role-write-decision")
+      .set("Authorization", `Bearer ${roleWriteAccessToken()}`)
+      .set("X-Identity-IAM-Role-Write-Correlation", "phase4-preview-selected")
+      .expect(200);
+
+    expect(selected.body.data).toMatchObject({
+      writePerformed: false,
+      sourceOfTruth: "legacy",
+      roleWriteMode: "dual-write",
+      rolloutMode: "canary",
+      selected: true,
+      reason: "canary_actor_selected",
+      correlationId: "phase4-preview-selected",
+      route: "change-role",
+      matchedSelectorKind: "uid"
+    });
+    expect(selected.body.data.actorFingerprint).toMatch(/^[a-f0-9]{16}$/);
+    expect(selected.headers["x-identity-iam-role-write"]).toBe("dual-write");
+    expect(selected.headers["x-identity-iam-role-write-decision"]).toBe("canary_actor_selected");
+    expect(JSON.stringify(selected.body)).not.toContain("guanfei");
+
+    const notSelected = await request(app.getHttpServer())
+      .get("/v1/plugin-user/role-write-decision")
+      .set("Authorization", `Bearer ${roleWriteAccessToken(25, "different-operator")}`)
+      .set("X-Identity-IAM-Role-Write-Correlation", "phase4-preview-not-selected")
+      .expect(200);
+
+    expect(notSelected.body.data).toMatchObject({
+      writePerformed: false,
+      selected: false,
+      reason: "canary_actor_not_selected",
+      correlationId: "phase4-preview-not-selected",
+      matchedSelectorKind: null
+    });
+    expect(operations.inputs).toHaveLength(0);
   });
 
   it("keeps organization-scoped role changes legacy-only even when the actor hits the dual-write canary", async () => {
@@ -4843,11 +4905,11 @@ describe("identity-adapter IAM role write API", () => {
     return policy.checksum;
   }
 
-  function roleWriteAccessToken(): string {
+  function roleWriteAccessToken(id = 24, username = "guanfei"): string {
     return new JwtIssuerService().issue(
       {
-        id: 24,
-        username: "guanfei",
+        id,
+        username,
         email: "ogre3d@163.com",
         status: 10,
         nickname: "babamama",
