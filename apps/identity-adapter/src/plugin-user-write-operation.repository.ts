@@ -235,6 +235,39 @@ export class PluginUserWriteOperationRepository implements OnModuleDestroy {
     }));
   }
 
+  async summarizeForLegacyUser(legacyUserId: number): Promise<PluginUserWriteOperationSummaryRow[] | null> {
+    if (!(await this.tableExists("plugin_user_write_operations"))) {
+      return null;
+    }
+
+    const pool = this.requirePool();
+    const [rows] = await pool.execute<RowDataPacket[]>(
+      `SELECT route,
+              mode,
+              status,
+              compensation_status AS compensationStatus,
+              COUNT(*) AS total,
+              MIN(requested_at) AS firstRequestedAt,
+              MAX(requested_at) AS lastRequestedAt
+         FROM plugin_user_write_operations
+        WHERE legacy_user_id = ?
+          AND route IN ('change-role', 'people-auth')
+        GROUP BY route, mode, status, compensation_status
+        ORDER BY route, mode, status, compensation_status`,
+      [legacyUserId]
+    );
+
+    return rows.map((row) => ({
+      route: row.route as PluginUserWriteRoute,
+      mode: row.mode as PluginUserWriteMode,
+      status: row.status as PluginUserWriteOperationStatus,
+      compensationStatus: row.compensationStatus as PluginUserWriteCompensationStatus,
+      total: Number(row.total ?? 0),
+      firstRequestedAt: dateString(row.firstRequestedAt),
+      lastRequestedAt: dateString(row.lastRequestedAt)
+    }));
+  }
+
   async listRecentSafe(input: { sinceMinutes: number; limit: number }): Promise<PluginUserWriteOperationRecentRow[]> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -320,6 +353,15 @@ export class PluginUserWriteOperationRepository implements OnModuleDestroy {
         KEY idx_plugin_user_write_operations_compensation (compensation_status, requested_at)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `);
+  }
+
+  private async tableExists(tableName: string): Promise<boolean> {
+    if (!this.pool) {
+      return false;
+    }
+
+    const [rows] = await this.pool.query<RowDataPacket[]>("SHOW TABLES LIKE ?", [tableName]);
+    return rows.length > 0;
   }
 
   private requirePool(): Pool {

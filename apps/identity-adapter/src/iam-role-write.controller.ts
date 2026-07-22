@@ -49,6 +49,24 @@ export class IamRoleWriteController {
     };
   }
 
+  @Get("internal/iam/role-write/subjects/:legacyUserId/alignment")
+  async subjectAlignment(
+    @Headers("x-identity-internal-token") token: string | undefined,
+    @Param("legacyUserId") legacyUserId: string,
+    @Query("checksum") checksum: string | undefined
+  ) {
+    this.assertInternalToken(token);
+    return {
+      status: "ok",
+      service: "identity-adapter",
+      capability: "iam-role-write-subject-alignment",
+      data: await this.roleWrite.subjectAlignment({
+        legacyUserId: parseLegacyUserId(legacyUserId),
+        policyChecksum: parsePolicyChecksum(checksum)
+      })
+    };
+  }
+
   @Post("internal/iam/role-write/operations/:operationKey/retry-identity-shadow")
   async retryIdentityShadow(
     @Headers("x-identity-internal-token") token: string | undefined,
@@ -115,4 +133,29 @@ interface IamRoleWriteExpressRequest {
 interface IamRoleWriteExpressResponse {
   status(code: number): unknown;
   setHeader(name: string, value: string): unknown;
+}
+
+function parseLegacyUserId(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new HttpException(
+      { code: "INVALID_LEGACY_USER_ID", message: "Legacy user id must be a positive integer." },
+      HttpStatus.BAD_REQUEST
+    );
+  }
+  return parsed;
+}
+
+function parsePolicyChecksum(value: string | undefined): string {
+  const checksum = value?.trim() ?? "";
+  if (!/^[a-f0-9]{64}$/.test(checksum)) {
+    throw new HttpException(
+      {
+        code: "INVALID_IAM_PERMISSION_CANDIDATE_CHECKSUM",
+        message: "A 64-character candidate checksum is required."
+      },
+      HttpStatus.BAD_REQUEST
+    );
+  }
+  return checksum;
 }

@@ -94,6 +94,13 @@ export class IamRoleWriteService {
       allowedExecutableModes: [...ROLE_WRITE_MODES],
       responseShapePreservedInLegacyProxy: true,
       recoveryEndpoint: "/internal/iam/role-write/operations/:operationKey/retry-identity-shadow",
+      subjectAlignment: {
+        endpoint: "/internal/iam/role-write/subjects/:legacyUserId/alignment?checksum=:policyChecksum",
+        readOnly: true,
+        requiresInternalToken: true,
+        requiresExplicitChecksum: true,
+        operationHistoryScope: "all"
+      },
       recoveryDrill: {
         enabled: iam.roleWriteRecoveryDrillEnabled,
         targetConfigured: iam.roleWriteRecoveryDrillTargetLegacyUserId > 0,
@@ -128,6 +135,112 @@ export class IamRoleWriteService {
       sinceMinutes,
       limit,
       operations: operations.filter((operation) => ROLE_WRITE_ROUTES.includes(operation.route as RoleWriteRoute)).slice(0, limit)
+    };
+  }
+
+  async subjectAlignment(input: { legacyUserId: number; policyChecksum: string }) {
+    if (!this.legacyReader.isConfigured()) {
+      throw new ServiceUnavailableException({
+        code: "LEGACY_IAM_SOURCE_NOT_CONFIGURED",
+        message: "Legacy IAM source is not configured for role-write subject alignment."
+      });
+    }
+    if (!this.iamRepository.isConfigured() || !this.operations.isConfigured()) {
+      throw new ServiceUnavailableException({
+        code: "IAM_ROLE_WRITE_ALIGNMENT_NOT_CONFIGURED",
+        message: "Identity candidate and operation ledger are required for role-write subject alignment."
+      });
+    }
+
+    const legacyUser = await this.legacyReader.getUserById(input.legacyUserId);
+    if (!legacyUser) {
+      throw new NotFoundException({
+        code: "IAM_ROLE_WRITE_ALIGNMENT_SUBJECT_NOT_FOUND",
+        message: "The requested Legacy subject was not found."
+      });
+    }
+    const policy = await this.iamRepository.getPermissionPolicyCandidate(input.policyChecksum);
+    if (!policy) {
+      throw new NotFoundException({
+        code: "IAM_ROLE_WRITE_ALIGNMENT_POLICY_NOT_FOUND",
+        message: "The requested Identity permission candidate was not found."
+      });
+    }
+
+    const identityUserId = `legacy:${input.legacyUserId}`;
+    const [legacyRows, candidateRows, operationSummary] = await Promise.all([
+      this.legacyReader.listUserRbacAssignments(input.legacyUserId),
+      this.iamRepository.listSubjectAssignments(identityUserId, input.policyChecksum),
+      this.operations.summarizeForLegacyUser(input.legacyUserId)
+    ]);
+    if (!operationSummary) {
+      throw new ServiceUnavailableException({
+        code: "IAM_ROLE_WRITE_LEDGER_NOT_AVAILABLE",
+        message: "Role-write operation ledger is not available for subject alignment."
+      });
+    }
+    const legacyAssignments = normalizeAssignmentKeys(legacyRows);
+    const candidateAssignments = normalizeAssignmentKeys(candidateRows);
+    const policyAssignments = normalizeAssignmentKeys([
+      ...policy.roles.map((role) => ({ name: role.name, type: "role" as const })),
+      ...policy.permissions.map((permission) => ({ name: permission.name, type: "permission" as const }))
+    ]);
+    const missingInCandidate = legacyAssignments.filter((assignment) => !candidateAssignments.includes(assignment));
+    const extraInCandidate = candidateAssignments.filter((assignment) => !legacyAssignments.includes(assignment));
+    const legacyOutsidePolicy = legacyAssignments.filter((assignment) => !policyAssignments.includes(assignment));
+    const candidateOutsidePolicy = candidateAssignments.filter((assignment) => !policyAssignments.includes(assignment));
+    const rootInLegacy = legacyAssignments.includes("role:root");
+    const rootInCandidate = candidateAssignments.includes("role:root");
+    const unresolvedOperationCount = operationSummary
+      .filter((row) => row.status !== "completed" || !["none", "completed"].includes(row.compensationStatus))
+      .reduce((total, row) => total + row.total, 0);
+    const assignmentAligned = missingInCandidate.length === 0 && extraInCandidate.length === 0;
+    const blockedReasons = [
+      ...(!assignmentAligned ? ["candidate-assignment-mismatch"] : []),
+      ...(legacyOutsidePolicy.length > 0 ? ["legacy-assignment-outside-policy"] : []),
+      ...(candidateOutsidePolicy.length > 0 ? ["candidate-assignment-outside-policy"] : []),
+      ...(rootInLegacy || rootInCandidate ? ["root-subject-protected"] : []),
+      ...(unresolvedOperationCount > 0 ? ["unresolved-role-write-operation"] : [])
+    ];
+
+    return {
+      legacyUserId: input.legacyUserId,
+      subjectFingerprint: shortDigest(identityUserId),
+      policyChecksum: input.policyChecksum,
+      assignments: {
+        legacy: legacyAssignments,
+        candidate: candidateAssignments,
+        missingInCandidate,
+        extraInCandidate,
+        legacyOutsidePolicy,
+        candidateOutsidePolicy,
+        aligned: assignmentAligned
+      },
+      operations: {
+        summary: operationSummary,
+        unresolvedCount: unresolvedOperationCount
+      },
+      rootProtection: {
+        legacyRoot: rootInLegacy,
+        candidateRoot: rootInCandidate,
+        protected: rootInLegacy || rootInCandidate
+      },
+      safetyGate: {
+        passed: blockedReasons.length === 0,
+        canRequestRuntime: blockedReasons.length === 0,
+        requiresCandidateRestore:
+          !assignmentAligned &&
+          legacyOutsidePolicy.length === 0 &&
+          !rootInLegacy &&
+          !rootInCandidate,
+        blockedReasons
+      },
+      safety: {
+        readOnly: true,
+        writePerformed: false,
+        legacyRemainsAuthoritative: true,
+        permissionUnionApplied: false
+      }
     };
   }
 
@@ -902,6 +1015,19 @@ function normalizeSinceMinutes(value: number | undefined): number {
 function normalizeRecentLimit(value: number | undefined): number {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? Math.max(1, Math.min(200, Math.trunc(numeric))) : 50;
+}
+
+function normalizeAssignmentKeys(
+  assignments: Array<
+    | { name: string; type: "role" | "permission" }
+    | { itemName: string; itemType: "role" | "permission" }
+  >
+): string[] {
+  return [...new Set(assignments.map((assignment) => (
+    "name" in assignment
+      ? `${assignment.type}:${assignment.name}`
+      : `${assignment.itemType}:${assignment.itemName}`
+  )))].sort();
 }
 
 function safeRolloutPercentage(value: number): number {

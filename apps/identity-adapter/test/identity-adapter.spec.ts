@@ -356,6 +356,32 @@ class FakePluginUserWriteOperationRepository {
     }));
   }
 
+  async summarizeForLegacyUser(legacyUserId: number): Promise<PluginUserWriteOperationSummaryRow[]> {
+    const counts = new Map<string, { input: PluginUserWriteOperationRecord; total: number }>();
+    for (const input of this.records.values()) {
+      if (input.legacyUserId !== legacyUserId || !["change-role", "people-auth"].includes(input.route)) {
+        continue;
+      }
+      const key = [input.route, input.mode, input.status, input.compensationStatus].join("\u001f");
+      const current = counts.get(key);
+      if (current) {
+        current.total += 1;
+        continue;
+      }
+      counts.set(key, { input, total: 1 });
+    }
+
+    return [...counts.values()].map(({ input, total }) => ({
+      route: input.route,
+      mode: input.mode,
+      status: input.status,
+      compensationStatus: input.compensationStatus,
+      total,
+      firstRequestedAt: "2026-06-30T00:00:00.000Z",
+      lastRequestedAt: "2026-06-30T00:00:00.000Z"
+    }));
+  }
+
   async listRecentSafe(input: { limit: number }): Promise<PluginUserWriteOperationRecentRow[]> {
     return [...this.records.values()].slice(-Math.max(1, input.limit)).reverse().map((operation) => ({
       route: operation.route,
@@ -4733,6 +4759,13 @@ describe("identity-adapter IAM role write API", () => {
       mutatesLegacy: false,
       requiresInternalToken: true
     });
+    expect(readiness.body.data.subjectAlignment).toEqual({
+      endpoint: "/internal/iam/role-write/subjects/:legacyUserId/alignment?checksum=:policyChecksum",
+      readOnly: true,
+      requiresInternalToken: true,
+      requiresExplicitChecksum: true,
+      operationHistoryScope: "all"
+    });
 
     await request(app.getHttpServer())
       .post("/internal/iam/role-write/recovery-drill/prepare")
@@ -5205,6 +5238,182 @@ describe("identity-adapter IAM role write API", () => {
       compensationStatus: "required",
       errorCode: "IAM_ROLE_WRITE_ROOT_PROTECTED"
     });
+  });
+
+  it("reports one exact role-write subject as aligned without performing a write", async () => {
+    const iamRepository = new FakeIamRepository();
+    const checksum = await seedRoleWritePolicy(iamRepository);
+    iamRepository.subjectAssignments.set(25, [{ itemName: "user", itemType: "role" }]);
+    const operations = new FakePluginUserWriteOperationRepository();
+    app = await createLifecycleTestApp(operations, iamRepository);
+
+    await request(app.getHttpServer())
+      .get(`/internal/iam/role-write/subjects/25/alignment?checksum=${checksum}`)
+      .expect(401);
+
+    const response = await request(app.getHttpServer())
+      .get(`/internal/iam/role-write/subjects/25/alignment?checksum=${checksum}`)
+      .set("x-identity-internal-token", "role-write-test-token")
+      .expect(200);
+
+    expect(response.body.data).toMatchObject({
+      legacyUserId: 25,
+      subjectFingerprint: expect.stringMatching(/^[a-f0-9]{16}$/),
+      policyChecksum: checksum,
+      assignments: {
+        legacy: ["role:user"],
+        candidate: ["role:user"],
+        missingInCandidate: [],
+        extraInCandidate: [],
+        legacyOutsidePolicy: [],
+        candidateOutsidePolicy: [],
+        aligned: true
+      },
+      operations: {
+        summary: [],
+        unresolvedCount: 0
+      },
+      rootProtection: {
+        legacyRoot: false,
+        candidateRoot: false,
+        protected: false
+      },
+      safetyGate: {
+        passed: true,
+        canRequestRuntime: true,
+        requiresCandidateRestore: false,
+        blockedReasons: []
+      },
+      safety: {
+        readOnly: true,
+        writePerformed: false,
+        legacyRemainsAuthoritative: true,
+        permissionUnionApplied: false
+      }
+    });
+    expect(operations.inputs).toHaveLength(0);
+  });
+
+  it("blocks runtime when the candidate retains a stale manager assignment", async () => {
+    const iamRepository = new FakeIamRepository();
+    const checksum = await seedRoleWritePolicy(iamRepository);
+    iamRepository.subjectAssignments.set(25, [{ itemName: "manager", itemType: "role" }]);
+    const operations = new FakePluginUserWriteOperationRepository();
+    app = await createLifecycleTestApp(operations, iamRepository);
+
+    const response = await request(app.getHttpServer())
+      .get(`/internal/iam/role-write/subjects/25/alignment?checksum=${checksum}`)
+      .set("x-identity-internal-token", "role-write-test-token")
+      .expect(200);
+
+    expect(response.body.data).toMatchObject({
+      assignments: {
+        legacy: ["role:user"],
+        candidate: ["role:manager"],
+        missingInCandidate: ["role:user"],
+        extraInCandidate: ["role:manager"],
+        legacyOutsidePolicy: [],
+        candidateOutsidePolicy: [],
+        aligned: false
+      },
+      safetyGate: {
+        passed: false,
+        canRequestRuntime: false,
+        requiresCandidateRestore: true,
+        blockedReasons: ["candidate-assignment-mismatch"]
+      }
+    });
+  });
+
+  it("blocks runtime while the exact subject has an unresolved role-write operation", async () => {
+    const iamRepository = new FakeIamRepository();
+    const checksum = await seedRoleWritePolicy(iamRepository);
+    iamRepository.subjectAssignments.set(25, [{ itemName: "user", itemType: "role" }]);
+    const operations = new FakePluginUserWriteOperationRepository();
+    await operations.begin({
+      operationKey: "plugin-user-write:v1:change-role:alignment-pending",
+      idempotencyKey: "alignment-pending",
+      route: "change-role",
+      mode: "dual-write",
+      actorSubject: "legacy:24",
+      targetSubject: "legacy:25",
+      legacyUserId: 25,
+      identityUserId: "legacy:25"
+    });
+    app = await createLifecycleTestApp(operations, iamRepository);
+
+    const response = await request(app.getHttpServer())
+      .get(`/internal/iam/role-write/subjects/25/alignment?checksum=${checksum}`)
+      .set("x-identity-internal-token", "role-write-test-token")
+      .expect(200);
+
+    expect(response.body.data.operations).toMatchObject({ unresolvedCount: 1 });
+    expect(response.body.data.safetyGate).toMatchObject({
+      passed: false,
+      canRequestRuntime: false,
+      requiresCandidateRestore: false,
+      blockedReasons: ["unresolved-role-write-operation"]
+    });
+  });
+
+  it("protects a subject when root appears in either assignment source", async () => {
+    const iamRepository = new FakeIamRepository();
+    const checksum = await seedRoleWritePolicy(iamRepository);
+    iamRepository.subjectAssignments.set(25, [{ itemName: "root", itemType: "role" }]);
+    app = await createLifecycleTestApp(new FakePluginUserWriteOperationRepository(), iamRepository);
+
+    const response = await request(app.getHttpServer())
+      .get(`/internal/iam/role-write/subjects/25/alignment?checksum=${checksum}`)
+      .set("x-identity-internal-token", "role-write-test-token")
+      .expect(200);
+
+    expect(response.body.data.rootProtection).toEqual({
+      legacyRoot: false,
+      candidateRoot: true,
+      protected: true
+    });
+    expect(response.body.data.safetyGate).toMatchObject({
+      passed: false,
+      canRequestRuntime: false,
+      requiresCandidateRestore: false,
+      blockedReasons: [
+        "candidate-assignment-mismatch",
+        "candidate-assignment-outside-policy",
+        "root-subject-protected"
+      ]
+    });
+  });
+
+  it("fails closed when the role-write operation ledger is not configured", async () => {
+    const iamRepository = new FakeIamRepository();
+    const checksum = await seedRoleWritePolicy(iamRepository);
+    iamRepository.subjectAssignments.set(25, [{ itemName: "user", itemType: "role" }]);
+    const operations = new FakePluginUserWriteOperationRepository();
+    operations.configured = false;
+    app = await createLifecycleTestApp(operations, iamRepository);
+
+    const response = await request(app.getHttpServer())
+      .get(`/internal/iam/role-write/subjects/25/alignment?checksum=${checksum}`)
+      .set("x-identity-internal-token", "role-write-test-token")
+      .expect(503);
+
+    expect(response.body).toMatchObject({ code: "IAM_ROLE_WRITE_ALIGNMENT_NOT_CONFIGURED" });
+  });
+
+  it("rejects malformed role-write alignment subject and checksum inputs", async () => {
+    app = await createLifecycleTestApp(new FakePluginUserWriteOperationRepository(), new FakeIamRepository());
+
+    const invalidSubject = await request(app.getHttpServer())
+      .get(`/internal/iam/role-write/subjects/not-a-user/alignment?checksum=${"a".repeat(64)}`)
+      .set("x-identity-internal-token", "role-write-test-token")
+      .expect(400);
+    expect(invalidSubject.body).toMatchObject({ code: "INVALID_LEGACY_USER_ID" });
+
+    const invalidChecksum = await request(app.getHttpServer())
+      .get("/internal/iam/role-write/subjects/25/alignment?checksum=not-a-checksum")
+      .set("x-identity-internal-token", "role-write-test-token")
+      .expect(400);
+    expect(invalidChecksum.body).toMatchObject({ code: "INVALID_IAM_PERMISSION_CANDIDATE_CHECKSUM" });
   });
 
   async function seedRoleWritePolicy(repository: FakeIamRepository): Promise<string> {
