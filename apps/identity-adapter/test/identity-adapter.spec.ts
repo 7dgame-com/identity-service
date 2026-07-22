@@ -4691,6 +4691,27 @@ describe("identity-adapter IAM role write API", () => {
     expect(url.toString()).toBe("http://legacy-api/v1/plugin-user/change-role");
   });
 
+  it("rejects a guarded plugin-user role write before legacy mutation when dual-write is disabled", async () => {
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "disabled";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "legacy-proxy";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_LEGACY_API_BASE_URL = "http://legacy-api";
+    app = await createLifecycleTestApp();
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ code: 0 }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await request(app.getHttpServer())
+      .post("/v1/plugin-user/change-role")
+      .set("X-Identity-IAM-Role-Write-Require-Dual-Write", "1")
+      .send({ id: 25, role: "manager" })
+      .expect(409);
+
+    expect(response.body).toMatchObject({
+      code: "IAM_ROLE_WRITE_DUAL_WRITE_REQUIRED",
+      reason: "role_write_disabled"
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("preserves the old people/auth method, body and response in legacy-proxy mode", async () => {
     app = await createLifecycleTestApp();
     const legacyBody = { success: true, data: { id: 25, auth: "user" } };
@@ -4705,6 +4726,24 @@ describe("identity-adapter IAM role write API", () => {
     expect(url.toString()).toBe("http://legacy-api/v1/people/auth?source=legacy");
     expect(init.method).toBe("PUT");
     expect(JSON.parse(String(init.body))).toEqual({ id: 25, auth: "user" });
+  });
+
+  it("rejects a guarded role write before legacy mutation in legacy-proxy mode", async () => {
+    app = await createLifecycleTestApp();
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ code: 0 }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await request(app.getHttpServer())
+      .post("/v1/plugin-user/change-role")
+      .set("X-Identity-IAM-Role-Write-Require-Dual-Write", "1")
+      .send({ id: 25, role: "manager" })
+      .expect(409);
+
+    expect(response.body).toMatchObject({
+      code: "IAM_ROLE_WRITE_DUAL_WRITE_REQUIRED",
+      reason: "legacy_proxy_mode"
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("dual-writes only an allowlisted operator and replays an explicit idempotency key", async () => {
@@ -4727,10 +4766,12 @@ describe("identity-adapter IAM role write API", () => {
         .set("Authorization", `Bearer ${accessToken}`)
         .set("Idempotency-Key", "role-write-test-idempotency")
         .set("X-Identity-IAM-Role-Write-Correlation", "phase4-role-write-test-correlation")
+        .set("X-Identity-IAM-Role-Write-Require-Dual-Write", "1")
         .send({ id: 24, role: "admin" })
         .expect(200);
       expect(response.headers["x-identity-plugin-user-write"]).toBe("dual-write");
       expect(response.headers["x-identity-iam-role-write"]).toBe("dual-write");
+      expect(response.headers["x-identity-iam-role-write-entry"]).toBe("plugin-user-change-role");
       expect(response.headers["x-identity-iam-role-write-decision"]).toBe("canary_actor_selected");
       expect(response.headers["x-identity-iam-role-write-correlation"]).toBe("phase4-role-write-test-correlation");
       expect(response.headers["x-identity-iam-role-write-route"]).toBe("change-role");
@@ -4786,8 +4827,22 @@ describe("identity-adapter IAM role write API", () => {
     });
     expect(selected.body.data.actorFingerprint).toMatch(/^[a-f0-9]{16}$/);
     expect(selected.headers["x-identity-iam-role-write"]).toBe("dual-write");
+    expect(selected.headers["x-identity-iam-role-write-entry"]).toBe("plugin-user-change-role");
     expect(selected.headers["x-identity-iam-role-write-decision"]).toBe("canary_actor_selected");
     expect(JSON.stringify(selected.body)).not.toContain("guanfei");
+
+    const guardedNotSelected = await request(app.getHttpServer())
+      .post("/v1/plugin-user/change-role")
+      .set("Authorization", `Bearer ${roleWriteAccessToken(25, "different-operator")}`)
+      .set("X-Identity-IAM-Role-Write-Require-Dual-Write", "1")
+      .send({ id: 24, role: "manager" })
+      .expect(409);
+
+    expect(guardedNotSelected.body).toMatchObject({
+      code: "IAM_ROLE_WRITE_DUAL_WRITE_REQUIRED",
+      reason: "canary_actor_not_selected"
+    });
+    expect(operations.inputs).toHaveLength(0);
 
     const notSelected = await request(app.getHttpServer())
       .get("/v1/plugin-user/role-write-decision")

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { Injectable, Logger, NotFoundException, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
+import { ConflictException, Injectable, Logger, NotFoundException, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
 import { loadConfig } from "./config.js";
 import {
   type IamRoleWriteEvidence,
@@ -126,6 +126,7 @@ export class IamRoleWriteService {
 
   async proxyPluginUser(request: IamRoleWriteRequest): Promise<IamRoleWriteProxyResponse> {
     if (this.config.iam.roleWriteMode === "disabled") {
+      this.assertRequiredDualWriteAvailable(request, "role_write_disabled");
       return this.pluginUserWrite.proxy(request, "/v1/plugin-user/change-role");
     }
     return this.proxy(request, "plugin-user-change-role");
@@ -214,9 +215,11 @@ export class IamRoleWriteService {
     const correlationId = roleWriteCorrelationId(request.headers);
     const claims = this.claimsFromAuthorization(request.headers.authorization);
     if (iam.roleWriteMode === "disabled") {
+      this.assertRequiredDualWriteAvailable(request, "role_write_disabled");
       throw new NotFoundException({ code: "IAM_ROLE_WRITE_DISABLED", message: "IAM role write migration is disabled." });
     }
     if (iam.roleWriteMode === "legacy-proxy") {
+      this.assertRequiredDualWriteAvailable(request, "legacy_proxy_mode");
       const decision = this.inactiveRolloutDecision(request, contract, correlationId, claims, "legacy_proxy_mode");
       this.logRolloutDecision(decision);
       return this.legacyProxy(request, contract, evidenceFromDecision(decision));
@@ -230,6 +233,7 @@ export class IamRoleWriteService {
 
     const unsupportedScopeField = unsupportedRoleWriteScopeField(request.body);
     if (unsupportedScopeField) {
+      this.assertRequiredDualWriteAvailable(request, "unsupported_scope_legacy_only");
       const decision: RoleWriteRolloutDecision = {
         selected: false,
         mode: iam.roleWriteRolloutMode,
@@ -258,7 +262,21 @@ export class IamRoleWriteService {
     const decision = this.dualWriteRolloutDecision(request, contract, correlationId, claims);
     this.logRolloutDecision(decision);
     const evidence = evidenceFromDecision(decision);
+    if (!decision.selected) {
+      this.assertRequiredDualWriteAvailable(request, decision.reason);
+    }
     return decision.selected ? this.dualWrite(request, contract, evidence) : this.legacyProxy(request, contract, evidence);
+  }
+
+  private assertRequiredDualWriteAvailable(request: IamRoleWriteRequest, reason: string): void {
+    if (!requiresDualWrite(request.headers)) {
+      return;
+    }
+    throw new ConflictException({
+      code: "IAM_ROLE_WRITE_DUAL_WRITE_REQUIRED",
+      message: "The guarded role-write request requires an active selected dual-write route.",
+      reason
+    });
   }
 
   private async dualWrite(
@@ -771,6 +789,11 @@ function stringValue(value: unknown): string | null {
 
 function firstHeader(value: string | string[] | undefined): string | null {
   return Array.isArray(value) ? value[0] ?? null : value ?? null;
+}
+
+function requiresDualWrite(headers: IamRoleWriteRequest["headers"]): boolean {
+  const value = firstHeader(headers["x-identity-iam-role-write-require-dual-write"]);
+  return value === "1" || value?.toLowerCase() === "true";
 }
 
 function copyHeader(

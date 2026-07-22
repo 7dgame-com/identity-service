@@ -67,6 +67,7 @@ export class PluginUserWriteController {
   ) {
     const decision = this.iamRoleWrite.previewPluginUserRollout(request);
     response.setHeader("X-Identity-IAM-Role-Write", decision.roleWriteMode);
+    response.setHeader("X-Identity-IAM-Role-Write-Entry", "plugin-user-change-role");
     this.applyRoleWriteEvidence(response, decision);
     return { code: 0, data: decision };
   }
@@ -99,6 +100,7 @@ export class PluginUserWriteController {
     response.status(upstream.status);
     response.setHeader("X-Identity-Plugin-User-Write", upstream.mode);
     response.setHeader("X-Identity-IAM-Role-Write", upstream.mode);
+    response.setHeader("X-Identity-IAM-Role-Write-Entry", "plugin-user-change-role");
     if (upstream.evidence) {
       this.applyRoleWriteEvidence(response, upstream.evidence);
     }
