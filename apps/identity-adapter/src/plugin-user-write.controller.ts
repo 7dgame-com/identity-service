@@ -61,11 +61,11 @@ export class PluginUserWriteController {
   }
 
   @Get("v1/plugin-user/role-write-decision")
-  roleWriteDecision(
+  async roleWriteDecision(
     @Req() request: PluginUserWriteExpressRequest,
     @Res({ passthrough: true }) response: PluginUserWriteExpressResponse
   ) {
-    const decision = this.iamRoleWrite.previewPluginUserRollout(request);
+    const decision = await this.iamRoleWrite.previewPluginUserRollout(request);
     response.setHeader("X-Identity-IAM-Role-Write", decision.roleWriteMode);
     response.setHeader("X-Identity-IAM-Role-Write-Entry", "plugin-user-change-role");
     this.applyRoleWriteEvidence(response, decision);

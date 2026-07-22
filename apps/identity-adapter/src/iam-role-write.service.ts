@@ -136,12 +136,19 @@ export class IamRoleWriteService {
     return this.proxy(request, "people-auth");
   }
 
-  previewPluginUserRollout(request: IamRoleWriteRequest) {
+  async previewPluginUserRollout(request: IamRoleWriteRequest) {
     const claims = this.requireClaims(request.headers.authorization);
     const correlationId = roleWriteCorrelationId(request.headers);
     const decision = this.config.iam.roleWriteMode === "dual-write"
       ? this.dualWriteRolloutDecision(request, "plugin-user-change-role", correlationId, claims)
       : this.inactiveRolloutDecision(request, "plugin-user-change-role", correlationId, claims);
+    const rollout = roleWriteRolloutReadiness(this.config.iam);
+    const dualWriteGate = this.config.iam.roleWriteMode === "dual-write"
+      ? await this.dualWriteGate(rollout)
+      : {
+          executable: false,
+          missingCapabilities: ["role-write-mode-not-dual-write"]
+        };
     const evidence = evidenceFromDecision(decision);
 
     this.logRolloutDecision(decision, true);
@@ -152,6 +159,8 @@ export class IamRoleWriteService {
       rolloutMode: decision.mode,
       selected: decision.selected,
       reason: decision.reason,
+      dualWriteExecutable: dualWriteGate.executable,
+      missingCapabilities: dualWriteGate.missingCapabilities,
       ...evidence
     };
   }

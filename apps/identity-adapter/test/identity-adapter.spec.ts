@@ -4821,6 +4821,8 @@ describe("identity-adapter IAM role write API", () => {
       rolloutMode: "canary",
       selected: true,
       reason: "canary_actor_selected",
+      dualWriteExecutable: true,
+      missingCapabilities: [],
       correlationId: "phase4-preview-selected",
       route: "change-role",
       matchedSelectorKind: "uid"
@@ -4857,6 +4859,37 @@ describe("identity-adapter IAM role write API", () => {
       correlationId: "phase4-preview-not-selected",
       matchedSelectorKind: null
     });
+    expect(operations.inputs).toHaveLength(0);
+  });
+
+  it("keeps role-write preview from looking executable when the dual-write gate is incomplete", async () => {
+    const iamRepository = new FakeIamRepository();
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_ROLE_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE = "canary";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_ALLOWLIST = "subject:24";
+    const operations = new FakePluginUserWriteOperationRepository();
+    app = await createLifecycleTestApp(operations, iamRepository);
+
+    const selectedButBlocked = await request(app.getHttpServer())
+      .get("/v1/plugin-user/role-write-decision")
+      .set("Authorization", `Bearer ${roleWriteAccessToken()}`)
+      .set("X-Identity-IAM-Role-Write-Correlation", "phase4-preview-selected-but-blocked")
+      .expect(200);
+
+    expect(selectedButBlocked.body.data).toMatchObject({
+      writePerformed: false,
+      sourceOfTruth: "legacy",
+      roleWriteMode: "dual-write",
+      rolloutMode: "canary",
+      selected: true,
+      reason: "canary_actor_selected",
+      dualWriteExecutable: false,
+      correlationId: "phase4-preview-selected-but-blocked",
+      route: "change-role",
+      matchedSelectorKind: "uid"
+    });
+    expect(selectedButBlocked.body.data.missingCapabilities).toContain("candidate-policy-checksum");
     expect(operations.inputs).toHaveLength(0);
   });
 
