@@ -37,6 +37,8 @@ IDENTITY_IAM_ROLE_WRITE_DUAL_WRITE_EXECUTION_ENABLED: "false"
 IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE: "off"
 IDENTITY_IAM_ROLE_WRITE_ROLLOUT_ALLOWLIST: ""
 IDENTITY_IAM_ROLE_WRITE_ROLLOUT_PERCENTAGE: "0"
+IDENTITY_IAM_ROLE_WRITE_CANDIDATE_RESTORE_ENABLED: "false"
+IDENTITY_IAM_ROLE_WRITE_CANDIDATE_RESTORE_TARGET_LEGACY_USER_ID: "0"
 IDENTITY_IAM_ROLE_WRITE_RECOVERY_DRILL_ENABLED: "false"
 IDENTITY_IAM_ROLE_WRITE_RECOVERY_DRILL_TARGET_LEGACY_USER_ID: "0"
 ```
@@ -113,6 +115,41 @@ POST /internal/iam/role-write/recovery-drill/prepare
 `disabled/false/off/空/0%`。本演练只能证明补偿执行器和真实存储链路，不替代正常
 `user -> manager -> user` dual-write 窗口。
 
+### 单账号 Identity candidate restore
+
+如果一次已完成的窗口留下“Legacy 已恢复、Identity candidate 仍多出旧角色”，不得重放历史
+grant/revoke，也不得重新导入整份 candidate policy。使用默认关闭的单账号恢复入口：
+
+```text
+POST /internal/iam/role-write/subjects/:legacyUserId/restore-candidate
+body: { "policyChecksum": "<approved-64-char-checksum>" }
+```
+
+该入口只在取得独立 Develop-only 批准后临时配置：
+
+```yaml
+IDENTITY_IAM_ROLE_WRITE_CANDIDATE_RESTORE_ENABLED: "true"
+IDENTITY_IAM_ROLE_WRITE_CANDIDATE_RESTORE_TARGET_LEGACY_USER_ID: "<exact-dedicated-test-user-id>"
+```
+
+恢复必须同时满足以下条件，否则 fail-closed 且不写入：
+
+- IAM 为 `readonly`，AuthZ 为 `legacy/off/空/0%` 且 fallback 保持开启；
+- role-write 为 `disabled/false/off/空/0%`，运行配置中不得设置 role policy checksum；
+- recovery drill 保持关闭；
+- 请求目标与配置的唯一目标完全一致，并携带内部 token 和已审 64 位 checksum；
+- before alignment 的唯一 blocker 是 `candidate-assignment-mismatch`；
+- Legacy/candidate 均无 policy 外 assignment、无 root、无 unresolved role-write operation。
+
+写入来源只能是调用时读取到的 **当前 Legacy assignment**，写入范围只能是该账号的 Identity
+candidate assignment。不得写 Legacy、不得创建或改写 operation ledger、不得执行 permission union、
+不得重放历史 mutation。响应只返回账号/checksum 摘要、before/after 计数和安全标记；完整 checksum
+只存在于内部请求，不写入报告或日志。
+
+恢复后必须再次执行只读 alignment，要求 assignment 集合完全相等、unresolved=0、无 root、
+`passed=true`。随后立即把恢复变量还原为 `false/0`；若 postcheck 未通过，role-write 仍保持关闭，
+不得申请运行时窗口。
+
 ## Root 保护与回滚
 
 legacy API 继续负责 root 保护。Identity candidate 路径永远不会 materialize `root`：请求目标角色
@@ -127,6 +164,8 @@ IDENTITY_IAM_ROLE_WRITE_DUAL_WRITE_EXECUTION_ENABLED: "false"
 IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE: "off"
 IDENTITY_IAM_ROLE_WRITE_ROLLOUT_ALLOWLIST: ""
 IDENTITY_IAM_ROLE_WRITE_ROLLOUT_PERCENTAGE: "0"
+IDENTITY_IAM_ROLE_WRITE_CANDIDATE_RESTORE_ENABLED: "false"
+IDENTITY_IAM_ROLE_WRITE_CANDIDATE_RESTORE_TARGET_LEGACY_USER_ID: "0"
 IDENTITY_IAM_ROLE_WRITE_RECOVERY_DRILL_ENABLED: "false"
 IDENTITY_IAM_ROLE_WRITE_RECOVERY_DRILL_TARGET_LEGACY_USER_ID: "0"
 ```

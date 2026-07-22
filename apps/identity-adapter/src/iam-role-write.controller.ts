@@ -81,6 +81,24 @@ export class IamRoleWriteController {
     };
   }
 
+  @Post("internal/iam/role-write/subjects/:legacyUserId/restore-candidate")
+  async restoreCandidate(
+    @Headers("x-identity-internal-token") token: string | undefined,
+    @Param("legacyUserId") legacyUserId: string,
+    @Body() body: { policyChecksum?: unknown }
+  ) {
+    this.assertInternalToken(token);
+    return {
+      status: "ok",
+      service: "identity-adapter",
+      capability: "iam-role-write-candidate-restore",
+      data: await this.roleWrite.restoreCandidateAssignments({
+        legacyUserId: parseLegacyUserId(legacyUserId),
+        policyChecksum: parsePolicyChecksum(typeof body?.policyChecksum === "string" ? body.policyChecksum : undefined)
+      })
+    };
+  }
+
   @Post("internal/iam/role-write/recovery-drill/prepare")
   async prepareRecoveryDrill(@Headers("x-identity-internal-token") token: string | undefined) {
     this.assertInternalToken(token);

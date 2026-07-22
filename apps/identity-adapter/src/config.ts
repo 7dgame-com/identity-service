@@ -116,6 +116,10 @@ export const configSchema = z.object({
     roleWriteRolloutAllowlist: z.string().default(""),
     roleWriteRolloutPercentage: numberFromEnv.default(0),
     roleWritePolicyChecksum: optionalStringFromEnv,
+    roleWriteCandidateRestoreEnabled: boolFromEnv.default(false),
+    roleWriteCandidateRestoreTargetLegacyUserId: numberFromEnv
+      .transform((value) => value ?? 0)
+      .pipe(z.number().int().min(0)),
     roleWriteRecoveryDrillEnabled: boolFromEnv.default(false),
     roleWriteRecoveryDrillTargetLegacyUserId: numberFromEnv
       .transform((value) => value ?? 0)
@@ -334,6 +338,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
       roleWriteRolloutAllowlist: env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_ALLOWLIST,
       roleWriteRolloutPercentage: env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_PERCENTAGE,
       roleWritePolicyChecksum: env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM,
+      roleWriteCandidateRestoreEnabled: env.IDENTITY_IAM_ROLE_WRITE_CANDIDATE_RESTORE_ENABLED,
+      roleWriteCandidateRestoreTargetLegacyUserId: env.IDENTITY_IAM_ROLE_WRITE_CANDIDATE_RESTORE_TARGET_LEGACY_USER_ID,
       roleWriteRecoveryDrillEnabled: env.IDENTITY_IAM_ROLE_WRITE_RECOVERY_DRILL_ENABLED,
       roleWriteRecoveryDrillTargetLegacyUserId: env.IDENTITY_IAM_ROLE_WRITE_RECOVERY_DRILL_TARGET_LEGACY_USER_ID,
       organizationWriteMode: env.IDENTITY_IAM_ORG_WRITE_MODE,

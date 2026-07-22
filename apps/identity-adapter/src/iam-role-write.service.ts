@@ -101,6 +101,16 @@ export class IamRoleWriteService {
         requiresExplicitChecksum: true,
         operationHistoryScope: "all"
       },
+      candidateRestore: {
+        enabled: iam.roleWriteCandidateRestoreEnabled,
+        targetConfigured: iam.roleWriteCandidateRestoreTargetLegacyUserId > 0,
+        endpoint: "/internal/iam/role-write/subjects/:legacyUserId/restore-candidate",
+        requiresInternalToken: true,
+        requiresExplicitChecksum: true,
+        sourceOfTruth: "legacy",
+        mutatesLegacy: false,
+        writeScope: "identity-candidate-only"
+      },
       recoveryDrill: {
         enabled: iam.roleWriteRecoveryDrillEnabled,
         targetConfigured: iam.roleWriteRecoveryDrillTargetLegacyUserId > 0,
@@ -337,6 +347,98 @@ export class IamRoleWriteService {
       });
       throw error;
     }
+  }
+
+  async restoreCandidateAssignments(input: { legacyUserId: number; policyChecksum: string }) {
+    const { iam } = this.config;
+    if (!iam.roleWriteCandidateRestoreEnabled) {
+      throw new NotFoundException({
+        code: "IAM_ROLE_WRITE_CANDIDATE_RESTORE_DISABLED",
+        message: "IAM role-write candidate restore is disabled."
+      });
+    }
+    if (iam.roleWriteCandidateRestoreTargetLegacyUserId !== input.legacyUserId) {
+      throw new ConflictException({
+        code: "IAM_ROLE_WRITE_CANDIDATE_RESTORE_TARGET_MISMATCH",
+        message: "IAM role-write candidate restore is not enabled for the requested subject."
+      });
+    }
+    const postureBlocked =
+      iam.mode !== "readonly" ||
+      iam.roleWriteMode !== "disabled" ||
+      iam.roleWriteDualWriteExecutionEnabled ||
+      iam.roleWriteRolloutMode !== "off" ||
+      iam.roleWriteRolloutAllowlist.trim() !== "" ||
+      iam.roleWriteRolloutPercentage !== 0 ||
+      Boolean(iam.roleWritePolicyChecksum) ||
+      iam.roleWriteRecoveryDrillEnabled ||
+      iam.authzReadMode !== "legacy" ||
+      iam.authzRolloutMode !== "off" ||
+      iam.authzRolloutAllowlist.trim() !== "" ||
+      iam.authzRolloutPercentage !== 0 ||
+      !iam.authzFallbackEnabled;
+    if (postureBlocked) {
+      throw new ConflictException({
+        code: "IAM_ROLE_WRITE_CANDIDATE_RESTORE_UNSAFE_POSTURE",
+        message: "Candidate restore requires IAM readonly, Legacy-authoritative AuthZ, and all role-write rollout controls disabled."
+      });
+    }
+
+    const before = await this.subjectAlignment(input);
+    const recoverable =
+      before.safetyGate.requiresCandidateRestore &&
+      before.safetyGate.blockedReasons.length === 1 &&
+      before.safetyGate.blockedReasons[0] === "candidate-assignment-mismatch" &&
+      before.assignments.legacyOutsidePolicy.length === 0 &&
+      before.assignments.candidateOutsidePolicy.length === 0 &&
+      before.operations.unresolvedCount === 0 &&
+      !before.rootProtection.protected;
+    if (!recoverable) {
+      throw new ConflictException({
+        code: "IAM_ROLE_WRITE_CANDIDATE_RESTORE_NOT_APPLICABLE",
+        message: "Subject alignment does not permit a candidate-only restore."
+      });
+    }
+
+    const assignmentCount = await this.iamRepository.replaceSubjectAssignments({
+      identityUserId: `legacy:${input.legacyUserId}`,
+      legacyUserId: input.legacyUserId,
+      policyChecksum: input.policyChecksum,
+      assignments: before.assignments.legacy.map(assignmentRowFromKey),
+      source: "role-write-candidate-restore"
+    });
+    const after = await this.subjectAlignment(input);
+    if (!after.safetyGate.passed) {
+      throw new ServiceUnavailableException({
+        code: "IAM_ROLE_WRITE_CANDIDATE_RESTORE_POSTCHECK_FAILED",
+        message: "Candidate restore completed but the post-restore alignment gate did not pass."
+      });
+    }
+
+    this.logger.log(
+      JSON.stringify({
+        event: "iam-role-write-candidate-restored",
+        subjectFingerprint: before.subjectFingerprint,
+        policyChecksumFingerprint: shortDigest(input.policyChecksum),
+        assignmentCount
+      })
+    );
+    return {
+      restored: true,
+      subjectFingerprint: before.subjectFingerprint,
+      policyChecksumFingerprint: shortDigest(input.policyChecksum),
+      assignmentCount,
+      before: alignmentSummary(before),
+      after: alignmentSummary(after),
+      safety: {
+        legacyWritePerformed: false,
+        identityCandidateWritePerformed: true,
+        historicalMutationReplayed: false,
+        legacyRemainsAuthoritative: true,
+        permissionUnionApplied: false,
+        writeScope: "identity-candidate-only"
+      }
+    };
   }
 
   async prepareRecoveryDrill() {
@@ -1028,6 +1130,45 @@ function normalizeAssignmentKeys(
       ? `${assignment.type}:${assignment.name}`
       : `${assignment.itemType}:${assignment.itemName}`
   )))].sort();
+}
+
+function alignmentSummary(alignment: {
+  assignments: {
+    legacy: string[];
+    candidate: string[];
+    missingInCandidate: string[];
+    extraInCandidate: string[];
+  };
+  operations: { unresolvedCount: number };
+  rootProtection: { protected: boolean };
+  safetyGate: {
+    passed: boolean;
+    canRequestRuntime: boolean;
+    requiresCandidateRestore: boolean;
+    blockedReasons: string[];
+  };
+}) {
+  return {
+    assignmentCounts: {
+      legacy: alignment.assignments.legacy.length,
+      candidate: alignment.assignments.candidate.length,
+      missingInCandidate: alignment.assignments.missingInCandidate.length,
+      extraInCandidate: alignment.assignments.extraInCandidate.length
+    },
+    unresolvedOperationCount: alignment.operations.unresolvedCount,
+    rootProtected: alignment.rootProtection.protected,
+    safetyGate: alignment.safetyGate
+  };
+}
+
+function assignmentRowFromKey(key: string): { itemName: string; itemType: "role" | "permission" } {
+  const separator = key.indexOf(":");
+  const itemType = key.slice(0, separator);
+  const itemName = key.slice(separator + 1);
+  if ((itemType !== "role" && itemType !== "permission") || !itemName) {
+    throw new Error("Invalid normalized IAM assignment key.");
+  }
+  return { itemName, itemType };
 }
 
 function safeRolloutPercentage(value: number): number {
