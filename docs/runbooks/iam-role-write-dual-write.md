@@ -37,6 +37,8 @@ IDENTITY_IAM_ROLE_WRITE_DUAL_WRITE_EXECUTION_ENABLED: "false"
 IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE: "off"
 IDENTITY_IAM_ROLE_WRITE_ROLLOUT_ALLOWLIST: ""
 IDENTITY_IAM_ROLE_WRITE_ROLLOUT_PERCENTAGE: "0"
+IDENTITY_IAM_ROLE_WRITE_RECOVERY_DRILL_ENABLED: "false"
+IDENTITY_IAM_ROLE_WRITE_RECOVERY_DRILL_TARGET_LEGACY_USER_ID: "0"
 ```
 
 `IDENTITY_IAM_ROLE_WRITE_LEGACY_API_BASE_URL` 可省略；服务会依次回退到
@@ -84,6 +86,33 @@ POST /internal/iam/role-write/operations/:operationKey/retry-identity-shadow
 该接口需要 `X-Identity-Internal-Token`。操作记录和日志不得携带 Authorization、Cookie、密码、
 完整 token 或原始 payload。
 
+### 等价补偿演练
+
+不要为了制造 Identity 写失败而关闭数据库、破坏 candidate policy 或修改真实用户。代码提供一个
+默认关闭的内部等价补偿演练入口，它只准备 `legacy_completed + compensation=required` 的可恢复
+ledger 状态，**不调用 Legacy 写接口**：
+
+```text
+POST /internal/iam/role-write/recovery-drill/prepare
+```
+
+该入口必须取得独立 Develop-only 批准，并同时满足：
+
+- `IDENTITY_IAM_ROLE_WRITE_RECOVERY_DRILL_ENABLED=true`；
+- `IDENTITY_IAM_ROLE_WRITE_RECOVERY_DRILL_TARGET_LEGACY_USER_ID` 只指向专用测试账号；
+- role-write 已处于获批的 dual-write/canary/0% 窗口，readiness gate 为 executable；
+- 目标在 Legacy 中恰好为 `user`，且不存在 root assignment；
+- 内部 token 有效。
+
+准备接口使用“目标 + 已审 policy checksum”的确定性 operation key；重复调用只返回原 operation，
+不会产生多条待恢复账本。随后使用返回的 operation key 调用既有
+`retry-identity-shadow`，确认它从当前 Legacy assignment 重建 Identity candidate，且 Legacy 写接口
+调用次数保持 0。报告只保留 operation key 摘要和目标摘要，不保留原始内部 token。
+
+演练结束必须把上述两个演练变量恢复为 `false/0`，并同时恢复 role-write 的
+`disabled/false/off/空/0%`。本演练只能证明补偿执行器和真实存储链路，不替代正常
+`user -> manager -> user` dual-write 窗口。
+
 ## Root 保护与回滚
 
 legacy API 继续负责 root 保护。Identity candidate 路径永远不会 materialize `root`：请求目标角色
@@ -98,6 +127,8 @@ IDENTITY_IAM_ROLE_WRITE_DUAL_WRITE_EXECUTION_ENABLED: "false"
 IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE: "off"
 IDENTITY_IAM_ROLE_WRITE_ROLLOUT_ALLOWLIST: ""
 IDENTITY_IAM_ROLE_WRITE_ROLLOUT_PERCENTAGE: "0"
+IDENTITY_IAM_ROLE_WRITE_RECOVERY_DRILL_ENABLED: "false"
+IDENTITY_IAM_ROLE_WRITE_RECOVERY_DRILL_TARGET_LEGACY_USER_ID: "0"
 ```
 
 窗口 closeout 至少保留：before/after readiness、测试账号命中证明、旧响应兼容、legacy 与

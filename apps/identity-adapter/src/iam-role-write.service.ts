@@ -94,6 +94,13 @@ export class IamRoleWriteService {
       allowedExecutableModes: [...ROLE_WRITE_MODES],
       responseShapePreservedInLegacyProxy: true,
       recoveryEndpoint: "/internal/iam/role-write/operations/:operationKey/retry-identity-shadow",
+      recoveryDrill: {
+        enabled: iam.roleWriteRecoveryDrillEnabled,
+        targetConfigured: iam.roleWriteRecoveryDrillTargetLegacyUserId > 0,
+        endpoint: "/internal/iam/role-write/recovery-drill/prepare",
+        mutatesLegacy: false,
+        requiresInternalToken: true
+      },
       dualWriteGate,
       blockedReasons: modeBlocked ? dualWriteGate.missingCapabilities : [],
       requiredBeforeDualWrite: [...REQUIRED_BEFORE_DUAL_WRITE]
@@ -217,6 +224,132 @@ export class IamRoleWriteService {
       });
       throw error;
     }
+  }
+
+  async prepareRecoveryDrill() {
+    const { iam } = this.config;
+    if (!iam.roleWriteRecoveryDrillEnabled) {
+      throw new NotFoundException({
+        code: "IAM_ROLE_WRITE_RECOVERY_DRILL_DISABLED",
+        message: "Role-write recovery drill is disabled."
+      });
+    }
+    if (iam.roleWriteMode !== "dual-write" || !iam.roleWriteDualWriteExecutionEnabled) {
+      throw new ConflictException({
+        code: "IAM_ROLE_WRITE_RECOVERY_DRILL_REQUIRES_DUAL_WRITE",
+        message: "Role-write recovery drill requires an explicitly enabled dual-write window."
+      });
+    }
+
+    const targetLegacyUserId = iam.roleWriteRecoveryDrillTargetLegacyUserId;
+    if (!Number.isInteger(targetLegacyUserId) || targetLegacyUserId <= 0) {
+      throw new ConflictException({
+        code: "IAM_ROLE_WRITE_RECOVERY_DRILL_TARGET_REQUIRED",
+        message: "Role-write recovery drill requires one configured dedicated target."
+      });
+    }
+
+    const rollout = roleWriteRolloutReadiness(iam);
+    const gate = await this.dualWriteGate(rollout);
+    if (!gate.executable) {
+      throw new ConflictException({
+        code: "IAM_ROLE_WRITE_RECOVERY_DRILL_GATE_BLOCKED",
+        message: "Role-write recovery drill is blocked by the dual-write readiness gate.",
+        missingCapabilities: gate.missingCapabilities
+      });
+    }
+
+    const user = await this.legacyReader.getUserById(targetLegacyUserId);
+    const assignments = await this.legacyReader.listUserRbacAssignments(targetLegacyUserId);
+    const roleAssignments = assignments.filter((assignment) => assignment.type === "role").map((assignment) => assignment.name);
+    if (!user || user.roles.includes("root") || roleAssignments.includes("root")) {
+      throw new ConflictException({
+        code: "IAM_ROLE_WRITE_RECOVERY_DRILL_TARGET_PROTECTED",
+        message: "Root or missing targets cannot be used for a role-write recovery drill."
+      });
+    }
+    if (user.roles.length !== 1 || user.roles[0] !== "user" || roleAssignments.length !== 1 || roleAssignments[0] !== "user") {
+      throw new ConflictException({
+        code: "IAM_ROLE_WRITE_RECOVERY_DRILL_TARGET_NOT_BASELINE_USER",
+        message: "Role-write recovery drill target must have the exact user baseline in Legacy."
+      });
+    }
+
+    const targetSubject = `legacy:${targetLegacyUserId}`;
+    const actorSubject = "internal:role-write-recovery-drill";
+    const requestFingerprint = pluginUserWriteRequestFingerprint("change-role", {
+      drill: "identity-assignment-recovery",
+      targetSubject,
+      policyChecksum: iam.roleWritePolicyChecksum,
+      version: 1
+    });
+    const operationKey = pluginUserWriteOperationKey({
+      route: "change-role",
+      actorSubject,
+      targetSubject,
+      requestFingerprint
+    });
+    const metadata = {
+      phase: "identity",
+      policyChecksum: iam.roleWritePolicyChecksum,
+      requestedRole: "user",
+      drill: {
+        kind: "identity-assignment-recovery",
+        noLegacyMutation: true,
+        exactLegacyBaseline: "user"
+      }
+    };
+    const begun = await this.operations.begin({
+      operationKey,
+      idempotencyKey: `recovery-drill:${requestFingerprint}`,
+      route: "change-role",
+      mode: "dual-write",
+      actorSubject,
+      targetSubject,
+      legacyUserId: targetLegacyUserId,
+      identityUserId: targetSubject,
+      metadata
+    });
+    if (begun.duplicate) {
+      const existing = await this.operations.findByOperationKey(operationKey);
+      if (!existing) {
+        throw new ConflictException({
+          code: "IAM_ROLE_WRITE_RECOVERY_DRILL_DUPLICATE",
+          message: "Role-write recovery drill operation already exists but cannot be read."
+        });
+      }
+      return {
+        operationKey,
+        operationKeyDigest: shortDigest(operationKey),
+        targetFingerprint: shortDigest(targetSubject),
+        status: existing.status,
+        compensationStatus: existing.compensationStatus,
+        noLegacyMutation: true,
+        duplicate: true,
+        nextAction: existing.status === "completed" ? "none" : "retry-identity-shadow"
+      };
+    }
+
+    await this.operations.update({
+      operationKey,
+      status: "legacy_completed",
+      legacyStatus: "drill:no-mutation",
+      identityStatus: "drill:recovery-required",
+      compensationStatus: "required",
+      errorCode: "IAM_ROLE_WRITE_RECOVERY_DRILL",
+      metadata
+    });
+
+    return {
+      operationKey,
+      operationKeyDigest: shortDigest(operationKey),
+      targetFingerprint: shortDigest(targetSubject),
+      status: "legacy_completed",
+      compensationStatus: "required",
+      noLegacyMutation: true,
+      duplicate: false,
+      nextAction: "retry-identity-shadow"
+    };
   }
 
   private async proxy(request: IamRoleWriteRequest, contract: RoleWriteContract): Promise<IamRoleWriteProxyResponse> {

@@ -4717,6 +4717,172 @@ describe("identity-adapter IAM role write API", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("keeps the recovery drill disabled and targetless by default", async () => {
+    const operations = new FakePluginUserWriteOperationRepository();
+    app = await createLifecycleTestApp(operations);
+
+    const readiness = await request(app.getHttpServer())
+      .get("/internal/iam/role-write/readiness")
+      .set("x-identity-internal-token", "role-write-test-token")
+      .expect(200);
+
+    expect(readiness.body.data.recoveryDrill).toEqual({
+      enabled: false,
+      targetConfigured: false,
+      endpoint: "/internal/iam/role-write/recovery-drill/prepare",
+      mutatesLegacy: false,
+      requiresInternalToken: true
+    });
+
+    await request(app.getHttpServer())
+      .post("/internal/iam/role-write/recovery-drill/prepare")
+      .expect(401);
+
+    await request(app.getHttpServer())
+      .post("/internal/iam/role-write/recovery-drill/prepare")
+      .set("x-identity-internal-token", "role-write-test-token")
+      .expect(404);
+
+    expect(operations.inputs).toHaveLength(0);
+  });
+
+  it("prepares a no-legacy-mutation recovery drill for one exact user target and recovers identity", async () => {
+    const iamRepository = new FakeIamRepository();
+    const checksum = await seedRoleWritePolicy(iamRepository);
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_ROLE_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE = "canary";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_ALLOWLIST = "username:guanfei";
+    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = checksum;
+    process.env.IDENTITY_IAM_ROLE_WRITE_RECOVERY_DRILL_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_RECOVERY_DRILL_TARGET_LEGACY_USER_ID = "25";
+    const operations = new FakePluginUserWriteOperationRepository();
+    const legacyReader = new FakeLegacyIdentityReader();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    app = await createLifecycleTestApp(operations, iamRepository, undefined, undefined, legacyReader);
+
+    const prepared = await request(app.getHttpServer())
+      .post("/internal/iam/role-write/recovery-drill/prepare")
+      .set("x-identity-internal-token", "role-write-test-token")
+      .expect(201);
+
+    expect(prepared.body.data).toMatchObject({
+      operationKey: expect.stringMatching(/^plugin-user-write:v1:change-role:/),
+      operationKeyDigest: expect.stringMatching(/^[a-f0-9]{16}$/),
+      targetFingerprint: expect.stringMatching(/^[a-f0-9]{16}$/),
+      status: "legacy_completed",
+      compensationStatus: "required",
+      noLegacyMutation: true,
+      duplicate: false,
+      nextAction: "retry-identity-shadow"
+    });
+    const operationKey = prepared.body.data.operationKey as string;
+    expect(await operations.findByOperationKey(operationKey)).toMatchObject({
+      status: "legacy_completed",
+      legacyStatus: "drill:no-mutation",
+      identityStatus: "drill:recovery-required",
+      compensationStatus: "required",
+      errorCode: "IAM_ROLE_WRITE_RECOVERY_DRILL"
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    const duplicate = await request(app.getHttpServer())
+      .post("/internal/iam/role-write/recovery-drill/prepare")
+      .set("x-identity-internal-token", "role-write-test-token")
+      .expect(201);
+
+    expect(duplicate.body.data).toMatchObject({
+      operationKey,
+      status: "legacy_completed",
+      compensationStatus: "required",
+      noLegacyMutation: true,
+      duplicate: true,
+      nextAction: "retry-identity-shadow"
+    });
+    expect(operations.inputs).toHaveLength(1);
+
+    const recovered = await request(app.getHttpServer())
+      .post(`/internal/iam/role-write/operations/${encodeURIComponent(operationKey)}/retry-identity-shadow`)
+      .set("x-identity-internal-token", "role-write-test-token")
+      .expect(201);
+
+    expect(recovered.body.data).toMatchObject({
+      operationKeyDigest: prepared.body.data.operationKeyDigest,
+      recovered: true,
+      assignmentCount: 1
+    });
+    expect(iamRepository.subjectAssignments.get(25)).toEqual([{ itemName: "user", itemType: "role" }]);
+    expect(await operations.findByOperationKey(operationKey)).toMatchObject({
+      status: "completed",
+      legacyStatus: "drill:no-mutation",
+      identityStatus: "recovered",
+      compensationStatus: "completed"
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    const completedDuplicate = await request(app.getHttpServer())
+      .post("/internal/iam/role-write/recovery-drill/prepare")
+      .set("x-identity-internal-token", "role-write-test-token")
+      .expect(201);
+
+    expect(completedDuplicate.body.data).toMatchObject({
+      operationKey,
+      status: "completed",
+      compensationStatus: "completed",
+      noLegacyMutation: true,
+      duplicate: true,
+      nextAction: "none"
+    });
+    expect(operations.inputs).toHaveLength(1);
+  });
+
+  it("refuses a recovery drill when the configured target is not the exact user baseline", async () => {
+    const iamRepository = new FakeIamRepository();
+    const checksum = await seedRoleWritePolicy(iamRepository);
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_ROLE_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE = "canary";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_ALLOWLIST = "username:guanfei";
+    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = checksum;
+    process.env.IDENTITY_IAM_ROLE_WRITE_RECOVERY_DRILL_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_RECOVERY_DRILL_TARGET_LEGACY_USER_ID = "24";
+    const operations = new FakePluginUserWriteOperationRepository();
+    app = await createLifecycleTestApp(operations, iamRepository);
+
+    const response = await request(app.getHttpServer())
+      .post("/internal/iam/role-write/recovery-drill/prepare")
+      .set("x-identity-internal-token", "role-write-test-token")
+      .expect(409);
+
+    expect(response.body).toMatchObject({ code: "IAM_ROLE_WRITE_RECOVERY_DRILL_TARGET_NOT_BASELINE_USER" });
+    expect(operations.inputs).toHaveLength(0);
+  });
+
+  it("never prepares a recovery drill for a target with a root assignment", async () => {
+    const iamRepository = new FakeIamRepository();
+    const checksum = await seedRoleWritePolicy(iamRepository);
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_ROLE_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE = "canary";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_ALLOWLIST = "username:guanfei";
+    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = checksum;
+    process.env.IDENTITY_IAM_ROLE_WRITE_RECOVERY_DRILL_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_RECOVERY_DRILL_TARGET_LEGACY_USER_ID = "24";
+    const operations = new FakePluginUserWriteOperationRepository();
+    const legacyReader = new FakeLegacyIdentityReader();
+    legacyReader.setUserRbacAssignments(24, [{ name: "root", type: "role" }]);
+    app = await createLifecycleTestApp(operations, iamRepository, undefined, undefined, legacyReader);
+
+    const response = await request(app.getHttpServer())
+      .post("/internal/iam/role-write/recovery-drill/prepare")
+      .set("x-identity-internal-token", "role-write-test-token")
+      .expect(409);
+
+    expect(response.body).toMatchObject({ code: "IAM_ROLE_WRITE_RECOVERY_DRILL_TARGET_PROTECTED" });
+    expect(operations.inputs).toHaveLength(0);
+  });
+
   it("preserves the old people/auth method, body and response in legacy-proxy mode", async () => {
     app = await createLifecycleTestApp();
     const legacyBody = { success: true, data: { id: 25, auth: "user" } };

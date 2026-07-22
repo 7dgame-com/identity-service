@@ -63,6 +63,17 @@ export class IamRoleWriteController {
     };
   }
 
+  @Post("internal/iam/role-write/recovery-drill/prepare")
+  async prepareRecoveryDrill(@Headers("x-identity-internal-token") token: string | undefined) {
+    this.assertInternalToken(token);
+    return {
+      status: "ok",
+      service: "identity-adapter",
+      capability: "iam-role-write-recovery-drill",
+      data: await this.roleWrite.prepareRecoveryDrill()
+    };
+  }
+
   @Put("v1/people/auth")
   async peopleAuth(
     @Req() request: IamRoleWriteExpressRequest,
