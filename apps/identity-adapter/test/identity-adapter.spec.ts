@@ -4806,6 +4806,79 @@ describe("identity-adapter IAM role write API", () => {
     expect(operations.inputs).toHaveLength(0);
   });
 
+  it("reports current Legacy candidate availability without exposing a checksum or mutating role-write state", async () => {
+    const iamRepository = new FakeIamRepository();
+    const legacyReader = new FakeLegacyIdentityReader();
+    const currentPolicy = createIamPermissionPolicySnapshot(await legacyReader.readRbacPolicySnapshot());
+    await iamRepository.upsertPermissionPolicyCandidate(currentPolicy, "role-write-diagnostics-test");
+    const operations = new FakePluginUserWriteOperationRepository();
+    app = await createLifecycleTestApp(operations, iamRepository, undefined, undefined, legacyReader);
+
+    await request(app.getHttpServer())
+      .get("/internal/iam/role-write/policy-diagnostics")
+      .expect(401);
+
+    const response = await request(app.getHttpServer())
+      .get("/internal/iam/role-write/policy-diagnostics")
+      .set("x-identity-internal-token", "role-write-test-token")
+      .expect(200);
+
+    expect(response.body.data).toMatchObject({
+      readOnly: true,
+      legacyRemainsAuthoritative: true,
+      writes: { legacy: false, identityCandidate: false, operationLedger: false },
+      configuredPolicy: {
+        checksumConfigured: false,
+        matchesCurrentLegacyPolicy: false,
+        candidateLookup: "not_configured"
+      },
+      currentLegacyPolicy: {
+        previewAvailable: true,
+        candidateLookup: "available",
+        roleCount: 3,
+        permissionCount: 2,
+        relationCount: 3
+      },
+      blockedReasons: ["candidate-policy-checksum-not-configured", "configured-candidate-not_configured"]
+    });
+    expect(JSON.stringify(response.body)).not.toContain(currentPolicy.checksum);
+    expect(iamRepository.subjectAssignmentWrites).toHaveLength(0);
+    expect(operations.inputs).toHaveLength(0);
+  });
+
+  it("distinguishes a stale configured candidate from the current Legacy policy without performing a write", async () => {
+    const iamRepository = new FakeIamRepository();
+    const staleChecksum = await seedRoleWritePolicy(iamRepository);
+    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = staleChecksum;
+    const operations = new FakePluginUserWriteOperationRepository();
+    app = await createLifecycleTestApp(operations, iamRepository);
+
+    const response = await request(app.getHttpServer())
+      .get("/internal/iam/role-write/policy-diagnostics")
+      .set("x-identity-internal-token", "role-write-test-token")
+      .expect(200);
+
+    expect(response.body.data).toMatchObject({
+      readOnly: true,
+      configuredPolicy: {
+        checksumConfigured: true,
+        matchesCurrentLegacyPolicy: false,
+        candidateLookup: "available"
+      },
+      currentLegacyPolicy: {
+        previewAvailable: true,
+        candidateLookup: "not_found"
+      },
+      blockedReasons: [
+        "configured-checksum-does-not-match-current-legacy-policy",
+        "current-legacy-candidate-not_found"
+      ]
+    });
+    expect(JSON.stringify(response.body)).not.toContain(staleChecksum);
+    expect(iamRepository.subjectAssignmentWrites).toHaveLength(0);
+    expect(operations.inputs).toHaveLength(0);
+  });
+
   it("restores one exact Identity candidate from current Legacy assignments without replaying a mutation", async () => {
     const iamRepository = new FakeIamRepository();
     const checksum = await seedRoleWritePolicy(iamRepository);

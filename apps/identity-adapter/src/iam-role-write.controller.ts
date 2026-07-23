@@ -20,6 +20,17 @@ export class IamRoleWriteController {
     };
   }
 
+  @Get("internal/iam/role-write/policy-diagnostics")
+  async policyDiagnostics(@Headers("x-identity-internal-token") token: string | undefined) {
+    this.assertInternalToken(token);
+    return {
+      status: "ok",
+      service: "identity-adapter",
+      capability: "iam-role-write-policy-diagnostics",
+      data: await this.roleWrite.policyDiagnostics()
+    };
+  }
+
   @Get("internal/iam/role-write/operations/summary")
   async operationLedgerSummary(
     @Headers("x-identity-internal-token") token: string | undefined,

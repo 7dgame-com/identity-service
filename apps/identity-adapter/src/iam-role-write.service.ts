@@ -10,6 +10,7 @@ import {
   roleWriteSelectorKind
 } from "./iam-role-write-evidence.js";
 import { IamRepository } from "./iam.repository.js";
+import { createIamPermissionPolicySnapshot } from "./iam-permission-model.js";
 import { JwtIssuerService, type VerifiedAccessToken } from "./jwt-issuer.service.js";
 import { LegacyIdentityReader } from "./legacy-identity.reader.js";
 import {
@@ -145,6 +146,76 @@ export class IamRoleWriteService {
       sinceMinutes,
       limit,
       operations: operations.filter((operation) => ROLE_WRITE_ROUTES.includes(operation.route as RoleWriteRoute)).slice(0, limit)
+    };
+  }
+
+  /**
+   * Explains why a configured role-write candidate is (or is not) executable without
+   * disclosing a policy checksum or mutating Legacy, Identity, or the operation ledger.
+   */
+  async policyDiagnostics() {
+    const { iam } = this.config;
+    const configuredChecksum = iam.roleWritePolicyChecksum;
+    const sources = {
+      legacyReaderConfigured: this.legacyReader.isConfigured(),
+      identityRepositoryConfigured: this.iamRepository.isConfigured()
+    };
+
+    if (!sources.legacyReaderConfigured || !sources.identityRepositoryConfigured) {
+      return {
+        readOnly: true,
+        legacyRemainsAuthoritative: true,
+        writes: { legacy: false, identityCandidate: false, operationLedger: false },
+        sources,
+        configuredPolicy: {
+          checksumConfigured: Boolean(configuredChecksum),
+          matchesCurrentLegacyPolicy: false,
+          candidateLookup: "not_checked" as const
+        },
+        currentLegacyPolicy: {
+          previewAvailable: false,
+          candidateLookup: "not_checked" as const,
+          roleCount: 0,
+          permissionCount: 0,
+          relationCount: 0
+        },
+        blockedReasons: [
+          ...(!sources.legacyReaderConfigured ? ["legacy-reader"] : []),
+          ...(!sources.identityRepositoryConfigured ? ["identity-repository"] : [])
+        ]
+      };
+    }
+
+    const currentLegacyPolicy = createIamPermissionPolicySnapshot(await this.legacyReader.readRbacPolicySnapshot());
+    const currentLookup = await this.policyCandidateLookup(currentLegacyPolicy.checksum);
+    const configuredMatchesCurrentLegacyPolicy = Boolean(configuredChecksum) && configuredChecksum === currentLegacyPolicy.checksum;
+    const configuredLookup = configuredMatchesCurrentLegacyPolicy
+      ? currentLookup
+      : await this.policyCandidateLookup(configuredChecksum);
+
+    return {
+      readOnly: true,
+      legacyRemainsAuthoritative: true,
+      writes: { legacy: false, identityCandidate: false, operationLedger: false },
+      sources,
+      configuredPolicy: {
+        checksumConfigured: Boolean(configuredChecksum),
+        matchesCurrentLegacyPolicy: configuredMatchesCurrentLegacyPolicy,
+        candidateLookup: configuredLookup
+      },
+      currentLegacyPolicy: {
+        previewAvailable: true,
+        candidateLookup: currentLookup,
+        roleCount: currentLegacyPolicy.roles.length,
+        permissionCount: currentLegacyPolicy.permissions.length,
+        relationCount: currentLegacyPolicy.relations.length
+      },
+      blockedReasons: policyDiagnosticsBlockedReasons({
+        configuredChecksumPresent: Boolean(configuredChecksum),
+        configuredMatchesCurrentLegacyPolicy,
+        configuredLookup,
+        currentLookup
+      })
     };
   }
 
@@ -1009,6 +1080,20 @@ export class IamRoleWriteService {
       missingCapabilities
     };
   }
+
+  private async policyCandidateLookup(checksum: string | undefined): Promise<PolicyCandidateLookup> {
+    if (!checksum) {
+      return "not_configured";
+    }
+
+    try {
+      return (await this.iamRepository.getPermissionPolicyCandidate(checksum)) ? "available" : "not_found";
+    } catch (error) {
+      return error instanceof Error && error.message === "IAM permission candidate checksum does not match stored policy data"
+        ? "materialization_checksum_mismatch"
+        : "repository_error";
+    }
+  }
 }
 
 class RoleWriteSyncError extends Error {
@@ -1024,6 +1109,35 @@ interface RoleWriteRolloutReadiness {
   percentage: number;
   selectionConfigured: boolean;
   unselectedBehavior: "legacy-proxy";
+}
+
+type PolicyCandidateLookup =
+  | "not_checked"
+  | "not_configured"
+  | "available"
+  | "not_found"
+  | "materialization_checksum_mismatch"
+  | "repository_error";
+
+function policyDiagnosticsBlockedReasons(input: {
+  configuredChecksumPresent: boolean;
+  configuredMatchesCurrentLegacyPolicy: boolean;
+  configuredLookup: PolicyCandidateLookup;
+  currentLookup: PolicyCandidateLookup;
+}): string[] {
+  const blockedReasons: string[] = [];
+  if (!input.configuredChecksumPresent) {
+    blockedReasons.push("candidate-policy-checksum-not-configured");
+  } else if (!input.configuredMatchesCurrentLegacyPolicy) {
+    blockedReasons.push("configured-checksum-does-not-match-current-legacy-policy");
+  }
+  if (input.configuredLookup !== "available") {
+    blockedReasons.push(`configured-candidate-${input.configuredLookup}`);
+  }
+  if (input.currentLookup !== "available") {
+    blockedReasons.push(`current-legacy-candidate-${input.currentLookup}`);
+  }
+  return blockedReasons;
 }
 
 interface RoleWriteRolloutDecision {
