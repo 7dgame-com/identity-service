@@ -622,6 +622,13 @@ export class IamRoleWriteService {
     if (!decision.selected) {
       this.assertRequiredDualWriteAvailable(request, decision.reason);
     }
+    if (decision.selected && iam.roleWriteRolloutMode === "canary" && !requiresDualWrite(request.headers)) {
+      throw new ConflictException({
+        code: "IAM_ROLE_WRITE_DUAL_WRITE_REQUIRED",
+        message: "A selected canary role-write requires the guarded dual-write handoff.",
+        reason: "canary_guard_required"
+      });
+    }
     return decision.selected ? this.dualWrite(request, contract, evidence) : this.legacyProxy(request, contract, evidence);
   }
 

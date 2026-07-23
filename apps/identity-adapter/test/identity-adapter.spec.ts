@@ -5214,6 +5214,33 @@ describe("identity-adapter IAM role write API", () => {
     expect(JSON.stringify(operation?.metadata)).not.toContain("guanfei");
   });
 
+  it("fails closed before Legacy mutation when a selected canary request lacks the guarded handoff", async () => {
+    const iamRepository = new FakeIamRepository();
+    const checksum = await seedRoleWritePolicy(iamRepository);
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_ROLE_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE = "canary";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_ALLOWLIST = "username:guanfei";
+    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = checksum;
+    const operations = new FakePluginUserWriteOperationRepository();
+    app = await createLifecycleTestApp(operations, iamRepository);
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ code: 0 }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await request(app.getHttpServer())
+      .post("/v1/plugin-user/change-role")
+      .set("Authorization", `Bearer ${roleWriteAccessToken()}`)
+      .send({ id: 24, role: "manager" })
+      .expect(409);
+
+    expect(response.body).toMatchObject({
+      code: "IAM_ROLE_WRITE_DUAL_WRITE_REQUIRED",
+      reason: "canary_guard_required"
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(operations.inputs).toHaveLength(0);
+  });
+
   it("previews the actual operator with a stable uid selector without writing", async () => {
     const iamRepository = new FakeIamRepository();
     const checksum = await seedRoleWritePolicy(iamRepository);
@@ -5354,6 +5381,7 @@ describe("identity-adapter IAM role write API", () => {
     await request(app.getHttpServer())
       .post("/v1/plugin-user/change-role")
       .set("Authorization", `Bearer ${roleWriteAccessToken()}`)
+      .set("X-Identity-IAM-Role-Write-Require-Dual-Write", "1")
       .set("Idempotency-Key", "role-write-recovery")
       .send({ id: 24, role: "manager" })
       .expect(200);
@@ -5393,6 +5421,7 @@ describe("identity-adapter IAM role write API", () => {
     await request(app.getHttpServer())
       .post("/v1/plugin-user/change-role")
       .set("Authorization", `Bearer ${roleWriteAccessToken()}`)
+      .set("X-Identity-IAM-Role-Write-Require-Dual-Write", "1")
       .set("Idempotency-Key", "role-write-recovery-retry")
       .send({ id: 24, role: "manager" })
       .expect(200);
@@ -5440,6 +5469,7 @@ describe("identity-adapter IAM role write API", () => {
     const response = await request(app.getHttpServer())
       .post("/v1/plugin-user/change-role")
       .set("Authorization", `Bearer ${roleWriteAccessToken()}`)
+      .set("X-Identity-IAM-Role-Write-Require-Dual-Write", "1")
       .send({ id: 24, role: "root" })
       .expect(200);
 
