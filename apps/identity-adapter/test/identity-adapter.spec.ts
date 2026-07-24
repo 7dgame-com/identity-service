@@ -59,6 +59,7 @@ import {
   ProfileWriteOperationSummaryRow
 } from "../src/profile-write-operation.repository.js";
 import { sanitizeMetadata } from "../src/login-audit.service.js";
+import { clientIpFromRequest } from "../src/auth.controller.js";
 import { assertReadonlySql } from "../src/readonly-write.guard.js";
 import { normalizeOtlpTraceEndpoint, startTelemetry } from "../src/telemetry.js";
 import {
@@ -208,6 +209,11 @@ class FakeLegacyIdentityReader {
 
   async listOrganizations() {
     return [{ id: 1, name: "test-university", title: "测试大学", createdAt: 1, updatedAt: 1 }];
+  }
+
+  async listUsersByOrganization(organizationId: number) {
+    const users = [await this.getUserById(24), await this.getUserById(25)].filter((user) => user !== null);
+    return users.filter((user) => user!.organizations.some((organization) => organization.id === organizationId));
   }
 
   async listUserPermissions(userId: number) {
@@ -1810,7 +1816,7 @@ class FakeLoginAuditRepository {
     return { duplicate: false };
   }
 
-  async getUserAudit(legacyUserId: number) {
+  async getUserAudit(legacyUserId: number, _limit = 20, ipExposure: "full" | "masked" = "full") {
     const stats = this.stats.get(legacyUserId);
 
     return {
@@ -1835,10 +1841,34 @@ class FakeLoginAuditRepository {
           occurredAt: event.occurredAt.toISOString(),
           source: event.source,
           traceId: event.traceId,
+          ipAddress: ipExposure === "full" ? event.ipAddress : maskTestIp(event.ipAddress),
           metadata: event.metadata
         }))
     };
   }
+
+  async listSuccessfulLoginEventsByLegacyUserIds(
+    legacyUserIds: number[],
+    input: { from?: Date; to?: Date }
+  ) {
+    const ids = new Set(legacyUserIds);
+    return [...this.events.values()]
+      .filter((event) => (
+        event.legacyUserId !== null
+        && ids.has(event.legacyUserId)
+        && event.success
+        && event.eventType === "login"
+        && (!input.from || event.occurredAt >= input.from)
+        && (!input.to || event.occurredAt <= input.to)
+      ))
+      .map((event) => ({ legacyUserId: event.legacyUserId!, occurredAt: event.occurredAt }));
+  }
+}
+
+function maskTestIp(value: string | null): string | null {
+  if (!value) return null;
+  const parts = value.split(".");
+  return parts.length === 4 ? `${parts.slice(0, 3).join(".")}.*` : "*";
 }
 
 class FakeUsageBillingRepository {
@@ -6363,6 +6393,63 @@ describe("identity-adapter plugin user readonly compatibility API", () => {
     });
   });
 
+  it("creates an organization invoice with one use for repeated same-day successful logins", async () => {
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    process.env.IDENTITY_LOGIN_AUDIT_ENABLED = "true";
+    process.env.IDENTITY_LOGIN_AUDIT_BILLING_TIMEZONE = "Asia/Shanghai";
+    process.env.IDENTITY_LOGIN_AUDIT_UNIT_PRICE_CENTS = "10000";
+    const loginAuditRepository = new FakeLoginAuditRepository();
+    app = await createPluginUserReadonlyTestApp(repository, new FakeIamRepository(), loginAuditRepository);
+    const login = await loginAs(app, "guanfei");
+
+    for (const [eventKey, occurredAt] of [
+      ["invoice-login-24-a", "2026-06-10T01:00:00.000Z"],
+      ["invoice-login-24-b", "2026-06-10T13:00:00.000Z"]
+    ] as const) {
+      await loginAuditRepository.recordEvent({
+        eventKey,
+        legacyUserId: 24,
+        identityUserId: null,
+        username: "guanfei",
+        eventType: "login",
+        success: true,
+        occurredAt: new Date(occurredAt),
+        ipAddress: "203.0.113.10",
+        ipAddressHash: null,
+        userAgentHash: null,
+        source: "identity-service",
+        traceId: null,
+        metadata: {}
+      });
+    }
+
+    const response = await request(app.getHttpServer())
+      .get("/v1/plugin-user/organizations/1/login-usage-invoice?from=2026-06-10T00:00:00.000Z&to=2026-06-10T23:59:59.999Z")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(200);
+
+    expect(response.body.data).toMatchObject({
+      billingRule: "successful-login-per-account-calendar-day-v1",
+      billingTimezone: "Asia/Shanghai",
+      unitPriceCents: 10000,
+      accountCount: 1,
+      accountsWithUsage: 1,
+      successfulLoginCount: 2,
+      usageCount: 1,
+      amountCents: 10000
+    });
+    expect(response.body.data.accounts).toEqual([
+      expect.objectContaining({
+        legacyUserId: 24,
+        username: "guanfei",
+        successfulLoginCount: 2,
+        usageCount: 1,
+        usageDays: ["2026-06-10"],
+        amountCents: 10000
+      })
+    ]);
+  });
+
   it("rejects organization-scoped login audit records for an account outside the campus", async () => {
     process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
     process.env.IDENTITY_LOGIN_AUDIT_ENABLED = "true";
@@ -8855,7 +8942,7 @@ describe("identity-adapter login audit API", () => {
       .expect(401);
   });
 
-  it("records successful login events without leaking raw client data", async () => {
+  it("records a valid client IP separately from the hashed audit fingerprint", async () => {
     const payload = {
       eventKey: "legacy-login:24:session-1",
       legacyUserId: 24,
@@ -8887,7 +8974,8 @@ describe("identity-adapter login audit API", () => {
       legacyUserId: 24,
       username: "guanfei",
       success: true,
-      source: "legacy-backend"
+      source: "legacy-backend",
+      ipAddress: "127.0.0.1"
     });
     expect(event?.ipAddressHash).toHaveLength(64);
     expect(event?.userAgentHash).toHaveLength(64);
@@ -8949,6 +9037,11 @@ describe("identity-adapter login audit API", () => {
         safe: "value"
       }
     });
+  });
+
+  it("uses the framework-resolved client IP instead of parsing forwarded headers in the controller", () => {
+    expect(clientIpFromRequest({ ip: "198.51.100.27", socket: { remoteAddress: "10.0.0.4" } })).toBe("198.51.100.27");
+    expect(clientIpFromRequest({ socket: { remoteAddress: "::ffff:203.0.113.9" } })).toBe("203.0.113.9");
   });
 });
 

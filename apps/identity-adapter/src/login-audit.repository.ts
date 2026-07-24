@@ -10,6 +10,7 @@ export interface PersistedLoginAuditEvent {
   eventType: string;
   success: boolean;
   occurredAt: Date;
+  ipAddress: string | null;
   ipAddressHash: string | null;
   userAgentHash: string | null;
   source: string;
@@ -35,8 +36,16 @@ export interface LoginAuditRecentEvent {
   occurredAt: string;
   source: string;
   traceId: string | null;
+  ipAddress: string | null;
   metadata: unknown;
 }
+
+export interface LoginUsageSourceEvent {
+  legacyUserId: number;
+  occurredAt: Date;
+}
+
+export type LoginAuditIpExposure = "full" | "masked";
 
 @Injectable()
 export class LoginAuditRepository implements OnModuleDestroy {
@@ -63,8 +72,8 @@ export class LoginAuditRepository implements OnModuleDestroy {
     const [result] = await pool.execute<ResultSetHeader>(
       `INSERT IGNORE INTO auth_login_events
         (event_key, legacy_user_id, identity_user_id, username, event_type, success, occurred_at,
-         ip_address_hash, user_agent_hash, source, trace_id, metadata)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         ip_address, ip_address_hash, user_agent_hash, source, trace_id, metadata)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         event.eventKey,
         event.legacyUserId,
@@ -73,6 +82,7 @@ export class LoginAuditRepository implements OnModuleDestroy {
         event.eventType,
         event.success ? 1 : 0,
         event.occurredAt,
+        event.ipAddress,
         event.ipAddressHash,
         event.userAgentHash,
         event.source,
@@ -89,7 +99,11 @@ export class LoginAuditRepository implements OnModuleDestroy {
     return { duplicate };
   }
 
-  async getUserAudit(legacyUserId: number, limit = 20): Promise<{ stats: LoginAuditStats | null; recentEvents: LoginAuditRecentEvent[] }> {
+  async getUserAudit(
+    legacyUserId: number,
+    limit = 20,
+    ipExposure: LoginAuditIpExposure = "full"
+  ): Promise<{ stats: LoginAuditStats | null; recentEvents: LoginAuditRecentEvent[] }> {
     const pool = this.requirePool();
     await this.ensureSchema();
 
@@ -117,6 +131,7 @@ export class LoginAuditRepository implements OnModuleDestroy {
               occurred_at AS occurredAt,
               source,
               trace_id AS traceId,
+              ip_address AS ipAddress,
               metadata
          FROM auth_login_events
         WHERE legacy_user_id = ?
@@ -127,8 +142,49 @@ export class LoginAuditRepository implements OnModuleDestroy {
 
     return {
       stats: statsRows[0] ? normalizeStats(statsRows[0]) : null,
-      recentEvents: eventRows.map(normalizeRecentEvent)
+      recentEvents: eventRows.map((row) => normalizeRecentEvent(row, ipExposure))
     };
+  }
+
+  async listSuccessfulLoginEventsByLegacyUserIds(
+    legacyUserIds: number[],
+    input: { from?: Date; to?: Date }
+  ): Promise<LoginUsageSourceEvent[]> {
+    if (legacyUserIds.length === 0) return [];
+
+    const pool = this.requirePool();
+    await this.ensureSchema();
+    const ids = [...new Set(legacyUserIds)].filter(Number.isSafeInteger).filter((id) => id > 0);
+    if (ids.length === 0) return [];
+
+    const where = [
+      "success = 1",
+      "event_type = 'login'",
+      `legacy_user_id IN (${ids.map(() => "?").join(", ")})`
+    ];
+    const params: Array<number | Date> = [...ids];
+    if (input.from) {
+      where.push("occurred_at >= ?");
+      params.push(input.from);
+    }
+    if (input.to) {
+      where.push("occurred_at <= ?");
+      params.push(input.to);
+    }
+
+    const [rows] = await pool.execute<RowDataPacket[]>(
+      `SELECT legacy_user_id AS legacyUserId,
+              occurred_at AS occurredAt
+         FROM auth_login_events
+        WHERE ${where.join(" AND ")}
+        ORDER BY legacy_user_id ASC, occurred_at ASC, id ASC`,
+      params
+    );
+
+    return rows.map((row) => ({
+      legacyUserId: Number(row.legacyUserId),
+      occurredAt: row.occurredAt instanceof Date ? row.occurredAt : new Date(String(row.occurredAt))
+    }));
   }
 
   private async upsertStats(event: PersistedLoginAuditEvent): Promise<void> {
@@ -194,6 +250,7 @@ export class LoginAuditRepository implements OnModuleDestroy {
         event_type VARCHAR(64) NOT NULL DEFAULT 'login',
         success TINYINT(1) NOT NULL DEFAULT 1,
         occurred_at DATETIME(3) NOT NULL,
+        ip_address VARCHAR(45) NULL,
         ip_address_hash CHAR(64) NULL,
         user_agent_hash CHAR(64) NULL,
         source VARCHAR(64) NOT NULL DEFAULT 'legacy-backend',
@@ -206,6 +263,8 @@ export class LoginAuditRepository implements OnModuleDestroy {
         KEY idx_auth_login_events_username (username, occurred_at)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `);
+
+    await this.ensureColumn("auth_login_events", "ip_address", "VARCHAR(45) NULL AFTER occurred_at");
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS user_login_stats (
@@ -223,6 +282,22 @@ export class LoginAuditRepository implements OnModuleDestroy {
         KEY idx_user_login_stats_username (username)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `);
+  }
+
+  private async ensureColumn(tableName: string, columnName: string, definition: string): Promise<void> {
+    const pool = this.requirePool();
+    const [rows] = await pool.execute<RowDataPacket[]>(
+      `SELECT 1
+         FROM information_schema.columns
+        WHERE table_schema = DATABASE()
+          AND table_name = ?
+          AND column_name = ?
+        LIMIT 1`,
+      [tableName, columnName]
+    );
+    if (rows.length === 0) {
+      await pool.query(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+    }
   }
 
   private requirePool(): Pool {
@@ -276,7 +351,7 @@ function normalizeStats(row: RowDataPacket): LoginAuditStats {
   };
 }
 
-function normalizeRecentEvent(row: RowDataPacket): LoginAuditRecentEvent {
+function normalizeRecentEvent(row: RowDataPacket, ipExposure: LoginAuditIpExposure): LoginAuditRecentEvent {
   return {
     eventKey: String(row.eventKey),
     eventType: String(row.eventType),
@@ -284,8 +359,26 @@ function normalizeRecentEvent(row: RowDataPacket): LoginAuditRecentEvent {
     occurredAt: dateToIso(row.occurredAt) ?? new Date(0).toISOString(),
     source: String(row.source),
     traceId: row.traceId ?? null,
+    ipAddress: exposeIpAddress(row.ipAddress, ipExposure),
     metadata: parseJsonMaybe(row.metadata)
   };
+}
+
+function exposeIpAddress(value: unknown, exposure: LoginAuditIpExposure): string | null {
+  if (typeof value !== "string" || !value.trim()) return null;
+  const ipAddress = value.trim();
+  return exposure === "full" ? ipAddress : maskIpAddress(ipAddress);
+}
+
+function maskIpAddress(ipAddress: string): string {
+  if (ipAddress.includes(".")) {
+    const segments = ipAddress.split(".");
+    if (segments.length === 4) return `${segments.slice(0, 3).join(".")}.*`;
+  }
+
+  const segments = ipAddress.split(":").filter(Boolean);
+  if (segments.length > 0) return `${segments.slice(0, 3).join(":")}:*`;
+  return "*";
 }
 
 function dateToIso(value: unknown): string | null {

@@ -1,5 +1,10 @@
-import { Body, Controller, Headers, Post } from "@nestjs/common";
+import { Body, Controller, Headers, Post, Req } from "@nestjs/common";
 import { TokenIssuanceService } from "./token-issuance.service.js";
+
+interface ClientIpRequest {
+  ip?: string;
+  socket?: { remoteAddress?: string | null };
+}
 
 @Controller("v1/auth")
 export class AuthController {
@@ -8,11 +13,11 @@ export class AuthController {
   @Post("login")
   login(
     @Body() body: unknown,
-    @Headers("x-forwarded-for") forwardedFor?: string,
+    @Req() request: ClientIpRequest,
     @Headers("user-agent") userAgent?: string
   ) {
     return this.tokenIssuance.login(body, {
-      ip: firstForwardedIp(forwardedFor),
+      ip: clientIpFromRequest(request),
       userAgent: userAgent ?? null
     });
   }
@@ -20,11 +25,11 @@ export class AuthController {
   @Post("refresh")
   refresh(
     @Body() body: unknown,
-    @Headers("x-forwarded-for") forwardedFor?: string,
+    @Req() request: ClientIpRequest,
     @Headers("user-agent") userAgent?: string
   ) {
     return this.tokenIssuance.refresh(body, {
-      ip: firstForwardedIp(forwardedFor),
+      ip: clientIpFromRequest(request),
       userAgent: userAgent ?? null
     });
   }
@@ -35,6 +40,11 @@ export class AuthController {
   }
 }
 
-function firstForwardedIp(value: string | undefined): string | null {
-  return value?.split(",")[0]?.trim() || null;
+export function clientIpFromRequest(request: ClientIpRequest): string | null {
+  const candidate = request.ip ?? request.socket?.remoteAddress ?? null;
+  if (!candidate) return null;
+
+  const normalized = candidate.trim();
+  if (!normalized) return null;
+  return normalized.startsWith("::ffff:") ? normalized.slice("::ffff:".length) : normalized;
 }
