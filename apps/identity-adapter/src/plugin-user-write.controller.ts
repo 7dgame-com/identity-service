@@ -1,4 +1,5 @@
 import { Controller, Get, Post, Query, Req, Res } from "@nestjs/common";
+import { roleWriteEvidenceHeaders } from "./iam-role-write-evidence.js";
 import { IamRoleWriteService } from "./iam-role-write.service.js";
 import { PluginUserWriteService } from "./plugin-user-write.service.js";
 
@@ -59,6 +60,18 @@ export class PluginUserWriteController {
     return this.forwardRole(request, response);
   }
 
+  @Get("v1/plugin-user/role-write-decision")
+  async roleWriteDecision(
+    @Req() request: PluginUserWriteExpressRequest,
+    @Res({ passthrough: true }) response: PluginUserWriteExpressResponse
+  ) {
+    const decision = await this.iamRoleWrite.previewPluginUserRollout(request);
+    response.setHeader("X-Identity-IAM-Role-Write", decision.roleWriteMode);
+    response.setHeader("X-Identity-IAM-Role-Write-Entry", "plugin-user-change-role");
+    this.applyRoleWriteEvidence(response, decision);
+    return { code: 0, data: decision };
+  }
+
   @Post("v1/plugin-user/batch-create-users")
   batchCreateUsers(
     @Req() request: PluginUserWriteExpressRequest,
@@ -86,7 +99,21 @@ export class PluginUserWriteController {
     const upstream = await this.iamRoleWrite.proxyPluginUser(request);
     response.status(upstream.status);
     response.setHeader("X-Identity-Plugin-User-Write", upstream.mode);
+    response.setHeader("X-Identity-IAM-Role-Write", upstream.mode);
+    response.setHeader("X-Identity-IAM-Role-Write-Entry", "plugin-user-change-role");
+    if (upstream.evidence) {
+      this.applyRoleWriteEvidence(response, upstream.evidence);
+    }
     return upstream.body;
+  }
+
+  private applyRoleWriteEvidence(
+    response: PluginUserWriteExpressResponse,
+    evidence: Parameters<typeof roleWriteEvidenceHeaders>[0]
+  ): void {
+    for (const [name, value] of Object.entries(roleWriteEvidenceHeaders(evidence))) {
+      response.setHeader(name, value);
+    }
   }
 }
 
