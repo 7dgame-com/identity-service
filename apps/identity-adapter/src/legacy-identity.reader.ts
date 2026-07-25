@@ -60,6 +60,11 @@ export interface LegacyUserReadModel {
   source: "legacy";
 }
 
+interface LegacyRoleAssignmentRow extends RowDataPacket {
+  role: unknown;
+  type: unknown;
+}
+
 export interface LegacyUserCredential {
   id: number;
   username: string | null;
@@ -489,15 +494,17 @@ export class LegacyIdentityReader implements OnModuleDestroy {
   }
 
   private async getUserRoles(userId: number): Promise<string[]> {
-    const rows = await this.query<RowDataPacket[]>(
-      `SELECT item_name AS role
-         FROM auth_assignment
-        WHERE user_id = ?
-        ORDER BY item_name ASC`,
+    const rows = await this.query<LegacyRoleAssignmentRow[]>(
+      `SELECT aa.item_name AS role, ai.type AS type
+         FROM auth_assignment aa
+         JOIN auth_item ai ON ai.name = aa.item_name
+        WHERE aa.user_id = ?
+          AND ai.type = 1
+        ORDER BY aa.item_name ASC`,
       [String(userId)]
     );
 
-    return rows.map((row) => String(row.role));
+    return legacyRoleNamesFromAssignments(rows);
   }
 
   private async getUserOrganizations(userId: number): Promise<LegacyOrganization[]> {
@@ -535,6 +542,13 @@ export class LegacyIdentityReader implements OnModuleDestroy {
     const [rows] = await this.pool.query<T>(sql, params);
     return rows;
   }
+}
+
+export function legacyRoleNamesFromAssignments(rows: Array<{ role: unknown; type: unknown }>): string[] {
+  return rows
+    .filter((row) => Number(row.type) === 1)
+    .map((row) => String(row.role).trim())
+    .filter(Boolean);
 }
 
 function normalizeOrganization(row: RowDataPacket): LegacyOrganization {

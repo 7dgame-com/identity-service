@@ -94,6 +94,14 @@ export const configSchema = z.object({
       .transform((value) => value ?? 50)
       .pipe(z.number().int().min(1).max(50)),
     permissionModelImportEnabled: boolFromEnv.default(false),
+    authzReadMode: z.enum(["legacy", "shadow", "identity-primary"]).default("legacy"),
+    authzFallbackEnabled: boolFromEnv.default(true),
+    authzRolloutMode: z.enum(["off", "allowlist", "percentage", "full"]).default("off"),
+    authzRolloutAllowlist: z.string().default(""),
+    authzRolloutPercentage: numberFromEnv
+      .transform((value) => value ?? 0)
+      .pipe(z.number().int().min(0).max(100)),
+    authzPolicyChecksum: optionalStringFromEnv,
     internalToken: optionalStringFromEnv,
     userViewEnabled: boolFromEnv.default(false),
     roleViewEnabled: boolFromEnv.default(false),
@@ -115,6 +123,14 @@ export const configSchema = z.object({
     roleWriteRolloutAllowlist: z.string().default(""),
     roleWriteRolloutPercentage: numberFromEnv.default(0),
     roleWritePolicyChecksum: optionalStringFromEnv,
+    roleWriteCandidateRestoreEnabled: boolFromEnv.default(false),
+    roleWriteCandidateRestoreTargetLegacyUserId: numberFromEnv
+      .transform((value) => value ?? 0)
+      .pipe(z.number().int().min(0)),
+    roleWriteRecoveryDrillEnabled: boolFromEnv.default(false),
+    roleWriteRecoveryDrillTargetLegacyUserId: numberFromEnv
+      .transform((value) => value ?? 0)
+      .pipe(z.number().int().min(0)),
     organizationWriteMode: z.enum(["disabled", "legacy-proxy", "dual-write", "identity-native"]).default("disabled"),
     pluginUserWriteMode: z.enum(["disabled", "legacy-proxy", "dual-write", "identity-native"]).default("disabled"),
     pluginUserWriteShadowMode: z.enum(["off", "plan", "ledger-only"]).default("off"),
@@ -300,6 +316,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
       rolePermissionMaterializationEnabled: env.IDENTITY_IAM_ROLE_PERMISSION_MATERIALIZATION_ENABLED,
       rolePermissionMaterializationMaxBatchSize: env.IDENTITY_IAM_ROLE_PERMISSION_MATERIALIZATION_MAX_BATCH,
       permissionModelImportEnabled: env.IDENTITY_IAM_PERMISSION_MODEL_IMPORT_ENABLED,
+      authzReadMode: env.IDENTITY_IAM_AUTHZ_READ_MODE,
+      authzFallbackEnabled: env.IDENTITY_IAM_AUTHZ_FALLBACK_ENABLED,
+      authzRolloutMode: env.IDENTITY_IAM_AUTHZ_ROLLOUT_MODE,
+      authzRolloutAllowlist: env.IDENTITY_IAM_AUTHZ_ROLLOUT_ALLOWLIST,
+      authzRolloutPercentage: env.IDENTITY_IAM_AUTHZ_ROLLOUT_PERCENTAGE,
+      authzPolicyChecksum: env.IDENTITY_IAM_AUTHZ_POLICY_CHECKSUM,
       internalToken: env.IDENTITY_IAM_INTERNAL_API_TOKEN ?? env.IDENTITY_INTERNAL_API_TOKEN,
       userViewEnabled: env.IDENTITY_IAM_USER_VIEW_ENABLED,
       roleViewEnabled: env.IDENTITY_IAM_ROLE_VIEW_ENABLED,
@@ -329,6 +351,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
       roleWriteRolloutAllowlist: env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_ALLOWLIST,
       roleWriteRolloutPercentage: env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_PERCENTAGE,
       roleWritePolicyChecksum: env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM,
+      roleWriteCandidateRestoreEnabled: env.IDENTITY_IAM_ROLE_WRITE_CANDIDATE_RESTORE_ENABLED,
+      roleWriteCandidateRestoreTargetLegacyUserId: env.IDENTITY_IAM_ROLE_WRITE_CANDIDATE_RESTORE_TARGET_LEGACY_USER_ID,
+      roleWriteRecoveryDrillEnabled: env.IDENTITY_IAM_ROLE_WRITE_RECOVERY_DRILL_ENABLED,
+      roleWriteRecoveryDrillTargetLegacyUserId: env.IDENTITY_IAM_ROLE_WRITE_RECOVERY_DRILL_TARGET_LEGACY_USER_ID,
       organizationWriteMode: env.IDENTITY_IAM_ORG_WRITE_MODE,
       pluginUserWriteMode: env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE,
       pluginUserWriteShadowMode: env.IDENTITY_IAM_PLUGIN_USER_WRITE_SHADOW_MODE,

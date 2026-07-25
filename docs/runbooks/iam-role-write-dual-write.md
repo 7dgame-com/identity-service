@@ -37,6 +37,10 @@ IDENTITY_IAM_ROLE_WRITE_DUAL_WRITE_EXECUTION_ENABLED: "false"
 IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE: "off"
 IDENTITY_IAM_ROLE_WRITE_ROLLOUT_ALLOWLIST: ""
 IDENTITY_IAM_ROLE_WRITE_ROLLOUT_PERCENTAGE: "0"
+IDENTITY_IAM_ROLE_WRITE_CANDIDATE_RESTORE_ENABLED: "false"
+IDENTITY_IAM_ROLE_WRITE_CANDIDATE_RESTORE_TARGET_LEGACY_USER_ID: "0"
+IDENTITY_IAM_ROLE_WRITE_RECOVERY_DRILL_ENABLED: "false"
+IDENTITY_IAM_ROLE_WRITE_RECOVERY_DRILL_TARGET_LEGACY_USER_ID: "0"
 ```
 
 `IDENTITY_IAM_ROLE_WRITE_LEGACY_API_BASE_URL` 可省略；服务会依次回退到
@@ -84,6 +88,68 @@ POST /internal/iam/role-write/operations/:operationKey/retry-identity-shadow
 该接口需要 `X-Identity-Internal-Token`。操作记录和日志不得携带 Authorization、Cookie、密码、
 完整 token 或原始 payload。
 
+### 等价补偿演练
+
+不要为了制造 Identity 写失败而关闭数据库、破坏 candidate policy 或修改真实用户。代码提供一个
+默认关闭的内部等价补偿演练入口，它只准备 `legacy_completed + compensation=required` 的可恢复
+ledger 状态，**不调用 Legacy 写接口**：
+
+```text
+POST /internal/iam/role-write/recovery-drill/prepare
+```
+
+该入口必须取得独立 Develop-only 批准，并同时满足：
+
+- `IDENTITY_IAM_ROLE_WRITE_RECOVERY_DRILL_ENABLED=true`；
+- `IDENTITY_IAM_ROLE_WRITE_RECOVERY_DRILL_TARGET_LEGACY_USER_ID` 只指向专用测试账号；
+- role-write 已处于获批的 dual-write/canary/0% 窗口，readiness gate 为 executable；
+- 目标在 Legacy 中恰好为 `user`，且不存在 root assignment；
+- 内部 token 有效。
+
+准备接口使用“目标 + 已审 policy checksum”的确定性 operation key；重复调用只返回原 operation，
+不会产生多条待恢复账本。随后使用返回的 operation key 调用既有
+`retry-identity-shadow`，确认它从当前 Legacy assignment 重建 Identity candidate，且 Legacy 写接口
+调用次数保持 0。报告只保留 operation key 摘要和目标摘要，不保留原始内部 token。
+
+演练结束必须把上述两个演练变量恢复为 `false/0`，并同时恢复 role-write 的
+`disabled/false/off/空/0%`。本演练只能证明补偿执行器和真实存储链路，不替代正常
+`user -> manager -> user` dual-write 窗口。
+
+### 单账号 Identity candidate restore
+
+如果一次已完成的窗口留下“Legacy 已恢复、Identity candidate 仍多出旧角色”，不得重放历史
+grant/revoke，也不得重新导入整份 candidate policy。使用默认关闭的单账号恢复入口：
+
+```text
+POST /internal/iam/role-write/subjects/:legacyUserId/restore-candidate
+body: { "policyChecksum": "<approved-64-char-checksum>" }
+```
+
+该入口只在取得独立 Develop-only 批准后临时配置：
+
+```yaml
+IDENTITY_IAM_ROLE_WRITE_CANDIDATE_RESTORE_ENABLED: "true"
+IDENTITY_IAM_ROLE_WRITE_CANDIDATE_RESTORE_TARGET_LEGACY_USER_ID: "<exact-dedicated-test-user-id>"
+```
+
+恢复必须同时满足以下条件，否则 fail-closed 且不写入：
+
+- IAM 为 `readonly`，AuthZ 为 `legacy/off/空/0%` 且 fallback 保持开启；
+- role-write 为 `disabled/false/off/空/0%`，运行配置中不得设置 role policy checksum；
+- recovery drill 保持关闭；
+- 请求目标与配置的唯一目标完全一致，并携带内部 token 和已审 64 位 checksum；
+- before alignment 的唯一 blocker 是 `candidate-assignment-mismatch`；
+- Legacy/candidate 均无 policy 外 assignment、无 root、无 unresolved role-write operation。
+
+写入来源只能是调用时读取到的 **当前 Legacy assignment**，写入范围只能是该账号的 Identity
+candidate assignment。不得写 Legacy、不得创建或改写 operation ledger、不得执行 permission union、
+不得重放历史 mutation。响应只返回账号/checksum 摘要、before/after 计数和安全标记；完整 checksum
+只存在于内部请求，不写入报告或日志。
+
+恢复后必须再次执行只读 alignment，要求 assignment 集合完全相等、unresolved=0、无 root、
+`passed=true`。随后立即把恢复变量还原为 `false/0`；若 postcheck 未通过，role-write 仍保持关闭，
+不得申请运行时窗口。
+
 ## Root 保护与回滚
 
 legacy API 继续负责 root 保护。Identity candidate 路径永远不会 materialize `root`：请求目标角色
@@ -98,6 +164,10 @@ IDENTITY_IAM_ROLE_WRITE_DUAL_WRITE_EXECUTION_ENABLED: "false"
 IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE: "off"
 IDENTITY_IAM_ROLE_WRITE_ROLLOUT_ALLOWLIST: ""
 IDENTITY_IAM_ROLE_WRITE_ROLLOUT_PERCENTAGE: "0"
+IDENTITY_IAM_ROLE_WRITE_CANDIDATE_RESTORE_ENABLED: "false"
+IDENTITY_IAM_ROLE_WRITE_CANDIDATE_RESTORE_TARGET_LEGACY_USER_ID: "0"
+IDENTITY_IAM_ROLE_WRITE_RECOVERY_DRILL_ENABLED: "false"
+IDENTITY_IAM_ROLE_WRITE_RECOVERY_DRILL_TARGET_LEGACY_USER_ID: "0"
 ```
 
 窗口 closeout 至少保留：before/after readiness、测试账号命中证明、旧响应兼容、legacy 与

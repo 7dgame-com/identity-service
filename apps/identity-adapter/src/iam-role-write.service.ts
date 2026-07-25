@@ -1,7 +1,16 @@
 import { createHash, randomUUID } from "node:crypto";
-import { Injectable, Logger, NotFoundException, ServiceUnavailableException } from "@nestjs/common";
+import { ConflictException, Injectable, Logger, NotFoundException, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
 import { loadConfig } from "./config.js";
+import {
+  type IamRoleWriteEvidence,
+  normalizeRoleWriteSelector,
+  roleWriteActorFingerprint,
+  roleWriteActorTokens,
+  roleWriteCorrelationId,
+  roleWriteSelectorKind
+} from "./iam-role-write-evidence.js";
 import { IamRepository } from "./iam.repository.js";
+import { createIamPermissionPolicySnapshot } from "./iam-permission-model.js";
 import { JwtIssuerService, type VerifiedAccessToken } from "./jwt-issuer.service.js";
 import { LegacyIdentityReader } from "./legacy-identity.reader.js";
 import {
@@ -27,6 +36,7 @@ export interface IamRoleWriteProxyResponse {
   status: number;
   body: unknown;
   mode: "legacy-proxy" | "dual-write";
+  evidence?: IamRoleWriteEvidence;
 }
 
 type RoleWriteContract = "plugin-user-change-role" | "people-auth";
@@ -85,6 +95,30 @@ export class IamRoleWriteService {
       allowedExecutableModes: [...ROLE_WRITE_MODES],
       responseShapePreservedInLegacyProxy: true,
       recoveryEndpoint: "/internal/iam/role-write/operations/:operationKey/retry-identity-shadow",
+      subjectAlignment: {
+        endpoint: "/internal/iam/role-write/subjects/:legacyUserId/alignment?checksum=:policyChecksum",
+        readOnly: true,
+        requiresInternalToken: true,
+        requiresExplicitChecksum: true,
+        operationHistoryScope: "all"
+      },
+      candidateRestore: {
+        enabled: iam.roleWriteCandidateRestoreEnabled,
+        targetConfigured: iam.roleWriteCandidateRestoreTargetLegacyUserId > 0,
+        endpoint: "/internal/iam/role-write/subjects/:legacyUserId/restore-candidate",
+        requiresInternalToken: true,
+        requiresExplicitChecksum: true,
+        sourceOfTruth: "legacy",
+        mutatesLegacy: false,
+        writeScope: "identity-candidate-only"
+      },
+      recoveryDrill: {
+        enabled: iam.roleWriteRecoveryDrillEnabled,
+        targetConfigured: iam.roleWriteRecoveryDrillTargetLegacyUserId > 0,
+        endpoint: "/internal/iam/role-write/recovery-drill/prepare",
+        mutatesLegacy: false,
+        requiresInternalToken: true
+      },
       dualWriteGate,
       blockedReasons: modeBlocked ? dualWriteGate.missingCapabilities : [],
       requiredBeforeDualWrite: [...REQUIRED_BEFORE_DUAL_WRITE]
@@ -115,8 +149,185 @@ export class IamRoleWriteService {
     };
   }
 
+  /**
+   * Explains why a configured role-write candidate is (or is not) executable without
+   * disclosing a policy checksum or mutating Legacy, Identity, or the operation ledger.
+   */
+  async policyDiagnostics() {
+    const { iam } = this.config;
+    const configuredChecksum = iam.roleWritePolicyChecksum;
+    const sources = {
+      legacyReaderConfigured: this.legacyReader.isConfigured(),
+      identityRepositoryConfigured: this.iamRepository.isConfigured()
+    };
+
+    if (!sources.legacyReaderConfigured || !sources.identityRepositoryConfigured) {
+      return {
+        readOnly: true,
+        legacyRemainsAuthoritative: true,
+        writes: { legacy: false, identityCandidate: false, operationLedger: false },
+        sources,
+        configuredPolicy: {
+          checksumConfigured: Boolean(configuredChecksum),
+          matchesCurrentLegacyPolicy: false,
+          candidateLookup: "not_checked" as const
+        },
+        currentLegacyPolicy: {
+          previewAvailable: false,
+          candidateLookup: "not_checked" as const,
+          roleCount: 0,
+          permissionCount: 0,
+          relationCount: 0
+        },
+        blockedReasons: [
+          ...(!sources.legacyReaderConfigured ? ["legacy-reader"] : []),
+          ...(!sources.identityRepositoryConfigured ? ["identity-repository"] : [])
+        ]
+      };
+    }
+
+    const currentLegacyPolicy = createIamPermissionPolicySnapshot(await this.legacyReader.readRbacPolicySnapshot());
+    const currentLookup = await this.policyCandidateLookup(currentLegacyPolicy.checksum);
+    const configuredMatchesCurrentLegacyPolicy = Boolean(configuredChecksum) && configuredChecksum === currentLegacyPolicy.checksum;
+    const configuredLookup = configuredMatchesCurrentLegacyPolicy
+      ? currentLookup
+      : await this.policyCandidateLookup(configuredChecksum);
+
+    return {
+      readOnly: true,
+      legacyRemainsAuthoritative: true,
+      writes: { legacy: false, identityCandidate: false, operationLedger: false },
+      sources,
+      configuredPolicy: {
+        checksumConfigured: Boolean(configuredChecksum),
+        matchesCurrentLegacyPolicy: configuredMatchesCurrentLegacyPolicy,
+        candidateLookup: configuredLookup
+      },
+      currentLegacyPolicy: {
+        previewAvailable: true,
+        candidateLookup: currentLookup,
+        roleCount: currentLegacyPolicy.roles.length,
+        permissionCount: currentLegacyPolicy.permissions.length,
+        relationCount: currentLegacyPolicy.relations.length
+      },
+      blockedReasons: policyDiagnosticsBlockedReasons({
+        configuredChecksumPresent: Boolean(configuredChecksum),
+        configuredMatchesCurrentLegacyPolicy,
+        configuredLookup,
+        currentLookup
+      })
+    };
+  }
+
+  async subjectAlignment(input: { legacyUserId: number; policyChecksum: string }) {
+    if (!this.legacyReader.isConfigured()) {
+      throw new ServiceUnavailableException({
+        code: "LEGACY_IAM_SOURCE_NOT_CONFIGURED",
+        message: "Legacy IAM source is not configured for role-write subject alignment."
+      });
+    }
+    if (!this.iamRepository.isConfigured() || !this.operations.isConfigured()) {
+      throw new ServiceUnavailableException({
+        code: "IAM_ROLE_WRITE_ALIGNMENT_NOT_CONFIGURED",
+        message: "Identity candidate and operation ledger are required for role-write subject alignment."
+      });
+    }
+
+    const legacyUser = await this.legacyReader.getUserById(input.legacyUserId);
+    if (!legacyUser) {
+      throw new NotFoundException({
+        code: "IAM_ROLE_WRITE_ALIGNMENT_SUBJECT_NOT_FOUND",
+        message: "The requested Legacy subject was not found."
+      });
+    }
+    const policy = await this.iamRepository.getPermissionPolicyCandidate(input.policyChecksum);
+    if (!policy) {
+      throw new NotFoundException({
+        code: "IAM_ROLE_WRITE_ALIGNMENT_POLICY_NOT_FOUND",
+        message: "The requested Identity permission candidate was not found."
+      });
+    }
+
+    const identityUserId = `legacy:${input.legacyUserId}`;
+    const [legacyRows, candidateRows, operationSummary] = await Promise.all([
+      this.legacyReader.listUserRbacAssignments(input.legacyUserId),
+      this.iamRepository.listSubjectAssignments(identityUserId, input.policyChecksum),
+      this.operations.summarizeForLegacyUser(input.legacyUserId)
+    ]);
+    if (!operationSummary) {
+      throw new ServiceUnavailableException({
+        code: "IAM_ROLE_WRITE_LEDGER_NOT_AVAILABLE",
+        message: "Role-write operation ledger is not available for subject alignment."
+      });
+    }
+    const legacyAssignments = normalizeAssignmentKeys(legacyRows);
+    const candidateAssignments = normalizeAssignmentKeys(candidateRows);
+    const policyAssignments = normalizeAssignmentKeys([
+      ...policy.roles.map((role) => ({ name: role.name, type: "role" as const })),
+      ...policy.permissions.map((permission) => ({ name: permission.name, type: "permission" as const }))
+    ]);
+    const missingInCandidate = legacyAssignments.filter((assignment) => !candidateAssignments.includes(assignment));
+    const extraInCandidate = candidateAssignments.filter((assignment) => !legacyAssignments.includes(assignment));
+    const legacyOutsidePolicy = legacyAssignments.filter((assignment) => !policyAssignments.includes(assignment));
+    const candidateOutsidePolicy = candidateAssignments.filter((assignment) => !policyAssignments.includes(assignment));
+    const rootInLegacy = legacyAssignments.includes("role:root");
+    const rootInCandidate = candidateAssignments.includes("role:root");
+    const unresolvedOperationCount = operationSummary
+      .filter((row) => row.status !== "completed" || !["none", "completed"].includes(row.compensationStatus))
+      .reduce((total, row) => total + row.total, 0);
+    const assignmentAligned = missingInCandidate.length === 0 && extraInCandidate.length === 0;
+    const blockedReasons = [
+      ...(!assignmentAligned ? ["candidate-assignment-mismatch"] : []),
+      ...(legacyOutsidePolicy.length > 0 ? ["legacy-assignment-outside-policy"] : []),
+      ...(candidateOutsidePolicy.length > 0 ? ["candidate-assignment-outside-policy"] : []),
+      ...(rootInLegacy || rootInCandidate ? ["root-subject-protected"] : []),
+      ...(unresolvedOperationCount > 0 ? ["unresolved-role-write-operation"] : [])
+    ];
+
+    return {
+      legacyUserId: input.legacyUserId,
+      subjectFingerprint: shortDigest(identityUserId),
+      policyChecksum: input.policyChecksum,
+      assignments: {
+        legacy: legacyAssignments,
+        candidate: candidateAssignments,
+        missingInCandidate,
+        extraInCandidate,
+        legacyOutsidePolicy,
+        candidateOutsidePolicy,
+        aligned: assignmentAligned
+      },
+      operations: {
+        summary: operationSummary,
+        unresolvedCount: unresolvedOperationCount
+      },
+      rootProtection: {
+        legacyRoot: rootInLegacy,
+        candidateRoot: rootInCandidate,
+        protected: rootInLegacy || rootInCandidate
+      },
+      safetyGate: {
+        passed: blockedReasons.length === 0,
+        canRequestRuntime: blockedReasons.length === 0,
+        requiresCandidateRestore:
+          !assignmentAligned &&
+          legacyOutsidePolicy.length === 0 &&
+          !rootInLegacy &&
+          !rootInCandidate,
+        blockedReasons
+      },
+      safety: {
+        readOnly: true,
+        writePerformed: false,
+        legacyRemainsAuthoritative: true,
+        permissionUnionApplied: false
+      }
+    };
+  }
+
   async proxyPluginUser(request: IamRoleWriteRequest): Promise<IamRoleWriteProxyResponse> {
     if (this.config.iam.roleWriteMode === "disabled") {
+      this.assertRequiredDualWriteAvailable(request, "role_write_disabled");
       return this.pluginUserWrite.proxy(request, "/v1/plugin-user/change-role");
     }
     return this.proxy(request, "plugin-user-change-role");
@@ -124,6 +335,35 @@ export class IamRoleWriteService {
 
   async proxyPeopleAuth(request: IamRoleWriteRequest): Promise<IamRoleWriteProxyResponse> {
     return this.proxy(request, "people-auth");
+  }
+
+  async previewPluginUserRollout(request: IamRoleWriteRequest) {
+    const claims = this.requireClaims(request.headers.authorization);
+    const correlationId = roleWriteCorrelationId(request.headers);
+    const decision = this.config.iam.roleWriteMode === "dual-write"
+      ? this.dualWriteRolloutDecision(request, "plugin-user-change-role", correlationId, claims)
+      : this.inactiveRolloutDecision(request, "plugin-user-change-role", correlationId, claims);
+    const rollout = roleWriteRolloutReadiness(this.config.iam);
+    const dualWriteGate = this.config.iam.roleWriteMode === "dual-write"
+      ? await this.dualWriteGate(rollout)
+      : {
+          executable: false,
+          missingCapabilities: ["role-write-mode-not-dual-write"]
+        };
+    const evidence = evidenceFromDecision(decision);
+
+    this.logRolloutDecision(decision, true);
+    return {
+      writePerformed: false,
+      sourceOfTruth: "legacy",
+      roleWriteMode: this.config.iam.roleWriteMode,
+      rolloutMode: decision.mode,
+      selected: decision.selected,
+      reason: decision.reason,
+      dualWriteExecutable: dualWriteGate.executable,
+      missingCapabilities: dualWriteGate.missingCapabilities,
+      ...evidence
+    };
   }
 
   async retryIdentityShadow(operationKey: string) {
@@ -180,13 +420,237 @@ export class IamRoleWriteService {
     }
   }
 
+  async restoreCandidateAssignments(input: { legacyUserId: number; policyChecksum: string }) {
+    const { iam } = this.config;
+    if (!iam.roleWriteCandidateRestoreEnabled) {
+      throw new NotFoundException({
+        code: "IAM_ROLE_WRITE_CANDIDATE_RESTORE_DISABLED",
+        message: "IAM role-write candidate restore is disabled."
+      });
+    }
+    if (iam.roleWriteCandidateRestoreTargetLegacyUserId !== input.legacyUserId) {
+      throw new ConflictException({
+        code: "IAM_ROLE_WRITE_CANDIDATE_RESTORE_TARGET_MISMATCH",
+        message: "IAM role-write candidate restore is not enabled for the requested subject."
+      });
+    }
+    const postureBlocked =
+      iam.mode !== "readonly" ||
+      iam.roleWriteMode !== "disabled" ||
+      iam.roleWriteDualWriteExecutionEnabled ||
+      iam.roleWriteRolloutMode !== "off" ||
+      iam.roleWriteRolloutAllowlist.trim() !== "" ||
+      iam.roleWriteRolloutPercentage !== 0 ||
+      Boolean(iam.roleWritePolicyChecksum) ||
+      iam.roleWriteRecoveryDrillEnabled ||
+      iam.authzReadMode !== "legacy" ||
+      iam.authzRolloutMode !== "off" ||
+      iam.authzRolloutAllowlist.trim() !== "" ||
+      iam.authzRolloutPercentage !== 0 ||
+      !iam.authzFallbackEnabled;
+    if (postureBlocked) {
+      throw new ConflictException({
+        code: "IAM_ROLE_WRITE_CANDIDATE_RESTORE_UNSAFE_POSTURE",
+        message: "Candidate restore requires IAM readonly, Legacy-authoritative AuthZ, and all role-write rollout controls disabled."
+      });
+    }
+
+    const before = await this.subjectAlignment(input);
+    const recoverable =
+      before.safetyGate.requiresCandidateRestore &&
+      before.safetyGate.blockedReasons.length === 1 &&
+      before.safetyGate.blockedReasons[0] === "candidate-assignment-mismatch" &&
+      before.assignments.legacyOutsidePolicy.length === 0 &&
+      before.assignments.candidateOutsidePolicy.length === 0 &&
+      before.operations.unresolvedCount === 0 &&
+      !before.rootProtection.protected;
+    if (!recoverable) {
+      throw new ConflictException({
+        code: "IAM_ROLE_WRITE_CANDIDATE_RESTORE_NOT_APPLICABLE",
+        message: "Subject alignment does not permit a candidate-only restore."
+      });
+    }
+
+    const assignmentCount = await this.iamRepository.replaceSubjectAssignments({
+      identityUserId: `legacy:${input.legacyUserId}`,
+      legacyUserId: input.legacyUserId,
+      policyChecksum: input.policyChecksum,
+      assignments: before.assignments.legacy.map(assignmentRowFromKey),
+      source: "role-write-candidate-restore"
+    });
+    const after = await this.subjectAlignment(input);
+    if (!after.safetyGate.passed) {
+      throw new ServiceUnavailableException({
+        code: "IAM_ROLE_WRITE_CANDIDATE_RESTORE_POSTCHECK_FAILED",
+        message: "Candidate restore completed but the post-restore alignment gate did not pass."
+      });
+    }
+
+    this.logger.log(
+      JSON.stringify({
+        event: "iam-role-write-candidate-restored",
+        subjectFingerprint: before.subjectFingerprint,
+        policyChecksumFingerprint: shortDigest(input.policyChecksum),
+        assignmentCount
+      })
+    );
+    return {
+      restored: true,
+      subjectFingerprint: before.subjectFingerprint,
+      policyChecksumFingerprint: shortDigest(input.policyChecksum),
+      assignmentCount,
+      before: alignmentSummary(before),
+      after: alignmentSummary(after),
+      safety: {
+        legacyWritePerformed: false,
+        identityCandidateWritePerformed: true,
+        historicalMutationReplayed: false,
+        legacyRemainsAuthoritative: true,
+        permissionUnionApplied: false,
+        writeScope: "identity-candidate-only"
+      }
+    };
+  }
+
+  async prepareRecoveryDrill() {
+    const { iam } = this.config;
+    if (!iam.roleWriteRecoveryDrillEnabled) {
+      throw new NotFoundException({
+        code: "IAM_ROLE_WRITE_RECOVERY_DRILL_DISABLED",
+        message: "Role-write recovery drill is disabled."
+      });
+    }
+    if (iam.roleWriteMode !== "dual-write" || !iam.roleWriteDualWriteExecutionEnabled) {
+      throw new ConflictException({
+        code: "IAM_ROLE_WRITE_RECOVERY_DRILL_REQUIRES_DUAL_WRITE",
+        message: "Role-write recovery drill requires an explicitly enabled dual-write window."
+      });
+    }
+
+    const targetLegacyUserId = iam.roleWriteRecoveryDrillTargetLegacyUserId;
+    if (!Number.isInteger(targetLegacyUserId) || targetLegacyUserId <= 0) {
+      throw new ConflictException({
+        code: "IAM_ROLE_WRITE_RECOVERY_DRILL_TARGET_REQUIRED",
+        message: "Role-write recovery drill requires one configured dedicated target."
+      });
+    }
+
+    const rollout = roleWriteRolloutReadiness(iam);
+    const gate = await this.dualWriteGate(rollout);
+    if (!gate.executable) {
+      throw new ConflictException({
+        code: "IAM_ROLE_WRITE_RECOVERY_DRILL_GATE_BLOCKED",
+        message: "Role-write recovery drill is blocked by the dual-write readiness gate.",
+        missingCapabilities: gate.missingCapabilities
+      });
+    }
+
+    const user = await this.legacyReader.getUserById(targetLegacyUserId);
+    const assignments = await this.legacyReader.listUserRbacAssignments(targetLegacyUserId);
+    const roleAssignments = assignments.filter((assignment) => assignment.type === "role").map((assignment) => assignment.name);
+    if (!user || user.roles.includes("root") || roleAssignments.includes("root")) {
+      throw new ConflictException({
+        code: "IAM_ROLE_WRITE_RECOVERY_DRILL_TARGET_PROTECTED",
+        message: "Root or missing targets cannot be used for a role-write recovery drill."
+      });
+    }
+    if (user.roles.length !== 1 || user.roles[0] !== "user" || roleAssignments.length !== 1 || roleAssignments[0] !== "user") {
+      throw new ConflictException({
+        code: "IAM_ROLE_WRITE_RECOVERY_DRILL_TARGET_NOT_BASELINE_USER",
+        message: "Role-write recovery drill target must have the exact user baseline in Legacy."
+      });
+    }
+
+    const targetSubject = `legacy:${targetLegacyUserId}`;
+    const actorSubject = "internal:role-write-recovery-drill";
+    const requestFingerprint = pluginUserWriteRequestFingerprint("change-role", {
+      drill: "identity-assignment-recovery",
+      targetSubject,
+      policyChecksum: iam.roleWritePolicyChecksum,
+      version: 1
+    });
+    const operationKey = pluginUserWriteOperationKey({
+      route: "change-role",
+      actorSubject,
+      targetSubject,
+      requestFingerprint
+    });
+    const metadata = {
+      phase: "identity",
+      policyChecksum: iam.roleWritePolicyChecksum,
+      requestedRole: "user",
+      drill: {
+        kind: "identity-assignment-recovery",
+        noLegacyMutation: true,
+        exactLegacyBaseline: "user"
+      }
+    };
+    const begun = await this.operations.begin({
+      operationKey,
+      idempotencyKey: `recovery-drill:${requestFingerprint}`,
+      route: "change-role",
+      mode: "dual-write",
+      actorSubject,
+      targetSubject,
+      legacyUserId: targetLegacyUserId,
+      identityUserId: targetSubject,
+      metadata
+    });
+    if (begun.duplicate) {
+      const existing = await this.operations.findByOperationKey(operationKey);
+      if (!existing) {
+        throw new ConflictException({
+          code: "IAM_ROLE_WRITE_RECOVERY_DRILL_DUPLICATE",
+          message: "Role-write recovery drill operation already exists but cannot be read."
+        });
+      }
+      return {
+        operationKey,
+        operationKeyDigest: shortDigest(operationKey),
+        targetFingerprint: shortDigest(targetSubject),
+        status: existing.status,
+        compensationStatus: existing.compensationStatus,
+        noLegacyMutation: true,
+        duplicate: true,
+        nextAction: existing.status === "completed" ? "none" : "retry-identity-shadow"
+      };
+    }
+
+    await this.operations.update({
+      operationKey,
+      status: "legacy_completed",
+      legacyStatus: "drill:no-mutation",
+      identityStatus: "drill:recovery-required",
+      compensationStatus: "required",
+      errorCode: "IAM_ROLE_WRITE_RECOVERY_DRILL",
+      metadata
+    });
+
+    return {
+      operationKey,
+      operationKeyDigest: shortDigest(operationKey),
+      targetFingerprint: shortDigest(targetSubject),
+      status: "legacy_completed",
+      compensationStatus: "required",
+      noLegacyMutation: true,
+      duplicate: false,
+      nextAction: "retry-identity-shadow"
+    };
+  }
+
   private async proxy(request: IamRoleWriteRequest, contract: RoleWriteContract): Promise<IamRoleWriteProxyResponse> {
     const { iam } = this.config;
+    const correlationId = roleWriteCorrelationId(request.headers);
+    const claims = this.claimsFromAuthorization(request.headers.authorization);
     if (iam.roleWriteMode === "disabled") {
+      this.assertRequiredDualWriteAvailable(request, "role_write_disabled");
       throw new NotFoundException({ code: "IAM_ROLE_WRITE_DISABLED", message: "IAM role write migration is disabled." });
     }
     if (iam.roleWriteMode === "legacy-proxy") {
-      return this.legacyProxy(request, contract);
+      this.assertRequiredDualWriteAvailable(request, "legacy_proxy_mode");
+      const decision = this.inactiveRolloutDecision(request, contract, correlationId, claims, "legacy_proxy_mode");
+      this.logRolloutDecision(decision);
+      return this.legacyProxy(request, contract, evidenceFromDecision(decision));
     }
     if (iam.roleWriteMode !== "dual-write") {
       throw new NotFoundException({
@@ -197,17 +661,20 @@ export class IamRoleWriteService {
 
     const unsupportedScopeField = unsupportedRoleWriteScopeField(request.body);
     if (unsupportedScopeField) {
-      const claims = this.claimsFromAuthorization(request.headers.authorization);
+      this.assertRequiredDualWriteAvailable(request, "unsupported_scope_legacy_only");
       const decision: RoleWriteRolloutDecision = {
         selected: false,
         mode: iam.roleWriteRolloutMode,
         route: routeForContract(contract),
         subjectId: claims ? `legacy:${claims.uid}` : null,
         reason: "unsupported_scope_legacy_only",
-        scopeField: unsupportedScopeField
+        scopeField: unsupportedScopeField,
+        correlationId,
+        actorFingerprint: roleWriteActorFingerprint(claims),
+        matchedSelectorKind: null
       };
       this.logRolloutDecision(decision);
-      return this.legacyProxy(request, contract);
+      return this.legacyProxy(request, contract, evidenceFromDecision(decision));
     }
 
     const rollout = roleWriteRolloutReadiness(iam);
@@ -220,13 +687,39 @@ export class IamRoleWriteService {
       });
     }
 
-    const decision = this.dualWriteRolloutDecision(request, contract);
+    const decision = this.dualWriteRolloutDecision(request, contract, correlationId, claims);
     this.logRolloutDecision(decision);
-    return decision.selected ? this.dualWrite(request, contract) : this.legacyProxy(request, contract);
+    const evidence = evidenceFromDecision(decision);
+    if (!decision.selected) {
+      this.assertRequiredDualWriteAvailable(request, decision.reason);
+    }
+    if (decision.selected && iam.roleWriteRolloutMode === "canary" && !requiresDualWrite(request.headers)) {
+      throw new ConflictException({
+        code: "IAM_ROLE_WRITE_DUAL_WRITE_REQUIRED",
+        message: "A selected canary role-write requires the guarded dual-write handoff.",
+        reason: "canary_guard_required"
+      });
+    }
+    return decision.selected ? this.dualWrite(request, contract, evidence) : this.legacyProxy(request, contract, evidence);
   }
 
-  private async dualWrite(request: IamRoleWriteRequest, contract: RoleWriteContract): Promise<IamRoleWriteProxyResponse> {
-    const plan = this.planOperation(request, contract);
+  private assertRequiredDualWriteAvailable(request: IamRoleWriteRequest, reason: string): void {
+    if (!requiresDualWrite(request.headers)) {
+      return;
+    }
+    throw new ConflictException({
+      code: "IAM_ROLE_WRITE_DUAL_WRITE_REQUIRED",
+      message: "The guarded role-write request requires an active selected dual-write route.",
+      reason
+    });
+  }
+
+  private async dualWrite(
+    request: IamRoleWriteRequest,
+    contract: RoleWriteContract,
+    evidence: IamRoleWriteEvidence
+  ): Promise<IamRoleWriteProxyResponse> {
+    const plan = this.planOperation(request, contract, evidence);
     const begun = await this.operations.begin({
       operationKey: plan.operationKey,
       idempotencyKey: plan.idempotencyKey,
@@ -243,7 +736,7 @@ export class IamRoleWriteService {
       const existing = await this.operations.findByOperationKey(plan.operationKey);
       const replay = existing ? pluginUserWriteReplayResponseFromOperation(existing) : null;
       if (replay) {
-        return { ...replay, mode: "dual-write" };
+        return { ...replay, mode: "dual-write", evidence };
       }
       throw new ServiceUnavailableException({
         code: "IAM_ROLE_WRITE_REPLAY_UNAVAILABLE",
@@ -253,7 +746,7 @@ export class IamRoleWriteService {
 
     let legacyResponse: IamRoleWriteProxyResponse;
     try {
-      legacyResponse = await this.legacyProxy(request, contract);
+      legacyResponse = await this.legacyProxy(request, contract, evidence);
     } catch (error) {
       await this.operations.update({
         operationKey: plan.operationKey,
@@ -278,7 +771,7 @@ export class IamRoleWriteService {
         errorCode: "LegacyRejected",
         metadata: { ...plan.metadata, ...responseReplay }
       });
-      return { ...legacyResponse, mode: "dual-write" };
+      return { ...legacyResponse, mode: "dual-write", evidence };
     }
 
     try {
@@ -318,7 +811,7 @@ export class IamRoleWriteService {
       });
     }
 
-    return { ...legacyResponse, mode: "dual-write" };
+    return { ...legacyResponse, mode: "dual-write", evidence };
   }
 
   private async syncIdentityAssignments(input: {
@@ -364,12 +857,20 @@ export class IamRoleWriteService {
     return { assignmentCount, policyChecksum: policy.checksum };
   }
 
-  private async legacyProxy(request: IamRoleWriteRequest, contract: RoleWriteContract): Promise<IamRoleWriteProxyResponse> {
-    const upstream = await this.callLegacy(request, contract);
-    return { status: upstream.status, body: await parseUpstreamBody(upstream), mode: "legacy-proxy" };
+  private async legacyProxy(
+    request: IamRoleWriteRequest,
+    contract: RoleWriteContract,
+    evidence?: IamRoleWriteEvidence
+  ): Promise<IamRoleWriteProxyResponse> {
+    const upstream = await this.callLegacy(request, contract, evidence);
+    return { status: upstream.status, body: await parseUpstreamBody(upstream), mode: "legacy-proxy", evidence };
   }
 
-  private async callLegacy(request: IamRoleWriteRequest, contract: RoleWriteContract): Promise<Response> {
+  private async callLegacy(
+    request: IamRoleWriteRequest,
+    contract: RoleWriteContract,
+    evidence?: IamRoleWriteEvidence
+  ): Promise<Response> {
     const baseUrl = this.config.iam.roleWriteLegacyApiBaseUrl;
     if (!baseUrl) {
       throw new ServiceUnavailableException({
@@ -387,6 +888,11 @@ export class IamRoleWriteService {
     copyHeader(request.headers, headers, "authorization", "Authorization");
     copyHeader(request.headers, headers, "x-forwarded-for", "X-Forwarded-For");
     copyHeader(request.headers, headers, "user-agent", "User-Agent");
+    if (evidence) {
+      headers.set("X-Identity-IAM-Role-Write-Correlation", evidence.correlationId);
+    } else {
+      copyHeader(request.headers, headers, "x-identity-iam-role-write-correlation", "X-Identity-IAM-Role-Write-Correlation");
+    }
     try {
       return await fetch(url, {
         method: request.method.toUpperCase(),
@@ -403,7 +909,7 @@ export class IamRoleWriteService {
     }
   }
 
-  private planOperation(request: IamRoleWriteRequest, contract: RoleWriteContract) {
+  private planOperation(request: IamRoleWriteRequest, contract: RoleWriteContract, evidence: IamRoleWriteEvidence) {
     const route: RoleWriteRoute = contract === "people-auth" ? "people-auth" : "change-role";
     const body = asRecord(request.body);
     const claims = this.claimsFromAuthorization(request.headers.authorization);
@@ -433,50 +939,98 @@ export class IamRoleWriteService {
         targetSubject,
         requestedRole,
         policyChecksum: this.config.iam.roleWritePolicyChecksum ?? null,
+        correlationId: evidence.correlationId,
+        rolloutDecision: evidence.decision,
+        actorFingerprint: evidence.actorFingerprint,
+        matchedSelectorKind: evidence.matchedSelectorKind,
         idempotencySource: explicitIdempotency ? "client-header" : "per-request",
         redactedBody: redactPluginUserWriteMetadata(body)
       }
     };
   }
 
-  private dualWriteRolloutDecision(request: IamRoleWriteRequest, contract: RoleWriteContract): RoleWriteRolloutDecision {
+  private dualWriteRolloutDecision(
+    request: IamRoleWriteRequest,
+    contract: RoleWriteContract,
+    correlationId: string,
+    verifiedClaims?: VerifiedAccessToken | null
+  ): RoleWriteRolloutDecision {
     const { iam } = this.config;
-    const claims = this.claimsFromAuthorization(request.headers.authorization);
+    const claims = verifiedClaims === undefined ? this.claimsFromAuthorization(request.headers.authorization) : verifiedClaims;
     const subjectId = claims ? `legacy:${claims.uid}` : null;
+    const base = {
+      route: routeForContract(contract),
+      subjectId,
+      correlationId,
+      actorFingerprint: roleWriteActorFingerprint(claims)
+    };
     if (iam.roleWriteRolloutMode === "full") {
-      return { selected: true, mode: "full", route: routeForContract(contract), subjectId, reason: "full_rollout" };
+      return { ...base, selected: true, mode: "full", reason: "full_rollout", matchedSelectorKind: "full" };
     }
     if (iam.roleWriteRolloutMode === "off") {
-      return { selected: false, mode: "off", route: routeForContract(contract), subjectId, reason: "rollout_off" };
+      return { ...base, selected: false, mode: "off", reason: "rollout_off", matchedSelectorKind: null };
     }
     if (iam.roleWriteRolloutMode === "canary") {
       const tokens = roleWriteActorTokens(claims);
-      const matchedToken = splitCsv(iam.roleWriteRolloutAllowlist).map(normalizeRolloutToken).find((item) => tokens.has(item));
+      const matchedToken = splitCsv(iam.roleWriteRolloutAllowlist).map(normalizeRoleWriteSelector).find((item) => tokens.has(item));
       return {
+        ...base,
         selected: Boolean(matchedToken),
         mode: "canary",
-        route: routeForContract(contract),
-        subjectId,
         reason: matchedToken ? "canary_actor_selected" : "canary_actor_not_selected",
-        matchedToken: matchedToken ?? null
+        matchedSelectorKind: roleWriteSelectorKind(matchedToken)
       };
     }
     const percentage = safeRolloutPercentage(iam.roleWriteRolloutPercentage);
     const bucket = subjectId ? rolloutBucket(subjectId) : null;
     const selected = percentage > 0 && bucket !== null && (percentage >= 100 || bucket < percentage);
     return {
+      ...base,
       selected,
       mode: "percentage",
-      route: routeForContract(contract),
-      subjectId,
       reason: selected ? "percentage_bucket_selected" : "percentage_bucket_not_selected",
       bucket,
-      percentage
+      percentage,
+      matchedSelectorKind: selected ? "percentage" : null
     };
   }
 
-  private logRolloutDecision(decision: RoleWriteRolloutDecision): void {
-    this.logger.log(JSON.stringify({ event: "identity.iam.role_write.rollout", ...decision, unselectedBehavior: "legacy-proxy" }));
+  private inactiveRolloutDecision(
+    request: IamRoleWriteRequest,
+    contract: RoleWriteContract,
+    correlationId: string,
+    verifiedClaims?: VerifiedAccessToken | null,
+    reason = "role_write_disabled"
+  ): RoleWriteRolloutDecision {
+    const claims = verifiedClaims === undefined ? this.claimsFromAuthorization(request.headers.authorization) : verifiedClaims;
+    return {
+      selected: false,
+      mode: "off",
+      route: routeForContract(contract),
+      subjectId: claims ? `legacy:${claims.uid}` : null,
+      reason,
+      correlationId,
+      actorFingerprint: roleWriteActorFingerprint(claims),
+      matchedSelectorKind: null
+    };
+  }
+
+  private logRolloutDecision(decision: RoleWriteRolloutDecision, preview = false): void {
+    this.logger.log(JSON.stringify({
+      event: "identity.iam.role_write.rollout",
+      preview,
+      correlationId: decision.correlationId,
+      mode: decision.mode,
+      selected: decision.selected,
+      reason: decision.reason,
+      route: decision.route,
+      actorFingerprint: decision.actorFingerprint,
+      matchedSelectorKind: decision.matchedSelectorKind,
+      bucket: decision.bucket ?? null,
+      percentage: decision.percentage ?? null,
+      scopeField: decision.scopeField ?? null,
+      unselectedBehavior: "legacy-proxy"
+    }));
   }
 
   private claimsFromAuthorization(authorization: string | string[] | undefined): VerifiedAccessToken | null {
@@ -489,6 +1043,17 @@ export class IamRoleWriteService {
     } catch {
       return null;
     }
+  }
+
+  private requireClaims(authorization: string | string[] | undefined): VerifiedAccessToken {
+    const claims = this.claimsFromAuthorization(authorization);
+    if (!claims) {
+      throw new UnauthorizedException({
+        code: "IAM_ROLE_WRITE_OPERATOR_TOKEN_INVALID",
+        message: "A valid Identity operator token is required for role-write rollout preview."
+      });
+    }
+    return claims;
   }
 
   private async dualWriteGate(rollout: RoleWriteRolloutReadiness) {
@@ -515,6 +1080,20 @@ export class IamRoleWriteService {
       missingCapabilities
     };
   }
+
+  private async policyCandidateLookup(checksum: string | undefined): Promise<PolicyCandidateLookup> {
+    if (!checksum) {
+      return "not_configured";
+    }
+
+    try {
+      return (await this.iamRepository.getPermissionPolicyCandidate(checksum)) ? "available" : "not_found";
+    } catch (error) {
+      return error instanceof Error && error.message === "IAM permission candidate checksum does not match stored policy data"
+        ? "materialization_checksum_mismatch"
+        : "repository_error";
+    }
+  }
 }
 
 class RoleWriteSyncError extends Error {
@@ -532,16 +1111,57 @@ interface RoleWriteRolloutReadiness {
   unselectedBehavior: "legacy-proxy";
 }
 
+type PolicyCandidateLookup =
+  | "not_checked"
+  | "not_configured"
+  | "available"
+  | "not_found"
+  | "materialization_checksum_mismatch"
+  | "repository_error";
+
+function policyDiagnosticsBlockedReasons(input: {
+  configuredChecksumPresent: boolean;
+  configuredMatchesCurrentLegacyPolicy: boolean;
+  configuredLookup: PolicyCandidateLookup;
+  currentLookup: PolicyCandidateLookup;
+}): string[] {
+  const blockedReasons: string[] = [];
+  if (!input.configuredChecksumPresent) {
+    blockedReasons.push("candidate-policy-checksum-not-configured");
+  } else if (!input.configuredMatchesCurrentLegacyPolicy) {
+    blockedReasons.push("configured-checksum-does-not-match-current-legacy-policy");
+  }
+  if (input.configuredLookup !== "available") {
+    blockedReasons.push(`configured-candidate-${input.configuredLookup}`);
+  }
+  if (input.currentLookup !== "available") {
+    blockedReasons.push(`current-legacy-candidate-${input.currentLookup}`);
+  }
+  return blockedReasons;
+}
+
 interface RoleWriteRolloutDecision {
   selected: boolean;
   mode: "off" | "canary" | "percentage" | "full";
   route: RoleWriteRoute;
   subjectId: string | null;
   reason: string;
-  matchedToken?: string | null;
+  correlationId: string;
+  actorFingerprint: string | null;
+  matchedSelectorKind: string | null;
   bucket?: number | null;
   percentage?: number;
   scopeField?: string | null;
+}
+
+function evidenceFromDecision(decision: RoleWriteRolloutDecision): IamRoleWriteEvidence {
+  return {
+    correlationId: decision.correlationId,
+    decision: decision.reason,
+    route: decision.route,
+    actorFingerprint: decision.actorFingerprint,
+    matchedSelectorKind: decision.matchedSelectorKind
+  };
 }
 
 function unsupportedRoleWriteScopeField(body: unknown): string | null {
@@ -595,13 +1215,6 @@ function routeForContract(contract: RoleWriteContract): RoleWriteRoute {
   return contract === "people-auth" ? "people-auth" : "change-role";
 }
 
-function roleWriteActorTokens(claims: VerifiedAccessToken | null): Set<string> {
-  if (!claims) {
-    return new Set();
-  }
-  return new Set([`legacy:${claims.uid}`, `uid:${claims.uid}`, `username:${claims.username}`].map(normalizeRolloutToken).filter(Boolean));
-}
-
 function validatedPolicyChecksum(value: string | null | undefined): string {
   if (!value || !/^[a-f0-9]{64}$/.test(value)) {
     throw new RoleWriteSyncError("IAM_ROLE_WRITE_POLICY_CHECKSUM_REQUIRED", "A 64-character IAM role policy checksum is required.");
@@ -627,6 +1240,58 @@ function normalizeRecentLimit(value: number | undefined): number {
   return Number.isFinite(numeric) ? Math.max(1, Math.min(200, Math.trunc(numeric))) : 50;
 }
 
+function normalizeAssignmentKeys(
+  assignments: Array<
+    | { name: string; type: "role" | "permission" }
+    | { itemName: string; itemType: "role" | "permission" }
+  >
+): string[] {
+  return [...new Set(assignments.map((assignment) => (
+    "name" in assignment
+      ? `${assignment.type}:${assignment.name}`
+      : `${assignment.itemType}:${assignment.itemName}`
+  )))].sort();
+}
+
+function alignmentSummary(alignment: {
+  assignments: {
+    legacy: string[];
+    candidate: string[];
+    missingInCandidate: string[];
+    extraInCandidate: string[];
+  };
+  operations: { unresolvedCount: number };
+  rootProtection: { protected: boolean };
+  safetyGate: {
+    passed: boolean;
+    canRequestRuntime: boolean;
+    requiresCandidateRestore: boolean;
+    blockedReasons: string[];
+  };
+}) {
+  return {
+    assignmentCounts: {
+      legacy: alignment.assignments.legacy.length,
+      candidate: alignment.assignments.candidate.length,
+      missingInCandidate: alignment.assignments.missingInCandidate.length,
+      extraInCandidate: alignment.assignments.extraInCandidate.length
+    },
+    unresolvedOperationCount: alignment.operations.unresolvedCount,
+    rootProtected: alignment.rootProtection.protected,
+    safetyGate: alignment.safetyGate
+  };
+}
+
+function assignmentRowFromKey(key: string): { itemName: string; itemType: "role" | "permission" } {
+  const separator = key.indexOf(":");
+  const itemType = key.slice(0, separator);
+  const itemName = key.slice(separator + 1);
+  if ((itemType !== "role" && itemType !== "permission") || !itemName) {
+    throw new Error("Invalid normalized IAM assignment key.");
+  }
+  return { itemName, itemType };
+}
+
 function safeRolloutPercentage(value: number): number {
   return Math.max(0, Math.min(100, Math.trunc(Number.isFinite(value) ? value : 0)));
 }
@@ -637,10 +1302,6 @@ function rolloutBucket(subject: string): number {
 
 function splitCsv(value: string): string[] {
   return value.split(",").map((item) => item.trim()).filter(Boolean);
-}
-
-function normalizeRolloutToken(value: string): string {
-  return value.trim().toLowerCase();
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -658,6 +1319,11 @@ function stringValue(value: unknown): string | null {
 
 function firstHeader(value: string | string[] | undefined): string | null {
   return Array.isArray(value) ? value[0] ?? null : value ?? null;
+}
+
+function requiresDualWrite(headers: IamRoleWriteRequest["headers"]): boolean {
+  const value = firstHeader(headers["x-identity-iam-role-write-require-dual-write"]);
+  return value === "1" || value?.toLowerCase() === "true";
 }
 
 function copyHeader(
