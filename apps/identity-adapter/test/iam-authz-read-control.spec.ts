@@ -19,7 +19,9 @@ describe("IAM authz read controls", () => {
         percentage: 0,
         allowlistEntryCount: 0,
         selectionConfigured: false,
-        unselectedBehavior: "legacy"
+        unselectedBehavior: "legacy",
+        retainedLegacySubjectCount: 0,
+        retainedSubjectBehavior: "legacy"
       },
       policy: {
         candidateChecksumConfigured: false
@@ -27,6 +29,7 @@ describe("IAM authz read controls", () => {
       safety: {
         rejectsPermissionUnion: true,
         semanticMismatchFallbackAllowed: false,
+        retainedSubjectsNeverReadIdentityCandidate: true,
         runtimeDecisionEndpointAvailable: true,
         runtimeRouteIntegrationEnabled: false,
         runtimeRouteIntegrationRequiresMainBackendOptIn: true
@@ -117,6 +120,64 @@ describe("IAM authz read controls", () => {
       sourceOfTruth: "legacy",
       reason: "subject_missing",
       subjectHash: null
+    });
+  });
+
+  it("keeps explicitly retained subjects on Legacy during full rollout", () => {
+    const iam = loadConfig({
+      IDENTITY_IAM_AUTHZ_READ_MODE: "identity-primary",
+      IDENTITY_IAM_AUTHZ_ROLLOUT_MODE: "full",
+      IDENTITY_IAM_AUTHZ_RETAINED_LEGACY_ALLOWLIST: "legacy:3,username:breakglass-root"
+    }).iam;
+
+    expect(iamAuthzReadiness(iam)).toMatchObject({
+      rollout: {
+        mode: "full",
+        retainedLegacySubjectCount: 2,
+        retainedSubjectBehavior: "legacy"
+      },
+      safety: { retainedSubjectsNeverReadIdentityCandidate: true }
+    });
+    expect(decideIamAuthzRead(iam, { legacyUserId: 3, username: "dirui" })).toMatchObject({
+      effectiveMode: "legacy",
+      selectedForIdentityPrimary: false,
+      compareIdentity: false,
+      sourceOfTruth: "legacy",
+      reason: "retained_legacy_subject"
+    });
+    expect(decideIamAuthzRead(iam, { legacyUserId: 24, username: "ordinary" })).toMatchObject({
+      effectiveMode: "identity-primary",
+      selectedForIdentityPrimary: true,
+      sourceOfTruth: "identity",
+      reason: "full_rollout"
+    });
+  });
+
+  it("does not let retained subject configuration alter legacy or shadow ownership", () => {
+    const legacy = loadConfig({
+      IDENTITY_IAM_AUTHZ_RETAINED_LEGACY_ALLOWLIST: "legacy:3"
+    }).iam;
+    const shadow = loadConfig({
+      IDENTITY_IAM_AUTHZ_READ_MODE: "shadow",
+      IDENTITY_IAM_AUTHZ_RETAINED_LEGACY_ALLOWLIST: "legacy:3"
+    }).iam;
+
+    expect(decideIamAuthzRead(legacy, { legacyUserId: 3 }).reason).toBe("legacy_mode");
+    expect(decideIamAuthzRead(shadow, { legacyUserId: 3 })).toMatchObject({
+      reason: "shadow_mode",
+      compareIdentity: true,
+      sourceOfTruth: "legacy"
+    });
+
+    const rolloutOff = loadConfig({
+      IDENTITY_IAM_AUTHZ_READ_MODE: "identity-primary",
+      IDENTITY_IAM_AUTHZ_ROLLOUT_MODE: "off",
+      IDENTITY_IAM_AUTHZ_RETAINED_LEGACY_ALLOWLIST: "legacy:3"
+    }).iam;
+    expect(decideIamAuthzRead(rolloutOff, { legacyUserId: 3 })).toMatchObject({
+      reason: "rollout_off",
+      selectedForIdentityPrimary: false,
+      sourceOfTruth: "legacy"
     });
   });
 

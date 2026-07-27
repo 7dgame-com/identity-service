@@ -446,6 +446,7 @@ export class IamRoleWriteService {
       iam.authzReadMode !== "legacy" ||
       iam.authzRolloutMode !== "off" ||
       iam.authzRolloutAllowlist.trim() !== "" ||
+      iam.authzRetainedLegacyAllowlist.trim() !== "" ||
       iam.authzRolloutPercentage !== 0 ||
       !iam.authzFallbackEnabled;
     if (postureBlocked) {
