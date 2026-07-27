@@ -91,6 +91,7 @@ export const configSchema = z.object({
     authzFallbackEnabled: boolFromEnv.default(true),
     authzRolloutMode: z.enum(["off", "allowlist", "percentage", "full"]).default("off"),
     authzRolloutAllowlist: z.string().default(""),
+    authzRetainedLegacyAllowlist: z.string().default(""),
     authzRolloutPercentage: numberFromEnv
       .transform((value) => value ?? 0)
       .pipe(z.number().int().min(0).max(100)),
@@ -307,6 +308,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
       authzFallbackEnabled: env.IDENTITY_IAM_AUTHZ_FALLBACK_ENABLED,
       authzRolloutMode: env.IDENTITY_IAM_AUTHZ_ROLLOUT_MODE,
       authzRolloutAllowlist: env.IDENTITY_IAM_AUTHZ_ROLLOUT_ALLOWLIST,
+      authzRetainedLegacyAllowlist: env.IDENTITY_IAM_AUTHZ_RETAINED_LEGACY_ALLOWLIST,
       authzRolloutPercentage: env.IDENTITY_IAM_AUTHZ_ROLLOUT_PERCENTAGE,
       authzPolicyChecksum: env.IDENTITY_IAM_AUTHZ_POLICY_CHECKSUM,
       internalToken: env.IDENTITY_IAM_INTERNAL_API_TOKEN ?? env.IDENTITY_INTERNAL_API_TOKEN,
