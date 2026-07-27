@@ -29,6 +29,7 @@ export interface IamAuthzReadSelection {
     | "legacy_mode"
     | "shadow_mode"
     | "subject_missing"
+    | "retained_legacy_subject"
     | "rollout_off"
     | "allowlist_subject_selected"
     | "allowlist_subject_not_selected"
@@ -89,6 +90,7 @@ export interface IamAuthzDecisionResult {
 
 export function iamAuthzReadiness(iam: IamConfig) {
   const allowlist = parseAllowlist(iam.authzRolloutAllowlist);
+  const retainedLegacyAllowlist = parseAllowlist(iam.authzRetainedLegacyAllowlist);
   return {
     readMode: iam.authzReadMode,
     fallbackEnabled: iam.authzFallbackEnabled,
@@ -101,7 +103,9 @@ export function iamAuthzReadiness(iam: IamConfig) {
         (iam.authzRolloutMode === "full" ||
           (iam.authzRolloutMode === "allowlist" && allowlist.size > 0) ||
           (iam.authzRolloutMode === "percentage" && boundedPercentage(iam.authzRolloutPercentage) > 0)),
-      unselectedBehavior: "legacy"
+      unselectedBehavior: "legacy",
+      retainedLegacySubjectCount: retainedLegacyAllowlist.size,
+      retainedSubjectBehavior: "legacy"
     },
     policy: {
       candidateChecksumConfigured: /^[a-f0-9]{64}$/.test(iam.authzPolicyChecksum ?? "")
@@ -110,6 +114,7 @@ export function iamAuthzReadiness(iam: IamConfig) {
       rejectsPermissionUnion: true,
       semanticMismatchFallbackAllowed: false,
       identityReadErrorFallbackOnly: true,
+      retainedSubjectsNeverReadIdentityCandidate: true,
       runtimeDecisionEndpointAvailable: true,
       runtimeRouteIntegrationEnabled: false,
       runtimeRouteIntegrationRequiresMainBackendOptIn: true
@@ -134,6 +139,21 @@ export function decideIamAuthzRead(iam: IamConfig, subject: IamAuthzSubject): Ia
   }
   if (iam.authzRolloutMode === "off") {
     return selection(iam, subjectHash, rolloutPercentage, null, false, false, "legacy", "rollout_off");
+  }
+  const retained = subjectTokens(subject).some((token) =>
+    parseAllowlist(iam.authzRetainedLegacyAllowlist).has(token)
+  );
+  if (retained) {
+    return selection(
+      iam,
+      subjectHash,
+      rolloutPercentage,
+      null,
+      false,
+      false,
+      "legacy",
+      "retained_legacy_subject"
+    );
   }
   if (iam.authzRolloutMode === "full") {
     return selection(iam, subjectHash, rolloutPercentage, null, true, false, "identity", "full_rollout");

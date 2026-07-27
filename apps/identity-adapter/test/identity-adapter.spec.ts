@@ -3330,6 +3330,49 @@ describe("identity-adapter IAM readonly API", () => {
     });
   });
 
+  it("keeps an explicitly retained root subject on Legacy during full rollout without candidate fallback", async () => {
+    await app.close();
+    await createApp({
+      IDENTITY_IAM_AUTHZ_READ_MODE: "identity-primary",
+      IDENTITY_IAM_AUTHZ_ROLLOUT_MODE: "full",
+      IDENTITY_IAM_AUTHZ_RETAINED_LEGACY_ALLOWLIST: "legacy:3",
+      IDENTITY_IAM_AUTHZ_FALLBACK_ENABLED: "true"
+    });
+
+    const response = await request(app.getHttpServer())
+      .post("/internal/iam/authz/resolve")
+      .set("x-identity-internal-token", "iam-test-token")
+      .send({
+        requestKey: "retained-root-system-admin",
+        permission: "system-admin.open",
+        resourceType: "plugin",
+        subject: { legacyUserId: 3 },
+        legacyDecision: "allow",
+        legacyPolicyVersion: "legacy-rbac-v1"
+      })
+      .expect(201);
+
+    expect(response.body.data).toMatchObject({
+      runtimeRouteDecision: true,
+      selection: {
+        selectedForIdentityPrimary: false,
+        sourceOfTruth: "legacy",
+        reason: "retained_legacy_subject"
+      },
+      outcome: {
+        decision: "allow",
+        responseSource: "legacy",
+        fallbackUsed: false,
+        failClosed: false
+      },
+      evidence: {
+        severity: "none",
+        classification: "not_compared"
+      }
+    });
+    expect(iamRepository.permissionPolicyCandidates.size).toBe(0);
+  });
+
   it("requires the internal token for IAM data views", async () => {
     await request(app.getHttpServer()).get("/internal/iam/users/24").expect(401);
   });
@@ -5821,6 +5864,7 @@ describe("identity-adapter IAM role write API", () => {
     process.env.IDENTITY_IAM_AUTHZ_FALLBACK_ENABLED = "true";
     process.env.IDENTITY_IAM_AUTHZ_ROLLOUT_MODE = "off";
     process.env.IDENTITY_IAM_AUTHZ_ROLLOUT_ALLOWLIST = "";
+    process.env.IDENTITY_IAM_AUTHZ_RETAINED_LEGACY_ALLOWLIST = "";
     process.env.IDENTITY_IAM_AUTHZ_ROLLOUT_PERCENTAGE = "0";
   }
 
