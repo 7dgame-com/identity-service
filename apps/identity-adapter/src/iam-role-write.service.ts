@@ -10,6 +10,10 @@ import {
   roleWriteSelectorKind
 } from "./iam-role-write-evidence.js";
 import { IamRepository } from "./iam.repository.js";
+import {
+  identityNativeRoleWriteTargetDecision,
+  identityNativeRoleWriteTargetScope
+} from "./iam-role-write-target-control.js";
 import { createIamPermissionPolicySnapshot } from "./iam-permission-model.js";
 import { JwtIssuerService, type VerifiedAccessToken } from "./jwt-issuer.service.js";
 import { LegacyIdentityReader } from "./legacy-identity.reader.js";
@@ -73,6 +77,7 @@ export class IamRoleWriteService {
   async readiness() {
     const { iam } = this.config;
     const rollout = roleWriteRolloutReadiness(iam);
+    const identityNativeTargetScope = identityNativeRoleWriteTargetScope(iam);
     const dualWriteGate = await this.dualWriteGate(rollout);
     const identityNativeGate = await this.identityNativeGate(rollout);
     const modeBlocked =
@@ -97,7 +102,10 @@ export class IamRoleWriteService {
       policyChecksumConfigured: Boolean(iam.roleWritePolicyChecksum),
       dualWriteExecutionEnabled: iam.roleWriteDualWriteExecutionEnabled,
       identityNativeExecutionEnabled: iam.roleWriteIdentityNativeExecutionEnabled,
-      identityNativeTargetConfigured: iam.roleWriteIdentityNativeTargetLegacyUserId > 0,
+      identityNativeTargetConfigured: identityNativeTargetScope.configured,
+      identityNativeTargetScope,
+      identityNativeUnownedTargetBehavior: "legacy-proxy",
+      identityNativeOwnedTargetUnselectedBehavior: "fail-closed",
       rollout,
       rootProtection: {
         legacyOwnerEnforced: true,
@@ -354,7 +362,7 @@ export class IamRoleWriteService {
     return this.proxy(request, "people-auth");
   }
 
-  async previewPluginUserRollout(request: IamRoleWriteRequest) {
+  async previewPluginUserRollout(request: IamRoleWriteRequest, targetLegacyUserId?: number) {
     const claims = this.requireClaims(request.headers.authorization);
     const correlationId = roleWriteCorrelationId(request.headers);
     const decision = this.config.iam.roleWriteMode === "dual-write" || this.config.iam.roleWriteMode === "identity-native"
@@ -371,14 +379,38 @@ export class IamRoleWriteService {
       ? await this.identityNativeGate(rollout)
       : { executable: false, missingCapabilities: ["role-write-mode-not-identity-native"] };
     const evidence = evidenceFromDecision(decision);
+    const targetScope = identityNativeRoleWriteTargetScope(this.config.iam);
+    const targetDecision = targetLegacyUserId
+      ? identityNativeRoleWriteTargetDecision(this.config.iam, targetLegacyUserId)
+      : null;
+    const effectiveSelected =
+      this.config.iam.roleWriteMode === "identity-native"
+        ? decision.selected && targetDecision?.owned === true
+        : decision.selected;
+    const effectiveWriteOwner = this.config.iam.roleWriteMode !== "identity-native" || targetDecision?.owned === false
+      ? "legacy"
+      : targetDecision?.owned === true && identityNativeGate.executable && decision.selected
+        ? "identity"
+        : "blocked";
 
     this.logRolloutDecision(decision, true);
     return {
       writePerformed: false,
-      sourceOfTruth: "legacy",
+      sourceOfTruth:
+        effectiveWriteOwner === "identity"
+          ? "identity-candidate"
+          : effectiveWriteOwner === "legacy"
+            ? "legacy"
+            : "unavailable",
       roleWriteMode: this.config.iam.roleWriteMode,
       rolloutMode: decision.mode,
       selected: decision.selected,
+      effectiveSelected,
+      effectiveWriteOwner,
+      targetProvided: targetLegacyUserId !== undefined,
+      targetOwned: targetDecision?.owned ?? null,
+      targetReason: targetDecision?.reason ?? "target_not_provided",
+      identityNativeTargetScope: targetScope,
       reason: decision.reason,
       dualWriteExecutable: dualWriteGate.executable,
       identityNativeExecutable: identityNativeGate.executable,
@@ -463,6 +495,9 @@ export class IamRoleWriteService {
       iam.roleWriteMode !== "disabled" ||
       iam.roleWriteDualWriteExecutionEnabled ||
       iam.roleWriteIdentityNativeExecutionEnabled ||
+      iam.roleWriteIdentityNativeTargetMode !== "single-target" ||
+      iam.roleWriteIdentityNativeTargetLegacyUserId !== 0 ||
+      iam.roleWriteIdentityNativeTargetAllowlist.trim() !== "" ||
       iam.roleWriteRolloutMode !== "off" ||
       iam.roleWriteRolloutAllowlist.trim() !== "" ||
       iam.roleWriteRolloutPercentage !== 0 ||
@@ -722,20 +757,46 @@ export class IamRoleWriteService {
       });
     }
 
-    const decision = this.dualWriteRolloutDecision(request, contract, correlationId, claims);
-    this.logRolloutDecision(decision);
-    const evidence = evidenceFromDecision(decision);
-    if (!decision.selected) {
-      this.assertRequiredDualWriteAvailable(request, decision.reason);
+    const targetLegacyUserId = positiveInteger(asRecord(request.body).id);
+    if (!targetLegacyUserId) {
+      throw new ConflictException({
+        code: "IAM_ROLE_WRITE_TARGET_REQUIRED",
+        message: "A target user and role are required."
+      });
     }
-    if (decision.selected && iam.roleWriteMode === "dual-write" && iam.roleWriteRolloutMode === "canary" && !requiresDualWrite(request.headers)) {
+    const targetDecision = identityNativeRoleWriteTargetDecision(iam, targetLegacyUserId);
+    const actorDecision = this.dualWriteRolloutDecision(request, contract, correlationId, claims);
+    if (iam.roleWriteMode === "identity-native" && !targetDecision.owned) {
+      const legacyDecision: RoleWriteRolloutDecision = {
+        ...actorDecision,
+        selected: false,
+        reason: "identity_native_target_not_owned",
+        matchedSelectorKind: null
+      };
+      this.logRolloutDecision(legacyDecision);
+      this.assertRequiredDualWriteAvailable(request, legacyDecision.reason);
+      return this.legacyProxy(request, contract, evidenceFromDecision(legacyDecision));
+    }
+
+    this.logRolloutDecision(actorDecision);
+    const evidence = evidenceFromDecision(actorDecision);
+    if (!actorDecision.selected && iam.roleWriteMode === "identity-native") {
+      throw new ConflictException({
+        code: "IAM_ROLE_WRITE_IDENTITY_NATIVE_OPERATOR_NOT_SELECTED",
+        message: "The target is owned by Identity, but this operator is outside the active role-write rollout."
+      });
+    }
+    if (!actorDecision.selected) {
+      this.assertRequiredDualWriteAvailable(request, actorDecision.reason);
+    }
+    if (actorDecision.selected && iam.roleWriteMode === "dual-write" && iam.roleWriteRolloutMode === "canary" && !requiresDualWrite(request.headers)) {
       throw new ConflictException({
         code: "IAM_ROLE_WRITE_DUAL_WRITE_REQUIRED",
         message: "A selected canary role-write requires the guarded dual-write handoff.",
         reason: "canary_guard_required"
       });
     }
-    if (!decision.selected) {
+    if (!actorDecision.selected) {
       return this.legacyProxy(request, contract, evidence);
     }
     return iam.roleWriteMode === "identity-native"
@@ -760,10 +821,11 @@ export class IamRoleWriteService {
     if (!plan.legacyUserId || !plan.requestedRole) {
       throw new ConflictException({ code: "IAM_ROLE_WRITE_TARGET_REQUIRED", message: "A target user and role are required." });
     }
-    if (plan.legacyUserId !== this.config.iam.roleWriteIdentityNativeTargetLegacyUserId) {
+    const targetDecision = identityNativeRoleWriteTargetDecision(this.config.iam, plan.legacyUserId);
+    if (!targetDecision.owned) {
       throw new ConflictException({
         code: "IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_MISMATCH",
-        message: "Identity-native role-write is restricted to the configured canary target."
+        message: "Identity-native role-write is restricted to configured owner targets."
       });
     }
     if (!VALID_IDENTITY_NATIVE_ROLES.has(plan.requestedRole) || plan.requestedRole === "root") {
@@ -791,6 +853,12 @@ export class IamRoleWriteService {
       throw new NotFoundException({ code: "IAM_ROLE_WRITE_TARGET_NOT_FOUND", message: "Role-write target was not found." });
     }
     const currentRoles = currentAssignments.filter((item) => item.itemType === "role").map((item) => item.itemName);
+    if (currentAssignments.length === 0) {
+      throw new ConflictException({
+        code: "IAM_ROLE_WRITE_IDENTITY_NATIVE_CANDIDATE_MISSING",
+        message: "Identity-native role-write requires a materialized candidate assignment for the owned target."
+      });
+    }
     if (target.roles.includes("root") || currentRoles.includes("root")) {
       throw new ConflictException({ code: "IAM_ROLE_WRITE_ROOT_PROTECTED", message: "Root subjects cannot be changed." });
     }
@@ -811,6 +879,13 @@ export class IamRoleWriteService {
       ...directPermissions
     ];
 
+    const nativeMetadata = {
+      ...plan.metadata,
+      owner: "identity",
+      ownerTargetMode: targetDecision.mode,
+      ownerTargetReason: targetDecision.reason,
+      legacyWritePerformed: false
+    };
     const begun = await this.operations.begin({
       operationKey: plan.operationKey,
       idempotencyKey: explicitIdempotency,
@@ -820,7 +895,7 @@ export class IamRoleWriteService {
       targetSubject: plan.targetSubject,
       legacyUserId: plan.legacyUserId,
       identityUserId: `legacy:${plan.legacyUserId}`,
-      metadata: { ...plan.metadata, owner: "identity", legacyWritePerformed: false }
+      metadata: nativeMetadata
     });
     if (begun.duplicate) {
       const existing = await this.operations.findByOperationKey(plan.operationKey);
@@ -848,7 +923,7 @@ export class IamRoleWriteService {
         legacyStatus: "not-called",
         identityStatus: "completed",
         compensationStatus: "none",
-        metadata: { ...plan.metadata, ...responseReplay, owner: "identity", legacyWritePerformed: false }
+        metadata: { ...nativeMetadata, ...responseReplay }
       });
       return { status: 200, body, mode: "identity-native", evidence };
     } catch (error) {
@@ -859,7 +934,7 @@ export class IamRoleWriteService {
         identityStatus: "failed",
         compensationStatus: "none",
         errorCode: errorCode(error),
-        metadata: { ...plan.metadata, owner: "identity", legacyWritePerformed: false }
+        metadata: nativeMetadata
       });
       throw error;
     }
@@ -1246,8 +1321,9 @@ export class IamRoleWriteService {
   private async identityNativeGate(rollout: RoleWriteRolloutReadiness) {
     const { iam } = this.config;
     const missingCapabilities: string[] = [];
+    const targetScope = identityNativeRoleWriteTargetScope(iam);
     if (!iam.roleWriteIdentityNativeExecutionEnabled) missingCapabilities.push("operator-identity-native-execution-flag");
-    if (iam.roleWriteIdentityNativeTargetLegacyUserId <= 0) missingCapabilities.push("single-target-legacy-user-id");
+    missingCapabilities.push(...targetScope.missingCapabilities);
     if (!this.operations.isConfigured()) missingCapabilities.push("operation-ledger");
     if (!this.iamRepository.isConfigured()) missingCapabilities.push("identity-repository");
     if (!this.legacyReader.isConfigured()) missingCapabilities.push("legacy-read-model");
@@ -1261,7 +1337,8 @@ export class IamRoleWriteService {
       executable: missingCapabilities.length === 0,
       sourceOfTruthForSelectedWrites: "identity-candidate",
       legacyWritePerformed: false,
-      targetConfigured: iam.roleWriteIdentityNativeTargetLegacyUserId > 0,
+      targetConfigured: targetScope.configured,
+      targetScope,
       supportedRoutes: missingCapabilities.length === 0 ? [...ROLE_WRITE_ROUTES] : [],
       blockedRoutes: missingCapabilities.length === 0 ? [] : [...ROLE_WRITE_ROUTES],
       missingCapabilities

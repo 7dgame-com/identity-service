@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Query, Req, Res } from "@nestjs/common";
+import { BadRequestException, Controller, Get, Post, Query, Req, Res } from "@nestjs/common";
 import { roleWriteEvidenceHeaders } from "./iam-role-write-evidence.js";
 import { IamRoleWriteService } from "./iam-role-write.service.js";
 import { PluginUserWriteService } from "./plugin-user-write.service.js";
@@ -63,9 +63,13 @@ export class PluginUserWriteController {
   @Get("v1/plugin-user/role-write-decision")
   async roleWriteDecision(
     @Req() request: PluginUserWriteExpressRequest,
-    @Res({ passthrough: true }) response: PluginUserWriteExpressResponse
+    @Res({ passthrough: true }) response: PluginUserWriteExpressResponse,
+    @Query("targetLegacyUserId") targetLegacyUserId: string | undefined
   ) {
-    const decision = await this.iamRoleWrite.previewPluginUserRollout(request);
+    const decision = await this.iamRoleWrite.previewPluginUserRollout(
+      request,
+      parseOptionalLegacyUserId(targetLegacyUserId)
+    );
     response.setHeader("X-Identity-IAM-Role-Write", decision.roleWriteMode);
     response.setHeader("X-Identity-IAM-Role-Write-Entry", "plugin-user-change-role");
     this.applyRoleWriteEvidence(response, decision);
@@ -127,4 +131,18 @@ interface PluginUserWriteExpressRequest {
 interface PluginUserWriteExpressResponse {
   status(code: number): unknown;
   setHeader(name: string, value: string): unknown;
+}
+
+function parseOptionalLegacyUserId(value: string | undefined): number | undefined {
+  if (value === undefined || value.trim() === "") {
+    return undefined;
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new BadRequestException({
+      code: "INVALID_LEGACY_USER_ID",
+      message: "targetLegacyUserId must be a positive integer."
+    });
+  }
+  return parsed;
 }

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { Injectable, Logger, ServiceUnavailableException } from "@nestjs/common";
 import { loadConfig } from "./config.js";
+import { identityNativeRoleWriteTargetDecision } from "./iam-role-write-target-control.js";
 import { IdentityOrganizationShadowRow, IdentityUserRow, IamRepository } from "./iam.repository.js";
 import { VerifiedAccessToken } from "./jwt-issuer.service.js";
 import {
@@ -189,13 +190,17 @@ export class PluginUserPrimaryReadService {
 
   private async managedRoleNames(legacyUserId: number): Promise<string[]> {
     const roleWrite = this.config.iam;
+    const shadowRoles = await this.repository.listRoleAssignmentsShadow(legacyUserId);
+    const shadowRoleNames = shadowRoles.map((role) => role.roleName);
+    if (shadowRoleNames.includes("root")) {
+      return shadowRoleNames;
+    }
     const ownsTarget = roleWrite.roleWriteMode === "identity-native"
       && roleWrite.roleWriteIdentityNativeExecutionEnabled
-      && roleWrite.roleWriteIdentityNativeTargetLegacyUserId === legacyUserId;
+      && identityNativeRoleWriteTargetDecision(roleWrite, legacyUserId).owned;
 
     if (!ownsTarget) {
-      const roles = await this.repository.listRoleAssignmentsShadow(legacyUserId);
-      return roles.map((role) => role.roleName);
+      return shadowRoleNames;
     }
 
     const policyChecksum = (roleWrite.roleWritePolicyChecksum ?? "").trim().toLowerCase();
