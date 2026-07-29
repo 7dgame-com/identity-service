@@ -82,6 +82,7 @@ export interface PluginUserWriteOperationRecentRow {
   rolloutDecision?: string | null;
   actorFingerprint?: string | null;
   matchedSelectorKind?: string | null;
+  idempotencySource?: "client-header" | "per-request" | null;
 }
 
 @Injectable()
@@ -121,7 +122,7 @@ export class PluginUserWriteOperationRepository implements OnModuleDestroy {
         input.legacyUserId ?? null,
         input.identityUserId ?? null,
         new Date(),
-        stringifyJson(redactPluginUserWriteMetadata(input.metadata))
+        stringifyJson(redactPluginUserWriteOperationMetadata(input.metadata))
       ]
     );
 
@@ -198,7 +199,7 @@ export class PluginUserWriteOperationRepository implements OnModuleDestroy {
         input.errorCode ?? null,
         input.status,
         new Date(),
-        stringifyJson(redactPluginUserWriteMetadata(input.metadata)),
+        stringifyJson(redactPluginUserWriteOperationMetadata(input.metadata)),
         input.operationKey
       ]
     );
@@ -307,7 +308,8 @@ export class PluginUserWriteOperationRepository implements OnModuleDestroy {
         correlationId: nullableString(metadata.correlationId),
         rolloutDecision: nullableString(metadata.rolloutDecision),
         actorFingerprint: nullableString(metadata.actorFingerprint),
-        matchedSelectorKind: nullableString(metadata.matchedSelectorKind)
+        matchedSelectorKind: nullableString(metadata.matchedSelectorKind),
+        idempotencySource: pluginUserWriteIdempotencySource(metadata.idempotencySource)
       };
     });
   }
@@ -417,6 +419,32 @@ export function redactPluginUserWriteMetadata(value: unknown): Record<string, un
   return { value: redacted };
 }
 
+/**
+ * Operation metadata is redacted again at the repository boundary so callers
+ * cannot accidentally persist secrets. A response replay has already been
+ * sanitized by pluginUserWriteResponseReplayMetadata(); preserve only its
+ * top-level business code so a completed retry keeps the legacy response
+ * contract. Nested verification codes and all other secret-shaped fields stay
+ * redacted.
+ */
+export function redactPluginUserWriteOperationMetadata(value: unknown): Record<string, unknown> {
+  const redacted = redactPluginUserWriteMetadata(value);
+  const sourceReplay = recordValue(recordValue(value).responseReplay);
+  const sourceBody = recordValue(sourceReplay.body);
+  const replay = recordValue(redacted.responseReplay);
+  const body = recordValue(replay.body);
+  const businessCode = sourceBody.code;
+
+  if (
+    (typeof businessCode === "number" && Number.isFinite(businessCode)) ||
+    (typeof businessCode === "string" && businessCode.length <= 80)
+  ) {
+    body.code = businessCode;
+  }
+
+  return redacted;
+}
+
 export function redactPluginUserWriteEvidence(value: unknown): unknown {
   return redactValue(value, 0, {});
 }
@@ -486,7 +514,7 @@ function redactValue(value: unknown, depth: number, options: { preserveBusinessC
 
   const output: Record<string, unknown> = {};
   for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-    if (isSecretKey(key, options)) {
+    if (isSecretKey(key, options, depth)) {
       output[key] = "[redacted]";
       continue;
     }
@@ -497,8 +525,8 @@ function redactValue(value: unknown, depth: number, options: { preserveBusinessC
   return output;
 }
 
-function isSecretKey(key: string, options: { preserveBusinessCode?: boolean }): boolean {
-  if (options.preserveBusinessCode && key.toLowerCase() === "code") {
+function isSecretKey(key: string, options: { preserveBusinessCode?: boolean }, depth: number): boolean {
+  if (options.preserveBusinessCode && depth === 0 && key.toLowerCase() === "code") {
     return false;
   }
 
@@ -561,6 +589,10 @@ function recordValue(value: unknown): Record<string, unknown> {
 
 function nullableString(value: unknown): string | null {
   return typeof value === "string" && value !== "" ? value : null;
+}
+
+function pluginUserWriteIdempotencySource(value: unknown): "client-header" | "per-request" | null {
+  return value === "client-header" || value === "per-request" ? value : null;
 }
 
 function nullableNumber(value: unknown): number | null {

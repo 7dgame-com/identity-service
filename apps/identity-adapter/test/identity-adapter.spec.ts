@@ -53,6 +53,7 @@ import {
   pluginUserWriteReplayResponseFromOperation,
   pluginUserWriteRequestFingerprint,
   pluginUserWriteResponseReplayMetadata,
+  redactPluginUserWriteOperationMetadata,
   redactPluginUserWriteMetadata
 } from "../src/plugin-user-write-operation.repository.js";
 import {
@@ -298,7 +299,7 @@ class FakePluginUserWriteOperationRepository {
         identityStatus: null,
         compensationStatus: "none",
         errorCode: null,
-        metadata: input.metadata ?? {}
+        metadata: redactPluginUserWriteOperationMetadata(input.metadata)
       });
     }
 
@@ -329,7 +330,7 @@ class FakePluginUserWriteOperationRepository {
       identityStatus: input.identityStatus ?? current.identityStatus,
       compensationStatus: input.compensationStatus ?? current.compensationStatus,
       errorCode: input.errorCode ?? null,
-      metadata: input.metadata ?? {}
+      metadata: redactPluginUserWriteOperationMetadata(input.metadata)
     });
   }
 
@@ -392,7 +393,11 @@ class FakePluginUserWriteOperationRepository {
       idempotencyKeyDigest: createHash("sha256").update(operation.idempotencyKey).digest("hex").slice(0, 16),
       legacyUserId: operation.legacyUserId ?? null,
       requestedAt: "2026-06-30T00:00:00.000Z",
-      completedAt: null
+      completedAt: null,
+      idempotencySource:
+        operation.metadata.idempotencySource === "client-header" || operation.metadata.idempotencySource === "per-request"
+          ? operation.metadata.idempotencySource
+          : null
     }));
   }
 }
@@ -2387,6 +2392,10 @@ describe("identity-adapter readonly API", () => {
   it("keeps role-write candidate restore disabled and targetless by default", () => {
     const config = loadConfig({});
 
+    expect(config.iam.roleWriteIdentityNativeExecutionEnabled).toBe(false);
+    expect(config.iam.roleWriteIdentityNativeTargetMode).toBe("single-target");
+    expect(config.iam.roleWriteIdentityNativeTargetLegacyUserId).toBe(0);
+    expect(config.iam.roleWriteIdentityNativeTargetAllowlist).toBe("");
     expect(config.iam.roleWriteCandidateRestoreEnabled).toBe(false);
     expect(config.iam.roleWriteCandidateRestoreTargetLegacyUserId).toBe(0);
   });
@@ -4849,6 +4858,42 @@ describe("identity-adapter IAM role write API", () => {
     expect(operations.inputs).toHaveLength(0);
   });
 
+  it("keeps identity-native readiness closed when storage, checksum, or candidate capabilities are missing", async () => {
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "identity-native";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_LEGACY_USER_ID = "25";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE = "canary";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_ALLOWLIST = "username:guanfei";
+    const operations = new FakePluginUserWriteOperationRepository();
+    operations.configured = false;
+    const iamRepository = new FakeIamRepository();
+    iamRepository.configured = false;
+    app = await createLifecycleTestApp(operations, iamRepository);
+
+    const missingStorage = await request(app.getHttpServer())
+      .get("/internal/iam/role-write/readiness")
+      .set("x-identity-internal-token", "role-write-test-token")
+      .expect(200);
+    expect(missingStorage.body.data.identityNativeGate.executable).toBe(false);
+    expect(missingStorage.body.data.identityNativeGate.missingCapabilities).toEqual(
+      expect.arrayContaining(["operation-ledger", "identity-repository", "candidate-policy-checksum"])
+    );
+
+    await app.close();
+    app = null;
+    operations.configured = true;
+    iamRepository.configured = true;
+    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = "a".repeat(64);
+    app = await createLifecycleTestApp(operations, iamRepository);
+
+    const missingCandidate = await request(app.getHttpServer())
+      .get("/internal/iam/role-write/readiness")
+      .set("x-identity-internal-token", "role-write-test-token")
+      .expect(200);
+    expect(missingCandidate.body.data.identityNativeGate.executable).toBe(false);
+    expect(missingCandidate.body.data.identityNativeGate.missingCapabilities).toContain("candidate-policy-not-found");
+  });
+
   it("reports current Legacy candidate availability without exposing a checksum or mutating role-write state", async () => {
     const iamRepository = new FakeIamRepository();
     const legacyReader = new FakeLegacyIdentityReader();
@@ -5330,6 +5375,356 @@ describe("identity-adapter IAM role write API", () => {
     expect(JSON.stringify(operation?.metadata)).not.toContain("guanfei");
   });
 
+  it("writes selected role changes to Identity only and replays completed identity-native requests", async () => {
+    const iamRepository = new FakeIamRepository();
+    const checksum = await seedRoleWritePolicy(iamRepository);
+    iamRepository.subjectAssignments.set(25, [
+      { itemName: "user", itemType: "role" },
+      { itemName: "plugin.open", itemType: "permission" }
+    ]);
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "identity-native";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_LEGACY_USER_ID = "25";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE = "canary";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_ALLOWLIST = "username:guanfei";
+    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = checksum;
+    const operations = new FakePluginUserWriteOperationRepository();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    app = await createLifecycleTestApp(operations, iamRepository);
+    const token = roleWriteAccessToken();
+
+    for (const _ of [0, 1]) {
+      const response = await request(app.getHttpServer())
+        .post("/v1/plugin-user/change-role")
+        .set("Authorization", `Bearer ${token}`)
+        .set("Idempotency-Key", "identity-native-manager")
+        .send({ id: 25, role: "manager" })
+        .expect(200);
+
+      expect(response.headers["x-identity-iam-role-write"]).toBe("identity-native");
+      expect(response.body).toMatchObject({ code: 0, data: { id: 25, roles: ["user", "manager"] } });
+    }
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(operations.inputs).toHaveLength(1);
+    expect(operations.inputs[0]).toMatchObject({ mode: "identity-native", legacyUserId: 25 });
+    expect(iamRepository.subjectAssignments.get(25)).toEqual([
+      { itemName: "user", itemType: "role" },
+      { itemName: "manager", itemType: "role" },
+      { itemName: "plugin.open", itemType: "permission" }
+    ]);
+    expect(await operations.findByOperationKey(operations.inputs[0]!.operationKey)).toMatchObject({
+      status: "completed",
+      legacyStatus: "not-called",
+      identityStatus: "completed"
+    });
+
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/change-role")
+      .set("Authorization", `Bearer ${token}`)
+      .set("Idempotency-Key", "identity-native-restore-user")
+      .send({ id: 25, role: "user" })
+      .expect(200);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(iamRepository.subjectAssignments.get(25)).toEqual([
+      { itemName: "user", itemType: "role" },
+      { itemName: "plugin.open", itemType: "permission" }
+    ]);
+  });
+
+  it("moves only allowlisted targets to Identity and keeps other targets on Legacy", async () => {
+    const iamRepository = new FakeIamRepository();
+    const checksum = await seedRoleWritePolicy(iamRepository);
+    iamRepository.subjectAssignments.set(25, [{ itemName: "user", itemType: "role" }]);
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "identity-native";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_MODE = "allowlist";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_ALLOWLIST = "25";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE = "canary";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_ALLOWLIST = "username:guanfei";
+    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = checksum;
+    const operations = new FakePluginUserWriteOperationRepository();
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ code: 0, data: { id: 26, roles: ["user"] } }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    app = await createLifecycleTestApp(operations, iamRepository);
+    const token = roleWriteAccessToken();
+
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/change-role")
+      .set("Authorization", `Bearer ${token}`)
+      .set("Idempotency-Key", "native-allowlist-owned")
+      .send({ id: 25, role: "manager" })
+      .expect(200)
+      .expect(({ headers }) => expect(headers["x-identity-iam-role-write"]).toBe("identity-native"));
+
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/change-role")
+      .set("Authorization", `Bearer ${token}`)
+      .set("Idempotency-Key", "native-allowlist-unowned")
+      .send({ id: 26, role: "user" })
+      .expect(200)
+      .expect(({ headers }) => expect(headers["x-identity-iam-role-write"]).toBe("legacy-proxy"));
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(operations.inputs).toHaveLength(1);
+    expect(operations.inputs[0]).toMatchObject({
+      mode: "identity-native",
+      legacyUserId: 25,
+      metadata: {
+        owner: "identity",
+        ownerTargetMode: "allowlist",
+        ownerTargetReason: "target_allowlist_owned",
+        legacyWritePerformed: false
+      }
+    });
+    expect(iamRepository.subjectAssignments.get(25)).toEqual([
+      { itemName: "user", itemType: "role" },
+      { itemName: "manager", itemType: "role" }
+    ]);
+  });
+
+  it("fails closed when an unselected operator writes an Identity-owned target", async () => {
+    const iamRepository = new FakeIamRepository();
+    const checksum = await seedRoleWritePolicy(iamRepository);
+    iamRepository.subjectAssignments.set(25, [{ itemName: "user", itemType: "role" }]);
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "identity-native";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_MODE = "allowlist";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_ALLOWLIST = "25";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE = "canary";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_ALLOWLIST = "username:guanfei";
+    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = checksum;
+    const operations = new FakePluginUserWriteOperationRepository();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    app = await createLifecycleTestApp(operations, iamRepository);
+
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/change-role")
+      .set("Authorization", `Bearer ${roleWriteAccessToken(24, "different-operator", ["root"])}`)
+      .set("Idempotency-Key", "native-owned-unselected-operator")
+      .send({ id: 25, role: "manager" })
+      .expect(409)
+      .expect(({ body }) => expect(body.code).toBe("IAM_ROLE_WRITE_IDENTITY_NATIVE_OPERATOR_NOT_SELECTED"));
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(operations.inputs).toHaveLength(0);
+    expect(iamRepository.subjectAssignments.get(25)).toEqual([{ itemName: "user", itemType: "role" }]);
+  });
+
+  it("supports a full non-root Identity owner only with full operator rollout", async () => {
+    const iamRepository = new FakeIamRepository();
+    const checksum = await seedRoleWritePolicy(iamRepository);
+    iamRepository.subjectAssignments.set(25, [{ itemName: "user", itemType: "role" }]);
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "identity-native";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_MODE = "full";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE = "full";
+    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = checksum;
+    const operations = new FakePluginUserWriteOperationRepository();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    app = await createLifecycleTestApp(operations, iamRepository);
+
+    const readiness = await request(app.getHttpServer())
+      .get("/internal/iam/role-write/readiness")
+      .set("x-identity-internal-token", "role-write-test-token")
+      .expect(200);
+    expect(readiness.body.data.identityNativeGate).toMatchObject({
+      executable: true,
+      targetScope: {
+        mode: "full",
+        configured: true,
+        targetCount: null,
+        missingCapabilities: []
+      }
+    });
+
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/change-role")
+      .set("Authorization", `Bearer ${roleWriteAccessToken()}`)
+      .set("Idempotency-Key", "native-full-manager")
+      .send({ id: 25, role: "manager" })
+      .expect(200)
+      .expect(({ headers }) => expect(headers["x-identity-iam-role-write"]).toBe("identity-native"));
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(iamRepository.subjectAssignments.get(25)).toEqual([
+      { itemName: "user", itemType: "role" },
+      { itemName: "manager", itemType: "role" }
+    ]);
+  });
+
+  it("fails closed when an Identity-owned target has no materialized candidate", async () => {
+    const iamRepository = new FakeIamRepository();
+    const checksum = await seedRoleWritePolicy(iamRepository);
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "identity-native";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_MODE = "allowlist";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_ALLOWLIST = "25";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE = "canary";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_ALLOWLIST = "username:guanfei";
+    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = checksum;
+    const operations = new FakePluginUserWriteOperationRepository();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    app = await createLifecycleTestApp(operations, iamRepository);
+
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/change-role")
+      .set("Authorization", `Bearer ${roleWriteAccessToken()}`)
+      .set("Idempotency-Key", "native-candidate-missing")
+      .send({ id: 25, role: "manager" })
+      .expect(409)
+      .expect(({ body }) => expect(body.code).toBe("IAM_ROLE_WRITE_IDENTITY_NATIVE_CANDIDATE_MISSING"));
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(operations.inputs).toHaveLength(0);
+  });
+
+  it("keeps identity-native role writes default-closed for missing execution, idempotency, scope, and root", async () => {
+    const iamRepository = new FakeIamRepository();
+    const checksum = await seedRoleWritePolicy(iamRepository);
+    iamRepository.subjectAssignments.set(25, [{ itemName: "user", itemType: "role" }]);
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "identity-native";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE = "canary";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_ALLOWLIST = "username:guanfei";
+    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = checksum;
+    const operations = new FakePluginUserWriteOperationRepository();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    app = await createLifecycleTestApp(operations, iamRepository);
+    const token = roleWriteAccessToken();
+
+    const disabled = await request(app.getHttpServer())
+      .post("/v1/plugin-user/change-role")
+      .set("Authorization", `Bearer ${token}`)
+      .set("Idempotency-Key", "native-disabled")
+      .send({ id: 25, role: "manager" })
+      .expect(404);
+    expect(disabled.body.missingCapabilities).toContain("operator-identity-native-execution-flag");
+
+    await app.close();
+    app = null;
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_LEGACY_USER_ID = "25";
+    app = await createLifecycleTestApp(operations, iamRepository);
+
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/change-role")
+      .set("Authorization", `Bearer ${token}`)
+      .send({ id: 25, role: "manager" })
+      .expect(409)
+      .expect(({ body }) => expect(body.code).toBe("IAM_ROLE_WRITE_IDEMPOTENCY_REQUIRED"));
+
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/change-role")
+      .set("Authorization", `Bearer ${token}`)
+      .set("Idempotency-Key", "native-scoped")
+      .send({ id: 25, role: "manager", organization_id: 7 })
+      .expect(409)
+      .expect(({ body }) => expect(body.code).toBe("IAM_ROLE_WRITE_SCOPED_ASSIGNMENT_UNSUPPORTED"));
+
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/change-role")
+      .set("Authorization", `Bearer ${token}`)
+      .set("Idempotency-Key", "native-root")
+      .send({ id: 25, role: "root" })
+      .expect(409)
+      .expect(({ body }) => expect(body.code).toBe("IAM_ROLE_WRITE_ROOT_PROTECTED"));
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(operations.inputs).toHaveLength(0);
+    expect(iamRepository.subjectAssignments.get(25)).toEqual([{ itemName: "user", itemType: "role" }]);
+  });
+
+  it("keeps identity-native writes restricted to owned targets and preserves role hierarchy", async () => {
+    const iamRepository = new FakeIamRepository();
+    const checksum = await seedRoleWritePolicy(iamRepository);
+    iamRepository.subjectAssignments.set(25, [{ itemName: "user", itemType: "role" }]);
+    iamRepository.subjectAssignments.set(26, [{ itemName: "user", itemType: "role" }]);
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "identity-native";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_LEGACY_USER_ID = "25";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE = "canary";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_ALLOWLIST = "username:guanfei";
+    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = checksum;
+    const operations = new FakePluginUserWriteOperationRepository();
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ code: 0, data: { id: 26, roles: ["manager"] } }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    app = await createLifecycleTestApp(operations, iamRepository);
+
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/change-role")
+      .set("Authorization", `Bearer ${roleWriteAccessToken()}`)
+      .set("Idempotency-Key", "native-wrong-target")
+      .send({ id: 26, role: "manager" })
+      .expect(200)
+      .expect(({ headers }) => expect(headers["x-identity-iam-role-write"]).toBe("legacy-proxy"));
+
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/change-role")
+      .set("Authorization", `Bearer ${roleWriteAccessToken(24, "guanfei", ["manager"])}`)
+      .set("Idempotency-Key", "native-above-operator")
+      .send({ id: 25, role: "admin" })
+      .expect(409)
+      .expect(({ body }) => expect(body.code).toBe("IAM_ROLE_WRITE_GRANT_ABOVE_OPERATOR"));
+
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/change-role")
+      .set("Authorization", `Bearer ${roleWriteAccessToken(24, "guanfei", ["user"])}`)
+      .set("Idempotency-Key", "native-user-operator")
+      .send({ id: 25, role: "user" })
+      .expect(401)
+      .expect(({ body }) => expect(body.code).toBe("IAM_ROLE_WRITE_OPERATOR_ELEVATION_REQUIRED"));
+
+    iamRepository.subjectAssignments.set(25, [{ itemName: "root", itemType: "role" }]);
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/change-role")
+      .set("Authorization", `Bearer ${roleWriteAccessToken(24, "guanfei", ["root"])}`)
+      .set("Idempotency-Key", "native-root-target")
+      .send({ id: 25, role: "user" })
+      .expect(409)
+      .expect(({ body }) => expect(body.code).toBe("IAM_ROLE_WRITE_ROOT_PROTECTED"));
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(operations.inputs).toHaveLength(0);
+    expect(iamRepository.subjectAssignments.get(25)).toEqual([{ itemName: "root", itemType: "role" }]);
+    expect(iamRepository.subjectAssignments.get(26)).toEqual([{ itemName: "user", itemType: "role" }]);
+  });
+
+  it("preserves the people/auth response contract in identity-native mode without calling Legacy", async () => {
+    const iamRepository = new FakeIamRepository();
+    const checksum = await seedRoleWritePolicy(iamRepository);
+    iamRepository.subjectAssignments.set(25, [{ itemName: "user", itemType: "role" }]);
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "identity-native";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_LEGACY_USER_ID = "25";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE = "canary";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_ALLOWLIST = "username:guanfei";
+    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = checksum;
+    const operations = new FakePluginUserWriteOperationRepository();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    app = await createLifecycleTestApp(operations, iamRepository);
+
+    const response = await request(app.getHttpServer())
+      .put("/v1/people/auth")
+      .set("Authorization", `Bearer ${roleWriteAccessToken()}`)
+      .set("Idempotency-Key", "native-people-manager")
+      .send({ id: 25, auth: "manager" })
+      .expect(200);
+
+    expect(response.body).toEqual({ user: "user", manager: "manager", success: true });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(iamRepository.subjectAssignments.get(25)).toEqual([
+      { itemName: "user", itemType: "role" },
+      { itemName: "manager", itemType: "role" }
+    ]);
+  });
+
   it("fails closed before Legacy mutation when a selected canary request lacks the guarded handoff", async () => {
     const iamRepository = new FakeIamRepository();
     const checksum = await seedRoleWritePolicy(iamRepository);
@@ -5419,6 +5814,74 @@ describe("identity-adapter IAM role write API", () => {
       correlationId: "phase4-preview-not-selected",
       matchedSelectorKind: null
     });
+    expect(operations.inputs).toHaveLength(0);
+  });
+
+  it("previews Identity owner target scope without writing", async () => {
+    const iamRepository = new FakeIamRepository();
+    const checksum = await seedRoleWritePolicy(iamRepository);
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "identity-native";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_MODE = "allowlist";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_ALLOWLIST = "25";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE = "canary";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_ALLOWLIST = "subject:24";
+    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = checksum;
+    const operations = new FakePluginUserWriteOperationRepository();
+    app = await createLifecycleTestApp(operations, iamRepository);
+
+    const owned = await request(app.getHttpServer())
+      .get("/v1/plugin-user/role-write-decision")
+      .query({ targetLegacyUserId: 25 })
+      .set("Authorization", `Bearer ${roleWriteAccessToken()}`)
+      .expect(200);
+    expect(owned.body.data).toMatchObject({
+      writePerformed: false,
+      selected: true,
+      effectiveSelected: true,
+      effectiveWriteOwner: "identity",
+      sourceOfTruth: "identity-candidate",
+      targetProvided: true,
+      targetOwned: true,
+      targetReason: "target_allowlist_owned",
+      identityNativeExecutable: true,
+      identityNativeTargetScope: { mode: "allowlist", configured: true, targetCount: 1 }
+    });
+
+    const retained = await request(app.getHttpServer())
+      .get("/v1/plugin-user/role-write-decision")
+      .query({ targetLegacyUserId: 26 })
+      .set("Authorization", `Bearer ${roleWriteAccessToken()}`)
+      .expect(200);
+    expect(retained.body.data).toMatchObject({
+      writePerformed: false,
+      selected: true,
+      effectiveSelected: false,
+      effectiveWriteOwner: "legacy",
+      sourceOfTruth: "legacy",
+      targetOwned: false,
+      targetReason: "target_not_owned"
+    });
+
+    const blocked = await request(app.getHttpServer())
+      .get("/v1/plugin-user/role-write-decision")
+      .query({ targetLegacyUserId: 25 })
+      .set("Authorization", `Bearer ${roleWriteAccessToken(26, "other-root", ["root"])}`)
+      .expect(200);
+    expect(blocked.body.data).toMatchObject({
+      writePerformed: false,
+      selected: false,
+      effectiveSelected: false,
+      effectiveWriteOwner: "blocked",
+      sourceOfTruth: "unavailable",
+      targetOwned: true
+    });
+    await request(app.getHttpServer())
+      .get("/v1/plugin-user/role-write-decision")
+      .query({ targetLegacyUserId: "invalid" })
+      .set("Authorization", `Bearer ${roleWriteAccessToken()}`)
+      .expect(400)
+      .expect(({ body }) => expect(body.code).toBe("INVALID_LEGACY_USER_ID"));
     expect(operations.inputs).toHaveLength(0);
   });
 
@@ -5815,7 +6278,7 @@ describe("identity-adapter IAM role write API", () => {
     return policy.checksum;
   }
 
-  function roleWriteAccessToken(id = 24, username = "guanfei"): string {
+  function roleWriteAccessToken(id = 24, username = "guanfei", roles = ["admin"]): string {
     return new JwtIssuerService().issue(
       {
         id,
@@ -5827,7 +6290,7 @@ describe("identity-adapter IAM role write API", () => {
         createdAt: null,
         updatedAt: null,
         userInfo: {},
-        roles: ["admin"],
+        roles,
         organizations: [],
         source: "legacy"
       },
@@ -5890,6 +6353,8 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
         dualWriteExecutionEnabled: false,
         operationLedgerSchemaAutoEnsure: false,
         idempotencyKeyFormat: "plugin-user-write:v1:<route>:<sha256-48>",
+        idempotencyBehavior:
+          "explicit Idempotency-Key replays; ordinary browser submits receive a unique operation key per request",
         redactionPolicy: "metadata-only-no-secret-payloads",
         compensationRecordsRequired: true,
         shadow: {
@@ -6106,6 +6571,12 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_MODE = "canary";
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_ALLOWLIST = "username:new-user";
+    const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
+    process.env.IDENTITY_JWT_PRIVATE_KEY_PEM = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    process.env.IDENTITY_JWT_ISSUER = "identity-plugin-user-write-test";
+    process.env.IDENTITY_JWT_AUDIENCE = "xrugc-plugin-user-write";
+    const operator = await new FakeLegacyIdentityReader().getUserById(24);
+    const accessToken = new JwtIssuerService().issue(operator!, "plugin-user-write-session-24").accessToken;
     const operations = new FakePluginUserWriteOperationRepository();
     const iamRepository = new FakeIamRepository();
     app = await createLifecycleTestApp(operations, iamRepository);
@@ -6136,6 +6607,7 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
 
     const response = await request(app.getHttpServer())
       .post("/v1/plugin-user/create-user")
+      .set("Authorization", `Bearer ${accessToken}`)
       .send({ username: "new-user", password: "Secret123!" })
       .expect(201);
 
@@ -6147,6 +6619,7 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
     expect(operation).toMatchObject({
       route: "create-user",
       mode: "dual-write",
+      actorSubject: "legacy-user:24",
       status: "completed",
       legacyStatus: "201",
       identityStatus: "completed",
@@ -6162,6 +6635,7 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
       })
     ]);
     expect(JSON.stringify(operation)).not.toContain("Secret123!");
+    expect(JSON.stringify(operation)).not.toContain(accessToken);
   });
 
   it("does not blank identity shadow user fields or list tombstones after dual-write delete", async () => {
@@ -6279,7 +6753,7 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
         required: true,
         phase: "identity",
         reason: "identity-shadow-write-failed",
-        errorCode: "Error",
+        errorCode: "[redacted]",
         legacyStatus: 201,
         identityStatus: "failed"
       }
@@ -6288,7 +6762,50 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
     expect(JSON.stringify(operation)).not.toContain("operator-token");
   });
 
-  it("replays completed dual-write responses for duplicate requests without repeating legacy writes", async () => {
+  it("does not replay password updates without an explicit idempotency key", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_MODE = "full";
+    const operations = new FakePluginUserWriteOperationRepository();
+    const iamRepository = new FakeIamRepository();
+    app = await createLifecycleTestApp(operations, iamRepository);
+    const fetchMock = vi.fn(async () => {
+      return new Response(JSON.stringify({ code: 0, data: { id: 42, username: "manager" } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    for (const password of ["ManagerSecret123!", "ManagerSecret456!"]) {
+      const response = await request(app.getHttpServer())
+        .post("/v1/plugin-user/update-user")
+        .send({ id: 42, nickname: "Manager", password })
+        .expect(200);
+
+      expect(response.headers["x-identity-plugin-user-write"]).toBe("dual-write");
+      expect(response.body).toEqual({ code: 0, data: { id: 42, username: "manager" } });
+    }
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(operations.inputs).toHaveLength(2);
+    expect(operations.inputs[0].operationKey).not.toBe(operations.inputs[1].operationKey);
+    expect(operations.inputs.map((input) => input.metadata)).toEqual([
+      expect.objectContaining({ idempotencySource: "per-request" }),
+      expect.objectContaining({ idempotencySource: "per-request" })
+    ]);
+    const recent = await request(app.getHttpServer())
+      .get("/internal/plugin-user-write/operations/recent")
+      .expect(200);
+    expect(recent.body.data.operations).toEqual([
+      expect.objectContaining({ idempotencySource: "per-request" }),
+      expect.objectContaining({ idempotencySource: "per-request" })
+    ]);
+    expect(JSON.stringify(operations.inputs)).not.toContain("ManagerSecret123!");
+    expect(JSON.stringify(operations.inputs)).not.toContain("ManagerSecret456!");
+  });
+
+  it("replays completed dual-write responses for the same explicit idempotency key without repeating legacy writes", async () => {
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_MODE = "full";
@@ -6306,6 +6823,7 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
     for (const _ of [0, 1]) {
       const response = await request(app.getHttpServer())
         .post("/v1/plugin-user/create-user")
+        .set("Idempotency-Key", "plugin-user-create-replay")
         .send({ username: "replay-user", password: "Secret123!" })
         .expect(201);
 
@@ -6316,22 +6834,249 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(operations.attempts).toHaveLength(2);
     expect(operations.inputs).toHaveLength(1);
+    expect(operations.inputs[0].metadata).toMatchObject({ idempotencySource: "client-header" });
     expect(iamRepository.identityShadowWrites).toHaveLength(1);
     const operation = await operations.findByOperationKey(operations.inputs[0].operationKey);
     expect(operation?.status).toBe("completed");
     expect(JSON.stringify(operation)).not.toContain("Secret123!");
+    expect(JSON.stringify(operation)).not.toContain("plugin-user-create-replay");
+    const recent = await request(app.getHttpServer())
+      .get("/internal/plugin-user-write/operations/recent")
+      .expect(200);
+    expect(recent.body.data.operations).toEqual([
+      expect.objectContaining({ idempotencySource: "client-header" })
+    ]);
+  });
+
+  it("treats password-only changes as the same explicit business operation", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_MODE = "full";
+    const operations = new FakePluginUserWriteOperationRepository();
+    const iamRepository = new FakeIamRepository();
+    app = await createLifecycleTestApp(operations, iamRepository);
+    const fetchMock = vi.fn(async () => new Response(
+      JSON.stringify({ code: 0, data: { id: 42, username: "manager" } }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+
+    for (const password of ["ManagerSecret123!", "ManagerSecret456!"]) {
+      await request(app.getHttpServer())
+        .post("/v1/plugin-user/update-user")
+        .set("Idempotency-Key", "manager-password-operation")
+        .send({ id: 42, nickname: "Manager", password })
+        .expect(200);
+    }
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(operations.attempts[0].operationKey).toBe(operations.attempts[1].operationKey);
+    expect(operations.attempts).toHaveLength(2);
+    expect(operations.inputs).toHaveLength(1);
+    expect(iamRepository.identityShadowWrites).toHaveLength(1);
+    const operation = await operations.findByOperationKey(operations.inputs[0].operationKey);
+    expect(operation?.metadata).toMatchObject({
+      idempotencySource: "client-header",
+      requestFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/)
+    });
+    expect(JSON.stringify(operation)).not.toContain("manager-password-operation");
+    expect(JSON.stringify(operation)).not.toContain("ManagerSecret123!");
+    expect(JSON.stringify(operation)).not.toContain("ManagerSecret456!");
+  });
+
+  it("rejects an explicit key reused with different non-sensitive input before legacy", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_MODE = "full";
+    const operations = new FakePluginUserWriteOperationRepository();
+    const iamRepository = new FakeIamRepository();
+    app = await createLifecycleTestApp(operations, iamRepository);
+    const fetchMock = vi.fn(async () => new Response(
+      JSON.stringify({ code: 0, data: { id: 42, username: "manager" } }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/update-user")
+      .set("Idempotency-Key", "nickname-operation")
+      .send({ id: 42, nickname: "Manager One", password: "ManagerSecret123!" })
+      .expect(200);
+
+    const conflict = await request(app.getHttpServer())
+      .post("/v1/plugin-user/update-user")
+      .set("Idempotency-Key", "nickname-operation")
+      .send({ id: 42, nickname: "Manager Two", password: "ManagerSecret456!" })
+      .expect(409);
+
+    expect(conflict.body).toMatchObject({ code: "IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_REQUEST" });
+    expect(JSON.stringify(conflict.body)).not.toContain("nickname-operation");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(operations.inputs).toHaveLength(1);
+    expect(iamRepository.identityShadowWrites).toHaveLength(1);
+  });
+
+  it("coordinates concurrent explicit-key requests through the shared operation ledger", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_MODE = "full";
+    const operations = new FakePluginUserWriteOperationRepository();
+    const iamRepository = new FakeIamRepository();
+    app = await createLifecycleTestApp(operations, iamRepository);
+    const secondNode = await createLifecycleTestApp(operations, iamRepository);
+    let releaseLegacy!: (response: Response) => void;
+    const fetchMock = vi.fn(() => new Promise<Response>((resolve) => {
+      releaseLegacy = resolve;
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const firstRequest = request(app.getHttpServer())
+      .post("/v1/plugin-user/update-user")
+      .set("Idempotency-Key", "concurrent-update-operation")
+      .send({ id: 42, nickname: "Concurrent Manager", password: "ManagerSecret123!" })
+      .then((response) => response);
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    try {
+      const duplicate = await request(secondNode.getHttpServer())
+        .post("/v1/plugin-user/update-user")
+        .set("Idempotency-Key", "concurrent-update-operation")
+        .send({ id: 42, nickname: "Concurrent Manager", password: "ManagerSecret123!" })
+        .expect(503);
+
+      expect(duplicate.body).toMatchObject({ code: "PLUGIN_USER_WRITE_REPLAY_UNAVAILABLE" });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      releaseLegacy(new Response(
+        JSON.stringify({ code: 0, data: { id: 42, username: "manager" } }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      ));
+      const first = await firstRequest;
+      expect(first.status).toBe(200);
+      expect(operations.inputs).toHaveLength(1);
+      expect(iamRepository.identityShadowWrites).toHaveLength(1);
+    } finally {
+      await secondNode.close();
+    }
+  });
+
+  it("validates explicit idempotency header boundaries without echoing values", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_MODE = "full";
+    const operations = new FakePluginUserWriteOperationRepository();
+    app = await createLifecycleTestApp(operations, new FakeIamRepository());
+    const fetchMock = vi.fn(async (_url: URL | string, init?: RequestInit) => {
+      const headers = init?.headers as Headers;
+      expect(headers.get("Idempotency-Key")).toBe("same-alias-key");
+      return new Response(JSON.stringify({ code: 0, data: { id: 42, username: "manager" } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const blank = await request(app.getHttpServer())
+      .post("/v1/plugin-user/update-user")
+      .set("X-Idempotency-Key", "   ")
+      .send({ id: 42, nickname: "Manager" })
+      .expect(400);
+    expect(blank.body).toMatchObject({ code: "IDEMPOTENCY_KEY_INVALID" });
+
+    const overlongKey = "k".repeat(181);
+    const overlong = await request(app.getHttpServer())
+      .post("/v1/plugin-user/update-user")
+      .set("Idempotency-Key", overlongKey)
+      .send({ id: 42, nickname: "Manager" })
+      .expect(400);
+    expect(overlong.body).toMatchObject({ code: "IDEMPOTENCY_KEY_INVALID" });
+    expect(JSON.stringify(overlong.body)).not.toContain(overlongKey);
+
+    const conflicting = await request(app.getHttpServer())
+      .post("/v1/plugin-user/update-user")
+      .set("Idempotency-Key", "primary-key")
+      .set("X-Idempotency-Key", "alias-key")
+      .send({ id: 42, nickname: "Manager" })
+      .expect(400);
+    expect(conflicting.body).toMatchObject({ code: "IDEMPOTENCY_KEY_CONFLICT" });
+    expect(JSON.stringify(conflicting.body)).not.toContain("primary-key");
+    expect(JSON.stringify(conflicting.body)).not.toContain("alias-key");
+
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/update-user")
+      .set("Idempotency-Key", "same-alias-key")
+      .set("X-Idempotency-Key", "same-alias-key")
+      .send({ id: 42, nickname: "Manager" })
+      .expect(200);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(operations.inputs).toHaveLength(1);
+  });
+
+  it("preserves legacy authorization rejection without partial identity writes", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_MODE = "full";
+    const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
+    process.env.IDENTITY_JWT_PRIVATE_KEY_PEM = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    process.env.IDENTITY_JWT_ISSUER = "identity-plugin-user-permission-test";
+    process.env.IDENTITY_JWT_AUDIENCE = "xrugc-plugin-user-permission";
+    const ordinaryUser = await new FakeLegacyIdentityReader().getUserById(25);
+    const ordinaryToken = new JwtIssuerService().issue(
+      { ...ordinaryUser!, roles: ["user"] },
+      "plugin-user-permission-session-25"
+    ).accessToken;
+    const operations = new FakePluginUserWriteOperationRepository();
+    const iamRepository = new FakeIamRepository();
+    app = await createLifecycleTestApp(operations, iamRepository);
+    const fetchMock = vi.fn(async () => new Response(
+      JSON.stringify({ code: 4030, message: "无权执行该操作" }),
+      { status: 403, headers: { "Content-Type": "application/json" } }
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+
+    for (const authorization of ["Bearer invalid-token", `Bearer ${ordinaryToken}`]) {
+      const denied = await request(app.getHttpServer())
+        .post("/v1/plugin-user/update-user")
+        .set("Authorization", authorization)
+        .send({ id: 42, nickname: "Denied Update", password: "DeniedSecret123!" })
+        .expect(403);
+      expect(denied.body).toEqual({ code: 4030, message: "无权执行该操作" });
+    }
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(iamRepository.identityShadowWrites).toHaveLength(0);
+    expect(operations.inputs).toHaveLength(2);
+    for (const input of operations.inputs) {
+      const operation = await operations.findByOperationKey(input.operationKey);
+      expect(operation).toMatchObject({
+        status: "failed",
+        legacyStatus: "403",
+        identityStatus: "skipped",
+        compensationStatus: "none"
+      });
+    }
+    expect(JSON.stringify(operations.inputs)).not.toContain("DeniedSecret123!");
+    expect(JSON.stringify(operations.inputs)).not.toContain("invalid-token");
+    expect(JSON.stringify(operations.inputs)).not.toContain(ordinaryToken);
   });
 
   it("resumes a ledger-only pending delete operation when dual-write needs to complete the identity shadow", async () => {
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_MODE = "full";
+    const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
+    process.env.IDENTITY_JWT_PRIVATE_KEY_PEM = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    process.env.IDENTITY_JWT_ISSUER = "identity-plugin-user-delete-test";
+    process.env.IDENTITY_JWT_AUDIENCE = "xrugc-plugin-user-delete";
+    const operator = await new FakeLegacyIdentityReader().getUserById(24);
+    const accessToken = new JwtIssuerService().issue(operator!, "plugin-user-delete-session-24").accessToken;
     const operations = new FakePluginUserWriteOperationRepository();
     const iamRepository = new FakeIamRepository();
     const requestBody = { id: 42 };
     const operationKey = pluginUserWriteOperationKey({
       route: "delete-user",
-      actorSubject: null,
+      actorSubject: "authorization:present",
       targetSubject: "legacy-user:42",
       requestFingerprint: pluginUserWriteRequestFingerprint("delete-user", requestBody)
     });
@@ -6340,7 +7085,7 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
       idempotencyKey: operationKey,
       route: "delete-user",
       mode: "dual-write",
-      actorSubject: null,
+      actorSubject: "authorization:present",
       targetSubject: "legacy-user:42",
       legacyUserId: 42,
       metadata: {
@@ -6358,6 +7103,7 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
     for (const _ of [0, 1]) {
       const response = await request(app.getHttpServer())
         .post("/v1/plugin-user/delete-user")
+        .set("Authorization", `Bearer ${accessToken}`)
         .send(requestBody)
         .expect(200);
 
@@ -6501,6 +7247,35 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
     });
     expect(key).toMatch(/^plugin-user-write:v1:create-user:[a-f0-9]{48}$/);
 
+    const explicitOperationIdentity = `idempotency:${createHash("sha256").update("same-client-key").digest("hex")}`;
+    const scopedKeys = [
+      pluginUserWriteOperationKey({
+        route: "create-user",
+        actorSubject: "legacy-user:24",
+        targetSubject: "username:stage-user",
+        requestFingerprint: explicitOperationIdentity
+      }),
+      pluginUserWriteOperationKey({
+        route: "update-user",
+        actorSubject: "legacy-user:24",
+        targetSubject: "legacy-user:42",
+        requestFingerprint: explicitOperationIdentity
+      }),
+      pluginUserWriteOperationKey({
+        route: "update-user",
+        actorSubject: "legacy-user:25",
+        targetSubject: "legacy-user:42",
+        requestFingerprint: explicitOperationIdentity
+      }),
+      pluginUserWriteOperationKey({
+        route: "update-user",
+        actorSubject: "legacy-user:24",
+        targetSubject: "legacy-user:43",
+        requestFingerprint: explicitOperationIdentity
+      })
+    ];
+    expect(new Set(scopedKeys)).toHaveLength(scopedKeys.length);
+
     const redacted = redactPluginUserWriteMetadata({
       username: "stage-user",
       password: "Secret123!",
@@ -6531,7 +7306,12 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
           username: "new-user",
           token: "should-not-persist",
           nested: {
-            password: "Secret123!"
+            password: "Secret123!",
+            code: "nested-verification-code"
+          },
+          responseHeaders: {
+            setCookie: "session=secret-cookie",
+            authorization: "Bearer response-secret"
           }
         }
       }
@@ -6539,7 +7319,7 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
 
     const replay = pluginUserWriteReplayResponseFromOperation({
       status: "completed",
-      metadata: responseReplay
+      metadata: redactPluginUserWriteOperationMetadata(responseReplay)
     });
     expect(replay).toEqual({
       status: 201,
@@ -6550,7 +7330,12 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
           username: "new-user",
           token: "[redacted]",
           nested: {
-            password: "[redacted]"
+            password: "[redacted]",
+            code: "[redacted]"
+          },
+          responseHeaders: {
+            setCookie: "[redacted]",
+            authorization: "[redacted]"
           }
         }
       }
@@ -6562,6 +7347,9 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
         metadata: responseReplay
       })
     ).toBeNull();
+    expect(JSON.stringify(responseReplay)).not.toContain("secret-cookie");
+    expect(JSON.stringify(responseReplay)).not.toContain("response-secret");
+    expect(JSON.stringify(responseReplay)).not.toContain("nested-verification-code");
     expect(
       pluginUserWriteReplayResponseFromOperation({
         status: "failed",
@@ -6796,6 +7584,7 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
       .set("Authorization", "Bearer operator-token")
       .set("X-Forwarded-For", "10.0.0.2")
       .set("User-Agent", "Vitest")
+      .set("Idempotency-Key", "legacy-proxy-operation")
       .send({
         username: "new-user",
         nickname: "New User",
@@ -6812,6 +7601,7 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
     expect(headers.get("Authorization")).toBe("Bearer operator-token");
     expect(headers.get("X-Forwarded-For")).toBe("10.0.0.2");
     expect(headers.get("User-Agent")).toBe("Vitest");
+    expect(headers.get("Idempotency-Key")).toBe("legacy-proxy-operation");
     expect(headers.get("X-Identity-Plugin-User-Write-Proxy")).toBe("1");
     expect(JSON.parse(String(init.body))).toEqual({
       username: "new-user",
@@ -7886,6 +8676,78 @@ describe("identity-adapter plugin user readonly compatibility API", () => {
         organizations: [{ id: 1, name: "test-university", title: "测试大学" }]
       }
     });
+    expect(response.headers["x-identity-user-source"]).toBe("identity-db");
+  });
+
+  it("reads an allowlisted owner target role from the Identity candidate", async () => {
+    const checksum = "a".repeat(64);
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_MODE = "allowlist";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ALLOWLIST = "uid:24";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "legacy-proxy";
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "identity-native";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_MODE = "allowlist";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_ALLOWLIST = "24";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE = "canary";
+    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = checksum;
+    const iamRepository = new FakeIamRepository();
+    iamRepository.subjectAssignments.set(24, [
+      { itemName: "user", itemType: "role" },
+      { itemName: "manager", itemType: "role" },
+      { itemName: "user-management.list-users", itemType: "permission" }
+    ]);
+    app = await createPluginUserReadonlyTestApp(repository, iamRepository);
+    const login = await loginAs(app, "guanfei");
+
+    const response = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users?id=24")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(200);
+
+    expect(response.body).toMatchObject({
+      code: 0,
+      data: {
+        id: 24,
+        username: "guanfei",
+        roles: ["user", "manager"]
+      }
+    });
+    expect(response.headers["x-identity-user-source"]).toBe("identity-db");
+  });
+
+  it("retains root from the Legacy shadow when non-root role ownership is full", async () => {
+    const checksum = "a".repeat(64);
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_MODE = "allowlist";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ALLOWLIST = "uid:24";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "legacy-proxy";
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "identity-native";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_MODE = "full";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE = "full";
+    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = checksum;
+    const iamRepository = new FakeIamRepository();
+    iamRepository.roleAssignments.set(24, [{
+      identityUserId: "id-user-24",
+      legacyUserId: 24,
+      roleName: "root",
+      source: "legacy-shadow",
+      status: "shadow",
+      observedAt: "2026-06-10T00:00:00.000Z"
+    }]);
+    iamRepository.subjectAssignments.set(24, [{ itemName: "admin", itemType: "role" }]);
+    app = await createPluginUserReadonlyTestApp(repository, iamRepository);
+    const login = await loginAs(app, "guanfei");
+
+    const response = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users?id=24")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(200);
+
+    expect(response.body.data.roles).toEqual(["root"]);
     expect(response.headers["x-identity-user-source"]).toBe("identity-db");
   });
 
