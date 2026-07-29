@@ -8717,6 +8717,81 @@ describe("identity-adapter plugin user readonly compatibility API", () => {
     expect(response.headers["x-identity-user-source"]).toBe("identity-db");
   });
 
+  it("overlays Identity-owned roles on legacy profile reads without widening primary-read rollout", async () => {
+    const checksum = "a".repeat(64);
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_MODE = "percentage";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_PERCENTAGE = "0";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "identity-native";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_MODE = "allowlist";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_ALLOWLIST = "24";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE = "canary";
+    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = checksum;
+    const iamRepository = new FakeIamRepository();
+    iamRepository.subjectAssignments.set(24, [
+      { itemName: "user", itemType: "role" },
+      { itemName: "manager", itemType: "role" }
+    ]);
+    app = await createPluginUserReadonlyTestApp(repository, iamRepository);
+    const login = await loginAs(app, "guanfei");
+
+    const detail = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users?id=24")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(200);
+    const list = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users?page=1&pageSize=1&search=guan&sort=id&order=asc")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(200);
+
+    expect(detail.body).toMatchObject({
+      code: 0,
+      data: {
+        id: 24,
+        username: "guanfei",
+        nickname: "babamama",
+        roles: ["user", "manager"]
+      }
+    });
+    expect(list.body.data[0]).toMatchObject({
+      id: 24,
+      username: "guanfei",
+      nickname: "babamama",
+      roles: ["user", "manager"]
+    });
+    expect(detail.headers["x-identity-user-source"]).toBe("legacy");
+    expect(list.headers["x-identity-user-source"]).toBe("legacy");
+  });
+
+  it("keeps unowned target roles on Legacy while role ownership is scoped", async () => {
+    const checksum = "a".repeat(64);
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_MODE = "percentage";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_PERCENTAGE = "0";
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "identity-native";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_MODE = "allowlist";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_ALLOWLIST = "25";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE = "canary";
+    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = checksum;
+    const iamRepository = new FakeIamRepository();
+    iamRepository.subjectAssignments.set(24, [{ itemName: "manager", itemType: "role" }]);
+    app = await createPluginUserReadonlyTestApp(repository, iamRepository);
+    const login = await loginAs(app, "guanfei");
+
+    const response = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users?id=24")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(200);
+
+    expect(response.body.data.roles).toEqual(["admin"]);
+    expect(response.headers["x-identity-user-source"]).toBe("legacy");
+  });
+
   it("retains root from the Legacy shadow when non-root role ownership is full", async () => {
     const checksum = "a".repeat(64);
     process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
