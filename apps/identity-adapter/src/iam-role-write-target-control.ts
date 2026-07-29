@@ -17,7 +17,12 @@ export interface IdentityNativeRoleWriteTargetScope {
 export interface IdentityNativeRoleWriteTargetDecision {
   owned: boolean;
   mode: IdentityNativeRoleWriteTargetMode;
-  reason: "single_target_owned" | "target_allowlist_owned" | "full_non_root_target_owned" | "target_not_owned";
+  reason:
+    | "single_target_owned"
+    | "target_allowlist_owned"
+    | "full_non_root_target_owned"
+    | "legacy_root_retained"
+    | "target_not_owned";
 }
 
 export function identityNativeRoleWriteTargetScope(

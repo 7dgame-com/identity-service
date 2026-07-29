@@ -12,7 +12,8 @@ import {
 import { IamRepository } from "./iam.repository.js";
 import {
   identityNativeRoleWriteTargetDecision,
-  identityNativeRoleWriteTargetScope
+  identityNativeRoleWriteTargetScope,
+  type IdentityNativeRoleWriteTargetDecision
 } from "./iam-role-write-target-control.js";
 import { createIamPermissionPolicySnapshot } from "./iam-permission-model.js";
 import { JwtIssuerService, type VerifiedAccessToken } from "./jwt-issuer.service.js";
@@ -381,7 +382,7 @@ export class IamRoleWriteService {
     const evidence = evidenceFromDecision(decision);
     const targetScope = identityNativeRoleWriteTargetScope(this.config.iam);
     const targetDecision = targetLegacyUserId
-      ? identityNativeRoleWriteTargetDecision(this.config.iam, targetLegacyUserId)
+      ? await this.identityNativeTargetDecision(targetLegacyUserId)
       : null;
     const effectiveSelected =
       this.config.iam.roleWriteMode === "identity-native"
@@ -764,8 +765,14 @@ export class IamRoleWriteService {
         message: "A target user and role are required."
       });
     }
-    const targetDecision = identityNativeRoleWriteTargetDecision(iam, targetLegacyUserId);
+    const targetDecision = await this.identityNativeTargetDecision(targetLegacyUserId);
     const actorDecision = this.dualWriteRolloutDecision(request, contract, correlationId, claims);
+    if (iam.roleWriteMode === "identity-native" && targetDecision.reason === "legacy_root_retained") {
+      throw new ConflictException({
+        code: "IAM_ROLE_WRITE_ROOT_PROTECTED",
+        message: "Root subjects remain Legacy-owned and cannot be changed by role-write."
+      });
+    }
     if (iam.roleWriteMode === "identity-native" && !targetDecision.owned) {
       const legacyDecision: RoleWriteRolloutDecision = {
         ...actorDecision,
@@ -804,6 +811,34 @@ export class IamRoleWriteService {
       : this.dualWrite(request, contract, evidence);
   }
 
+  private async identityNativeTargetDecision(
+    legacyUserId: number
+  ): Promise<IdentityNativeRoleWriteTargetDecision> {
+    const decision = identityNativeRoleWriteTargetDecision(this.config.iam, legacyUserId);
+    if (!decision.owned) {
+      return decision;
+    }
+
+    const checksum = this.config.iam.roleWritePolicyChecksum;
+    const candidateAssignments =
+      this.iamRepository.isConfigured() && /^[a-f0-9]{64}$/.test(checksum ?? "")
+        ? this.iamRepository.listSubjectAssignments(`legacy:${legacyUserId}`, checksum!)
+        : Promise.resolve([]);
+    const [legacyUser, legacyAssignments, identityAssignments] = await Promise.all([
+      this.legacyReader.getUserById(legacyUserId),
+      this.legacyReader.listUserRbacAssignments(legacyUserId),
+      candidateAssignments
+    ]);
+    const rootProtected =
+      legacyUser?.roles.includes("root") === true ||
+      legacyAssignments.some((assignment) => assignment.type === "role" && assignment.name === "root") ||
+      identityAssignments.some((assignment) => assignment.itemType === "role" && assignment.itemName === "root");
+
+    return rootProtected
+      ? { owned: false, mode: decision.mode, reason: "legacy_root_retained" }
+      : decision;
+  }
+
   private async identityNativeWrite(
     request: IamRoleWriteRequest,
     contract: RoleWriteContract,
@@ -821,7 +856,7 @@ export class IamRoleWriteService {
     if (!plan.legacyUserId || !plan.requestedRole) {
       throw new ConflictException({ code: "IAM_ROLE_WRITE_TARGET_REQUIRED", message: "A target user and role are required." });
     }
-    const targetDecision = identityNativeRoleWriteTargetDecision(this.config.iam, plan.legacyUserId);
+    const targetDecision = await this.identityNativeTargetDecision(plan.legacyUserId);
     if (!targetDecision.owned) {
       throw new ConflictException({
         code: "IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_MISMATCH",
