@@ -36,6 +36,12 @@ export interface PluginUserWriteOperationUpdate {
   metadata?: Record<string, unknown> | null;
 }
 
+export interface PluginUserWriteOperationReopenInput {
+  operationKey: string;
+  requestFingerprint: string;
+  metadata: Record<string, unknown>;
+}
+
 export interface PluginUserWriteOperationRecord {
   operationKey: string;
   idempotencyKey: string;
@@ -50,6 +56,7 @@ export interface PluginUserWriteOperationRecord {
   identityStatus: string | null;
   compensationStatus: PluginUserWriteCompensationStatus;
   errorCode: string | null;
+  requestedAt: string | null;
   metadata: Record<string, unknown>;
 }
 
@@ -147,6 +154,7 @@ export class PluginUserWriteOperationRepository implements OnModuleDestroy {
               identity_status AS identityStatus,
               compensation_status AS compensationStatus,
               error_code AS errorCode,
+              requested_at AS requestedAt,
               metadata
          FROM plugin_user_write_operations
         WHERE operation_key = ?
@@ -173,6 +181,7 @@ export class PluginUserWriteOperationRepository implements OnModuleDestroy {
       identityStatus: nullableString(row.identityStatus),
       compensationStatus: row.compensationStatus as PluginUserWriteCompensationStatus,
       errorCode: nullableString(row.errorCode),
+      requestedAt: dateString(row.requestedAt),
       metadata: parseMetadata(row.metadata)
     };
   }
@@ -203,6 +212,43 @@ export class PluginUserWriteOperationRepository implements OnModuleDestroy {
         input.operationKey
       ]
     );
+  }
+
+  /**
+   * A legacy 401 is the only failed write known not to have reached the
+   * mutation path. Keep every eligibility predicate in this UPDATE so two
+   * service instances cannot both reopen the same operation.
+   */
+  async reopenFailedLegacyUnauthorized(input: PluginUserWriteOperationReopenInput): Promise<boolean> {
+    const pool = this.requirePool();
+    await this.ensureSchema();
+
+    const [result] = await pool.execute<ResultSetHeader>(
+      `UPDATE plugin_user_write_operations
+          SET status = 'pending',
+              legacy_status = NULL,
+              identity_status = NULL,
+              compensation_status = 'none',
+              error_code = NULL,
+              completed_at = NULL,
+              metadata = ?
+        WHERE operation_key = ?
+          AND mode = 'dual-write'
+          AND status = 'failed'
+          AND legacy_status = '401'
+          AND identity_status = 'skipped'
+          AND compensation_status = 'none'
+          AND error_code = 'LegacyRejected'
+          AND JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.idempotencySource')) = 'client-header'
+          AND JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.requestFingerprint')) = ?`,
+      [
+        stringifyJson(redactPluginUserWriteOperationMetadata(input.metadata)),
+        input.operationKey,
+        input.requestFingerprint
+      ]
+    );
+
+    return result.affectedRows === 1;
   }
 
   async summarizeRecent(input: { sinceMinutes: number }): Promise<PluginUserWriteOperationSummaryRow[]> {

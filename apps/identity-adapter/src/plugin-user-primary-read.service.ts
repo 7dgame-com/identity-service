@@ -36,14 +36,14 @@ export class PluginUserPrimaryReadService {
 
     if (decision === "legacy") {
       this.logDecision("detail", claims, "legacy", false, false, false);
-      return { data: await this.legacyReader.getUserById(id), source: "legacy" };
+      return { data: await this.withAuthoritativeRoles(await this.legacyReader.getUserById(id)), source: "legacy" };
     }
 
     if (decision === "shadow-compare") {
       const legacy = await this.legacyReader.getUserById(id);
       const identity = await this.safeIdentityUserById(id);
       this.logComparison("detail", claims, compareUsers(legacy, identity.data), identity.fallbackReason);
-      return { data: legacy, source: "legacy" };
+      return { data: await this.withAuthoritativeRoles(legacy), source: "legacy" };
     }
 
     const identity = await this.safeIdentityUserById(id);
@@ -52,7 +52,9 @@ export class PluginUserPrimaryReadService {
       return { data: identity.data, source: "identity-db" };
     }
 
-    return this.fallback("detail", claims, identity.fallbackReason, () => this.legacyReader.getUserById(id));
+    return this.fallback("detail", claims, identity.fallbackReason, async () =>
+      this.withAuthoritativeRoles(await this.legacyReader.getUserById(id))
+    );
   }
 
   async listUsers(
@@ -63,7 +65,7 @@ export class PluginUserPrimaryReadService {
 
     if (decision === "legacy") {
       this.logDecision("list", claims, "legacy", false, false, false);
-      return { data: await this.legacyReader.listManagedUsers(input), source: "legacy" };
+      return { data: await this.withAuthoritativeListRoles(await this.legacyReader.listManagedUsers(input)), source: "legacy" };
     }
 
     if (decision === "shadow-compare") {
@@ -72,7 +74,7 @@ export class PluginUserPrimaryReadService {
         this.safeIdentityUserList(input)
       ]);
       this.logComparison("list", claims, compareLists(legacy, identity.data), identity.fallbackReason);
-      return { data: legacy, source: "legacy" };
+      return { data: await this.withAuthoritativeListRoles(legacy), source: "legacy" };
     }
 
     const identity = await this.safeIdentityUserList(input);
@@ -81,7 +83,9 @@ export class PluginUserPrimaryReadService {
       return { data: identity.data, source: "identity-db" };
     }
 
-    return this.fallback("list", claims, identity.fallbackReason, () => this.legacyReader.listManagedUsers(input));
+    return this.fallback("list", claims, identity.fallbackReason, async () =>
+      this.withAuthoritativeListRoles(await this.legacyReader.listManagedUsers(input))
+    );
   }
 
   private readDecision(claims: VerifiedAccessToken): "legacy" | "shadow-compare" | "primary" {
@@ -188,19 +192,33 @@ export class PluginUserPrimaryReadService {
     };
   }
 
-  private async managedRoleNames(legacyUserId: number): Promise<string[]> {
+  private async withAuthoritativeRoles(user: LegacyUserReadModel | null): Promise<LegacyUserReadModel | null> {
+    if (!user) return null;
+    return {
+      ...user,
+      roles: await this.managedRoleNames(user.id, user.roles)
+    };
+  }
+
+  private async withAuthoritativeListRoles(result: LegacyManagedUserListResult): Promise<LegacyManagedUserListResult> {
+    return {
+      ...result,
+      users: await Promise.all(result.users.map(async (user) => (await this.withAuthoritativeRoles(user))!))
+    };
+  }
+
+  private async managedRoleNames(legacyUserId: number, observedRoleNames?: string[]): Promise<string[]> {
     const roleWrite = this.config.iam;
-    const shadowRoles = await this.repository.listRoleAssignmentsShadow(legacyUserId);
-    const shadowRoleNames = shadowRoles.map((role) => role.roleName);
-    if (shadowRoleNames.includes("root")) {
-      return shadowRoleNames;
+    const currentRoleNames = observedRoleNames ?? (await this.repository.listRoleAssignmentsShadow(legacyUserId)).map((role) => role.roleName);
+    if (currentRoleNames.includes("root")) {
+      return currentRoleNames;
     }
     const ownsTarget = roleWrite.roleWriteMode === "identity-native"
       && roleWrite.roleWriteIdentityNativeExecutionEnabled
       && identityNativeRoleWriteTargetDecision(roleWrite, legacyUserId).owned;
 
     if (!ownsTarget) {
-      return shadowRoleNames;
+      return currentRoleNames;
     }
 
     const policyChecksum = (roleWrite.roleWritePolicyChecksum ?? "").trim().toLowerCase();

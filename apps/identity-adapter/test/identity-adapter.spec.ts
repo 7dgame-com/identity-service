@@ -46,6 +46,7 @@ import {
   PluginUserWriteOperationInput,
   PluginUserWriteOperationRecord,
   PluginUserWriteOperationRecentRow,
+  PluginUserWriteOperationReopenInput,
   PluginUserWriteOperationSummaryRow,
   PluginUserWriteOperationRepository,
   pluginUserWriteCompensationMetadata,
@@ -266,7 +267,11 @@ class FakePluginUserWriteOperationRepository {
   configured = true;
   readonly inputs: PluginUserWriteOperationInput[] = [];
   readonly attempts: PluginUserWriteOperationInput[] = [];
+  readonly reopenAttempts: PluginUserWriteOperationReopenInput[] = [];
+  readonly reopenWinners: PluginUserWriteOperationReopenInput[] = [];
   failNextBegin = false;
+  beforeRejectedReopenReturn: ((input: PluginUserWriteOperationReopenInput) => Promise<void>) | null = null;
+  onRecordUpdated: ((record: PluginUserWriteOperationRecord) => void) | null = null;
   private readonly seenOperationKeys = new Set<string>();
   private readonly records = new Map<string, PluginUserWriteOperationRecord>();
 
@@ -299,6 +304,7 @@ class FakePluginUserWriteOperationRepository {
         identityStatus: null,
         compensationStatus: "none",
         errorCode: null,
+        requestedAt: new Date().toISOString(),
         metadata: redactPluginUserWriteOperationMetadata(input.metadata)
       });
     }
@@ -308,6 +314,14 @@ class FakePluginUserWriteOperationRepository {
 
   async findByOperationKey(operationKey: string) {
     return this.records.get(operationKey) ?? null;
+  }
+
+  setRequestedAt(operationKey: string, requestedAt: string): void {
+    const current = this.records.get(operationKey);
+    if (!current) {
+      throw new Error("PluginUserWriteOperationNotFound");
+    }
+    this.records.set(operationKey, { ...current, requestedAt });
   }
 
   async update(input: {
@@ -323,7 +337,7 @@ class FakePluginUserWriteOperationRepository {
     if (!current) {
       return;
     }
-    this.records.set(input.operationKey, {
+    const updated = {
       ...current,
       status: input.status,
       legacyStatus: input.legacyStatus ?? current.legacyStatus,
@@ -331,7 +345,41 @@ class FakePluginUserWriteOperationRepository {
       compensationStatus: input.compensationStatus ?? current.compensationStatus,
       errorCode: input.errorCode ?? null,
       metadata: redactPluginUserWriteOperationMetadata(input.metadata)
-    });
+    };
+    this.records.set(input.operationKey, updated);
+    this.onRecordUpdated?.(updated);
+  }
+
+  async reopenFailedLegacyUnauthorized(input: PluginUserWriteOperationReopenInput): Promise<boolean> {
+    this.reopenAttempts.push(input);
+    const current = this.records.get(input.operationKey);
+    const eligible =
+      current?.mode === "dual-write" &&
+      current.status === "failed" &&
+      current.legacyStatus === "401" &&
+      current.identityStatus === "skipped" &&
+      current.compensationStatus === "none" &&
+      current.errorCode === "LegacyRejected" &&
+      current.metadata.idempotencySource === "client-header" &&
+      current.metadata.requestFingerprint === input.requestFingerprint;
+    if (!eligible || !current) {
+      await this.beforeRejectedReopenReturn?.(input);
+      return false;
+    }
+
+    const reopened = {
+      ...current,
+      status: "pending" as const,
+      legacyStatus: null,
+      identityStatus: null,
+      compensationStatus: "none" as const,
+      errorCode: null,
+      metadata: redactPluginUserWriteOperationMetadata(input.metadata)
+    };
+    this.records.set(input.operationKey, reopened);
+    this.reopenWinners.push(input);
+    this.onRecordUpdated?.(reopened);
+    return true;
   }
 
   async summarizeRecent(_input: { sinceMinutes: number }): Promise<PluginUserWriteOperationSummaryRow[]> {
@@ -6355,6 +6403,9 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
         idempotencyKeyFormat: "plugin-user-write:v1:<route>:<sha256-48>",
         idempotencyBehavior:
           "explicit Idempotency-Key replays; ordinary browser submits receive a unique operation key per request",
+        authorizationRetryBehavior:
+          "client-header operations rejected by legacy with 401 may be atomically reopened after authorization refresh",
+        legacyDeleteReplayMaxAgeDays: 45,
         redactionPolicy: "metadata-only-no-secret-payloads",
         compensationRecordsRequired: true,
         shadow: {
@@ -6960,6 +7011,324 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
     }
   });
 
+  it("reopens one exact client-header legacy 401 retry and completes it without retaining secrets", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_MODE = "full";
+    const operations = new FakePluginUserWriteOperationRepository();
+    const iamRepository = new FakeIamRepository();
+    app = await createLifecycleTestApp(operations, iamRepository);
+    const rawIdempotencyKey = "manager-expired-session-retry";
+    const firstPassword = "ManagerRetrySecret123!";
+    const secondPassword = "ManagerRetrySecret456!";
+    const legacyToken = "legacy-expired-token-value";
+    const expiredAuthorizationToken = "expired-authorization-token";
+    const refreshedAuthorizationToken = "refreshed-authorization-token";
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(
+        JSON.stringify({
+          code: 4010,
+          message: "登录已过期",
+          debug: { password: firstPassword, token: legacyToken }
+        }),
+        { status: 401, headers: { "Content-Type": "application/json" } }
+      ))
+      .mockResolvedValueOnce(new Response(
+        JSON.stringify({ code: 0, data: { id: 42, username: "manager" } }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      ));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/update-user")
+      .set("Authorization", `Bearer ${expiredAuthorizationToken}`)
+      .set("Idempotency-Key", rawIdempotencyKey)
+      .send({ id: 42, nickname: "Manager", password: firstPassword })
+      .expect(401);
+
+    const operationKey = operations.inputs[0]!.operationKey;
+    const failed = await operations.findByOperationKey(operationKey);
+    expect(failed).toMatchObject({
+      actorSubject: "authorization:present",
+      status: "failed",
+      legacyStatus: "401",
+      identityStatus: "skipped",
+      compensationStatus: "none",
+      errorCode: "LegacyRejected",
+      metadata: {
+        idempotencySource: "client-header",
+        requestFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/),
+        responseReplay: {
+          httpStatus: 401,
+          body: {
+            debug: { password: "[redacted]", token: "[redacted]" }
+          }
+        }
+      }
+    });
+    expect(JSON.stringify(failed)).not.toContain(firstPassword);
+    expect(JSON.stringify(failed)).not.toContain(legacyToken);
+    expect(JSON.stringify(failed)).not.toContain(expiredAuthorizationToken);
+    expect(JSON.stringify(failed)).not.toContain(rawIdempotencyKey);
+
+    const retry = await request(app.getHttpServer())
+      .post("/v1/plugin-user/update-user")
+      .set("Authorization", `Bearer ${refreshedAuthorizationToken}`)
+      .set("Idempotency-Key", rawIdempotencyKey)
+      .send({ id: 42, nickname: "Manager", password: secondPassword })
+      .expect(200);
+
+    expect(retry.body).toEqual({ code: 0, data: { id: 42, username: "manager" } });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(operations.reopenAttempts).toHaveLength(1);
+    expect(operations.reopenWinners).toHaveLength(1);
+    expect(operations.reopenAttempts[0]).toMatchObject({
+      operationKey,
+      requestFingerprint: failed?.metadata.requestFingerprint
+    });
+    expect(iamRepository.identityShadowWrites).toHaveLength(1);
+    const completed = await operations.findByOperationKey(operationKey);
+    expect(completed).toMatchObject({
+      status: "completed",
+      legacyStatus: "200",
+      identityStatus: "completed",
+      compensationStatus: "none",
+      errorCode: null
+    });
+    const evidence = JSON.stringify({ completed, reopenAttempts: operations.reopenAttempts });
+    expect(evidence).not.toContain(firstPassword);
+    expect(evidence).not.toContain(secondPassword);
+    expect(evidence).not.toContain(legacyToken);
+    expect(evidence).not.toContain(expiredAuthorizationToken);
+    expect(evidence).not.toContain(refreshedAuthorizationToken);
+    expect(evidence).not.toContain(rawIdempotencyKey);
+  });
+
+  it("allows only one concurrent failed-401 reopen winner while a loser fails closed", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_MODE = "full";
+    const operations = new FakePluginUserWriteOperationRepository();
+    const iamRepository = new FakeIamRepository();
+    app = await createLifecycleTestApp(operations, iamRepository);
+    const secondNode = await createLifecycleTestApp(operations, iamRepository);
+    let releaseLegacyRetry!: (response: Response) => void;
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(
+        JSON.stringify({ code: 4010, message: "登录已过期" }),
+        { status: 401, headers: { "Content-Type": "application/json" } }
+      ))
+      .mockImplementationOnce(() => new Promise<Response>((resolve) => {
+        releaseLegacyRetry = resolve;
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+    const idempotencyKey = "concurrent-expired-session-retry";
+    const body = { id: 42, nickname: "Concurrent Manager", password: "ConcurrentSecret123!" };
+
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/update-user")
+      .set("Idempotency-Key", idempotencyKey)
+      .send(body)
+      .expect(401);
+
+    const winnerRequest = request(app.getHttpServer())
+      .post("/v1/plugin-user/update-user")
+      .set("Idempotency-Key", idempotencyKey)
+      .send(body)
+      .then((response) => response);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    try {
+      const loser = await request(secondNode.getHttpServer())
+        .post("/v1/plugin-user/update-user")
+        .set("Idempotency-Key", idempotencyKey)
+        .send(body)
+        .expect(503);
+
+      expect(loser.body).toMatchObject({ code: "PLUGIN_USER_WRITE_REPLAY_UNAVAILABLE" });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(operations.reopenAttempts).toHaveLength(2);
+      expect(operations.reopenWinners).toHaveLength(1);
+
+      releaseLegacyRetry(new Response(
+        JSON.stringify({ code: 0, data: { id: 42, username: "manager" } }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      ));
+      const winner = await winnerRequest;
+      expect(winner.status).toBe(200);
+
+      await request(secondNode.getHttpServer())
+        .post("/v1/plugin-user/update-user")
+        .set("Idempotency-Key", idempotencyKey)
+        .send(body)
+        .expect(200);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(iamRepository.identityShadowWrites).toHaveLength(1);
+    } finally {
+      await secondNode.close();
+    }
+  });
+
+  it("returns the concurrent winner replay when a CAS loser refetches after completion", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_MODE = "full";
+    const operations = new FakePluginUserWriteOperationRepository();
+    const iamRepository = new FakeIamRepository();
+    app = await createLifecycleTestApp(operations, iamRepository);
+    const secondNode = await createLifecycleTestApp(operations, iamRepository);
+    let releaseLegacyRetry!: (response: Response) => void;
+    let resolveWinnerCompleted!: () => void;
+    const winnerCompleted = new Promise<void>((resolve) => {
+      resolveWinnerCompleted = resolve;
+    });
+    operations.onRecordUpdated = (record) => {
+      if (record.status === "completed") {
+        resolveWinnerCompleted();
+      }
+    };
+    operations.beforeRejectedReopenReturn = async () => winnerCompleted;
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(
+        JSON.stringify({ code: 4010, message: "登录已过期" }),
+        { status: 401, headers: { "Content-Type": "application/json" } }
+      ))
+      .mockImplementationOnce(() => new Promise<Response>((resolve) => {
+        releaseLegacyRetry = resolve;
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+    const idempotencyKey = "concurrent-completed-replay";
+    const body = { id: 42, nickname: "Concurrent Manager", password: "ConcurrentSecret456!" };
+
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/update-user")
+      .set("Idempotency-Key", idempotencyKey)
+      .send(body)
+      .expect(401);
+
+    const winnerRequest = request(app.getHttpServer())
+      .post("/v1/plugin-user/update-user")
+      .set("Idempotency-Key", idempotencyKey)
+      .send(body)
+      .then((response) => response);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    const loserRequest = request(secondNode.getHttpServer())
+      .post("/v1/plugin-user/update-user")
+      .set("Idempotency-Key", idempotencyKey)
+      .send(body)
+      .then((response) => response);
+    await vi.waitFor(() => expect(operations.reopenAttempts).toHaveLength(2));
+
+    try {
+      releaseLegacyRetry(new Response(
+        JSON.stringify({ code: 0, data: { id: 42, username: "manager" } }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      ));
+      const [winner, loser] = await Promise.all([winnerRequest, loserRequest]);
+      expect(winner.status).toBe(200);
+      expect(loser.status).toBe(200);
+      expect(loser.body).toEqual({ code: 0, data: { id: 42, username: "manager" } });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(operations.reopenWinners).toHaveLength(1);
+      expect(iamRepository.identityShadowWrites).toHaveLength(1);
+    } finally {
+      await secondNode.close();
+    }
+  });
+
+  it("does not reopen explicit-key legacy rejections other than 401", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_MODE = "full";
+    const operations = new FakePluginUserWriteOperationRepository();
+    app = await createLifecycleTestApp(operations, new FakeIamRepository());
+    const statuses = [400, 403, 500, 502, 503, 504];
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    for (const status of statuses) {
+      fetchMock.mockResolvedValueOnce(new Response(
+        JSON.stringify({ code: status, message: `legacy rejected ${status}` }),
+        { status, headers: { "Content-Type": "application/json" } }
+      ));
+      const idempotencyKey = `non-retryable-status-${status}`;
+      const body = { id: status, nickname: "Rejected Manager", password: `RejectedSecret${status}!` };
+
+      await request(app.getHttpServer())
+        .post("/v1/plugin-user/update-user")
+        .set("Idempotency-Key", idempotencyKey)
+        .send(body)
+        .expect(status);
+
+      const duplicate = await request(app.getHttpServer())
+        .post("/v1/plugin-user/update-user")
+        .set("Idempotency-Key", idempotencyKey)
+        .send(body)
+        .expect(503);
+      expect(duplicate.body).toMatchObject({ code: "PLUGIN_USER_WRITE_REPLAY_UNAVAILABLE" });
+    }
+
+    expect(fetchMock).toHaveBeenCalledTimes(statuses.length);
+    expect(operations.reopenAttempts).toHaveLength(statuses.length);
+    expect(operations.reopenWinners).toHaveLength(0);
+    for (const [index, status] of statuses.entries()) {
+      await expect(operations.findByOperationKey(operations.inputs[index]!.operationKey)).resolves.toMatchObject({
+        status: "failed",
+        legacyStatus: String(status),
+        identityStatus: "skipped",
+        compensationStatus: "none",
+        errorCode: "LegacyRejected"
+      });
+      expect(JSON.stringify(operations.inputs[index])).not.toContain(`non-retryable-status-${status}`);
+      expect(JSON.stringify(operations.inputs[index])).not.toContain(`RejectedSecret${status}!`);
+    }
+  });
+
+  it("does not reopen an ambiguous legacy timeout", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_MODE = "full";
+    const operations = new FakePluginUserWriteOperationRepository();
+    app = await createLifecycleTestApp(operations, new FakeIamRepository());
+    const fetchMock = vi.fn(async () => {
+      throw new Error("simulated timeout");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const idempotencyKey = "ambiguous-timeout-operation";
+    const password = "TimeoutSecret123!";
+    const body = { id: 42, nickname: "Timeout Manager", password };
+
+    const initial = await request(app.getHttpServer())
+      .post("/v1/plugin-user/update-user")
+      .set("Idempotency-Key", idempotencyKey)
+      .send(body)
+      .expect(503);
+    expect(initial.body).toMatchObject({ code: "PLUGIN_USER_WRITE_LEGACY_API_UNAVAILABLE" });
+
+    const duplicate = await request(app.getHttpServer())
+      .post("/v1/plugin-user/update-user")
+      .set("Idempotency-Key", idempotencyKey)
+      .send(body)
+      .expect(503);
+    expect(duplicate.body).toMatchObject({ code: "PLUGIN_USER_WRITE_REPLAY_UNAVAILABLE" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(operations.reopenAttempts).toHaveLength(1);
+    expect(operations.reopenWinners).toHaveLength(0);
+    const operation = await operations.findByOperationKey(operations.inputs[0]!.operationKey);
+    expect(operation).toMatchObject({
+      status: "failed",
+      legacyStatus: "unavailable",
+      identityStatus: "skipped",
+      compensationStatus: "none",
+      errorCode: "ServiceUnavailableException"
+    });
+    expect(JSON.stringify(operation)).not.toContain(idempotencyKey);
+    expect(JSON.stringify(operation)).not.toContain(password);
+  });
+
   it("validates explicit idempotency header boundaries without echoing values", async () => {
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
@@ -7193,6 +7562,76 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
     const operation = await operations.findByOperationKey(operationKey);
     expect(operation).toMatchObject({
       route: "delete-user",
+      status: "completed",
+      legacyStatus: "200",
+      identityStatus: "completed",
+      compensationStatus: "none"
+    });
+  });
+
+  it("does not replay legacy delete compatibility evidence after the 45 day safety window", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_MODE = "full";
+    const operations = new FakePluginUserWriteOperationRepository();
+    const iamRepository = new FakeIamRepository();
+    const requestBody = { id: 42 };
+    const legacyOperationKey = pluginUserWriteOperationKey({
+      route: "delete-user",
+      actorSubject: null,
+      targetSubject: "legacy-user:42",
+      requestFingerprint: pluginUserWriteRequestFingerprint("delete-user", requestBody)
+    });
+    await operations.begin({
+      operationKey: legacyOperationKey,
+      idempotencyKey: legacyOperationKey,
+      route: "delete-user",
+      mode: "dual-write",
+      actorSubject: null,
+      targetSubject: "legacy-user:42",
+      legacyUserId: 42,
+      metadata: {
+        route: "delete-user",
+        method: "POST",
+        targetSubject: "legacy-user:42",
+        redactedBody: requestBody
+      }
+    });
+    await operations.update({
+      operationKey: legacyOperationKey,
+      status: "completed",
+      legacyStatus: "200",
+      identityStatus: "completed",
+      compensationStatus: "none",
+      metadata: pluginUserWriteResponseReplayMetadata({
+        status: 200,
+        body: { code: 0, data: { id: 42 }, message: "old replay" }
+      })
+    });
+    operations.setRequestedAt(
+      legacyOperationKey,
+      new Date(Date.now() - 46 * 24 * 60 * 60 * 1000).toISOString()
+    );
+    app = await createLifecycleTestApp(operations, iamRepository);
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ code: 0, data: { id: 42 }, message: "fresh delete" }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await request(app.getHttpServer())
+      .post("/v1/plugin-user/delete-user")
+      .set("Idempotency-Key", "fresh-delete-after-compatibility-window")
+      .send(requestBody)
+      .expect(200);
+
+    expect(response.body).toEqual({ code: 0, data: { id: 42 }, message: "fresh delete" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(operations.inputs).toHaveLength(2);
+    expect(operations.inputs[1]!.operationKey).not.toBe(legacyOperationKey);
+    await expect(operations.findByOperationKey(operations.inputs[1]!.operationKey)).resolves.toMatchObject({
       status: "completed",
       legacyStatus: "200",
       identityStatus: "completed",
@@ -8715,6 +9154,81 @@ describe("identity-adapter plugin user readonly compatibility API", () => {
       }
     });
     expect(response.headers["x-identity-user-source"]).toBe("identity-db");
+  });
+
+  it("overlays Identity-owned roles on legacy profile reads without widening primary-read rollout", async () => {
+    const checksum = "a".repeat(64);
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_MODE = "percentage";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_PERCENTAGE = "0";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "identity-native";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_MODE = "allowlist";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_ALLOWLIST = "24";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE = "canary";
+    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = checksum;
+    const iamRepository = new FakeIamRepository();
+    iamRepository.subjectAssignments.set(24, [
+      { itemName: "user", itemType: "role" },
+      { itemName: "manager", itemType: "role" }
+    ]);
+    app = await createPluginUserReadonlyTestApp(repository, iamRepository);
+    const login = await loginAs(app, "guanfei");
+
+    const detail = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users?id=24")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(200);
+    const list = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users?page=1&pageSize=1&search=guan&sort=id&order=asc")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(200);
+
+    expect(detail.body).toMatchObject({
+      code: 0,
+      data: {
+        id: 24,
+        username: "guanfei",
+        nickname: "babamama",
+        roles: ["user", "manager"]
+      }
+    });
+    expect(list.body.data[0]).toMatchObject({
+      id: 24,
+      username: "guanfei",
+      nickname: "babamama",
+      roles: ["user", "manager"]
+    });
+    expect(detail.headers["x-identity-user-source"]).toBe("legacy");
+    expect(list.headers["x-identity-user-source"]).toBe("legacy");
+  });
+
+  it("keeps unowned target roles on Legacy while role ownership is scoped", async () => {
+    const checksum = "a".repeat(64);
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_MODE = "percentage";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_PERCENTAGE = "0";
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "identity-native";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_MODE = "allowlist";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_ALLOWLIST = "25";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE = "canary";
+    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = checksum;
+    const iamRepository = new FakeIamRepository();
+    iamRepository.subjectAssignments.set(24, [{ itemName: "manager", itemType: "role" }]);
+    app = await createPluginUserReadonlyTestApp(repository, iamRepository);
+    const login = await loginAs(app, "guanfei");
+
+    const response = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users?id=24")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(200);
+
+    expect(response.body.data.roles).toEqual(["admin"]);
+    expect(response.headers["x-identity-user-source"]).toBe("legacy");
   });
 
   it("retains root from the Legacy shadow when non-root role ownership is full", async () => {
