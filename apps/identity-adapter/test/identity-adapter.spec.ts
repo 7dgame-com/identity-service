@@ -8127,6 +8127,42 @@ describe("identity-adapter plugin user readonly compatibility API", () => {
     expect(response.headers["x-identity-user-source"]).toBe("identity-db");
   });
 
+  it("reads the selected target role from the Identity candidate while identity-native owns role writes", async () => {
+    const checksum = "a".repeat(64);
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_MODE = "allowlist";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ALLOWLIST = "uid:24";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "legacy-proxy";
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "identity-native";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_LEGACY_USER_ID = "24";
+    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = checksum;
+    const iamRepository = new FakeIamRepository();
+    iamRepository.subjectAssignments.set(24, [
+      { itemName: "user", itemType: "role" },
+      { itemName: "manager", itemType: "role" },
+      { itemName: "user-management.list-users", itemType: "permission" }
+    ]);
+    app = await createPluginUserReadonlyTestApp(repository, iamRepository);
+    const login = await loginAs(app, "guanfei");
+
+    const response = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users?id=24")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(200);
+
+    expect(response.body).toMatchObject({
+      code: 0,
+      data: {
+        id: 24,
+        username: "guanfei",
+        roles: ["user", "manager"]
+      }
+    });
+    expect(response.headers["x-identity-user-source"]).toBe("identity-db");
+  });
+
   it("keeps plugin-user reads on legacy while plugin-user writes are legacy-proxy", async () => {
     process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
     process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ENABLED = "true";
