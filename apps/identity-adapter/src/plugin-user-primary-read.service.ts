@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { Injectable, Logger, ServiceUnavailableException } from "@nestjs/common";
 import { loadConfig } from "./config.js";
+import { identityNativeRoleWriteTargetDecision } from "./iam-role-write-target-control.js";
 import { IdentityOrganizationShadowRow, IdentityUserRow, IamRepository } from "./iam.repository.js";
 import { VerifiedAccessToken } from "./jwt-issuer.service.js";
 import {
@@ -84,7 +85,10 @@ export class PluginUserPrimaryReadService {
   }
 
   private readDecision(claims: VerifiedAccessToken): "legacy" | "shadow-compare" | "primary" {
-    if (this.config.iam.pluginUserWriteMode === "legacy-proxy") {
+    if (
+      this.config.iam.pluginUserWriteMode === "legacy-proxy"
+      && this.config.iam.roleWriteMode !== "identity-native"
+    ) {
       return "legacy";
     }
 
@@ -163,8 +167,8 @@ export class PluginUserPrimaryReadService {
     }
 
     const metadata = recordMetadata(identity.metadata);
-    const [roles, organizations] = await Promise.all([
-      this.repository.listRoleAssignmentsShadow(legacyUserId),
+    const [roleNames, organizations] = await Promise.all([
+      this.managedRoleNames(legacyUserId),
       this.repository.listOrganizationMembershipsShadow(legacyUserId)
     ]);
 
@@ -178,10 +182,43 @@ export class PluginUserPrimaryReadService {
       createdAt: numberOrNull(metadata.legacyCreatedAt) ?? secondsFromIso(identity.createdAt),
       updatedAt: numberOrNull(metadata.legacyUpdatedAt) ?? secondsFromIso(identity.updatedAt),
       userInfo: metadata.legacyUserInfo ?? null,
-      roles: roles.map((role) => role.roleName),
+      roles: roleNames,
       organizations: organizations.map(toLegacyOrganization),
       source: "legacy"
     };
+  }
+
+  private async managedRoleNames(legacyUserId: number): Promise<string[]> {
+    const roleWrite = this.config.iam;
+    const shadowRoles = await this.repository.listRoleAssignmentsShadow(legacyUserId);
+    const shadowRoleNames = shadowRoles.map((role) => role.roleName);
+    if (shadowRoleNames.includes("root")) {
+      return shadowRoleNames;
+    }
+    const ownsTarget = roleWrite.roleWriteMode === "identity-native"
+      && roleWrite.roleWriteIdentityNativeExecutionEnabled
+      && identityNativeRoleWriteTargetDecision(roleWrite, legacyUserId).owned;
+
+    if (!ownsTarget) {
+      return shadowRoleNames;
+    }
+
+    const policyChecksum = (roleWrite.roleWritePolicyChecksum ?? "").trim().toLowerCase();
+    if (!/^[a-f0-9]{64}$/.test(policyChecksum)) {
+      throw new Error("identity_native_role_read_policy_checksum_missing");
+    }
+
+    const assignments = await this.repository.listSubjectAssignments(
+      `legacy:${legacyUserId}`,
+      policyChecksum
+    );
+    const roles = assignments
+      .filter((assignment) => assignment.itemType === "role")
+      .map((assignment) => assignment.itemName);
+    if (roles.length === 0) {
+      throw new Error("identity_native_role_read_assignment_missing");
+    }
+    return roles;
   }
 
   private async fallback<T>(

@@ -120,6 +120,12 @@ export const configSchema = z.object({
     roleWriteLegacyApiBaseUrl: optionalStringFromEnv,
     roleWriteTimeoutMs: numberFromEnv.default(1500),
     roleWriteDualWriteExecutionEnabled: boolFromEnv.default(false),
+    roleWriteIdentityNativeExecutionEnabled: boolFromEnv.default(false),
+    roleWriteIdentityNativeTargetMode: z.enum(["single-target", "allowlist", "full"]).default("single-target"),
+    roleWriteIdentityNativeTargetLegacyUserId: numberFromEnv
+      .transform((value) => value ?? 0)
+      .pipe(z.number().int().min(0)),
+    roleWriteIdentityNativeTargetAllowlist: z.string().default(""),
     roleWriteRolloutMode: z.enum(["off", "canary", "percentage", "full"]).default("off"),
     roleWriteRolloutAllowlist: z.string().default(""),
     roleWriteRolloutPercentage: numberFromEnv.default(0),
@@ -349,6 +355,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
         env.IDENTITY_IAM_PLUGIN_USER_WRITE_TIMEOUT_MS ??
         env.IDENTITY_ACCOUNT_LIFECYCLE_TIMEOUT_MS,
       roleWriteDualWriteExecutionEnabled: env.IDENTITY_IAM_ROLE_WRITE_DUAL_WRITE_EXECUTION_ENABLED,
+      roleWriteIdentityNativeExecutionEnabled: env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_EXECUTION_ENABLED,
+      roleWriteIdentityNativeTargetMode: env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_MODE,
+      roleWriteIdentityNativeTargetLegacyUserId: env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_LEGACY_USER_ID,
+      roleWriteIdentityNativeTargetAllowlist: env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_ALLOWLIST,
       roleWriteRolloutMode: env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE,
       roleWriteRolloutAllowlist: env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_ALLOWLIST,
       roleWriteRolloutPercentage: env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_PERCENTAGE,
