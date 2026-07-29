@@ -5605,6 +5605,55 @@ describe("identity-adapter IAM role write API", () => {
     ]);
   });
 
+  it("keeps a Legacy root target outside the full Identity role owner", async () => {
+    const iamRepository = new FakeIamRepository();
+    const checksum = await seedRoleWritePolicy(iamRepository);
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "identity-native";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_MODE = "full";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE = "full";
+    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = checksum;
+    const operations = new FakePluginUserWriteOperationRepository();
+    const legacyReader = new FakeLegacyIdentityReader();
+    legacyReader.setUserRbacAssignments(24, [{ name: "root", type: "role" }]);
+    const fetchMock = vi.fn(async () => new Response(
+      JSON.stringify({ code: 0, data: { id: 24, role: "root" } }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+    app = await createLifecycleTestApp(operations, iamRepository, undefined, undefined, legacyReader);
+
+    const preview = await request(app.getHttpServer())
+      .get("/v1/plugin-user/role-write-decision")
+      .query({ targetLegacyUserId: 24 })
+      .set("Authorization", `Bearer ${roleWriteAccessToken(24, "guanfei", ["root"])}`)
+      .expect(200);
+    expect(preview.body.data).toMatchObject({
+      writePerformed: false,
+      roleWriteMode: "identity-native",
+      rolloutMode: "full",
+      selected: true,
+      effectiveSelected: false,
+      effectiveWriteOwner: "legacy",
+      sourceOfTruth: "legacy",
+      targetOwned: false,
+      targetReason: "legacy_root_retained",
+      identityNativeExecutable: true
+    });
+
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/change-role")
+      .set("Authorization", `Bearer ${roleWriteAccessToken(24, "guanfei", ["root"])}`)
+      .set("Idempotency-Key", "native-full-root-retained")
+      .send({ id: 24, role: "user" })
+      .expect(409)
+      .expect(({ body }) => expect(body.code).toBe("IAM_ROLE_WRITE_ROOT_PROTECTED"));
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(operations.inputs).toHaveLength(0);
+    expect(iamRepository.subjectAssignments.get(24)).toBeUndefined();
+  });
+
   it("fails closed when an Identity-owned target has no materialized candidate", async () => {
     const iamRepository = new FakeIamRepository();
     const checksum = await seedRoleWritePolicy(iamRepository);
