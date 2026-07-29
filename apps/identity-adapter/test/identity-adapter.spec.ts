@@ -53,6 +53,7 @@ import {
   pluginUserWriteReplayResponseFromOperation,
   pluginUserWriteRequestFingerprint,
   pluginUserWriteResponseReplayMetadata,
+  redactPluginUserWriteOperationMetadata,
   redactPluginUserWriteMetadata
 } from "../src/plugin-user-write-operation.repository.js";
 import {
@@ -298,7 +299,7 @@ class FakePluginUserWriteOperationRepository {
         identityStatus: null,
         compensationStatus: "none",
         errorCode: null,
-        metadata: input.metadata ?? {}
+        metadata: redactPluginUserWriteOperationMetadata(input.metadata)
       });
     }
 
@@ -329,7 +330,7 @@ class FakePluginUserWriteOperationRepository {
       identityStatus: input.identityStatus ?? current.identityStatus,
       compensationStatus: input.compensationStatus ?? current.compensationStatus,
       errorCode: input.errorCode ?? null,
-      metadata: input.metadata ?? {}
+      metadata: redactPluginUserWriteOperationMetadata(input.metadata)
     });
   }
 
@@ -392,7 +393,11 @@ class FakePluginUserWriteOperationRepository {
       idempotencyKeyDigest: createHash("sha256").update(operation.idempotencyKey).digest("hex").slice(0, 16),
       legacyUserId: operation.legacyUserId ?? null,
       requestedAt: "2026-06-30T00:00:00.000Z",
-      completedAt: null
+      completedAt: null,
+      idempotencySource:
+        operation.metadata.idempotencySource === "client-header" || operation.metadata.idempotencySource === "per-request"
+          ? operation.metadata.idempotencySource
+          : null
     }));
   }
 }
@@ -6128,6 +6133,8 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
         dualWriteExecutionEnabled: false,
         operationLedgerSchemaAutoEnsure: false,
         idempotencyKeyFormat: "plugin-user-write:v1:<route>:<sha256-48>",
+        idempotencyBehavior:
+          "explicit Idempotency-Key replays; ordinary browser submits receive a unique operation key per request",
         redactionPolicy: "metadata-only-no-secret-payloads",
         compensationRecordsRequired: true,
         shadow: {
@@ -6344,6 +6351,12 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_MODE = "canary";
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_ALLOWLIST = "username:new-user";
+    const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
+    process.env.IDENTITY_JWT_PRIVATE_KEY_PEM = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    process.env.IDENTITY_JWT_ISSUER = "identity-plugin-user-write-test";
+    process.env.IDENTITY_JWT_AUDIENCE = "xrugc-plugin-user-write";
+    const operator = await new FakeLegacyIdentityReader().getUserById(24);
+    const accessToken = new JwtIssuerService().issue(operator!, "plugin-user-write-session-24").accessToken;
     const operations = new FakePluginUserWriteOperationRepository();
     const iamRepository = new FakeIamRepository();
     app = await createLifecycleTestApp(operations, iamRepository);
@@ -6374,6 +6387,7 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
 
     const response = await request(app.getHttpServer())
       .post("/v1/plugin-user/create-user")
+      .set("Authorization", `Bearer ${accessToken}`)
       .send({ username: "new-user", password: "Secret123!" })
       .expect(201);
 
@@ -6385,6 +6399,7 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
     expect(operation).toMatchObject({
       route: "create-user",
       mode: "dual-write",
+      actorSubject: "legacy-user:24",
       status: "completed",
       legacyStatus: "201",
       identityStatus: "completed",
@@ -6400,6 +6415,7 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
       })
     ]);
     expect(JSON.stringify(operation)).not.toContain("Secret123!");
+    expect(JSON.stringify(operation)).not.toContain(accessToken);
   });
 
   it("does not blank identity shadow user fields or list tombstones after dual-write delete", async () => {
@@ -6517,7 +6533,7 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
         required: true,
         phase: "identity",
         reason: "identity-shadow-write-failed",
-        errorCode: "Error",
+        errorCode: "[redacted]",
         legacyStatus: 201,
         identityStatus: "failed"
       }
@@ -6526,7 +6542,50 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
     expect(JSON.stringify(operation)).not.toContain("operator-token");
   });
 
-  it("replays completed dual-write responses for duplicate requests without repeating legacy writes", async () => {
+  it("does not replay password updates without an explicit idempotency key", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_MODE = "full";
+    const operations = new FakePluginUserWriteOperationRepository();
+    const iamRepository = new FakeIamRepository();
+    app = await createLifecycleTestApp(operations, iamRepository);
+    const fetchMock = vi.fn(async () => {
+      return new Response(JSON.stringify({ code: 0, data: { id: 42, username: "manager" } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    for (const password of ["ManagerSecret123!", "ManagerSecret456!"]) {
+      const response = await request(app.getHttpServer())
+        .post("/v1/plugin-user/update-user")
+        .send({ id: 42, nickname: "Manager", password })
+        .expect(200);
+
+      expect(response.headers["x-identity-plugin-user-write"]).toBe("dual-write");
+      expect(response.body).toEqual({ code: 0, data: { id: 42, username: "manager" } });
+    }
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(operations.inputs).toHaveLength(2);
+    expect(operations.inputs[0].operationKey).not.toBe(operations.inputs[1].operationKey);
+    expect(operations.inputs.map((input) => input.metadata)).toEqual([
+      expect.objectContaining({ idempotencySource: "per-request" }),
+      expect.objectContaining({ idempotencySource: "per-request" })
+    ]);
+    const recent = await request(app.getHttpServer())
+      .get("/internal/plugin-user-write/operations/recent")
+      .expect(200);
+    expect(recent.body.data.operations).toEqual([
+      expect.objectContaining({ idempotencySource: "per-request" }),
+      expect.objectContaining({ idempotencySource: "per-request" })
+    ]);
+    expect(JSON.stringify(operations.inputs)).not.toContain("ManagerSecret123!");
+    expect(JSON.stringify(operations.inputs)).not.toContain("ManagerSecret456!");
+  });
+
+  it("replays completed dual-write responses for the same explicit idempotency key without repeating legacy writes", async () => {
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_MODE = "full";
@@ -6544,6 +6603,7 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
     for (const _ of [0, 1]) {
       const response = await request(app.getHttpServer())
         .post("/v1/plugin-user/create-user")
+        .set("Idempotency-Key", "plugin-user-create-replay")
         .send({ username: "replay-user", password: "Secret123!" })
         .expect(201);
 
@@ -6554,22 +6614,249 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(operations.attempts).toHaveLength(2);
     expect(operations.inputs).toHaveLength(1);
+    expect(operations.inputs[0].metadata).toMatchObject({ idempotencySource: "client-header" });
     expect(iamRepository.identityShadowWrites).toHaveLength(1);
     const operation = await operations.findByOperationKey(operations.inputs[0].operationKey);
     expect(operation?.status).toBe("completed");
     expect(JSON.stringify(operation)).not.toContain("Secret123!");
+    expect(JSON.stringify(operation)).not.toContain("plugin-user-create-replay");
+    const recent = await request(app.getHttpServer())
+      .get("/internal/plugin-user-write/operations/recent")
+      .expect(200);
+    expect(recent.body.data.operations).toEqual([
+      expect.objectContaining({ idempotencySource: "client-header" })
+    ]);
+  });
+
+  it("treats password-only changes as the same explicit business operation", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_MODE = "full";
+    const operations = new FakePluginUserWriteOperationRepository();
+    const iamRepository = new FakeIamRepository();
+    app = await createLifecycleTestApp(operations, iamRepository);
+    const fetchMock = vi.fn(async () => new Response(
+      JSON.stringify({ code: 0, data: { id: 42, username: "manager" } }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+
+    for (const password of ["ManagerSecret123!", "ManagerSecret456!"]) {
+      await request(app.getHttpServer())
+        .post("/v1/plugin-user/update-user")
+        .set("Idempotency-Key", "manager-password-operation")
+        .send({ id: 42, nickname: "Manager", password })
+        .expect(200);
+    }
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(operations.attempts[0].operationKey).toBe(operations.attempts[1].operationKey);
+    expect(operations.attempts).toHaveLength(2);
+    expect(operations.inputs).toHaveLength(1);
+    expect(iamRepository.identityShadowWrites).toHaveLength(1);
+    const operation = await operations.findByOperationKey(operations.inputs[0].operationKey);
+    expect(operation?.metadata).toMatchObject({
+      idempotencySource: "client-header",
+      requestFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/)
+    });
+    expect(JSON.stringify(operation)).not.toContain("manager-password-operation");
+    expect(JSON.stringify(operation)).not.toContain("ManagerSecret123!");
+    expect(JSON.stringify(operation)).not.toContain("ManagerSecret456!");
+  });
+
+  it("rejects an explicit key reused with different non-sensitive input before legacy", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_MODE = "full";
+    const operations = new FakePluginUserWriteOperationRepository();
+    const iamRepository = new FakeIamRepository();
+    app = await createLifecycleTestApp(operations, iamRepository);
+    const fetchMock = vi.fn(async () => new Response(
+      JSON.stringify({ code: 0, data: { id: 42, username: "manager" } }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/update-user")
+      .set("Idempotency-Key", "nickname-operation")
+      .send({ id: 42, nickname: "Manager One", password: "ManagerSecret123!" })
+      .expect(200);
+
+    const conflict = await request(app.getHttpServer())
+      .post("/v1/plugin-user/update-user")
+      .set("Idempotency-Key", "nickname-operation")
+      .send({ id: 42, nickname: "Manager Two", password: "ManagerSecret456!" })
+      .expect(409);
+
+    expect(conflict.body).toMatchObject({ code: "IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_REQUEST" });
+    expect(JSON.stringify(conflict.body)).not.toContain("nickname-operation");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(operations.inputs).toHaveLength(1);
+    expect(iamRepository.identityShadowWrites).toHaveLength(1);
+  });
+
+  it("coordinates concurrent explicit-key requests through the shared operation ledger", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_MODE = "full";
+    const operations = new FakePluginUserWriteOperationRepository();
+    const iamRepository = new FakeIamRepository();
+    app = await createLifecycleTestApp(operations, iamRepository);
+    const secondNode = await createLifecycleTestApp(operations, iamRepository);
+    let releaseLegacy!: (response: Response) => void;
+    const fetchMock = vi.fn(() => new Promise<Response>((resolve) => {
+      releaseLegacy = resolve;
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const firstRequest = request(app.getHttpServer())
+      .post("/v1/plugin-user/update-user")
+      .set("Idempotency-Key", "concurrent-update-operation")
+      .send({ id: 42, nickname: "Concurrent Manager", password: "ManagerSecret123!" })
+      .then((response) => response);
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    try {
+      const duplicate = await request(secondNode.getHttpServer())
+        .post("/v1/plugin-user/update-user")
+        .set("Idempotency-Key", "concurrent-update-operation")
+        .send({ id: 42, nickname: "Concurrent Manager", password: "ManagerSecret123!" })
+        .expect(503);
+
+      expect(duplicate.body).toMatchObject({ code: "PLUGIN_USER_WRITE_REPLAY_UNAVAILABLE" });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      releaseLegacy(new Response(
+        JSON.stringify({ code: 0, data: { id: 42, username: "manager" } }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      ));
+      const first = await firstRequest;
+      expect(first.status).toBe(200);
+      expect(operations.inputs).toHaveLength(1);
+      expect(iamRepository.identityShadowWrites).toHaveLength(1);
+    } finally {
+      await secondNode.close();
+    }
+  });
+
+  it("validates explicit idempotency header boundaries without echoing values", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_MODE = "full";
+    const operations = new FakePluginUserWriteOperationRepository();
+    app = await createLifecycleTestApp(operations, new FakeIamRepository());
+    const fetchMock = vi.fn(async (_url: URL | string, init?: RequestInit) => {
+      const headers = init?.headers as Headers;
+      expect(headers.get("Idempotency-Key")).toBe("same-alias-key");
+      return new Response(JSON.stringify({ code: 0, data: { id: 42, username: "manager" } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const blank = await request(app.getHttpServer())
+      .post("/v1/plugin-user/update-user")
+      .set("X-Idempotency-Key", "   ")
+      .send({ id: 42, nickname: "Manager" })
+      .expect(400);
+    expect(blank.body).toMatchObject({ code: "IDEMPOTENCY_KEY_INVALID" });
+
+    const overlongKey = "k".repeat(181);
+    const overlong = await request(app.getHttpServer())
+      .post("/v1/plugin-user/update-user")
+      .set("Idempotency-Key", overlongKey)
+      .send({ id: 42, nickname: "Manager" })
+      .expect(400);
+    expect(overlong.body).toMatchObject({ code: "IDEMPOTENCY_KEY_INVALID" });
+    expect(JSON.stringify(overlong.body)).not.toContain(overlongKey);
+
+    const conflicting = await request(app.getHttpServer())
+      .post("/v1/plugin-user/update-user")
+      .set("Idempotency-Key", "primary-key")
+      .set("X-Idempotency-Key", "alias-key")
+      .send({ id: 42, nickname: "Manager" })
+      .expect(400);
+    expect(conflicting.body).toMatchObject({ code: "IDEMPOTENCY_KEY_CONFLICT" });
+    expect(JSON.stringify(conflicting.body)).not.toContain("primary-key");
+    expect(JSON.stringify(conflicting.body)).not.toContain("alias-key");
+
+    await request(app.getHttpServer())
+      .post("/v1/plugin-user/update-user")
+      .set("Idempotency-Key", "same-alias-key")
+      .set("X-Idempotency-Key", "same-alias-key")
+      .send({ id: 42, nickname: "Manager" })
+      .expect(200);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(operations.inputs).toHaveLength(1);
+  });
+
+  it("preserves legacy authorization rejection without partial identity writes", async () => {
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_MODE = "full";
+    const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
+    process.env.IDENTITY_JWT_PRIVATE_KEY_PEM = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    process.env.IDENTITY_JWT_ISSUER = "identity-plugin-user-permission-test";
+    process.env.IDENTITY_JWT_AUDIENCE = "xrugc-plugin-user-permission";
+    const ordinaryUser = await new FakeLegacyIdentityReader().getUserById(25);
+    const ordinaryToken = new JwtIssuerService().issue(
+      { ...ordinaryUser!, roles: ["user"] },
+      "plugin-user-permission-session-25"
+    ).accessToken;
+    const operations = new FakePluginUserWriteOperationRepository();
+    const iamRepository = new FakeIamRepository();
+    app = await createLifecycleTestApp(operations, iamRepository);
+    const fetchMock = vi.fn(async () => new Response(
+      JSON.stringify({ code: 4030, message: "无权执行该操作" }),
+      { status: 403, headers: { "Content-Type": "application/json" } }
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+
+    for (const authorization of ["Bearer invalid-token", `Bearer ${ordinaryToken}`]) {
+      const denied = await request(app.getHttpServer())
+        .post("/v1/plugin-user/update-user")
+        .set("Authorization", authorization)
+        .send({ id: 42, nickname: "Denied Update", password: "DeniedSecret123!" })
+        .expect(403);
+      expect(denied.body).toEqual({ code: 4030, message: "无权执行该操作" });
+    }
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(iamRepository.identityShadowWrites).toHaveLength(0);
+    expect(operations.inputs).toHaveLength(2);
+    for (const input of operations.inputs) {
+      const operation = await operations.findByOperationKey(input.operationKey);
+      expect(operation).toMatchObject({
+        status: "failed",
+        legacyStatus: "403",
+        identityStatus: "skipped",
+        compensationStatus: "none"
+      });
+    }
+    expect(JSON.stringify(operations.inputs)).not.toContain("DeniedSecret123!");
+    expect(JSON.stringify(operations.inputs)).not.toContain("invalid-token");
+    expect(JSON.stringify(operations.inputs)).not.toContain(ordinaryToken);
   });
 
   it("resumes a ledger-only pending delete operation when dual-write needs to complete the identity shadow", async () => {
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE = "dual-write";
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED = "true";
     process.env.IDENTITY_IAM_PLUGIN_USER_WRITE_ROLLOUT_MODE = "full";
+    const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
+    process.env.IDENTITY_JWT_PRIVATE_KEY_PEM = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    process.env.IDENTITY_JWT_ISSUER = "identity-plugin-user-delete-test";
+    process.env.IDENTITY_JWT_AUDIENCE = "xrugc-plugin-user-delete";
+    const operator = await new FakeLegacyIdentityReader().getUserById(24);
+    const accessToken = new JwtIssuerService().issue(operator!, "plugin-user-delete-session-24").accessToken;
     const operations = new FakePluginUserWriteOperationRepository();
     const iamRepository = new FakeIamRepository();
     const requestBody = { id: 42 };
     const operationKey = pluginUserWriteOperationKey({
       route: "delete-user",
-      actorSubject: null,
+      actorSubject: "authorization:present",
       targetSubject: "legacy-user:42",
       requestFingerprint: pluginUserWriteRequestFingerprint("delete-user", requestBody)
     });
@@ -6578,7 +6865,7 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
       idempotencyKey: operationKey,
       route: "delete-user",
       mode: "dual-write",
-      actorSubject: null,
+      actorSubject: "authorization:present",
       targetSubject: "legacy-user:42",
       legacyUserId: 42,
       metadata: {
@@ -6596,6 +6883,7 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
     for (const _ of [0, 1]) {
       const response = await request(app.getHttpServer())
         .post("/v1/plugin-user/delete-user")
+        .set("Authorization", `Bearer ${accessToken}`)
         .send(requestBody)
         .expect(200);
 
@@ -6739,6 +7027,35 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
     });
     expect(key).toMatch(/^plugin-user-write:v1:create-user:[a-f0-9]{48}$/);
 
+    const explicitOperationIdentity = `idempotency:${createHash("sha256").update("same-client-key").digest("hex")}`;
+    const scopedKeys = [
+      pluginUserWriteOperationKey({
+        route: "create-user",
+        actorSubject: "legacy-user:24",
+        targetSubject: "username:stage-user",
+        requestFingerprint: explicitOperationIdentity
+      }),
+      pluginUserWriteOperationKey({
+        route: "update-user",
+        actorSubject: "legacy-user:24",
+        targetSubject: "legacy-user:42",
+        requestFingerprint: explicitOperationIdentity
+      }),
+      pluginUserWriteOperationKey({
+        route: "update-user",
+        actorSubject: "legacy-user:25",
+        targetSubject: "legacy-user:42",
+        requestFingerprint: explicitOperationIdentity
+      }),
+      pluginUserWriteOperationKey({
+        route: "update-user",
+        actorSubject: "legacy-user:24",
+        targetSubject: "legacy-user:43",
+        requestFingerprint: explicitOperationIdentity
+      })
+    ];
+    expect(new Set(scopedKeys)).toHaveLength(scopedKeys.length);
+
     const redacted = redactPluginUserWriteMetadata({
       username: "stage-user",
       password: "Secret123!",
@@ -6769,7 +7086,12 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
           username: "new-user",
           token: "should-not-persist",
           nested: {
-            password: "Secret123!"
+            password: "Secret123!",
+            code: "nested-verification-code"
+          },
+          responseHeaders: {
+            setCookie: "session=secret-cookie",
+            authorization: "Bearer response-secret"
           }
         }
       }
@@ -6777,7 +7099,7 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
 
     const replay = pluginUserWriteReplayResponseFromOperation({
       status: "completed",
-      metadata: responseReplay
+      metadata: redactPluginUserWriteOperationMetadata(responseReplay)
     });
     expect(replay).toEqual({
       status: 201,
@@ -6788,7 +7110,12 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
           username: "new-user",
           token: "[redacted]",
           nested: {
-            password: "[redacted]"
+            password: "[redacted]",
+            code: "[redacted]"
+          },
+          responseHeaders: {
+            setCookie: "[redacted]",
+            authorization: "[redacted]"
           }
         }
       }
@@ -6800,6 +7127,9 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
         metadata: responseReplay
       })
     ).toBeNull();
+    expect(JSON.stringify(responseReplay)).not.toContain("secret-cookie");
+    expect(JSON.stringify(responseReplay)).not.toContain("response-secret");
+    expect(JSON.stringify(responseReplay)).not.toContain("nested-verification-code");
     expect(
       pluginUserWriteReplayResponseFromOperation({
         status: "failed",
@@ -7034,6 +7364,7 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
       .set("Authorization", "Bearer operator-token")
       .set("X-Forwarded-For", "10.0.0.2")
       .set("User-Agent", "Vitest")
+      .set("Idempotency-Key", "legacy-proxy-operation")
       .send({
         username: "new-user",
         nickname: "New User",
@@ -7050,6 +7381,7 @@ describe("identity-adapter plugin user write legacy-proxy API", () => {
     expect(headers.get("Authorization")).toBe("Bearer operator-token");
     expect(headers.get("X-Forwarded-For")).toBe("10.0.0.2");
     expect(headers.get("User-Agent")).toBe("Vitest");
+    expect(headers.get("Idempotency-Key")).toBe("legacy-proxy-operation");
     expect(headers.get("X-Identity-Plugin-User-Write-Proxy")).toBe("1");
     expect(JSON.parse(String(init.body))).toEqual({
       username: "new-user",

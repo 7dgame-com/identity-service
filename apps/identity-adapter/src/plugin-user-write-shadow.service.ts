@@ -40,6 +40,13 @@ export interface PluginUserWriteShadowResult {
   errorCode?: string;
 }
 
+export interface PluginUserWritePlanOptions {
+  actorSubject?: string | null;
+  operationIdentity?: string | null;
+  operationNonce?: string | null;
+  idempotencySource?: "client-header" | "per-request";
+}
+
 @Injectable()
 export class PluginUserWriteShadowService {
   private readonly config = loadConfig();
@@ -160,22 +167,34 @@ export class PluginUserWriteShadowService {
   }
 }
 
-export function planShadowOperation(input: PluginUserWriteShadowRequest) {
+export function planShadowOperation(input: PluginUserWriteShadowRequest, options: PluginUserWritePlanOptions = {}) {
   const route = routeFromPath(input.path);
   const redactedBody = redactPluginUserWriteMetadata(input.body ?? {});
   const targetSubject = targetSubjectForRoute(route, redactedBody);
-  const actorSubject = actorSubjectFromHeaders(input.headers);
+  const legacyShadowActorSubject = actorSubjectFromHeaders(input.headers);
+  const actorSubject =
+    options.actorSubject === undefined ? legacyShadowActorSubject : options.actorSubject;
   const requestFingerprint = pluginUserWriteRequestFingerprint(route, redactedBody);
+  const legacyShadowOperationKey = pluginUserWriteOperationKey({
+    route,
+    actorSubject: legacyShadowActorSubject,
+    targetSubject,
+    requestFingerprint
+  });
   const operationKey = pluginUserWriteOperationKey({
     route,
     actorSubject,
     targetSubject,
-    requestFingerprint
+    requestFingerprint: options.operationIdentity ?? (options.operationNonce
+      ? `${requestFingerprint}\u001f${options.operationNonce}`
+      : requestFingerprint)
   });
   const correlationId = shadowCorrelationId(operationKey);
 
   return {
     operationKey,
+    legacyShadowOperationKey,
+    legacyShadowActorSubject,
     correlationId,
     route,
     actorSubject,
@@ -186,6 +205,8 @@ export function planShadowOperation(input: PluginUserWriteShadowRequest) {
       method: input.method.toUpperCase(),
       legacyStatus: input.legacyStatus,
       targetSubject,
+      ...(options.idempotencySource ? { idempotencySource: options.idempotencySource } : {}),
+      requestFingerprint,
       redactedBody
     }
   };

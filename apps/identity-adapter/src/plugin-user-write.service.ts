@@ -1,5 +1,12 @@
-import { createHash } from "node:crypto";
-import { Injectable, Logger, NotFoundException, ServiceUnavailableException } from "@nestjs/common";
+import { createHash, randomUUID } from "node:crypto";
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  Logger,
+  NotFoundException,
+  ServiceUnavailableException
+} from "@nestjs/common";
 import { loadConfig } from "./config.js";
 import { IamRepository } from "./iam.repository.js";
 import { JwtIssuerService, VerifiedAccessToken } from "./jwt-issuer.service.js";
@@ -95,6 +102,8 @@ export class PluginUserWriteService {
       dualWriteExecutionEnabled: iam.pluginUserWriteDualWriteExecutionEnabled,
       operationLedgerSchemaAutoEnsure: false,
       idempotencyKeyFormat: "plugin-user-write:v1:<route>:<sha256-48>",
+      idempotencyBehavior:
+        "explicit Idempotency-Key replays; ordinary browser submits receive a unique operation key per request",
       redactionPolicy: "metadata-only-no-secret-payloads",
       compensationRecordsRequired: true,
       shadow: this.shadow.readiness(),
@@ -181,14 +190,16 @@ export class PluginUserWriteService {
         });
       }
 
-      const rolloutDecision = this.dualWriteRolloutDecision(request, path);
+      const claims = this.claimsFromAuthorization(request.headers.authorization);
+      const plan = this.planDualWriteOperation(request, path, claims);
+      const rolloutDecision = this.dualWriteRolloutDecision(plan, claims);
       if (!rolloutDecision.selected) {
         this.logRolloutDecision(rolloutDecision);
         return this.legacyProxy(request, path, true);
       }
 
       this.logRolloutDecision(rolloutDecision);
-      return this.dualWrite(request, path);
+      return this.dualWrite(request, path, plan);
     }
 
     throw new NotFoundException({
@@ -197,16 +208,34 @@ export class PluginUserWriteService {
     });
   }
 
-  private dualWriteRolloutDecision(request: PluginUserWriteRequest, path: string): PluginUserWriteRolloutDecision {
+  private planDualWriteOperation(
+    request: PluginUserWriteRequest,
+    path: string,
+    claims: VerifiedAccessToken | null
+  ): ReturnType<typeof planShadowOperation> {
+    const explicitIdempotency = clientPluginUserWriteIdempotencyKey(request.headers);
+    return planShadowOperation(
+      {
+        method: request.method,
+        path,
+        headers: request.headers,
+        body: request.body,
+        legacyStatus: 0
+      },
+      {
+        actorSubject: claims ? `legacy-user:${claims.uid}` : undefined,
+        operationIdentity: explicitIdempotency ? `idempotency:${idempotencyKeyHash(explicitIdempotency)}` : undefined,
+        operationNonce: explicitIdempotency ? undefined : `request:${randomUUID()}`,
+        idempotencySource: explicitIdempotency ? "client-header" : "per-request"
+      }
+    );
+  }
+
+  private dualWriteRolloutDecision(
+    plan: ReturnType<typeof planShadowOperation>,
+    claims: VerifiedAccessToken | null
+  ): PluginUserWriteRolloutDecision {
     const { iam } = this.config;
-    const plan = planShadowOperation({
-      method: request.method,
-      path,
-      headers: request.headers,
-      body: request.body,
-      legacyStatus: 0
-    });
-    const claims = this.claimsFromAuthorization(request.headers.authorization);
     const actorTokens = pluginUserWriteActorTokens(plan.actorSubject, claims);
     const targetTokens = pluginUserWriteTargetTokens(plan.targetSubject);
     const tokens = new Set([...actorTokens, ...targetTokens].map(normalizeRolloutToken).filter(Boolean));
@@ -304,14 +333,38 @@ export class PluginUserWriteService {
     };
   }
 
-  private async dualWrite(request: PluginUserWriteRequest, path: string): Promise<PluginUserWriteProxyResponse> {
-    const plan = planShadowOperation({
-      method: request.method,
-      path,
-      headers: request.headers,
-      body: request.body,
-      legacyStatus: 0
-    });
+  private async dualWrite(
+    request: PluginUserWriteRequest,
+    path: string,
+    initialPlan: ReturnType<typeof planShadowOperation>
+  ): Promise<PluginUserWriteProxyResponse> {
+    let plan = initialPlan;
+    if (plan.route === "delete-user" && plan.operationKey !== plan.legacyShadowOperationKey) {
+      // Ledger-only mode recorded successful deletes under the former deterministic key.
+      // Reuse only delete records that already contain enough safe replay evidence.
+      const legacyShadowPlan = {
+        ...plan,
+        operationKey: plan.legacyShadowOperationKey,
+        actorSubject: plan.legacyShadowActorSubject
+      };
+      const legacyShadowOperation = await this.operations.findByOperationKey(legacyShadowPlan.operationKey);
+      if (
+        legacyShadowOperation &&
+        (pluginUserWriteReplayResponseFromOperation(legacyShadowOperation) ||
+          deleteReplayFromIncompleteOperation(legacyShadowOperation, legacyShadowPlan))
+      ) {
+        plan = legacyShadowPlan;
+      }
+    }
+
+    const operationMetadata = {
+      route: plan.route,
+      method: request.method.toUpperCase(),
+      targetSubject: plan.targetSubject,
+      idempotencySource: plan.metadata.idempotencySource,
+      requestFingerprint: plan.metadata.requestFingerprint,
+      redactedBody: plan.metadata.redactedBody
+    };
     const begin = await this.operations.begin({
       operationKey: plan.operationKey,
       idempotencyKey: plan.operationKey,
@@ -320,17 +373,18 @@ export class PluginUserWriteService {
       actorSubject: plan.actorSubject,
       targetSubject: plan.targetSubject,
       legacyUserId: plan.legacyUserId,
-      metadata: {
-        route: plan.route,
-        method: request.method.toUpperCase(),
-        targetSubject: plan.targetSubject,
-        redactedBody: plan.metadata.redactedBody
-      }
+      metadata: operationMetadata
     });
 
     let legacyResponse: PluginUserWriteProxyResponse | null = null;
     if (begin.duplicate) {
       const existing = await this.operations.findByOperationKey(plan.operationKey);
+      if (requestFingerprintConflicts(existing, plan)) {
+        throw new ConflictException({
+          code: "IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_REQUEST",
+          message: "The idempotency key was already used for a different request."
+        });
+      }
       const replay = existing ? pluginUserWriteReplayResponseFromOperation(existing) : null;
       if (replay) {
         return {
@@ -360,6 +414,7 @@ export class PluginUserWriteService {
           compensationStatus: "none",
           errorCode: error instanceof Error ? error.name : "PluginUserWriteLegacyError",
           metadata: {
+            ...operationMetadata,
             phase: "legacy",
             route: plan.route
           }
@@ -380,7 +435,10 @@ export class PluginUserWriteService {
         identityStatus: "skipped",
         compensationStatus: "none",
         errorCode: "LegacyRejected",
-        metadata: responseReplay
+        metadata: {
+          ...operationMetadata,
+          ...responseReplay
+        }
       });
       return {
         ...legacyResponse,
@@ -404,6 +462,7 @@ export class PluginUserWriteService {
           compensationStatus: "required",
           errorCode: "IdentityShadowPlanSkipped",
           metadata: {
+            ...operationMetadata,
             ...responseReplay,
             ...pluginUserWriteCompensationMetadata({
               phase: "identity",
@@ -445,6 +504,7 @@ export class PluginUserWriteService {
         identityStatus: identityPlan.skippedReason ? `skipped:${identityPlan.skippedReason}` : "completed",
         compensationStatus: "none",
         metadata: {
+          ...operationMetadata,
           ...responseReplay,
           identityShadow: {
             writeCount: identityPlan.writes.length,
@@ -465,6 +525,7 @@ export class PluginUserWriteService {
         compensationStatus: "required",
         errorCode: error instanceof Error ? error.name : "PluginUserWriteIdentityError",
         metadata: {
+          ...operationMetadata,
           ...responseReplay,
           ...pluginUserWriteCompensationMetadata({
             phase: "identity",
@@ -509,6 +570,7 @@ export class PluginUserWriteService {
     const authorization = firstHeader(request.headers.authorization);
     const forwardedFor = firstHeader(request.headers["x-forwarded-for"]);
     const userAgent = firstHeader(request.headers["user-agent"]);
+    const idempotencyKey = clientPluginUserWriteIdempotencyKey(request.headers);
     if (authorization) {
       headers.set("Authorization", authorization);
     }
@@ -517,6 +579,9 @@ export class PluginUserWriteService {
     }
     if (userAgent) {
       headers.set("User-Agent", userAgent);
+    }
+    if (idempotencyKey) {
+      headers.set("Idempotency-Key", idempotencyKey);
     }
 
     const init: RequestInit = {
@@ -783,6 +848,51 @@ function firstHeader(value: string | string[] | undefined): string | null {
   }
 
   return value ?? null;
+}
+
+function clientPluginUserWriteIdempotencyKey(headers: PluginUserWriteRequest["headers"]): string | null {
+  const primary = normalizedIdempotencyHeader(headers["idempotency-key"]);
+  const alias = normalizedIdempotencyHeader(headers["x-idempotency-key"]);
+  if (primary !== null && alias !== null && primary !== alias) {
+    throw new BadRequestException({
+      code: "IDEMPOTENCY_KEY_CONFLICT",
+      message: "Conflicting idempotency headers were provided."
+    });
+  }
+
+  return primary ?? alias;
+}
+
+function normalizedIdempotencyHeader(value: string | string[] | undefined): string | null {
+  if (value === undefined) {
+    return null;
+  }
+
+  const normalized = firstHeader(value)?.trim() ?? "";
+  if (normalized.length === 0 || normalized.length > 180) {
+    throw new BadRequestException({
+      code: "IDEMPOTENCY_KEY_INVALID",
+      message: "The idempotency key must contain between 1 and 180 characters."
+    });
+  }
+
+  return normalized;
+}
+
+function idempotencyKeyHash(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function requestFingerprintConflicts(
+  operation: PluginUserWriteOperationRecord | null,
+  plan: ReturnType<typeof planShadowOperation>
+): boolean {
+  if (!operation || plan.metadata.idempotencySource !== "client-header") {
+    return false;
+  }
+
+  const existingFingerprint = operation.metadata.requestFingerprint;
+  return typeof existingFingerprint === "string" && existingFingerprint !== plan.metadata.requestFingerprint;
 }
 
 function deleteReplayFromIncompleteOperation(
