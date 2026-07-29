@@ -74,6 +74,174 @@ describe.skipIf(!mysqlIntegrationEnabled)("plugin-user operation MySQL concurren
       }
     }
   }, 30_000);
+
+  it("atomically reopens only one exact failed legacy 401 retry across connection pools", async () => {
+    const database = safeMysqlTestTarget();
+    const firstRepository = new PluginUserWriteOperationRepository();
+    const secondRepository = new PluginUserWriteOperationRepository();
+    repositories.push(firstRepository, secondRepository);
+
+    const requestFingerprint = "f".repeat(64);
+    const operationKey = pluginUserWriteOperationKey({
+      route: "update-user",
+      actorSubject: "integration-test-actor",
+      targetSubject: "legacy-user:42",
+      requestFingerprint: `integration-test-reopen:${randomUUID()}`
+    });
+    const operationMetadata = {
+      route: "update-user",
+      method: "POST",
+      targetSubject: "legacy-user:42",
+      idempotencySource: "client-header" as const,
+      requestFingerprint,
+      redactedBody: { id: 42, password: "[redacted]" }
+    };
+
+    let assertionsCompleted = false;
+    try {
+      await firstRepository.begin({
+        operationKey,
+        idempotencyKey: operationKey,
+        route: "update-user",
+        mode: "dual-write",
+        actorSubject: "integration-test-actor",
+        targetSubject: "legacy-user:42",
+        legacyUserId: 42,
+        metadata: operationMetadata
+      });
+      await firstRepository.update({
+        operationKey,
+        status: "failed",
+        legacyStatus: "401",
+        identityStatus: "skipped",
+        compensationStatus: "none",
+        errorCode: "LegacyRejected",
+        metadata: {
+          ...operationMetadata,
+          responseReplay: {
+            httpStatus: 401,
+            body: { code: 4010, password: "must-not-persist", token: "must-not-persist" }
+          }
+        }
+      });
+
+      await expect(firstRepository.reopenFailedLegacyUnauthorized({
+        operationKey,
+        requestFingerprint: "0".repeat(64),
+        metadata: operationMetadata
+      })).resolves.toBe(false);
+
+      const results = await Promise.all([
+        firstRepository.reopenFailedLegacyUnauthorized({
+          operationKey,
+          requestFingerprint,
+          metadata: {
+            ...operationMetadata,
+            authorization: "must-not-persist"
+          }
+        }),
+        secondRepository.reopenFailedLegacyUnauthorized({
+          operationKey,
+          requestFingerprint,
+          metadata: {
+            ...operationMetadata,
+            authorization: "must-not-persist"
+          }
+        })
+      ]);
+
+      expect(results.sort()).toEqual([false, true]);
+      const reopened = await firstRepository.findByOperationKey(operationKey);
+      expect(reopened).toMatchObject({
+        status: "pending",
+        legacyStatus: null,
+        identityStatus: null,
+        compensationStatus: "none",
+        errorCode: null,
+        metadata: {
+          idempotencySource: "client-header",
+          requestFingerprint,
+          authorization: "[redacted]"
+        }
+      });
+      expect(JSON.stringify(reopened)).not.toContain("must-not-persist");
+
+      await firstRepository.update({
+        operationKey,
+        status: "failed",
+        legacyStatus: "403",
+        identityStatus: "skipped",
+        compensationStatus: "none",
+        errorCode: "LegacyRejected",
+        metadata: operationMetadata
+      });
+      await expect(Promise.all([
+        firstRepository.reopenFailedLegacyUnauthorized({ operationKey, requestFingerprint, metadata: operationMetadata }),
+        secondRepository.reopenFailedLegacyUnauthorized({ operationKey, requestFingerprint, metadata: operationMetadata })
+      ])).resolves.toEqual([false, false]);
+      await expect(firstRepository.findByOperationKey(operationKey)).resolves.toMatchObject({
+        status: "failed",
+        legacyStatus: "403"
+      });
+
+      const ineligibleStates = [
+        {
+          status: "legacy_completed" as const,
+          legacyStatus: "401",
+          identityStatus: "skipped",
+          compensationStatus: "none" as const,
+          errorCode: "LegacyRejected",
+          metadata: operationMetadata
+        },
+        {
+          status: "failed" as const,
+          legacyStatus: "401",
+          identityStatus: "failed",
+          compensationStatus: "none" as const,
+          errorCode: "LegacyRejected",
+          metadata: operationMetadata
+        },
+        {
+          status: "failed" as const,
+          legacyStatus: "401",
+          identityStatus: "skipped",
+          compensationStatus: "required" as const,
+          errorCode: "LegacyRejected",
+          metadata: operationMetadata
+        },
+        {
+          status: "failed" as const,
+          legacyStatus: "401",
+          identityStatus: "skipped",
+          compensationStatus: "none" as const,
+          errorCode: "DifferentFailure",
+          metadata: operationMetadata
+        },
+        {
+          status: "failed" as const,
+          legacyStatus: "401",
+          identityStatus: "skipped",
+          compensationStatus: "none" as const,
+          errorCode: "LegacyRejected",
+          metadata: { ...operationMetadata, idempotencySource: "per-request" as const }
+        }
+      ];
+      for (const state of ineligibleStates) {
+        await firstRepository.update({ operationKey, ...state });
+        await expect(firstRepository.reopenFailedLegacyUnauthorized({
+          operationKey,
+          requestFingerprint,
+          metadata: operationMetadata
+        })).resolves.toBe(false);
+      }
+      assertionsCompleted = true;
+    } finally {
+      const deletedRows = await deleteTestOperation(database, operationKey);
+      if (assertionsCompleted) {
+        expect(deletedRows).toBe(1);
+      }
+    }
+  }, 30_000);
 });
 
 interface MysqlTestTarget {

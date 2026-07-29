@@ -27,6 +27,8 @@ export interface PluginUserWriteProxyResponse {
 }
 
 const PLUGIN_USER_WRITE_EXECUTABLE_MODES = ["disabled", "legacy-proxy", "dual-write"] as const;
+const LEGACY_DELETE_REPLAY_MAX_AGE_DAYS = 45;
+const LEGACY_DELETE_REPLAY_MAX_AGE_MS = LEGACY_DELETE_REPLAY_MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
 const PLUGIN_USER_WRITE_ROUTES = [
   "create-user",
   "update-user",
@@ -104,6 +106,9 @@ export class PluginUserWriteService {
       idempotencyKeyFormat: "plugin-user-write:v1:<route>:<sha256-48>",
       idempotencyBehavior:
         "explicit Idempotency-Key replays; ordinary browser submits receive a unique operation key per request",
+      authorizationRetryBehavior:
+        "client-header operations rejected by legacy with 401 may be atomically reopened after authorization refresh",
+      legacyDeleteReplayMaxAgeDays: LEGACY_DELETE_REPLAY_MAX_AGE_DAYS,
       redactionPolicy: "metadata-only-no-secret-payloads",
       compensationRecordsRequired: true,
       shadow: this.shadow.readiness(),
@@ -350,6 +355,7 @@ export class PluginUserWriteService {
       const legacyShadowOperation = await this.operations.findByOperationKey(legacyShadowPlan.operationKey);
       if (
         legacyShadowOperation &&
+        isRecentLegacyDeleteCompatibilityOperation(legacyShadowOperation) &&
         (pluginUserWriteReplayResponseFromOperation(legacyShadowOperation) ||
           deleteReplayFromIncompleteOperation(legacyShadowOperation, legacyShadowPlan))
       ) {
@@ -395,10 +401,32 @@ export class PluginUserWriteService {
 
       legacyResponse = deleteReplayFromIncompleteOperation(existing, plan);
       if (!legacyResponse) {
-        throw new ServiceUnavailableException({
-          code: "PLUGIN_USER_WRITE_REPLAY_UNAVAILABLE",
-          message: "Plugin user write operation is already recorded but has no completed replay response."
+        const reopened = await this.operations.reopenFailedLegacyUnauthorized({
+          operationKey: plan.operationKey,
+          requestFingerprint: plan.metadata.requestFingerprint,
+          metadata: operationMetadata
         });
+        if (!reopened) {
+          const latest = await this.operations.findByOperationKey(plan.operationKey);
+          if (requestFingerprintConflicts(latest, plan)) {
+            throw new ConflictException({
+              code: "IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_REQUEST",
+              message: "The idempotency key was already used for a different request."
+            });
+          }
+          const concurrentReplay = latest ? pluginUserWriteReplayResponseFromOperation(latest) : null;
+          if (concurrentReplay) {
+            return {
+              ...concurrentReplay,
+              mode: "dual-write"
+            };
+          }
+
+          throw new ServiceUnavailableException({
+            code: "PLUGIN_USER_WRITE_REPLAY_UNAVAILABLE",
+            message: "Plugin user write operation is already recorded but has no completed replay response."
+          });
+        }
       }
     }
 
@@ -952,6 +980,19 @@ function deleteReplayFromIncompleteOperation(
     },
     mode: "dual-write"
   };
+}
+
+function isRecentLegacyDeleteCompatibilityOperation(
+  operation: PluginUserWriteOperationRecord,
+  nowMs = Date.now()
+): boolean {
+  if (!operation.requestedAt) {
+    return false;
+  }
+
+  const requestedAtMs = Date.parse(operation.requestedAt);
+  const ageMs = nowMs - requestedAtMs;
+  return Number.isFinite(requestedAtMs) && ageMs >= 0 && ageMs <= LEGACY_DELETE_REPLAY_MAX_AGE_MS;
 }
 
 function recordValue(value: unknown): Record<string, unknown> {
