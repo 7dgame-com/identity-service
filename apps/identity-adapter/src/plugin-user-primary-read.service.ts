@@ -234,6 +234,10 @@ export class PluginUserPrimaryReadService {
       .filter((assignment) => assignment.itemType === "role")
       .map((assignment) => assignment.itemName);
     if (roles.length === 0) {
+      // Candidate import intentionally stores no rows for a Legacy subject with no assignments.
+      if (observedRoleNames !== undefined && observedRoleNames.length === 0) {
+        return [];
+      }
       throw new Error("identity_native_role_read_assignment_missing");
     }
     return roles;

@@ -9254,6 +9254,69 @@ describe("identity-adapter plugin user readonly compatibility API", () => {
     expect(list.headers["x-identity-user-source"]).toBe("legacy");
   });
 
+  it("preserves an explicitly observed empty Legacy role set for an Identity-owned user", async () => {
+    const checksum = "a".repeat(64);
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_MODE = "percentage";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_PERCENTAGE = "0";
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "identity-native";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_MODE = "full";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE = "full";
+    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = checksum;
+
+    const legacyReader = new FakeLegacyIdentityReader();
+    const getUserById = legacyReader.getUserById.bind(legacyReader);
+    vi.spyOn(legacyReader, "getUserById").mockImplementation(async (id: number) => {
+      const user = await getUserById(id);
+      return user && id === 25 ? { ...user, roles: [] } : user;
+    });
+    legacyReader.setUserRbacAssignments(25, []);
+
+    const iamRepository = new FakeIamRepository();
+    iamRepository.subjectAssignments.set(25, []);
+    app = await createPluginUserReadonlyTestApp(repository, iamRepository, undefined, legacyReader);
+    const login = await loginAs(app, "guanfei");
+
+    const detail = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users?id=25")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(200);
+    const list = await request(app.getHttpServer())
+      .get("/v1/plugin-user/users?page=1&pageSize=1&search=unverified&sort=id&order=asc")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(200);
+
+    expect(detail.body.data.roles).toEqual([]);
+    expect(list.body.data[0].roles).toEqual([]);
+    expect(detail.headers["x-identity-user-source"]).toBe("legacy");
+    expect(list.headers["x-identity-user-source"]).toBe("legacy");
+  });
+
+  it("fails closed when an Identity-owned user has Legacy roles but no candidate assignment", async () => {
+    const checksum = "a".repeat(64);
+    process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_ENABLED = "true";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_MODE = "percentage";
+    process.env.IDENTITY_PLUGIN_USER_PRIMARY_READ_PERCENTAGE = "0";
+    process.env.IDENTITY_IAM_ROLE_WRITE_MODE = "identity-native";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_EXECUTION_ENABLED = "true";
+    process.env.IDENTITY_IAM_ROLE_WRITE_IDENTITY_NATIVE_TARGET_MODE = "full";
+    process.env.IDENTITY_IAM_ROLE_WRITE_ROLLOUT_MODE = "full";
+    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = checksum;
+
+    const iamRepository = new FakeIamRepository();
+    iamRepository.subjectAssignments.set(25, []);
+    app = await createPluginUserReadonlyTestApp(repository, iamRepository);
+    const login = await loginAs(app, "guanfei");
+
+    await request(app.getHttpServer())
+      .get("/v1/plugin-user/users?id=25")
+      .set("Authorization", `Bearer ${login.accessToken}`)
+      .expect(500);
+  });
+
   it("keeps unowned target roles on Legacy while role ownership is scoped", async () => {
     const checksum = "a".repeat(64);
     process.env.IDENTITY_PLUGIN_USER_READONLY_ENABLED = "true";
