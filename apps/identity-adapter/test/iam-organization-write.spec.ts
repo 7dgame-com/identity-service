@@ -96,6 +96,35 @@ describe("IAM organization membership write compatibility layer", () => {
     expect(fixture.legacy.getUserById).not.toHaveBeenCalled();
   });
 
+  it("previews selected and unselected legacy-proxy targets without reading or writing", () => {
+    enableLegacyProxy();
+    const fixture = createFixture();
+
+    expect(fixture.service.previewMembershipRollout(24)).toMatchObject({
+      mutation: false,
+      mode: "legacy-proxy",
+      route: "/v1/plugin-user/update-user",
+      scope: "membership-replace",
+      selected: true,
+      executable: true,
+      decision: "selected:allowlist",
+      matchedSelectorKind: "legacy",
+      sourceOfTruth: "legacy",
+      identityNativeSupported: false,
+      blockedReasons: []
+    });
+    expect(fixture.service.previewMembershipRollout(25)).toMatchObject({
+      mutation: false,
+      selected: false,
+      executable: false,
+      decision: "not-selected:allowlist",
+      blockedReasons: ["target-not-selected"]
+    });
+    expect(fixture.plugin.proxy).not.toHaveBeenCalled();
+    expect(fixture.repository.begin).not.toHaveBeenCalled();
+    expect(fixture.legacy.getUserById).not.toHaveBeenCalled();
+  });
+
   it("leaves malformed organization_ids to the existing Legacy contract path", async () => {
     enableLegacyProxy();
     const fixture = createFixture();

@@ -155,6 +155,31 @@ export class IamOrganizationWriteService {
     return this.dualWrite(request, parsed, idempotencyKey, evidence);
   }
 
+  previewMembershipRollout(legacyUserId: number) {
+    const { iam } = this.config;
+    const readiness = this.readiness();
+    const decision = organizationRolloutDecision(iam, legacyUserId, null);
+    const modeGateExecutable = iam.organizationWriteMode === "legacy-proxy"
+      ? readiness.legacyProxyGate.executable
+      : iam.organizationWriteMode === "dual-write"
+        ? readiness.dualWriteGate.executable
+        : false;
+    return {
+      mutation: false,
+      mode: iam.organizationWriteMode,
+      route: "/v1/plugin-user/update-user",
+      scope: "membership-replace",
+      targetFingerprint: organizationWriteFingerprint(`legacy:${legacyUserId}`),
+      selected: decision.selected,
+      executable: decision.selected && modeGateExecutable,
+      decision: decision.decision,
+      matchedSelectorKind: decision.selectorKind,
+      sourceOfTruth: "legacy",
+      identityNativeSupported: false,
+      blockedReasons: decision.selected ? readiness.blockedReasons : ["target-not-selected"]
+    };
+  }
+
   async operationLedgerSummary(input: { sinceMinutes?: number }) {
     const sinceMinutes = normalizeNumber(input.sinceMinutes, 60, 1, 1440);
     return this.repository.isConfigured()
