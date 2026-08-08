@@ -75,7 +75,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run plugin-user MySQL concurrency test
+      - name: Run write-ledger MySQL integration tests
         env:
           NODE_ENV: test
           IDENTITY_TEST_MYSQL: "1"
@@ -84,7 +84,7 @@ jobs:
           IDENTITY_DB_NAME: xrugc_identity_test
           IDENTITY_DB_USER: identity_test
           IDENTITY_DB_PASSWORD: identity_test_password
-        run: npm test -- apps/identity-adapter/test/plugin-user-write-operation.mysql.spec.ts
+        run: npm test -- apps/identity-adapter/test/plugin-user-write-operation.mysql.spec.ts apps/identity-adapter/test/iam-organization-write.mysql.spec.ts
 
   build:
     name: Build & Push Docker Image

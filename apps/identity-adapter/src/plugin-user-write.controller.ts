@@ -1,13 +1,16 @@
 import { BadRequestException, Controller, Get, Post, Query, Req, Res } from "@nestjs/common";
 import { roleWriteEvidenceHeaders } from "./iam-role-write-evidence.js";
 import { IamRoleWriteService } from "./iam-role-write.service.js";
+import { organizationWriteEvidenceHeaders } from "./iam-organization-write-evidence.js";
+import { IamOrganizationWriteService } from "./iam-organization-write.service.js";
 import { PluginUserWriteService } from "./plugin-user-write.service.js";
 
 @Controller()
 export class PluginUserWriteController {
   constructor(
     private readonly pluginUserWrite: PluginUserWriteService,
-    private readonly iamRoleWrite: IamRoleWriteService
+    private readonly iamRoleWrite: IamRoleWriteService,
+    private readonly iamOrganizationWrite: IamOrganizationWriteService
   ) {}
 
   @Get("internal/plugin-user-write/readiness")
@@ -89,9 +92,18 @@ export class PluginUserWriteController {
     response: PluginUserWriteExpressResponse,
     path: string
   ): Promise<unknown> {
-    const upstream = await this.pluginUserWrite.proxy(request, path);
+    const organizationUpstream = path === "/v1/plugin-user/update-user"
+      ? await this.iamOrganizationWrite.proxyMembershipUpdate(request)
+      : null;
+    const upstream = organizationUpstream ?? await this.pluginUserWrite.proxy(request, path);
     response.status(upstream.status);
     response.setHeader("X-Identity-Plugin-User-Write", upstream.mode);
+    if (organizationUpstream) {
+      response.setHeader("X-Identity-IAM-Organization-Write", organizationUpstream.mode);
+      for (const [name, value] of Object.entries(organizationWriteEvidenceHeaders(organizationUpstream.evidence))) {
+        response.setHeader(name, value);
+      }
+    }
 
     return upstream.body;
   }
