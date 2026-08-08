@@ -48,6 +48,18 @@ export class IamOrganizationWriteService {
     const legacyOwnerExecutable =
       pluginUserOwner.mode === "legacy-proxy" ||
       (pluginUserOwner.mode === "dual-write" && pluginUserOwner.dualWriteSupported === true);
+    const legacyProxyGate = {
+      executable:
+        iam.organizationWriteMode === "legacy-proxy" &&
+        iam.organizationWriteRouteIntegrationEnabled &&
+        legacyOwnerExecutable &&
+        rollout.selectionConfigured,
+      missingCapabilities: [
+        ...(!iam.organizationWriteRouteIntegrationEnabled ? ["route-integration"] : []),
+        ...(!legacyOwnerExecutable ? ["plugin-user-legacy-write-owner"] : []),
+        ...(!rollout.selectionConfigured ? ["scoped-rollout-selector"] : [])
+      ]
+    };
     const dualWriteGate = {
       executable:
         iam.organizationWriteMode === "dual-write" &&
@@ -79,6 +91,7 @@ export class IamOrganizationWriteService {
         legacyProxyConfigured: pluginUserOwner.legacyProxyConfigured,
         executable: legacyOwnerExecutable
       },
+      legacyProxyGate,
       dualWriteExecutionEnabled: iam.organizationWriteDualWriteExecutionEnabled,
       dualWriteGate,
       identityNativeSupported: false,
@@ -87,6 +100,8 @@ export class IamOrganizationWriteService {
       blockedReasons:
         iam.organizationWriteMode === "identity-native"
           ? ["identity-native-not-authorized", "legacy-owner-retained"]
+          : iam.organizationWriteMode === "legacy-proxy" && !legacyProxyGate.executable
+            ? legacyProxyGate.missingCapabilities
           : iam.organizationWriteMode === "dual-write" && !dualWriteGate.executable
             ? dualWriteGate.missingCapabilities
             : []
@@ -109,11 +124,10 @@ export class IamOrganizationWriteService {
       matchedSelectorKind: decision.selectorKind
     };
 
-    if (iam.organizationWriteMode === "legacy-proxy" || !decision.selected) {
+    if (!decision.selected) return null;
+    if (iam.organizationWriteMode === "legacy-proxy") {
       const upstream = await this.pluginUserWrite.proxy(request, "/v1/plugin-user/update-user");
-      const readbackEvidence = iam.organizationWriteMode === "legacy-proxy"
-        ? await this.legacyProxyReadbackEvidence(upstream.status, parsed, evidence)
-        : evidence;
+      const readbackEvidence = await this.legacyProxyReadbackEvidence(upstream.status, parsed, evidence);
       this.logDecision(readbackEvidence, parsed.legacyUserId, parsed.organizationIds.length);
       return { ...upstream, evidence: readbackEvidence };
     }
