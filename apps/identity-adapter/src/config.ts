@@ -132,6 +132,13 @@ export const configSchema = z.object({
       .transform((value) => value ?? 0)
       .pipe(z.number().int().min(0)),
     organizationWriteMode: z.enum(["disabled", "legacy-proxy", "dual-write", "identity-native"]).default("disabled"),
+    organizationWriteRouteIntegrationEnabled: boolFromEnv.default(false),
+    organizationWriteDualWriteExecutionEnabled: boolFromEnv.default(false),
+    organizationWriteRolloutMode: z.enum(["off", "allowlist", "percentage", "full"]).default("off"),
+    organizationWriteRolloutAllowlist: z.string().default(""),
+    organizationWriteRolloutPercentage: numberFromEnv
+      .transform((value) => value ?? 0)
+      .pipe(z.number().int().min(0).max(100)),
     pluginUserWriteMode: z.enum(["disabled", "legacy-proxy", "dual-write", "identity-native"]).default("disabled"),
     pluginUserWriteShadowMode: z.enum(["off", "plan", "ledger-only"]).default("off"),
     pluginUserWriteDualWriteExecutionEnabled: boolFromEnv.default(false),
@@ -355,6 +362,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
       roleWriteRecoveryDrillEnabled: env.IDENTITY_IAM_ROLE_WRITE_RECOVERY_DRILL_ENABLED,
       roleWriteRecoveryDrillTargetLegacyUserId: env.IDENTITY_IAM_ROLE_WRITE_RECOVERY_DRILL_TARGET_LEGACY_USER_ID,
       organizationWriteMode: env.IDENTITY_IAM_ORG_WRITE_MODE,
+      organizationWriteRouteIntegrationEnabled: env.IDENTITY_IAM_ORG_WRITE_ROUTE_INTEGRATION_ENABLED,
+      organizationWriteDualWriteExecutionEnabled: env.IDENTITY_IAM_ORG_WRITE_DUAL_WRITE_EXECUTION_ENABLED,
+      organizationWriteRolloutMode: env.IDENTITY_IAM_ORG_WRITE_ROLLOUT_MODE,
+      organizationWriteRolloutAllowlist: env.IDENTITY_IAM_ORG_WRITE_ROLLOUT_ALLOWLIST,
+      organizationWriteRolloutPercentage: env.IDENTITY_IAM_ORG_WRITE_ROLLOUT_PERCENTAGE,
       pluginUserWriteMode: env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE,
       pluginUserWriteShadowMode: env.IDENTITY_IAM_PLUGIN_USER_WRITE_SHADOW_MODE,
       pluginUserWriteDualWriteExecutionEnabled: env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED,
