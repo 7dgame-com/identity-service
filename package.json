@@ -14,6 +14,8 @@
     "iam:reconciliation:smoke:dist": "node dist/scripts/iam-reconciliation-smoke.js",
     "iam:organization-write:public-gate": "tsx scripts/iam-organization-write-public-gate.ts",
     "iam:organization-write:public-gate:dist": "node dist/scripts/iam-organization-write-public-gate.js",
+    "iam:organization-write:window-gate": "tsx scripts/iam-organization-write-window-gate.ts",
+    "iam:organization-write:window-gate:dist": "node dist/scripts/iam-organization-write-window-gate.js",
     "invitation:import": "tsx scripts/invitation-import.ts"
   },
   "dependencies": {
