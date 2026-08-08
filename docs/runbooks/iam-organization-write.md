@@ -30,6 +30,18 @@ IDENTITY_IAM_ORG_WRITE_ROLLOUT_PERCENTAGE: "0"
 
 ## 只读检查
 
+公开 `/health` 会返回脱敏的 `capabilities.organizationWrite`，包括 mode、route integration、
+dual-write execution、rollout mode、allowlist 数量、percentage、事实源和 native 支持状态；不会暴露
+allowlist 主体。双域默认关闭门禁可直接执行：
+
+```sh
+npm run iam:organization-write:public-gate -- \
+  --urls=https://identity.d.xrteeth.com/health,https://identity.d.tmrpp.com/health
+```
+
+命令默认要求两个域名均为 `disabled / false / false / off / 0%`、Legacy 事实源且 native 不支持。
+窗口期间必须显式传入期望值；不得以配置截图代替此 request-level 公共证据。
+
 以下内部接口都要求 `X-Identity-Internal-Token`：
 
 ```text

@@ -2353,6 +2353,16 @@ describe("identity-adapter readonly API", () => {
       }
     });
     expect(response.body.capabilities.oidc).toBe("disabled");
+    expect(response.body.capabilities.organizationWrite).toEqual({
+      mode: "disabled",
+      routeIntegrationEnabled: false,
+      dualWriteExecutionEnabled: false,
+      rolloutMode: "off",
+      rolloutAllowlistCount: 0,
+      rolloutPercentage: 0,
+      sourceOfTruth: "legacy",
+      identityNativeSupported: false
+    });
   });
 
   it("returns safe empty JWKS by default", async () => {

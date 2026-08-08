@@ -46,6 +46,19 @@ export class HealthController {
             invitation: this.config.accountLifecycle.invitationEnabled ? "enabled" : "disabled"
           },
           profileWrite: this.config.iam.profileWriteMode,
+          organizationWrite: {
+            mode: this.config.iam.organizationWriteMode,
+            routeIntegrationEnabled: this.config.iam.organizationWriteRouteIntegrationEnabled,
+            dualWriteExecutionEnabled: this.config.iam.organizationWriteDualWriteExecutionEnabled,
+            rolloutMode: this.config.iam.organizationWriteRolloutMode,
+            rolloutAllowlistCount: this.config.iam.organizationWriteRolloutAllowlist
+              .split(",")
+              .map((item) => item.trim())
+              .filter(Boolean).length,
+            rolloutPercentage: this.config.iam.organizationWriteRolloutPercentage,
+            sourceOfTruth: "legacy",
+            identityNativeSupported: false
+          },
           pluginUserWrite: this.config.iam.pluginUserWriteMode
         }
       };
