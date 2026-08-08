@@ -62,13 +62,16 @@ GET /internal/iam/organization-write/subjects/:legacyUserId/alignment
 IDENTITY_IAM_ORG_WRITE_MODE: "legacy-proxy"
 IDENTITY_IAM_ORG_WRITE_ROUTE_INTEGRATION_ENABLED: "true"
 IDENTITY_IAM_ORG_WRITE_DUAL_WRITE_EXECUTION_ENABLED: "false"
-IDENTITY_IAM_ORG_WRITE_ROLLOUT_MODE: "off"
-IDENTITY_IAM_ORG_WRITE_ROLLOUT_ALLOWLIST: ""
+IDENTITY_IAM_ORG_WRITE_ROLLOUT_MODE: "allowlist"
+IDENTITY_IAM_ORG_WRITE_ROLLOUT_ALLOWLIST: "legacy:<approved-dedicated-user-id>"
 IDENTITY_IAM_ORG_WRITE_ROLLOUT_PERCENTAGE: "0"
 ```
 
 该窗口仍只调用既有 plugin-user Legacy owner 一次，并原样返回状态码和响应体，不写 Identity
-candidate。完成专用账号 replace/empty/preserve、未知组织 422 与普通用户负向回归后，立即恢复默认。
+candidate。未命中 allowlist 的请求完全旁路 organization compatibility layer，继续既有 plugin-user
+Legacy 路径且不产生 organization route-hit header/readback。`rollout=off` 会 fail closed，不得作为
+legacy-proxy 窗口配置。完成专用账号 replace/empty/preserve、未知组织 422 与普通用户负向回归后，
+立即恢复默认。
 
 ## Phase 4：小范围 dual-write 窗口
 

@@ -63,10 +63,37 @@ describe("IAM organization membership write compatibility layer", () => {
       status: 200,
       body: { code: 0, data: { id: 24, organizations: [] } },
       mode: "legacy-proxy",
-      evidence: { decision: "not-selected:off", identityStatus: "legacy-readback-aligned" }
+      evidence: { decision: "selected:allowlist", matchedSelectorKind: "legacy", identityStatus: "legacy-readback-aligned" }
     });
     expect(fixture.plugin.proxy).toHaveBeenCalledTimes(1);
     expect(fixture.repository.begin).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when legacy-proxy has no scoped rollout selector", async () => {
+    process.env.IDENTITY_IAM_ORG_WRITE_MODE = "legacy-proxy";
+    process.env.IDENTITY_IAM_ORG_WRITE_ROUTE_INTEGRATION_ENABLED = "true";
+    const fixture = createFixture();
+
+    expect(fixture.service.readiness()).toMatchObject({
+      legacyProxyGate: { executable: false, missingCapabilities: ["scoped-rollout-selector"] },
+      blockedReasons: ["scoped-rollout-selector"]
+    });
+    await expect(fixture.service.proxyMembershipUpdate(updateRequest([1]))).resolves.toBeNull();
+    expect(fixture.plugin.proxy).not.toHaveBeenCalled();
+    expect(fixture.legacy.getUserById).not.toHaveBeenCalled();
+  });
+
+  it("does not intercept a legacy-proxy membership update outside the approved allowlist", async () => {
+    enableLegacyProxy();
+    const fixture = createFixture();
+
+    await expect(fixture.service.proxyMembershipUpdate({
+      method: "POST",
+      headers: {},
+      body: { id: 25, organization_ids: [1] }
+    })).resolves.toBeNull();
+    expect(fixture.plugin.proxy).not.toHaveBeenCalled();
+    expect(fixture.legacy.getUserById).not.toHaveBeenCalled();
   });
 
   it("leaves malformed organization_ids to the existing Legacy contract path", async () => {
@@ -311,6 +338,8 @@ function organization(id: number, name: string, title: string): LegacyOrganizati
 function enableLegacyProxy(): void {
   process.env.IDENTITY_IAM_ORG_WRITE_MODE = "legacy-proxy";
   process.env.IDENTITY_IAM_ORG_WRITE_ROUTE_INTEGRATION_ENABLED = "true";
+  process.env.IDENTITY_IAM_ORG_WRITE_ROLLOUT_MODE = "allowlist";
+  process.env.IDENTITY_IAM_ORG_WRITE_ROLLOUT_ALLOWLIST = "legacy:24";
 }
 
 function enableDualWrite(): void {
