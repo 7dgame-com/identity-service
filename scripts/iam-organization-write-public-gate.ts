@@ -6,6 +6,7 @@ interface GateOptions {
   expectedRolloutMode: "off" | "allowlist" | "percentage" | "full";
   expectedRolloutPercentage: number;
   expectedAllowlistCount?: number;
+  expectedRevision?: string;
 }
 
 interface OrganizationWritePosture {
@@ -36,6 +37,7 @@ async function inspect(url: string, options: GateOptions) {
 
   if (!response.ok) failures.push(`HTTP ${response.status}`);
   if (body.status !== "ok" || body.service !== "identity-adapter") failures.push("identity health is not ok");
+  if (options.expectedRevision !== undefined) compare(failures, "revision", body.revision, options.expectedRevision);
   if (!posture) {
     failures.push("capabilities.organizationWrite is missing; deploy a compatible identity-service image first");
   } else {
@@ -51,7 +53,7 @@ async function inspect(url: string, options: GateOptions) {
     compare(failures, "identityNativeSupported", posture.identityNativeSupported, false);
   }
 
-  return { url, status: response.status, posture: posture ?? null, failures };
+  return { url, status: response.status, revision: body.revision ?? null, posture: posture ?? null, failures };
 }
 
 function compare(failures: string[], field: string, actual: unknown, expected: unknown): void {
@@ -78,11 +80,18 @@ function parseArgs(argv: string[]): GateOptions {
     else if (arg.startsWith("--expected-rollout-percentage=")) options.expectedRolloutPercentage = integerValue(arg, "--expected-rollout-percentage=", 0, 100);
     else if (arg.startsWith("--expected-allowlist-count=")) options.expectedAllowlistCount = integerValue(arg, "--expected-allowlist-count=", 0, 10_000);
     else if (arg === "--ignore-allowlist-count") options.expectedAllowlistCount = undefined;
+    else if (arg.startsWith("--expected-revision=")) options.expectedRevision = revisionValue(arg.slice("--expected-revision=".length));
     else throw new Error(`Unknown argument: ${arg}`);
   }
 
   if (options.urls.length === 0) throw new Error("--urls must contain at least one health URL");
   return options;
+}
+
+function revisionValue(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  if (!/^[a-f0-9]{40}$/.test(normalized)) throw new Error("--expected-revision must be a full 40-character Git SHA");
+  return normalized;
 }
 
 function csv(value: string): string[] {

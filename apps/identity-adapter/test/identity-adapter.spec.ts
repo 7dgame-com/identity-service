@@ -2323,6 +2323,7 @@ describe("identity-adapter readonly API", () => {
       }
     });
     expect(response.body.capabilities.oidc).toBe("disabled");
+    expect(response.body.revision).toBe("unknown");
     expect(response.body.capabilities.organizationWrite).toEqual({
       mode: "disabled",
       routeIntegrationEnabled: false,

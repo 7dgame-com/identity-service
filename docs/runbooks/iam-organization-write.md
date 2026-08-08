@@ -36,7 +36,8 @@ allowlist 主体。双域默认关闭门禁可直接执行：
 
 ```sh
 npm run iam:organization-write:public-gate -- \
-  --urls=https://identity.d.xrteeth.com/health,https://identity.d.tmrpp.com/health
+  --urls=https://identity.d.xrteeth.com/health,https://identity.d.tmrpp.com/health \
+  --expected-revision=<full-develop-git-sha>
 ```
 
 命令默认要求两个域名均为 `disabled / false / false / off / 0%`、Legacy 事实源且 native 不支持。
@@ -46,10 +47,15 @@ npm run iam:organization-write:public-gate -- \
 
 ```text
 GET /internal/iam/organization-write/readiness
+GET /internal/iam/organization-write/subjects/:legacyUserId/decision
 GET /internal/iam/organization-write/operations/summary?sinceMinutes=60
 GET /internal/iam/organization-write/operations/recent?sinceMinutes=60&limit=50
 GET /internal/iam/organization-write/subjects/:legacyUserId/alignment
 ```
+
+`subjects/:legacyUserId/decision` 只计算当前 target 是否命中 allowlist 以及 mode gate 是否 executable，
+返回脱敏 target fingerprint，不读取 Legacy、不写 Legacy/Identity。它只能用于写前 preflight；真正的
+request-level route hit 仍必须由获批 mutation 的响应 header/日志/ledger 证明。
 
 对账等级：P0 为 Legacy 用户不存在，P1 为成员组织 ID 集合不一致，P2 为相同 ID 的 name/title
 不一致。候选态不一致不得推进窗口。
