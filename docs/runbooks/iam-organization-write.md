@@ -57,6 +57,26 @@ GET /internal/iam/organization-write/subjects/:legacyUserId/alignment
 返回脱敏 target fingerprint，不读取 Legacy、不写 Legacy/Identity。它只能用于写前 preflight；真正的
 request-level route hit 仍必须由获批 mutation 的响应 header/日志/ledger 证明。
 
+容器或受控内网入口中可用只读窗口门禁一次核验 health revision、内部 readiness、目标 decision、
+近期 ledger 风险以及（dual-write 时）alignment。token 只允许通过环境变量传入，脚本不接受
+`--token`，且只发送 GET：
+
+```sh
+IDENTITY_IAM_INTERNAL_API_TOKEN='<runtime-secret>' \
+npm run iam:organization-write:window-gate -- \
+  --adapter-url=http://127.0.0.1:8086 \
+  --legacy-user-id=<approved-dedicated-user-id> \
+  --expected-mode=legacy-proxy \
+  --expected-revision=<full-develop-git-sha> \
+  --expected-allowlist-count=1 \
+  --since-minutes=60
+```
+
+dual-write 窗口另加 `--expected-mode=dual-write --require-alignment`。门禁遇到 pending/failed
+operation、required/failed compensation、未命中 allowlist、不可执行 mode gate 或 alignment
+任一 P0/P1/P2/mismatch 非零都会失败。输出不得保存 token，也不替代 Dedicated Test Assets 的
+人工批准或真实 mutation 证据。
+
 对账等级：P0 为 Legacy 用户不存在，P1 为成员组织 ID 集合不一致，P2 为相同 ID 的 name/title
 不一致。候选态不一致不得推进窗口。
 
