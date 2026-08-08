@@ -1,0 +1,110 @@
+interface GateOptions {
+  urls: string[];
+  expectedMode: "disabled" | "legacy-proxy" | "dual-write" | "identity-native";
+  expectedRouteIntegration: boolean;
+  expectedDualWriteExecution: boolean;
+  expectedRolloutMode: "off" | "allowlist" | "percentage" | "full";
+  expectedRolloutPercentage: number;
+  expectedAllowlistCount?: number;
+}
+
+interface OrganizationWritePosture {
+  mode: string;
+  routeIntegrationEnabled: boolean;
+  dualWriteExecutionEnabled: boolean;
+  rolloutMode: string;
+  rolloutAllowlistCount: number;
+  rolloutPercentage: number;
+  sourceOfTruth: string;
+  identityNativeSupported: boolean;
+}
+
+async function main(): Promise<void> {
+  const options = parseArgs(process.argv.slice(2));
+  const results = await Promise.all(options.urls.map((url) => inspect(url, options)));
+  const failures = results.flatMap((result) => result.failures.map((failure) => `${result.url}: ${failure}`));
+
+  console.log(JSON.stringify({ passed: failures.length === 0, results, failures }, null, 2));
+  if (failures.length > 0) process.exitCode = 1;
+}
+
+async function inspect(url: string, options: GateOptions) {
+  const response = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+  const body = await response.json() as Record<string, any>;
+  const posture = body.capabilities?.organizationWrite as OrganizationWritePosture | undefined;
+  const failures: string[] = [];
+
+  if (!response.ok) failures.push(`HTTP ${response.status}`);
+  if (body.status !== "ok" || body.service !== "identity-adapter") failures.push("identity health is not ok");
+  if (!posture) {
+    failures.push("capabilities.organizationWrite is missing; deploy a compatible identity-service image first");
+  } else {
+    compare(failures, "mode", posture.mode, options.expectedMode);
+    compare(failures, "routeIntegrationEnabled", posture.routeIntegrationEnabled, options.expectedRouteIntegration);
+    compare(failures, "dualWriteExecutionEnabled", posture.dualWriteExecutionEnabled, options.expectedDualWriteExecution);
+    compare(failures, "rolloutMode", posture.rolloutMode, options.expectedRolloutMode);
+    compare(failures, "rolloutPercentage", posture.rolloutPercentage, options.expectedRolloutPercentage);
+    if (options.expectedAllowlistCount !== undefined) {
+      compare(failures, "rolloutAllowlistCount", posture.rolloutAllowlistCount, options.expectedAllowlistCount);
+    }
+    compare(failures, "sourceOfTruth", posture.sourceOfTruth, "legacy");
+    compare(failures, "identityNativeSupported", posture.identityNativeSupported, false);
+  }
+
+  return { url, status: response.status, posture: posture ?? null, failures };
+}
+
+function compare(failures: string[], field: string, actual: unknown, expected: unknown): void {
+  if (actual !== expected) failures.push(`${field} expected ${String(expected)}, got ${String(actual)}`);
+}
+
+function parseArgs(argv: string[]): GateOptions {
+  const options: GateOptions = {
+    urls: ["https://identity.d.xrteeth.com/health", "https://identity.d.tmrpp.com/health"],
+    expectedMode: "disabled",
+    expectedRouteIntegration: false,
+    expectedDualWriteExecution: false,
+    expectedRolloutMode: "off",
+    expectedRolloutPercentage: 0,
+    expectedAllowlistCount: 0
+  };
+
+  for (const arg of argv) {
+    if (arg.startsWith("--urls=")) options.urls = csv(arg.slice("--urls=".length));
+    else if (arg.startsWith("--expected-mode=")) options.expectedMode = enumValue(arg, "--expected-mode=", ["disabled", "legacy-proxy", "dual-write", "identity-native"]);
+    else if (arg.startsWith("--expected-route-integration=")) options.expectedRouteIntegration = booleanValue(arg, "--expected-route-integration=");
+    else if (arg.startsWith("--expected-dual-write-execution=")) options.expectedDualWriteExecution = booleanValue(arg, "--expected-dual-write-execution=");
+    else if (arg.startsWith("--expected-rollout-mode=")) options.expectedRolloutMode = enumValue(arg, "--expected-rollout-mode=", ["off", "allowlist", "percentage", "full"]);
+    else if (arg.startsWith("--expected-rollout-percentage=")) options.expectedRolloutPercentage = integerValue(arg, "--expected-rollout-percentage=", 0, 100);
+    else if (arg.startsWith("--expected-allowlist-count=")) options.expectedAllowlistCount = integerValue(arg, "--expected-allowlist-count=", 0, 10_000);
+    else if (arg === "--ignore-allowlist-count") options.expectedAllowlistCount = undefined;
+    else throw new Error(`Unknown argument: ${arg}`);
+  }
+
+  if (options.urls.length === 0) throw new Error("--urls must contain at least one health URL");
+  return options;
+}
+
+function csv(value: string): string[] {
+  return value.split(",").map((entry) => entry.trim()).filter(Boolean);
+}
+
+function enumValue<T extends string>(arg: string, prefix: string, values: readonly T[]): T {
+  const value = arg.slice(prefix.length) as T;
+  if (!values.includes(value)) throw new Error(`${prefix.slice(0, -1)} must be one of ${values.join(", ")}`);
+  return value;
+}
+
+function booleanValue(arg: string, prefix: string): boolean {
+  const value = arg.slice(prefix.length);
+  if (value !== "true" && value !== "false") throw new Error(`${prefix.slice(0, -1)} must be true or false`);
+  return value === "true";
+}
+
+function integerValue(arg: string, prefix: string, min: number, max: number): number {
+  const value = Number(arg.slice(prefix.length));
+  if (!Number.isInteger(value) || value < min || value > max) throw new Error(`${prefix.slice(0, -1)} must be an integer from ${min} to ${max}`);
+  return value;
+}
+
+await main();
