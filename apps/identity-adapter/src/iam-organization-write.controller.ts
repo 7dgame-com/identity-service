@@ -57,6 +57,20 @@ export class IamOrganizationWriteController {
     };
   }
 
+  @Get("subjects/:legacyUserId/decision")
+  previewMembershipRollout(
+    @Headers("x-identity-internal-token") token: string | undefined,
+    @Param("legacyUserId") legacyUserId: string
+  ) {
+    this.assertInternalToken(token);
+    return {
+      status: "ok",
+      service: "identity-adapter",
+      capability: "iam-organization-write-rollout-preview",
+      data: this.organizationWrite.previewMembershipRollout(parseLegacyUserId(legacyUserId))
+    };
+  }
+
   @Post("operations/:operationKey/retry-identity-candidate")
   async retryIdentityCandidate(
     @Headers("x-identity-internal-token") token: string | undefined,

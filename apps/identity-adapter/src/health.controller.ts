@@ -19,6 +19,7 @@ export class HealthController {
         service: "identity-adapter",
         mode: this.config.readonlyMode ? "readonly" : "unsafe",
         version: process.env.npm_package_version ?? "0.1.0",
+        revision: buildRevision(),
         dependencies: {
           legacyDatabase,
           keycloak: this.config.keycloak.baseUrl ? "configured" : "not_configured"
@@ -66,4 +67,9 @@ export class HealthController {
       span.end();
     }
   }
+}
+
+function buildRevision(): string {
+  const value = process.env.IDENTITY_BUILD_REVISION?.trim().toLowerCase() ?? "";
+  return /^[a-f0-9]{40}$/.test(value) ? value : "unknown";
 }
