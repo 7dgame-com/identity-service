@@ -69,6 +69,19 @@ describe("IAM organization membership write compatibility layer", () => {
     expect(fixture.repository.begin).not.toHaveBeenCalled();
   });
 
+  it("does not leak the underlying plugin-user dual-write mode into a legacy-proxy organization response", async () => {
+    enableLegacyProxy();
+    const fixture = createFixture({ pluginMode: "dual-write" });
+    const response = await fixture.service.proxyMembershipUpdate(updateRequest([999]));
+
+    expect(response).toMatchObject({
+      status: 200,
+      mode: "legacy-proxy",
+      evidence: { decision: "selected:allowlist", matchedSelectorKind: "legacy" }
+    });
+    await expect(fixture.plugin.proxy.mock.results[0]?.value).resolves.toMatchObject({ mode: "dual-write" });
+  });
+
   it("fails closed when legacy-proxy has no scoped rollout selector", async () => {
     process.env.IDENTITY_IAM_ORG_WRITE_MODE = "legacy-proxy";
     process.env.IDENTITY_IAM_ORG_WRITE_ROUTE_INTEGRATION_ENABLED = "true";
@@ -298,21 +311,23 @@ function createFixture(input: {
   existingCompensationStatus?: "none" | "required" | "completed" | "failed";
   candidateMissing?: boolean;
   pluginResponse?: { status: number; body: unknown };
+  pluginMode?: "legacy-proxy" | "dual-write";
   username?: string;
   roles?: string[];
 } = {}) {
   const organizations = input.organizations ?? [];
+  const pluginMode = input.pluginMode ?? "legacy-proxy";
   const plugin = {
     readiness: vi.fn(() => ({
       enabled: true,
-      mode: "legacy-proxy",
+      mode: pluginMode,
       legacyProxyConfigured: true,
-      dualWriteSupported: false
+      dualWriteSupported: pluginMode === "dual-write"
     })),
     proxy: vi.fn(async () => ({
       status: input.pluginResponse?.status ?? 200,
       body: input.pluginResponse?.body ?? { code: 0, data: { id: 24, organizations } },
-      mode: "legacy-proxy" as const
+      mode: pluginMode
     }))
   };
   const repository = {
