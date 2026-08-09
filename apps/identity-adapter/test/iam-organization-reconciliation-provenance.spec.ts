@@ -56,6 +56,14 @@ describe("trusted external provenance for organization reconciliation", () => {
       ...fixture.context,
       attestationBundle: { ...fixture.context.attestationBundle, attestations }
     })).toMatchObject({ verified: false, code: "signature-invalid", verifiedAttestationCount: 0 });
+
+    expect(verifyOrganizationReconciliationProvenance(fixture.binding, {
+      ...fixture.context,
+      trustPolicy: {
+        ...fixture.context.trustPolicy,
+        contract: "iam-organization-reconciliation-trust-policy/v2"
+      } as never
+    })).toMatchObject({ verified: false, code: "trusted-context-invalid" });
   });
 
   it("verifies complete aligned evidence but retains the compiled real-adapter blocker", () => {

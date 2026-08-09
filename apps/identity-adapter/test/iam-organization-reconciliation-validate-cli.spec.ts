@@ -321,6 +321,12 @@ describe("offline IAM organization reconciliation CLI", () => {
     expect(() => parseOrganizationReconciliationJson(JSON.stringify(v2Contract)))
       .toThrow(OrganizationReconciliationCliError);
 
+    const v2DecisionContract = structuredClone(alignedInput()) as unknown as Record<string, any>;
+    v2DecisionContract.collectionEnvelope.legacy.decisionUniverses.pluginVisibility.derivationContract =
+      "iam-organization-reconciliation-decision-universe/v2";
+    expect(() => parseOrganizationReconciliationJson(JSON.stringify(v2DecisionContract)))
+      .toThrow(OrganizationReconciliationCliError);
+
     for (const subjectRef of [
       "private-subject",
       "legacy-user:0",

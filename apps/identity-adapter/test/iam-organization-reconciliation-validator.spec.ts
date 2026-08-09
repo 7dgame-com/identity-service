@@ -1,3 +1,4 @@
+import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   createOrganizationReconciliationEvidenceHash,
@@ -95,6 +96,18 @@ describe("work-package 4 full-scope organization reconciliation validator", () =
       } as never
     });
     expect(oldManifestContract.coverageBlockers).toContainEqual({
+      surface: "collection-envelope",
+      code: "component-manifest-invalid"
+    });
+
+    const oldOperationEvidenceContract = validateOrganizationReconciliationRaw({
+      ...evidenceBody,
+      componentManifest: {
+        ...componentManifest!,
+        evidenceContract: "iam-organization-reconciliation-operation-evidence/v1"
+      } as never
+    });
+    expect(oldOperationEvidenceContract.coverageBlockers).toContainEqual({
       surface: "collection-envelope",
       code: "component-manifest-invalid"
     });
@@ -296,6 +309,16 @@ describe("work-package 4 full-scope organization reconciliation validator", () =
       { surface: "plugin-visibility", code: "record-schema-invalid", side: "legacy" },
       { surface: "plugin-visibility", code: "record-schema-invalid", side: "identity" }
     ]));
+  });
+
+  it("domain-separates v3 evidence HMACs from the retired v2 contract", () => {
+    const value = "domain-test";
+    const current = createOrganizationReconciliationEvidenceHash(EVIDENCE_NONCE, value);
+    const retired = createHmac("sha256", EVIDENCE_NONCE)
+      .update("iam-organization-reconciliation:v2\u001f")
+      .update(JSON.stringify(value))
+      .digest("hex");
+    expect(current).not.toBe(retired);
   });
 
   it("rejects plugin visibility allows without the exact active binding", () => {
