@@ -1,4 +1,5 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import { isProxy } from "node:util/types";
 import {
   ORGANIZATION_RECONCILIATION_PAGINATION_MODE,
   ORGANIZATION_RECONCILIATION_SNAPSHOT_MODE,
@@ -24,7 +25,10 @@ import {
   createOrganizationReconciliationEvidenceHash
 } from "../../iam-organization-reconciliation-validator.js";
 import { subjectRefForLegacyUserId } from "../../iam-organization-reconciliation-refs.js";
-import type { MysqlRepeatableReadSnapshotConnectionFactory } from "../mysql-repeatable-read-snapshot.js";
+import {
+  ORGANIZATION_RECONCILIATION_MYSQL_STATEMENT_CATALOG_SHA256,
+  type MysqlRepeatableReadSnapshotConnectionFactory
+} from "../mysql-repeatable-read-snapshot.js";
 import {
   openIdentityMysqlRawSnapshot,
   openLegacyMainMysqlRawSnapshot,
@@ -39,8 +43,39 @@ import {
 
 export const ORGANIZATION_RECONCILIATION_MYSQL_TRANSACTION_DATASET_ADAPTER_CONTRACT =
   "iam-organization-reconciliation-mysql-transaction-dataset-adapter/v1" as const;
+export const ORGANIZATION_RECONCILIATION_MYSQL_TRANSACTION_DATASET_ADAPTER_FACTORY_PROVENANCE_CONTRACT =
+  "iam-organization-reconciliation-mysql-transaction-dataset-adapter-factory-provenance/v1" as const;
 /** Owner catalogs and reviewed physical runtime bindings remain deliberately absent. */
 export const ORGANIZATION_RECONCILIATION_MYSQL_TRANSACTION_DATASET_ADAPTER_READY = false as const;
+
+/**
+ * Runtime proof of one deliberately narrow fact: the exact adapter object was
+ * created by this hardened factory with the captured declarations below. It
+ * does not authenticate the physical database or approve the declared catalog.
+ */
+export interface OrganizationReconciliationMysqlTransactionDatasetAdapterFactoryProvenance {
+  readonly contract:
+    typeof ORGANIZATION_RECONCILIATION_MYSQL_TRANSACTION_DATASET_ADAPTER_FACTORY_PROVENANCE_CONTRACT;
+  readonly adapterContract:
+    typeof ORGANIZATION_RECONCILIATION_MYSQL_TRANSACTION_DATASET_ADAPTER_CONTRACT;
+  readonly trust: "factory-origin-only";
+  readonly physicalSourceTrust: "unattested";
+  readonly ownerCatalogTrust: typeof ORGANIZATION_RECONCILIATION_DATASET_CATALOG_TRUST;
+  readonly componentId: OrganizationReconciliationMysqlRawComponentId;
+  readonly expectedSourceId: string;
+  readonly declaredCatalogSha256: string;
+  readonly structuralCatalogSha256: string;
+  readonly datasetIds: readonly string[];
+  readonly datasetCatalog: OrganizationReconciliationDatasetCatalog;
+  readonly statementCatalogSha256: string;
+}
+
+export interface OrganizationReconciliationMysqlTransactionDatasetAdapterFactoryBinding {
+  readonly componentId: OrganizationReconciliationMysqlRawComponentId;
+  readonly expectedSourceId: string;
+  readonly catalogSha256: string;
+  readonly datasetCatalog: OrganizationReconciliationDatasetCatalog;
+}
 
 export interface OrganizationReconciliationMysqlTransactionDatasetAdapterReadiness {
   readonly ready: false;
@@ -117,6 +152,19 @@ interface ActiveSnapshot {
   closePromise: Promise<void> | null;
 }
 
+interface FactoryProvenanceBrand {
+  readonly provenance: OrganizationReconciliationMysqlTransactionDatasetAdapterFactoryProvenance;
+  readonly adapterValues: Readonly<{
+    sourceId: string;
+    openSnapshot: OrganizationReconciliationDatasetSourceAdapter<OrganizationReconciliationInventoryJsonValue>["openSnapshot"];
+    readSnapshotPage: OrganizationReconciliationDatasetSourceAdapter<OrganizationReconciliationInventoryJsonValue>["readSnapshotPage"];
+    verifySnapshotDatasetReplay:
+      OrganizationReconciliationDatasetSourceAdapter<OrganizationReconciliationInventoryJsonValue>["verifySnapshotDatasetReplay"];
+    closeSnapshot: OrganizationReconciliationDatasetSourceAdapter<OrganizationReconciliationInventoryJsonValue>["closeSnapshot"];
+  }>;
+  readonly canonicalCatalogJson: string;
+}
+
 const COMPONENT_DATASETS: Readonly<Record<OrganizationReconciliationMysqlRawComponentId, readonly string[]>> =
   Object.freeze({
     "legacy-main": Object.freeze([
@@ -138,6 +186,11 @@ const COMPONENT_DATASETS: Readonly<Record<OrganizationReconciliationMysqlRawComp
 const MAX_COMPONENT_CACHED_BYTES = 64 * 1024 * 1024;
 const MAX_COMPONENT_PAGES = 10_000;
 const MAX_COMPONENT_RECORDS = 10_000_000;
+const STRUCTURAL_CATALOG_HASH_DOMAIN = Buffer.from(
+  "iam-organization-reconciliation:mysql-transaction-dataset-structural-catalog:v1\u001f",
+  "utf8"
+);
+const factoryProvenanceBrands = new WeakMap<object, FactoryProvenanceBrand>();
 
 export function createOrganizationReconciliationMysqlTransactionDatasetAdapter(
   candidate: CreateOrganizationReconciliationMysqlTransactionDatasetAdapterOptions
@@ -314,7 +367,94 @@ export function createOrganizationReconciliationMysqlTransactionDatasetAdapter(
       return state.closePromise;
     }
   };
-  return Object.freeze(adapter);
+  const frozenAdapter = Object.freeze(adapter);
+  const provenance = Object.freeze({
+    contract:
+      ORGANIZATION_RECONCILIATION_MYSQL_TRANSACTION_DATASET_ADAPTER_FACTORY_PROVENANCE_CONTRACT,
+    adapterContract: ORGANIZATION_RECONCILIATION_MYSQL_TRANSACTION_DATASET_ADAPTER_CONTRACT,
+    trust: "factory-origin-only" as const,
+    physicalSourceTrust: "unattested" as const,
+    ownerCatalogTrust: ORGANIZATION_RECONCILIATION_DATASET_CATALOG_TRUST,
+    componentId: options.componentId,
+    expectedSourceId: options.expectedSourceId,
+    declaredCatalogSha256: options.catalogSha256,
+    structuralCatalogSha256: options.structuralCatalogSha256,
+    datasetIds: Object.freeze(options.datasets.map((dataset) => dataset.datasetId)),
+    datasetCatalog: options.datasetCatalog,
+    statementCatalogSha256: ORGANIZATION_RECONCILIATION_MYSQL_STATEMENT_CATALOG_SHA256
+  } satisfies OrganizationReconciliationMysqlTransactionDatasetAdapterFactoryProvenance);
+  factoryProvenanceBrands.set(frozenAdapter, Object.freeze({
+    provenance,
+    adapterValues: Object.freeze({
+      sourceId: frozenAdapter.sourceId,
+      openSnapshot: frozenAdapter.openSnapshot,
+      readSnapshotPage: frozenAdapter.readSnapshotPage,
+      verifySnapshotDatasetReplay: frozenAdapter.verifySnapshotDatasetReplay,
+      closeSnapshot: frozenAdapter.closeSnapshot
+    }),
+    canonicalCatalogJson: JSON.stringify(options.datasetCatalog)
+  }));
+  return frozenAdapter;
+}
+
+/**
+ * Validates the exact factory-created object and its exact captured binding.
+ * The returned metadata is descriptive only; cloning it never transfers the
+ * private runtime brand held by this module.
+ */
+export function assertOrganizationReconciliationMysqlTransactionDatasetAdapterFactoryProvenance(
+  candidateAdapter: unknown,
+  candidateBinding: unknown
+): OrganizationReconciliationMysqlTransactionDatasetAdapterFactoryProvenance {
+  if (
+    candidateAdapter === null ||
+    typeof candidateAdapter !== "object" ||
+    isProxy(candidateAdapter)
+  ) {
+    throw new Error("The transaction dataset adapter has no factory provenance.");
+  }
+  const brand = factoryProvenanceBrands.get(candidateAdapter);
+  if (!brand) {
+    throw new Error("The transaction dataset adapter has no factory provenance.");
+  }
+  const adapterValues = exact(candidateAdapter, [
+    "sourceId",
+    "openSnapshot",
+    "readSnapshotPage",
+    "verifySnapshotDatasetReplay",
+    "closeSnapshot"
+  ]);
+  if (
+    !Object.isFrozen(candidateAdapter) ||
+    adapterValues.sourceId !== brand.adapterValues.sourceId ||
+    adapterValues.openSnapshot !== brand.adapterValues.openSnapshot ||
+    adapterValues.readSnapshotPage !== brand.adapterValues.readSnapshotPage ||
+    adapterValues.verifySnapshotDatasetReplay !== brand.adapterValues.verifySnapshotDatasetReplay ||
+    adapterValues.closeSnapshot !== brand.adapterValues.closeSnapshot
+  ) {
+    throw new Error("The transaction dataset adapter factory provenance changed.");
+  }
+
+  const binding = exact(candidateBinding, [
+    "componentId", "expectedSourceId", "catalogSha256", "datasetCatalog"
+  ]);
+  const componentId = requireComponentId(binding.componentId);
+  const expectedSourceId = requireMetadata(binding.expectedSourceId, "source ID");
+  const declaredCatalogSha256 = requireSha256(binding.catalogSha256, "catalog digest");
+  const datasetCatalog = captureDatasetCatalog(componentId, binding.datasetCatalog);
+  const structuralCatalogSha256 = createStructuralCatalogSha256(datasetCatalog);
+  if (
+    componentId !== brand.provenance.componentId ||
+    expectedSourceId !== brand.provenance.expectedSourceId ||
+    declaredCatalogSha256 !== brand.provenance.declaredCatalogSha256 ||
+    structuralCatalogSha256 !== brand.provenance.structuralCatalogSha256 ||
+    JSON.stringify(datasetCatalog) !== brand.canonicalCatalogJson ||
+    brand.provenance.statementCatalogSha256 !==
+      ORGANIZATION_RECONCILIATION_MYSQL_STATEMENT_CATALOG_SHA256
+  ) {
+    throw new Error("The transaction dataset adapter does not match its factory binding.");
+  }
+  return brand.provenance;
 }
 
 interface ValidatedOptions {
@@ -323,6 +463,8 @@ interface ValidatedOptions {
   readonly connectionFactory: MysqlRepeatableReadSnapshotConnectionFactory;
   readonly evidenceNonce: string;
   readonly catalogSha256: string;
+  readonly structuralCatalogSha256: string;
+  readonly datasetCatalog: OrganizationReconciliationDatasetCatalog;
   readonly datasets: readonly OrganizationReconciliationDatasetSpec[];
 }
 
@@ -339,7 +481,25 @@ function validateOptions(candidate: unknown): ValidatedOptions {
     throw new Error("A high-entropy evidence nonce is required.");
   }
   const catalogSha256 = requireSha256(options.catalogSha256, "catalog digest");
-  const catalog = exact(options.datasetCatalog, ["contract", "trust", "datasets"]);
+  const datasetCatalog = captureDatasetCatalog(options.componentId, options.datasetCatalog);
+  const datasets = datasetCatalog.datasets;
+  return Object.freeze({
+    componentId: options.componentId,
+    expectedSourceId,
+    connectionFactory: options.connectionFactory as MysqlRepeatableReadSnapshotConnectionFactory,
+    evidenceNonce: options.evidenceNonce,
+    catalogSha256,
+    structuralCatalogSha256: createStructuralCatalogSha256(datasetCatalog),
+    datasetCatalog,
+    datasets
+  });
+}
+
+function captureDatasetCatalog(
+  componentId: OrganizationReconciliationMysqlRawComponentId,
+  candidate: unknown
+): OrganizationReconciliationDatasetCatalog {
+  const catalog = exact(candidate, ["contract", "trust", "datasets"]);
   if (catalog.contract !== ORGANIZATION_RECONCILIATION_DATASET_LINEAGE_CONTRACT ||
     catalog.trust !== ORGANIZATION_RECONCILIATION_DATASET_CATALOG_TRUST) {
     throw new Error("The structural dataset catalog is invalid.");
@@ -354,7 +514,7 @@ function validateOptions(candidate: unknown): ValidatedOptions {
       maxRecords: requireBound(spec.maxRecords, 0, 10_000_000, "record count")
     });
   }).sort((left, right) => left.datasetId < right.datasetId ? -1 : left.datasetId > right.datasetId ? 1 : 0);
-  const requiredDatasets = COMPONENT_DATASETS[options.componentId];
+  const requiredDatasets = COMPONENT_DATASETS[componentId];
   if (datasets.map((dataset) => dataset.datasetId).join("\u001f") !== requiredDatasets.join("\u001f")) {
     throw new Error("The structural dataset catalog does not cover the fixed component datasets.");
   }
@@ -363,13 +523,17 @@ function validateOptions(candidate: unknown): ValidatedOptions {
     throw new Error("The structural dataset catalog exceeds its aggregate component bound.");
   }
   return Object.freeze({
-    componentId: options.componentId,
-    expectedSourceId,
-    connectionFactory: options.connectionFactory as MysqlRepeatableReadSnapshotConnectionFactory,
-    evidenceNonce: options.evidenceNonce,
-    catalogSha256,
+    contract: ORGANIZATION_RECONCILIATION_DATASET_LINEAGE_CONTRACT,
+    trust: ORGANIZATION_RECONCILIATION_DATASET_CATALOG_TRUST,
     datasets: Object.freeze(datasets)
   });
+}
+
+function createStructuralCatalogSha256(catalog: OrganizationReconciliationDatasetCatalog): string {
+  return createHash("sha256")
+    .update(STRUCTURAL_CATALOG_HASH_DOMAIN)
+    .update(JSON.stringify(catalog), "utf8")
+    .digest("hex");
 }
 
 async function openRawSnapshot(options: ValidatedOptions): Promise<RawSnapshot> {
@@ -515,7 +679,7 @@ function poisonActiveSnapshot(state: ActiveSnapshot): void {
 }
 
 function safeArray(candidate: unknown, label: string, minimum: number, maximum: number): readonly unknown[] {
-  if (!Array.isArray(candidate) || Object.getPrototypeOf(candidate) !== Array.prototype ||
+  if (!Array.isArray(candidate) || isProxy(candidate) || Object.getPrototypeOf(candidate) !== Array.prototype ||
     Object.getOwnPropertySymbols(candidate).length > 0) {
     throw new Error(`The ${label} is invalid.`);
   }
@@ -545,6 +709,7 @@ function safeArray(candidate: unknown, label: string, minimum: number, maximum: 
 
 function exact(candidate: unknown, keys: readonly string[]): Record<string, unknown> {
   if (!candidate || typeof candidate !== "object" || Array.isArray(candidate) ||
+    isProxy(candidate) ||
     (Object.getPrototypeOf(candidate) !== Object.prototype && Object.getPrototypeOf(candidate) !== null) ||
     Object.getOwnPropertySymbols(candidate).length > 0) throw new Error("Materialized dataset configuration is invalid.");
   const descriptors = Object.getOwnPropertyDescriptors(candidate);
@@ -563,6 +728,13 @@ function exact(candidate: unknown, keys: readonly string[]): Record<string, unkn
 function requireMetadata(value: unknown, label: string): string {
   if (typeof value !== "string" || value.length < 1 || value.length > 1_024 || value.trim() !== value ||
     value.normalize("NFC") !== value || /[\u0000-\u001f\u007f]/u.test(value)) throw new Error(`The ${label} is invalid.`);
+  return value;
+}
+
+function requireComponentId(value: unknown): OrganizationReconciliationMysqlRawComponentId {
+  if (value !== "legacy-main" && value !== "identity" && value !== "plugin") {
+    throw new Error("A materialized dataset component ID is invalid.");
+  }
   return value;
 }
 
