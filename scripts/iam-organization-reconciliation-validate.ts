@@ -8,34 +8,70 @@ import {
   OrganizationReconciliationInput,
   validateOrganizationReconciliation
 } from "../apps/identity-adapter/src/iam-organization-reconciliation-validator.js";
+import {
+  parseOrganizationReconciliationAttestationBundle,
+  parseOrganizationReconciliationTrustPolicy,
+  type OrganizationReconciliationTrustedProfile
+} from "../apps/identity-adapter/src/iam-organization-reconciliation-provenance.js";
+import {
+  resolveCompiledOrganizationReconciliationTrustProfile
+} from "../apps/identity-adapter/src/iam-organization-reconciliation-trust-profiles.js";
 
 export type OrganizationReconciliationCliOptions =
   | { readonly mode: "help" }
-  | { readonly mode: "validate"; readonly inputPath: string };
+  | {
+      readonly mode: "validate";
+      readonly inputPath: string;
+      readonly trustedProvenance?: {
+        readonly attestationPath: string;
+        readonly trustPolicyPath: string;
+        readonly trustProfile: string;
+      };
+    };
 
 export interface OrganizationReconciliationCliIo {
   readonly inspectInputFile: (path: string) => Promise<{ readonly isFile: boolean; readonly size: number }>;
   readonly readInputFile: (path: string) => Promise<string>;
+  /** Tests may inject a resolver; production uses only the immutable compiled registry. */
+  readonly resolveTrustProfile?: (profileId: string) => OrganizationReconciliationTrustedProfile | undefined;
+  readonly now?: () => Date;
   readonly writeStdout: (text: string) => void;
   readonly writeStderr: (text: string) => void;
 }
 
 export const organizationReconciliationCliHelp = `Usage:
   npm run iam:organization-reconciliation:validate -- --input=<local-json-file>
+  npm run iam:organization-reconciliation:validate -- --input=<local-json-file> \\
+    --attestation=<local-json-file> --trust-policy=<local-json-file> \\
+    --trust-profile=<compiled-profile-id>
 
 Options:
   --input=<local-json-file>  Explicit local JSON snapshot file (required).
+  --attestation=<local-json-file>
+                             Signed external collector attestations (optional;
+                             requires trust-policy and trust-profile).
+  --trust-policy=<local-json-file>
+                             Change-controlled Ed25519 public-key policy
+                             (optional; requires attestation and trust-profile).
+  --trust-profile=<identifier>
+                             Resolved only from the immutable compiled trust
+                             registry (optional; requires both files).
   --help                     Show this help.
 
 The command performs no network or database access. URL, token, stdin, and
-network parameters are not supported. This version verifies envelope
-self-consistency but has no trusted collector attestation verifier, so even
-staticChecksPassed=true remains safetyGate.passed=false and exits with status 1.
-Only a future trusted-provenance verifier may allow status 0. Argument, file,
-JSON, or schema errors exit with status 2.
+network parameters are not supported. Snapshot-only mode may set
+staticChecksPassed=true but remains safetyGate.passed=false because no
+trusted-provenance verifier input was supplied. Trusted mode additionally
+requires a provisioned compiled trust profile; no policy pin is accepted from
+arguments, environment, evidence, attestations, or policy JSON. It verifies
+every policy-required Ed25519 collector against
+the complete evidence digest, environment/node binding, collection window, and
+freshness limits. Invalid or absent provenance fails closed. Argument, file,
+JSON, schema, or unknown/unprovisioned-profile errors exit with status 2.
 `;
 
 const MAX_INPUT_BYTES = 16 * 1024 * 1024;
+const MAX_TRUSTED_ARTIFACT_BYTES = 1024 * 1024;
 const nonBlankString = z.string().min(1).refine((value) => value.trim().length > 0);
 const organizationId = z.union([z.number().int().positive(), nonBlankString]);
 const decision = z.enum(["allow", "deny"]);
@@ -150,7 +186,13 @@ export class OrganizationReconciliationCliError extends Error {
       | "input-file-not-regular"
       | "input-file-too-large"
       | "input-json-invalid"
-      | "input-schema-invalid",
+      | "input-schema-invalid"
+      | "trust-profile-unprovisioned"
+      | "trusted-artifact-read-failed"
+      | "trusted-artifact-not-regular"
+      | "trusted-artifact-too-large"
+      | "trusted-artifact-json-invalid"
+      | "trusted-artifact-schema-invalid",
     message: string
   ) {
     super(message);
@@ -165,30 +207,91 @@ export function parseOrganizationReconciliationCliArgs(argv: readonly string[]):
   }
 
   let inputPath: string | null = null;
+  let attestationPath: string | null = null;
+  let trustPolicyPath: string | null = null;
+  let trustProfile: string | null = null;
   for (const arg of argv) {
     if (arg.startsWith("--input=")) {
       if (inputPath !== null) {
         throw new OrganizationReconciliationCliError("argument-invalid", "--input may be provided only once.");
       }
-      const candidate = arg.slice("--input=".length);
-      if (!candidate.trim() || candidate === "-" || candidate.includes("\0") || isUrl(candidate)) {
-        throw new OrganizationReconciliationCliError(
-          "argument-invalid",
-          "--input must identify one explicit local JSON file; URL and stdin inputs are forbidden."
-        );
+      inputPath = parseLocalPathArgument("--input", arg.slice("--input=".length));
+      continue;
+    }
+    if (arg.startsWith("--attestation=")) {
+      if (attestationPath !== null) {
+        throw new OrganizationReconciliationCliError("argument-invalid", "--attestation may be provided only once.");
       }
-      inputPath = candidate;
+      attestationPath = parseLocalPathArgument("--attestation", arg.slice("--attestation=".length));
+      continue;
+    }
+    if (arg.startsWith("--trust-policy=")) {
+      if (trustPolicyPath !== null) {
+        throw new OrganizationReconciliationCliError("argument-invalid", "--trust-policy may be provided only once.");
+      }
+      trustPolicyPath = parseLocalPathArgument("--trust-policy", arg.slice("--trust-policy=".length));
+      continue;
+    }
+    if (arg.startsWith("--trust-profile=")) {
+      if (trustProfile !== null) {
+        throw new OrganizationReconciliationCliError("argument-invalid", "--trust-profile may be provided only once.");
+      }
+      trustProfile = parseTrustProfileArgument(arg.slice("--trust-profile=".length));
       continue;
     }
     throw new OrganizationReconciliationCliError(
       "argument-invalid",
-      "Unknown argument. Only --input=<local-json-file> and --help are supported; URL and token parameters are forbidden."
+      "Unknown argument. Only local input, attestation, trust-policy, compiled trust-profile, and --help parameters are supported; URL and token parameters are forbidden."
     );
   }
   if (inputPath === null) {
     throw new OrganizationReconciliationCliError("argument-invalid", "--input=<local-json-file> is required.");
   }
-  return { mode: "validate", inputPath };
+  const trustedArgumentCount = [attestationPath, trustPolicyPath, trustProfile]
+    .filter((value) => value !== null).length;
+  if (trustedArgumentCount !== 0 && trustedArgumentCount !== 3) {
+    throw new OrganizationReconciliationCliError(
+      "argument-invalid",
+      "--attestation, --trust-policy, and --trust-profile must be provided together."
+    );
+  }
+  if (
+    attestationPath !== null &&
+    trustPolicyPath !== null &&
+    new Set([inputPath, attestationPath, trustPolicyPath]).size !== 3
+  ) {
+    throw new OrganizationReconciliationCliError(
+      "argument-invalid",
+      "Input, attestation, and trust-policy must be distinct local files."
+    );
+  }
+  return {
+    mode: "validate",
+    inputPath,
+    ...(attestationPath !== null && trustPolicyPath !== null && trustProfile !== null
+      ? { trustedProvenance: { attestationPath, trustPolicyPath, trustProfile } }
+      : {})
+  };
+}
+
+function parseTrustProfileArgument(candidate: string): string {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(candidate)) {
+    throw new OrganizationReconciliationCliError(
+      "argument-invalid",
+      "--trust-profile must be one explicit compiled profile identifier."
+    );
+  }
+  return candidate;
+}
+
+function parseLocalPathArgument(name: string, candidate: string): string {
+  if (!candidate.trim() || candidate !== candidate.trim() || candidate === "-" || candidate.includes("\0") || isUrl(candidate)) {
+    throw new OrganizationReconciliationCliError(
+      "argument-invalid",
+      `${name} must identify one explicit local JSON file; URL and stdin inputs are forbidden.`
+    );
+  }
+  return candidate;
 }
 
 export function parseOrganizationReconciliationJson(raw: string): OrganizationReconciliationInput {
@@ -251,12 +354,90 @@ export async function runOrganizationReconciliationCli(
 
   try {
     const input = parseOrganizationReconciliationJson(raw);
-    const report = validateOrganizationReconciliation(input);
+    let trustedProvenance;
+    if (options.trustedProvenance) {
+      const trustedProfile = io.resolveTrustProfile?.(
+        options.trustedProvenance.trustProfile
+      );
+      if (!trustedProfile || trustedProfile.profileId !== options.trustedProvenance.trustProfile) {
+        throw new OrganizationReconciliationCliError(
+          "trust-profile-unprovisioned",
+          "The requested compiled trust profile is unknown or unprovisioned."
+        );
+      }
+      const [attestationRaw, trustPolicyRaw] = await Promise.all([
+        readTrustedArtifact(io, options.trustedProvenance.attestationPath),
+        readTrustedArtifact(io, options.trustedProvenance.trustPolicyPath)
+      ]);
+      const attestationValue = parseTrustedArtifactJson(attestationRaw);
+      const trustPolicyValue = parseTrustedArtifactJson(trustPolicyRaw);
+      try {
+        trustedProvenance = {
+          trustedProfile,
+          attestationBundle: parseOrganizationReconciliationAttestationBundle(attestationValue),
+          trustPolicy: parseOrganizationReconciliationTrustPolicy(trustPolicyValue),
+          now: io.now?.() ?? new Date()
+        };
+      } catch {
+        throw new OrganizationReconciliationCliError(
+          "trusted-artifact-schema-invalid",
+          "Trusted provenance JSON does not match the strict attestation or trust-policy schema."
+        );
+      }
+    }
+    const report = validateOrganizationReconciliation(input, { trustedProvenance });
     io.writeStdout(`${JSON.stringify(report, null, 2)}\n`);
     return report.safetyGate.passed ? 0 : 1;
   } catch (error) {
     writeSanitizedError(io, error);
     return 2;
+  }
+}
+
+async function readTrustedArtifact(io: OrganizationReconciliationCliIo, path: string): Promise<string> {
+  try {
+    const inspection = await io.inspectInputFile(path);
+    if (!inspection.isFile) {
+      throw new OrganizationReconciliationCliError(
+        "trusted-artifact-not-regular",
+        "Trusted provenance paths must be regular local files."
+      );
+    }
+    if (
+      !Number.isSafeInteger(inspection.size) ||
+      inspection.size < 0 ||
+      inspection.size > MAX_TRUSTED_ARTIFACT_BYTES
+    ) {
+      throw new OrganizationReconciliationCliError(
+        "trusted-artifact-too-large",
+        "Trusted provenance JSON exceeds the 1 MiB offline limit."
+      );
+    }
+    const raw = await io.readInputFile(path);
+    if (Buffer.byteLength(raw, "utf8") > MAX_TRUSTED_ARTIFACT_BYTES) {
+      throw new OrganizationReconciliationCliError(
+        "trusted-artifact-too-large",
+        "Trusted provenance JSON exceeds the 1 MiB offline limit."
+      );
+    }
+    return raw;
+  } catch (error) {
+    if (error instanceof OrganizationReconciliationCliError) throw error;
+    throw new OrganizationReconciliationCliError(
+      "trusted-artifact-read-failed",
+      "Unable to read a trusted provenance local file."
+    );
+  }
+}
+
+function parseTrustedArtifactJson(raw: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw new OrganizationReconciliationCliError(
+      "trusted-artifact-json-invalid",
+      "A trusted provenance file is not valid JSON."
+    );
   }
 }
 
@@ -278,6 +459,8 @@ async function main(): Promise<void> {
       return { isFile: details.isFile(), size: details.size };
     },
     readInputFile: (path) => readFile(path, "utf8"),
+    resolveTrustProfile: resolveCompiledOrganizationReconciliationTrustProfile,
+    now: () => new Date(),
     writeStdout: (text) => process.stdout.write(text),
     writeStderr: (text) => process.stderr.write(text)
   });

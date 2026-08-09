@@ -4,6 +4,7 @@ import { loadConfig } from "../src/config.js";
 import { IamOrganizationWriteController } from "../src/iam-organization-write.controller.js";
 import { IamOrganizationWriteService } from "../src/iam-organization-write.service.js";
 import {
+  IamOrganizationWriteRepository,
   ORGANIZATION_CANDIDATE_MATERIALIZATION_PENDING_LEASE_MS,
   organizationCandidateMaterializationOperationKey,
   organizationCandidateSnapshotFingerprint,
@@ -70,6 +71,7 @@ describe("IAM organization membership write compatibility layer", () => {
 
   it("maps the internal preview/apply controller contract without accepting conflicting idempotency headers", async () => {
     process.env.IDENTITY_IAM_INTERNAL_API_TOKEN = "organization-internal-test";
+    process.env.IDENTITY_BUILD_REVISION = "a".repeat(40);
     const organizationWrite = {
       previewCandidateMaterialization: vi.fn(async () => ({ mutation: false, expectedSnapshotFingerprint: "a".repeat(64) })),
       materializeCandidate: vi.fn(async () => ({ materialized: true }))
@@ -82,6 +84,7 @@ describe("IAM organization membership write compatibility layer", () => {
     });
     await expect(controller.materializeCandidate(
       "organization-internal-test",
+      "a".repeat(40),
       "materialize-24",
       undefined,
       "24",
@@ -97,11 +100,116 @@ describe("IAM organization membership write compatibility layer", () => {
     });
     await expect(controller.materializeCandidate(
       "organization-internal-test",
+      "a".repeat(40),
       "one",
       "two",
       "24",
       { expectedSnapshotFingerprint: "a".repeat(64) }
     )).rejects.toMatchObject({ response: { code: "IDEMPOTENCY_KEY_CONFLICT" } });
+  });
+
+  it.each([
+    [undefined, "IDENTITY_EXPECTED_BUILD_REVISION_INVALID"],
+    ["invalid", "IDENTITY_EXPECTED_BUILD_REVISION_INVALID"],
+    ["b".repeat(40), "IDENTITY_BUILD_REVISION_MISMATCH"]
+  ])("rejects materialization revision %s before any service call", async (expectedRevision, code) => {
+    process.env.IDENTITY_IAM_INTERNAL_API_TOKEN = "organization-internal-test";
+    process.env.IDENTITY_BUILD_REVISION = "a".repeat(40);
+    const organizationWrite = { materializeCandidate: vi.fn() };
+    const controller = new IamOrganizationWriteController(organizationWrite as never);
+
+    await expect(controller.materializeCandidate(
+      "organization-internal-test",
+      expectedRevision,
+      "materialize-24",
+      undefined,
+      "24",
+      { expectedSnapshotFingerprint: "a".repeat(64) }
+    )).rejects.toMatchObject({ response: { code } });
+    expect(organizationWrite.materializeCandidate).not.toHaveBeenCalled();
+  });
+
+  it("rejects duplicate expected revision headers before any service call", async () => {
+    process.env.IDENTITY_IAM_INTERNAL_API_TOKEN = "organization-internal-test";
+    process.env.IDENTITY_BUILD_REVISION = "a".repeat(40);
+    const organizationWrite = { materializeCandidate: vi.fn() };
+    const controller = new IamOrganizationWriteController(organizationWrite as never);
+
+    await expect(controller.materializeCandidate(
+      "organization-internal-test",
+      ["a".repeat(40), "a".repeat(40)],
+      "materialize-24",
+      undefined,
+      "24",
+      { expectedSnapshotFingerprint: "a".repeat(64) }
+    )).rejects.toMatchObject({ response: { code: "IDENTITY_EXPECTED_BUILD_REVISION_INVALID" } });
+    expect(organizationWrite.materializeCandidate).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, "invalid", "A".repeat(40)])(
+    "rejects unavailable or invalid running revision %s before any service call",
+    async (actualRevision) => {
+      process.env.IDENTITY_IAM_INTERNAL_API_TOKEN = "organization-internal-test";
+      if (actualRevision === undefined) delete process.env.IDENTITY_BUILD_REVISION;
+      else process.env.IDENTITY_BUILD_REVISION = actualRevision;
+      const organizationWrite = { materializeCandidate: vi.fn() };
+      const controller = new IamOrganizationWriteController(organizationWrite as never);
+
+      await expect(controller.materializeCandidate(
+        "organization-internal-test",
+        "a".repeat(40),
+        "materialize-24",
+        undefined,
+        "24",
+        { expectedSnapshotFingerprint: "a".repeat(64) }
+      )).rejects.toMatchObject({ response: { code: "IDENTITY_BUILD_REVISION_UNAVAILABLE" } });
+      expect(organizationWrite.materializeCandidate).not.toHaveBeenCalled();
+    }
+  );
+
+  it("preserves safe completed and failed materialization ledger states through the service and controller", async () => {
+    process.env.IDENTITY_IAM_INTERNAL_API_TOKEN = "organization-internal-test";
+    const operations = [
+      {
+        operationKeyDigest: "a".repeat(64),
+        idempotencyKeyDigest: "b".repeat(64),
+        legacyUserId: 581,
+        mode: "candidate-materialization",
+        status: "completed",
+        legacyStatus: "read-only",
+        identityStatus: "candidate-materialized",
+        compensationStatus: "none",
+        errorCode: null
+      },
+      {
+        operationKeyDigest: "c".repeat(64),
+        idempotencyKeyDigest: "d".repeat(64),
+        legacyUserId: 581,
+        mode: "candidate-materialization",
+        status: "failed",
+        legacyStatus: "read-only",
+        identityStatus: "candidate-write-outcome-unknown",
+        compensationStatus: "required",
+        errorCode: "ServiceUnavailableException"
+      }
+    ];
+    const fixture = createFixture({ recentOperations: operations });
+
+    await expect(fixture.service.operationLedgerRecent({ sinceMinutes: 60, limit: 50 })).resolves.toMatchObject({
+      configured: true,
+      schemaReady: true,
+      sinceMinutes: 60,
+      limit: 50,
+      operations
+    });
+    expect(fixture.repository.listRecentSafe).toHaveBeenCalledWith(60, 50);
+
+    const controller = new IamOrganizationWriteController(fixture.service);
+    await expect(controller.operationLedgerRecent("organization-internal-test", "60", "50")).resolves.toMatchObject({
+      status: "ok",
+      capability: "iam-organization-write-operation-ledger",
+      data: { configured: true, schemaReady: true, operations }
+    });
   });
 
   it("does not intercept updates when organization_ids is absent", async () => {
@@ -789,8 +897,8 @@ describe("IAM organization membership write compatibility layer", () => {
       requestFingerprint: currentFingerprint,
       metadata: expect.objectContaining({
         recovery: "stale-pending-current-reviewed-legacy-snapshot",
-        recoveryPreviousSnapshotFingerprint: previousFingerprint,
-        recoverySnapshotFingerprint: currentFingerprint,
+        recoveryPreviousSnapshotFingerprintDigest: shortHash(previousFingerprint),
+        recoverySnapshotFingerprintDigest: shortHash(currentFingerprint),
         source: "current-legacy-read"
       })
     }));
@@ -1043,6 +1151,107 @@ describe("IAM organization membership write compatibility layer", () => {
     });
   });
 
+  it("returns strict string-or-null operation statuses from the safe recent ledger view", async () => {
+    const completedOperationKey = "candidate-materialization-completed";
+    const failedOperationKey = "candidate-materialization-failed";
+    const query = vi.fn(async (_sql: string, _params?: unknown[]) => [[
+      {
+        operationKey: completedOperationKey,
+        idempotencyKeyDigest: "a".repeat(64),
+        requestFingerprint: "c".repeat(64),
+        legacyUserId: 581,
+        mode: "candidate-materialization",
+        status: "completed",
+        legacyStatus: "read-only",
+        identityStatus: "candidate-materialized",
+        compensationStatus: "none",
+        errorCode: null,
+        requestedAt: "2026-08-09T01:00:00.000Z",
+        completedAt: "2026-08-09T01:00:01.000Z",
+        metadata: JSON.stringify({ source: "test", token: "must-redact" })
+      },
+      {
+        operationKey: failedOperationKey,
+        idempotencyKeyDigest: "b".repeat(64),
+        requestFingerprint: "d".repeat(64),
+        legacyUserId: 581,
+        mode: "candidate-materialization",
+        status: "failed",
+        legacyStatus: "read-only",
+        identityStatus: "candidate-write-outcome-unknown",
+        compensationStatus: "required",
+        errorCode: "ServiceUnavailableException",
+        requestedAt: "2026-08-09T01:01:00.000Z",
+        completedAt: "2026-08-09T01:01:01.000Z",
+        metadata: { source: "test" }
+      }
+    ]]);
+    const repository = repositoryWithQuery(query);
+
+    await expect(repository.listRecentSafe(60, 50)).resolves.toEqual([
+      {
+        operationKeyDigest: createHash("sha256").update(completedOperationKey).digest("hex"),
+        idempotencyKeyDigest: "a".repeat(64),
+        requestFingerprintDigest: createHash("sha256").update("c".repeat(64)).digest("hex"),
+        legacyUserId: 581,
+        mode: "candidate-materialization",
+        status: "completed",
+        legacyStatus: "read-only",
+        identityStatus: "candidate-materialized",
+        compensationStatus: "none",
+        errorCode: null,
+        requestedAt: "2026-08-09T01:00:00.000Z",
+        completedAt: "2026-08-09T01:00:01.000Z",
+        metadata: { source: "test", token: "[redacted]" }
+      },
+      {
+        operationKeyDigest: createHash("sha256").update(failedOperationKey).digest("hex"),
+        idempotencyKeyDigest: "b".repeat(64),
+        requestFingerprintDigest: createHash("sha256").update("d".repeat(64)).digest("hex"),
+        legacyUserId: 581,
+        mode: "candidate-materialization",
+        status: "failed",
+        legacyStatus: "read-only",
+        identityStatus: "candidate-write-outcome-unknown",
+        compensationStatus: "required",
+        errorCode: "ServiceUnavailableException",
+        requestedAt: "2026-08-09T01:01:00.000Z",
+        completedAt: "2026-08-09T01:01:01.000Z",
+        metadata: { source: "test" }
+      }
+    ]);
+    expect(query.mock.calls[0]?.[0]).toContain("legacy_status AS legacyStatus");
+    expect(query.mock.calls[0]?.[0]).toContain("request_fingerprint AS requestFingerprint");
+    expect(query.mock.calls[0]?.[0]).toContain("identity_status AS identityStatus");
+    expect(query.mock.calls[0]?.[0]).toContain("error_code AS errorCode");
+  });
+
+  it.each([
+    ["legacyStatus", 200],
+    ["identityStatus", { unsafe: true }],
+    ["errorCode", undefined]
+  ])("fails closed when safe recent ledger %s is neither a string nor null", async (field, invalidValue) => {
+    const row: Record<string, unknown> = {
+      operationKey: "candidate-materialization-invalid-status",
+      idempotencyKeyDigest: "a".repeat(64),
+      requestFingerprint: "b".repeat(64),
+      legacyUserId: 581,
+      mode: "candidate-materialization",
+      status: "failed",
+      legacyStatus: "read-only",
+      identityStatus: "candidate-write-outcome-unknown",
+      compensationStatus: "required",
+      errorCode: "ServiceUnavailableException",
+      requestedAt: "2026-08-09T01:01:00.000Z",
+      completedAt: "2026-08-09T01:01:01.000Z",
+      metadata: {}
+    };
+    row[field] = invalidValue;
+
+    await expect(repositoryWithQuery(vi.fn(async () => [[row]])).listRecentSafe(60, 50))
+      .rejects.toThrow(`Invalid organization write operation ${field}: expected string or null`);
+  });
+
   it("fails closed for unknown ledger mode, status, or compensation values", () => {
     expect(() => organizationWriteOperationMode("future-mode")).toThrow("Unknown organization write operation mode");
     expect(() => organizationWriteOperationStatus("future-status")).toThrow("Unknown organization write operation status");
@@ -1071,6 +1280,7 @@ function createFixture(input: {
   initialMaterializationOperation?: Record<string, any>;
   postcheckUser?: Partial<LegacyUserReadModel> | null;
   replaceCandidateGate?: Promise<void>;
+  recentOperations?: Record<string, unknown>[];
   unresolvedCount?: number;
   pluginResponse?: { status: number; body: unknown };
   pluginMode?: "legacy-proxy" | "dual-write";
@@ -1224,7 +1434,7 @@ function createFixture(input: {
     candidateForLegacyUser: vi.fn(async () => candidateState),
     countUnresolvedForLegacyUser: vi.fn(async () => input.unresolvedCount ?? 0),
     summarizeRecent: vi.fn(async () => []),
-    listRecentSafe: vi.fn(async () => [])
+    listRecentSafe: vi.fn(async () => input.recentOperations ?? [])
   };
   const legacyUser: LegacyUserReadModel = {
     id: 24,
@@ -1253,6 +1463,12 @@ function createFixture(input: {
   return { service, plugin, repository, legacy, legacyUser };
 }
 
+function repositoryWithQuery(query: ReturnType<typeof vi.fn>): IamOrganizationWriteRepository {
+  const repository = Object.create(IamOrganizationWriteRepository.prototype) as IamOrganizationWriteRepository;
+  Object.defineProperty(repository, "pool", { value: { query } });
+  return repository;
+}
+
 function updateRequest(organizationIds: number[] | undefined, idempotencyKey?: string) {
   return {
     method: "POST",
@@ -1270,6 +1486,10 @@ function operationDigest(legacyUserId: number, idempotencyKey: string): string {
     .update(organizationCandidateMaterializationOperationKey(legacyUserId, idempotencyKey))
     .digest("hex")
     .slice(0, 16);
+}
+
+function shortHash(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 16);
 }
 
 function enableLegacyProxy(): void {

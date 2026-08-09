@@ -466,9 +466,10 @@ export class IamOrganizationWriteRepository implements OnModuleDestroy {
     const safeLimit = clamp(limit, 1, 200);
     const [rows] = await pool.query<RowDataPacket[]>(
       `SELECT operation_key AS operationKey, idempotency_key_digest AS idempotencyKeyDigest,
-              legacy_user_id AS legacyUserId, mode, status,
-              compensation_status AS compensationStatus, requested_at AS requestedAt,
-              completed_at AS completedAt, metadata
+              request_fingerprint AS requestFingerprint, legacy_user_id AS legacyUserId, mode, status,
+              legacy_status AS legacyStatus, identity_status AS identityStatus,
+              compensation_status AS compensationStatus, error_code AS errorCode,
+              requested_at AS requestedAt, completed_at AS completedAt, metadata
          FROM identity_organization_write_operations
         WHERE requested_at >= ? ORDER BY requested_at DESC, id DESC LIMIT ${safeLimit}`,
       [since]
@@ -476,10 +477,14 @@ export class IamOrganizationWriteRepository implements OnModuleDestroy {
     return rows.map((row) => ({
       operationKeyDigest: digest(String(row.operationKey)),
       idempotencyKeyDigest: String(row.idempotencyKeyDigest),
+      requestFingerprintDigest: digest(strictFullFingerprint(row.requestFingerprint, "requestFingerprint")),
       legacyUserId: Number(row.legacyUserId),
       mode: String(row.mode),
       status: String(row.status),
+      legacyStatus: strictNullableString(row.legacyStatus, "legacyStatus"),
+      identityStatus: strictNullableString(row.identityStatus, "identityStatus"),
       compensationStatus: String(row.compensationStatus),
+      errorCode: strictNullableString(row.errorCode, "errorCode"),
       requestedAt: dateString(row.requestedAt),
       completedAt: dateString(row.completedAt),
       metadata: publicOrganizationWriteMetadata(parseMetadata(row.metadata))
@@ -726,6 +731,16 @@ function parseMetadata(value: unknown): Record<string, unknown> {
 function digest(value: string): string { return createHash("sha256").update(value).digest("hex"); }
 function clamp(value: number, min: number, max: number): number { return Math.max(min, Math.min(max, Number.isFinite(value) ? Math.trunc(value) : min)); }
 function nullableString(value: unknown): string | null { return typeof value === "string" && value !== "" ? value : null; }
+function strictNullableString(value: unknown, field: string): string | null {
+  if (value === null) return null;
+  if (typeof value === "string") return value;
+  throw new Error(`Invalid organization write operation ${field}: expected string or null`);
+}
+
+function strictFullFingerprint(value: unknown, field: string): string {
+  if (typeof value === "string" && /^[a-f0-9]{64}$/.test(value)) return value;
+  throw new Error(`Invalid organization write operation ${field}: expected full hexadecimal fingerprint`);
+}
 function nullableNumber(value: unknown): number | null {
   if (value === null || value === undefined || value === "") return null;
   const number = Number(value);

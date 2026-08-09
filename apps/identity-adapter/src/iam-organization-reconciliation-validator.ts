@@ -1,4 +1,10 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import {
+  createOrganizationReconciliationProvenanceBinding,
+  verifyOrganizationReconciliationProvenance,
+  type OrganizationReconciliationProvenanceVerification,
+  type OrganizationReconciliationTrustedProvenanceContext
+} from "./iam-organization-reconciliation-provenance.js";
 
 export type OrganizationReconciliationSeverity = "P0" | "P1" | "P2" | "info";
 export type OrganizationDecision = "allow" | "deny";
@@ -53,6 +59,12 @@ export interface ReconciliationPage<T> {
 export interface ReconciliationPair<T> {
   readonly legacy?: ReconciliationPage<T>;
   readonly identity?: ReconciliationPage<T>;
+}
+
+export interface OrganizationReconciliationCollectedPage<T> {
+  readonly requestCursor: string | null;
+  readonly nextCursor: string | null;
+  readonly records: readonly T[];
 }
 
 export interface OrganizationDirectoryRecord {
@@ -194,7 +206,9 @@ export interface OrganizationReconciliationReport {
   readonly dryRun: true;
   readonly writeSideEffects: "none";
   readonly evidencePolicy: "hash-only";
-  readonly assuranceScope: "collector-envelope-self-consistency";
+  readonly assuranceScope:
+    | "collector-envelope-self-consistency"
+    | "collector-envelope-with-trusted-external-attestation";
   readonly externalProvenanceRequired: true;
   readonly comparisonPolicy: "pairwise-no-union";
   /** True only when the caller-supplied envelope is internally consistent. */
@@ -203,6 +217,15 @@ export interface OrganizationReconciliationReport {
   readonly findings: readonly OrganizationReconciliationFinding[];
   readonly coverage: readonly OrganizationReconciliationSurfaceCoverage[];
   readonly coverageBlockers: readonly OrganizationReconciliationCoverageBlocker[];
+  readonly provenanceVerification: {
+    readonly verified: boolean;
+    readonly reasonCode: OrganizationReconciliationProvenanceVerification["code"];
+    readonly requiredAttestationCount: number;
+    readonly verifiedAttestationCount: number;
+    readonly trustPolicyHash?: string;
+    readonly trustProfileHash?: string;
+    readonly environmentHash?: string;
+  };
   readonly safetyGate: {
     readonly passed: boolean;
     readonly blocksDualWrite: boolean;
@@ -211,7 +234,7 @@ export interface OrganizationReconciliationReport {
     readonly p1Blocks: true;
     readonly p2Classified: true;
     readonly unionForbidden: true;
-    readonly externalProvenanceVerified: false;
+    readonly externalProvenanceVerified: boolean;
     readonly blockedReasons: readonly (
       | "coverage-incomplete"
       | "p0-findings"
@@ -228,6 +251,12 @@ interface ValidationAccumulator {
   coverage: OrganizationReconciliationSurfaceCoverage[];
   evidenceNonce: string;
   collectionEnvelope?: OrganizationReconciliationCollectionEnvelope;
+  provenanceVerification: OrganizationReconciliationProvenanceVerification;
+}
+
+export interface OrganizationReconciliationValidationOptions {
+  /** Trusted context is separate from caller-controlled evidence and is cryptographically verified. */
+  readonly trustedProvenance?: OrganizationReconciliationTrustedProvenanceContext;
 }
 
 interface ComparableRecordOptions<T> {
@@ -261,8 +290,10 @@ const REQUIRED_SURFACES: readonly OrganizationReconciliationSurface[] = [
  * never returns raw subjects, organization IDs, names, bindings, or versions.
  */
 export function validateOrganizationReconciliation(
-  input: OrganizationReconciliationInput
+  input: OrganizationReconciliationInput,
+  options: OrganizationReconciliationValidationOptions = {}
 ): OrganizationReconciliationReport {
+  const provenanceVerification = verifyTrustedProvenance(input, options.trustedProvenance);
   const accumulator: ValidationAccumulator = {
     findings: [],
     blockers: [],
@@ -270,7 +301,8 @@ export function validateOrganizationReconciliation(
     collectionEnvelope: input.collectionEnvelope,
     evidenceNonce: validEvidenceNonce(input.collectionEnvelope?.evidenceNonce)
       ? input.collectionEnvelope.evidenceNonce
-      : "invalid-evidence-nonce"
+      : "invalid-evidence-nonce",
+    provenanceVerification
   };
   validateCollectionEnvelope(accumulator, input.collectionEnvelope);
   if (!validEvidenceNonce(input.collectionEnvelope?.evidenceNonce)) {
@@ -392,37 +424,76 @@ function finalizeReport(accumulator: ValidationAccumulator): OrganizationReconci
   if (severity.P0 > 0) blockedReasons.push("p0-findings");
   if (severity.P1 > 0) blockedReasons.push("p1-findings");
   const staticChecksPassed = blockedReasons.length === 0;
-  // This offline validator has no trusted collector key or attestation verifier.
-  // No field in the caller-controlled JSON may promote self-consistent evidence.
-  blockedReasons.push("external-provenance-required");
+  if (!accumulator.provenanceVerification.verified) blockedReasons.push("external-provenance-required");
+  const provenanceVerification = {
+    verified: accumulator.provenanceVerification.verified,
+    reasonCode: accumulator.provenanceVerification.code,
+    requiredAttestationCount: accumulator.provenanceVerification.requiredAttestationCount,
+    verifiedAttestationCount: accumulator.provenanceVerification.verifiedAttestationCount,
+    ...(accumulator.provenanceVerification.trustPolicySha256
+      ? { trustPolicyHash: evidenceHash(accumulator, accumulator.provenanceVerification.trustPolicySha256) }
+      : {}),
+    ...(accumulator.provenanceVerification.trustProfileId
+      ? { trustProfileHash: evidenceHash(accumulator, accumulator.provenanceVerification.trustProfileId) }
+      : {}),
+    ...(accumulator.provenanceVerification.environment
+      ? { environmentHash: evidenceHash(accumulator, accumulator.provenanceVerification.environment) }
+      : {})
+  };
   const reportCore = {
     severity,
     findings: accumulator.findings,
     coverage: accumulator.coverage,
     coverageBlockers: accumulator.blockers,
+    provenanceVerification,
     comparisonPolicy: "pairwise-no-union" as const
   };
+  const passed = staticChecksPassed && accumulator.provenanceVerification.verified;
   return {
     dryRun: true,
     writeSideEffects: "none",
     evidencePolicy: "hash-only",
-    assuranceScope: "collector-envelope-self-consistency",
+    assuranceScope: accumulator.provenanceVerification.verified
+      ? "collector-envelope-with-trusted-external-attestation"
+      : "collector-envelope-self-consistency",
     externalProvenanceRequired: true,
     staticChecksPassed,
     ...reportCore,
     safetyGate: {
-      passed: false,
-      blocksDualWrite: true,
+      passed,
+      blocksDualWrite: !passed,
       coverageComplete,
       p0Blocks: true,
       p1Blocks: true,
       p2Classified: true,
       unionForbidden: true,
-      externalProvenanceVerified: false,
+      externalProvenanceVerified: accumulator.provenanceVerification.verified,
       blockedReasons
     },
     reportHash: evidenceHash(accumulator, reportCore)
   };
+}
+
+function verifyTrustedProvenance(
+  input: OrganizationReconciliationInput,
+  context: OrganizationReconciliationTrustedProvenanceContext | undefined
+): OrganizationReconciliationProvenanceVerification {
+  if (!context) return verifyOrganizationReconciliationProvenance(undefined, undefined);
+  const envelope = input.collectionEnvelope;
+  if (!envelope) return verifyOrganizationReconciliationProvenance(undefined, context);
+  try {
+    const binding = createOrganizationReconciliationProvenanceBinding(
+      input,
+      envelope.collectorContractHash,
+      envelope.logicalSnapshotId,
+      envelope.windowId,
+      envelope.windowStartedAt,
+      envelope.windowEndedAt
+    );
+    return verifyOrganizationReconciliationProvenance(binding, context);
+  } catch {
+    return verifyOrganizationReconciliationProvenance(undefined, context);
+  }
 }
 
 function addUntrustedCoverage(
@@ -922,6 +993,70 @@ export function createOrganizationReconciliationEvidenceHash(
     .update("iam-organization-reconciliation:v2\u001f")
     .update(stableSerialize(value))
     .digest("hex");
+}
+
+/**
+ * Assembles a complete cursor chain from source-owned page results. It does no
+ * I/O and refuses truncated, reordered, repeated, or non-terminal page sets.
+ */
+export function createOrganizationReconciliationCollectedSnapshot<T>(
+  evidenceNonce: string,
+  sourceVersion: string,
+  snapshotId: string,
+  pages: readonly OrganizationReconciliationCollectedPage<T>[]
+): ReconciliationPage<T> {
+  if (!validEvidenceNonce(evidenceNonce)) throw new Error("A high-entropy evidence nonce is required.");
+  if (!hasVersion(sourceVersion) || !hasVersion(snapshotId)) {
+    throw new Error("Source version and snapshot ID are required.");
+  }
+  if (pages.length < 1 || pages.length > 10_000) throw new Error("A bounded, non-empty page chain is required.");
+
+  const records: T[] = [];
+  const evidence: OrganizationReconciliationPageEvidence[] = [];
+  const observedContinuationCursors = new Set<string>();
+  let expectedRequestCursor: string | null = null;
+  for (let index = 0; index < pages.length; index += 1) {
+    const page = pages[index]!;
+    const isLast = index === pages.length - 1;
+    if (
+      page.requestCursor !== expectedRequestCursor ||
+      (index === 0 ? page.requestCursor !== null : !isContinuationCursor(page.requestCursor)) ||
+      (isLast ? page.nextCursor !== null : !isContinuationCursor(page.nextCursor))
+    ) {
+      throw new Error("Collected pages do not form one complete cursor chain.");
+    }
+    if (isContinuationCursor(page.nextCursor)) {
+      if (observedContinuationCursors.has(page.nextCursor)) {
+        throw new Error("Collected pages repeat a continuation cursor.");
+      }
+      observedContinuationCursors.add(page.nextCursor);
+    }
+    const recordOffset = records.length;
+    records.push(...page.records);
+    evidence.push({
+      pageNumber: index + 1,
+      requestCursor: page.requestCursor,
+      nextCursor: page.nextCursor,
+      recordOffset,
+      recordCount: page.records.length,
+      recordsHash: createOrganizationReconciliationEvidenceHash(evidenceNonce, page.records as JsonValue)
+    });
+    expectedRequestCursor = page.nextCursor;
+  }
+
+  return {
+    records,
+    sourceVersion,
+    nextCursor: null,
+    collection: {
+      snapshotId,
+      firstCursor: null,
+      pageCount: pages.length,
+      recordCount: records.length,
+      recordsHash: createOrganizationReconciliationEvidenceHash(evidenceNonce, records as JsonValue),
+      pages: evidence
+    }
+  };
 }
 
 function evidenceHash(accumulator: ValidationAccumulator, value: JsonValue | object): string {

@@ -1,5 +1,6 @@
 import { Body, Controller, Get, Headers, HttpException, HttpStatus, Param, Post, Query } from "@nestjs/common";
 import { loadConfig } from "./config.js";
+import { currentBuildRevision, normalizeBuildRevision } from "./build-revision.js";
 import { IamOrganizationWriteService } from "./iam-organization-write.service.js";
 
 @Controller("internal/iam/organization-write")
@@ -102,12 +103,14 @@ export class IamOrganizationWriteController {
   @Post("subjects/:legacyUserId/materialize-candidate")
   async materializeCandidate(
     @Headers("x-identity-internal-token") token: string | undefined,
+    @Headers("x-identity-expected-revision") expectedRevisionHeader: string | string[] | undefined,
     @Headers("idempotency-key") idempotencyKey: string | string[] | undefined,
     @Headers("x-idempotency-key") idempotencyKeyAlias: string | string[] | undefined,
     @Param("legacyUserId") legacyUserId: string,
     @Body() body: unknown
   ) {
     this.assertInternalToken(token);
+    this.assertExpectedBuildRevision(expectedRevisionHeader);
     return {
       status: "ok",
       service: "identity-adapter",
@@ -130,6 +133,36 @@ export class IamOrganizationWriteController {
     }
     if (token !== configuredToken) {
       throw new HttpException({ code: "INTERNAL_TOKEN_INVALID", message: "Internal service token is invalid." }, HttpStatus.UNAUTHORIZED);
+    }
+  }
+
+  private assertExpectedBuildRevision(value: string | string[] | undefined): void {
+    if (Array.isArray(value) && value.length !== 1) {
+      throw new HttpException(
+        { code: "IDENTITY_EXPECTED_BUILD_REVISION_INVALID", message: "A single full expected build revision is required." },
+        HttpStatus.BAD_REQUEST
+      );
+    }
+    const rawExpected = firstHeader(value);
+    const expected = normalizeBuildRevision(rawExpected);
+    if (!expected || rawExpected?.trim() !== expected) {
+      throw new HttpException(
+        { code: "IDENTITY_EXPECTED_BUILD_REVISION_INVALID", message: "A full expected build revision is required." },
+        HttpStatus.BAD_REQUEST
+      );
+    }
+    const actual = currentBuildRevision();
+    if (!actual) {
+      throw new HttpException(
+        { code: "IDENTITY_BUILD_REVISION_UNAVAILABLE", message: "The running build revision is unavailable." },
+        HttpStatus.SERVICE_UNAVAILABLE
+      );
+    }
+    if (actual !== expected) {
+      throw new HttpException(
+        { code: "IDENTITY_BUILD_REVISION_MISMATCH", message: "The running build does not match the reviewed revision." },
+        HttpStatus.CONFLICT
+      );
     }
   }
 }

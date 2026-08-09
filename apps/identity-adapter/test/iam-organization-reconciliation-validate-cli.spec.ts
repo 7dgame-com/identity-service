@@ -1,3 +1,4 @@
+import { generateKeyPairSync } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import {
   createOrganizationReconciliationEvidenceHash,
@@ -5,6 +6,19 @@ import {
   ORGANIZATION_RECONCILIATION_COLLECTOR_CONTRACT_HASH,
   type OrganizationReconciliationInput
 } from "../src/iam-organization-reconciliation-validator.js";
+import {
+  createOrganizationReconciliationAttestationBundleForTest,
+  createOrganizationReconciliationPolicyForTest,
+  createOrganizationReconciliationTrustedProfileForTest
+} from "./iam-organization-reconciliation-provenance.test-fixture.js";
+import {
+  createOrganizationReconciliationProvenanceBinding,
+  type OrganizationReconciliationTrustedProfile
+} from "../src/iam-organization-reconciliation-provenance.js";
+import {
+  compiledOrganizationReconciliationTrustProfileCount,
+  resolveCompiledOrganizationReconciliationTrustProfile
+} from "../src/iam-organization-reconciliation-trust-profiles.js";
 import {
   OrganizationReconciliationCliError,
   organizationReconciliationCliHelp,
@@ -20,10 +34,27 @@ describe("offline IAM organization reconciliation CLI", () => {
       inputPath: "/tmp/work-package4.json"
     });
     expect(parseOrganizationReconciliationCliArgs(["--help"])).toEqual({ mode: "help" });
+    expect(parseOrganizationReconciliationCliArgs([
+      "--input=/tmp/work-package4.json",
+      "--attestation=/tmp/work-package4.attestation.json",
+      "--trust-policy=/tmp/work-package4.policy.json",
+      "--trust-profile=test-dual-node"
+    ])).toEqual({
+      mode: "validate",
+      inputPath: "/tmp/work-package4.json",
+      trustedProvenance: {
+        attestationPath: "/tmp/work-package4.attestation.json",
+        trustPolicyPath: "/tmp/work-package4.policy.json",
+        trustProfile: "test-dual-node"
+      }
+    });
     expect(organizationReconciliationCliHelp).toContain("--input=<local-json-file>");
     expect(organizationReconciliationCliHelp).toContain("no network or database access");
     expect(organizationReconciliationCliHelp).toContain("staticChecksPassed=true");
     expect(organizationReconciliationCliHelp).toContain("trusted-provenance verifier");
+    expect(organizationReconciliationCliHelp).toContain("--trust-profile=<identifier>");
+    expect(organizationReconciliationCliHelp).toContain("immutable compiled trust");
+    expect(organizationReconciliationCliHelp).not.toContain("TRUST_POLICY_SHA256");
   });
 
   it("rejects missing, duplicate, URL, stdin, token, network, and unknown arguments", () => {
@@ -36,12 +67,26 @@ describe("offline IAM organization reconciliation CLI", () => {
       ["--token=private-token"],
       ["--url=https://example.invalid"],
       ["--network=true"],
+      ["--input=/tmp/a.json", "--attestation=/tmp/a.attestation.json"],
+      ["--input=/tmp/a.json", "--trust-policy=/tmp/a.policy.json"],
+      ["--input=/tmp/a.json", "--trust-profile=test-profile"],
+      ["--input=/tmp/a.json", "--attestation=/tmp/a.attestation.json", "--trust-policy=/tmp/a.policy.json"],
+      ["--input=/tmp/a.json", "--attestation=/tmp/a.json", "--trust-policy=/tmp/a.policy.json", "--trust-profile=test-profile"],
+      ["--input=/tmp/a.json", "--attestation=/tmp/a.attestation.json", "--trust-policy=/tmp/a.policy.json", "--trust-profile=bad profile"],
+      ["--input=/tmp/a.json", "--attestation=/tmp/a.attestation.json", "--trust-policy=/tmp/a.policy.json", "--trust-profile=a", "--trust-profile=b"],
+      ["--input=/tmp/a.json", "--trust-policy-sha256=" + "0".repeat(64)],
       ["/tmp/positional.json"],
       ["--help", "--input=/tmp/a.json"]
     ];
     for (const args of invalidCases) {
       expect(() => parseOrganizationReconciliationCliArgs(args)).toThrow(OrganizationReconciliationCliError);
     }
+  });
+
+  it("ships with no production trust profile or pin provisioned", () => {
+    expect(compiledOrganizationReconciliationTrustProfileCount).toBe(0);
+    expect(resolveCompiledOrganizationReconciliationTrustProfile("test-dual-node")).toBeUndefined();
+    expect(resolveCompiledOrganizationReconciliationTrustProfile("invalid profile")).toBeUndefined();
   });
 
   it("parses a strict full-scope snapshot without changing its evidence values", () => {
@@ -75,6 +120,78 @@ describe("offline IAM organization reconciliation CLI", () => {
     });
     expect(report.reportHash).toMatch(/^[a-f0-9]{24}$/);
     expectNoRawEvidence(io.stdout);
+  });
+
+  it("returns zero only with a separately pinned, complete trusted attestation set", async () => {
+    const fixture = trustedCliFixture();
+    const io = artifactIo(fixture.files, fixture.trustedProfile);
+    const exitCode = await runOrganizationReconciliationCli([
+      "--input=/tmp/full-scope.json",
+      "--attestation=/tmp/attestation.json",
+      "--trust-policy=/tmp/trust-policy.json",
+      "--trust-profile=test-dual-node"
+    ], io);
+
+    expect(exitCode).toBe(0);
+    expect(io.stderr).toBe("");
+    expect(JSON.parse(io.stdout)).toMatchObject({
+      assuranceScope: "collector-envelope-with-trusted-external-attestation",
+      staticChecksPassed: true,
+      provenanceVerification: {
+        verified: true,
+        reasonCode: "verified",
+        requiredAttestationCount: 2,
+        verifiedAttestationCount: 2,
+        trustProfileHash: expect.stringMatching(/^[a-f0-9]{24}$/),
+        environmentHash: expect.stringMatching(/^[a-f0-9]{24}$/)
+      },
+      safetyGate: {
+        passed: true,
+        blocksDualWrite: false,
+        externalProvenanceVerified: true,
+        blockedReasons: []
+      }
+    });
+    expectNoRawEvidence(io.stdout);
+    expect(io.stdout).not.toContain("trusted-cli-collector");
+    expect(io.stdout).not.toContain("trusted-cli-node");
+    expect(io.stdout).not.toContain("trusted-cli-key");
+  });
+
+  it("fails closed for unknown profiles or a profile resolved to the wrong policy", async () => {
+    const fixture = trustedCliFixture();
+    const args = [
+      "--input=/tmp/full-scope.json",
+      "--attestation=/tmp/attestation.json",
+      "--trust-policy=/tmp/trust-policy.json",
+      "--trust-profile=test-dual-node"
+    ];
+    const missingPin = artifactIo(fixture.files, undefined);
+    expect(await runOrganizationReconciliationCli(args, missingPin)).toBe(2);
+    expect(JSON.parse(missingPin.stderr)).toMatchObject({ code: "trust-profile-unprovisioned" });
+    expect(missingPin.stdout).toBe("");
+
+    const mismatchedProfile = artifactIo(fixture.files, {
+      ...fixture.trustedProfile,
+      profileId: "different-compiled-profile"
+    });
+    expect(await runOrganizationReconciliationCli(args, mismatchedProfile)).toBe(2);
+    expect(JSON.parse(mismatchedProfile.stderr)).toMatchObject({ code: "trust-profile-unprovisioned" });
+
+    const wrongPin = artifactIo(fixture.files, {
+      ...fixture.trustedProfile,
+      policySha256: "0".repeat(64)
+    });
+    expect(await runOrganizationReconciliationCli(args, wrongPin)).toBe(1);
+    expect(JSON.parse(wrongPin.stdout)).toMatchObject({
+      staticChecksPassed: true,
+      provenanceVerification: { verified: false, reasonCode: "trust-policy-pin-mismatch" },
+      safetyGate: {
+        passed: false,
+        blocksDualWrite: true,
+        blockedReasons: ["external-provenance-required"]
+      }
+    });
   });
 
   it("prints the hash-only report but exits one when safetyGate fails", async () => {
@@ -207,6 +324,66 @@ function memoryIo(input: string | Error) {
     writeStderr: (text: string) => { stderr += text; },
     get stdout() { return stdout; },
     get stderr() { return stderr; }
+  };
+}
+
+function artifactIo(
+  files: Readonly<Record<string, string>>,
+  trustedProfile: OrganizationReconciliationTrustedProfile | undefined
+) {
+  let stdout = "";
+  let stderr = "";
+  return {
+    inspectInputFile: vi.fn(async (path: string) => {
+      const value = files[path];
+      if (value === undefined) throw new Error("missing private test file");
+      return { isFile: true, size: Buffer.byteLength(value) };
+    }),
+    readInputFile: vi.fn(async (path: string) => {
+      const value = files[path];
+      if (value === undefined) throw new Error("missing private test file");
+      return value;
+    }),
+    resolveTrustProfile: (profileId: string) =>
+      profileId === "test-dual-node" ? trustedProfile : undefined,
+    now: () => new Date("2026-08-09T00:10:00.000Z"),
+    writeStdout: (text: string) => { stdout += text; },
+    writeStderr: (text: string) => { stderr += text; },
+    get stdout() { return stdout; },
+    get stderr() { return stderr; }
+  };
+}
+
+function trustedCliFixture() {
+  const input = alignedInput();
+  const envelope = input.collectionEnvelope!;
+  const binding = createOrganizationReconciliationProvenanceBinding(
+    input,
+    envelope.collectorContractHash,
+    envelope.logicalSnapshotId,
+    envelope.windowId,
+    envelope.windowStartedAt,
+    envelope.windowEndedAt
+  );
+  const keys = [generateKeyPairSync("ed25519"), generateKeyPairSync("ed25519")];
+  const policy = createOrganizationReconciliationPolicyForTest(keys.map(({ publicKey }, index) => ({
+    collectorId: `trusted-cli-collector-${index + 1}`,
+    nodeId: `trusted-cli-node-${index + 1}`,
+    keyId: `trusted-cli-key-${index + 1}`,
+    publicKey
+  })));
+  const bundle = createOrganizationReconciliationAttestationBundleForTest(
+    binding,
+    policy,
+    keys.map(({ privateKey }, index) => ({ keyId: `trusted-cli-key-${index + 1}`, privateKey }))
+  );
+  return {
+    trustedProfile: createOrganizationReconciliationTrustedProfileForTest(policy),
+    files: {
+      "/tmp/full-scope.json": JSON.stringify(input),
+      "/tmp/attestation.json": JSON.stringify(bundle),
+      "/tmp/trust-policy.json": JSON.stringify(policy)
+    }
   };
 }
 

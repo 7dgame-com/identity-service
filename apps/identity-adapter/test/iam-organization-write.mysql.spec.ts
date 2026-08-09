@@ -34,6 +34,7 @@ describe.skipIf(!enabled)("IAM organization write MySQL integration", () => {
     const staleOperationKey = organizationCandidateMaterializationOperationKey(legacyUserId, `stale-${randomUUID()}`);
     const failedNoneOperationKey = organizationCandidateMaterializationOperationKey(legacyUserId + 1, `failed-none-${randomUUID()}`);
     const failedCompletedOperationKey = organizationCandidateMaterializationOperationKey(legacyUserId + 1, `failed-completed-${randomUUID()}`);
+    const failedRequiredOperationKey = organizationCandidateMaterializationOperationKey(legacyUserId + 1, `failed-required-${randomUUID()}`);
     const requestFingerprint = organizationWriteRequestFingerprint(legacyUserId, [legacyOrganizationId]);
     const input = {
       operationKey,
@@ -288,6 +289,43 @@ describe.skipIf(!enabled)("IAM organization write MySQL integration", () => {
         metadata: { source: "mysql-failed-completed" }
       });
       await expect(first.countUnresolvedForLegacyUser(unresolvedUserId)).resolves.toBe(1);
+
+      await first.beginCandidateMaterialization({
+        operationKey: failedRequiredOperationKey,
+        idempotencyKeyDigest: "9".repeat(64),
+        requestFingerprint: unresolvedFingerprint,
+        legacyUserId: unresolvedUserId,
+        claimToken: "a".repeat(64),
+        metadata: { source: "mysql-failed-required" }
+      });
+      await first.update({
+        operationKey: failedRequiredOperationKey,
+        status: "failed",
+        legacyStatus: "read-only",
+        identityStatus: "candidate-write-outcome-unknown",
+        compensationStatus: "required",
+        errorCode: "InjectedCandidateFailure",
+        metadata: { source: "mysql-failed-required" }
+      });
+      const recent = await first.listRecentSafe(60, 200);
+      expect(recent.find((operation) => operation.idempotencyKeyDigest === "b".repeat(64))).toMatchObject({
+        legacyUserId,
+        mode: "candidate-materialization",
+        status: "completed",
+        legacyStatus: "read-only",
+        identityStatus: "candidate-materialized",
+        compensationStatus: "none",
+        errorCode: null
+      });
+      expect(recent.find((operation) => operation.idempotencyKeyDigest === "9".repeat(64))).toMatchObject({
+        legacyUserId: unresolvedUserId,
+        mode: "candidate-materialization",
+        status: "failed",
+        legacyStatus: "read-only",
+        identityStatus: "candidate-write-outcome-unknown",
+        compensationStatus: "required",
+        errorCode: "InjectedCandidateFailure"
+      });
       await setOperationMode(target, failedCompletedOperationKey, "future-mode");
       await expect(first.find(failedCompletedOperationKey)).rejects.toThrow("Unknown organization write operation mode");
       await expect(first.countUnresolvedForLegacyUser(unresolvedUserId)).resolves.toBe(1);
@@ -298,7 +336,8 @@ describe.skipIf(!enabled)("IAM organization write MySQL integration", () => {
           materializationOperationKey,
           staleOperationKey,
           failedNoneOperationKey,
-          failedCompletedOperationKey
+          failedCompletedOperationKey,
+          failedRequiredOperationKey
         ],
         legacyUserId,
         legacyOrganizationId

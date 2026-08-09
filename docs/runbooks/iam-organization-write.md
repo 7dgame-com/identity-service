@@ -37,13 +37,20 @@ dual-write execution、rollout mode、allowlist 数量、percentage、事实源�
 allowlist 主体。双域默认关闭门禁可直接执行：
 
 ```sh
-npm run iam:organization-write:public-gate -- \
-  --urls=https://identity.d.xrteeth.com/health,https://identity.d.tmrpp.com/health \
-  --expected-revision=<full-develop-git-sha>
+npm run iam:organization-write:public-gate:dist -- \
+  --urls=https://identity.d.xrteeth.com/health \
+  --expected-revision=<full-xrteeth-develop-git-sha>
+
+npm run iam:organization-write:public-gate:dist -- \
+  --urls=https://identity.d.tmrpp.com/health \
+  --expected-revision=<full-tmrpp-develop-git-sha>
 ```
 
-命令默认要求两个域名均为 `disabled / false / false / off / 0%`、Legacy 事实源且 native 不支持。
-窗口期间必须显式传入期望值；不得以配置截图代替此 request-level 公共证据。
+两个域名必须分开执行，因为镜像同步时点、完整 revision 和 candidate window 期望可能不同。命令默认
+要求当前单个域名为 `disabled / false / false / off / 0%`、candidate disabled/target unconfigured、
+Legacy 事实源且 native 不支持。窗口期间必须显式传入该域名的期望值；不得以配置截图代替此
+request-level 公共证据。tmrpp 只执行公开 health 请求，不进入 tmrpp Portainer；镜像同步继续由用户
+按既定弹性服务器流程完成。
 
 以下内部接口都要求 `X-Identity-Internal-Token`：
 
@@ -65,7 +72,7 @@ request-level route hit 仍必须由获批 mutation 的响应 header/日志/ledg
 
 ```sh
 IDENTITY_IAM_INTERNAL_API_TOKEN='<runtime-secret>' \
-npm run iam:organization-write:window-gate -- \
+npm run iam:organization-write:window-gate:dist -- \
   --adapter-url=http://127.0.0.1:8086 \
   --legacy-user-id=<approved-dedicated-user-id> \
   --expected-mode=legacy-proxy \
@@ -107,6 +114,118 @@ IDENTITY_IAM_ORG_WRITE_CANDIDATE_MATERIALIZATION_TARGET_LEGACY_USER_ID: "0"
 GET  /internal/iam/organization-write/subjects/:legacyUserId/materialization-preview
 POST /internal/iam/organization-write/subjects/:legacyUserId/materialize-candidate
 ```
+
+### Candidate 受控命令单
+
+以下命令只适用于已经发布且另外获批的 xrteeth Develop 单目标窗口；它们不构成部署、配置变更或
+materialization 授权。生产镜像只包含编译产物，因此一律使用 `:dist` 脚本。内部 adapter URL 必须是
+`http://127.0.0.1:<port>`、`http://localhost:<port>` 或 `http://[::1]:<port>`，不得带 credentials、path、
+query 或 fragment。`--expected-revision` 必须是本次已审核镜像的完整 40 位小写 Git SHA，不能使用短
+SHA、tag 或浮动分支名。
+
+1. **Preview（只读）**：仅配置一个精确 target，保持 candidate materialization disabled。token 只从
+   环境变量读取；命令只发送 health/readiness/preview/alignment/ledger GET，不发送 POST：
+
+   ```sh
+   IDENTITY_IAM_INTERNAL_API_TOKEN='<runtime-secret>' \
+   npm run iam:organization-write:materialization-gate:dist -- \
+     --adapter-url=http://127.0.0.1:8086 \
+     --legacy-user-id=<approved-positive-legacy-user-id> \
+     --expected-revision=<full-40-character-develop-git-sha> \
+     --since-minutes=60
+   ```
+
+   只有 `passed=true`，且输出中的 target fingerprint、组织数量、missing-candidate alignment、schema
+   readiness 与零 unresolved ledger 均符合审核预期时，才可把输出中的完整 64 位
+   `target.snapshotFingerprint` 登记为 reviewed fingerprint。不得把 token 或主体原始资料写入证据。
+
+2. **Apply（唯一写命令）**：取得独立写批准后，临时将 candidate materialization enabled，并保持同一
+   精确 target。fingerprint 必须逐字使用刚审核的 64 位小写十六进制值；1–180 字符 idempotency key
+   只从专用环境变量读取，不得作为 CLI 参数：
+
+   ```sh
+   IDENTITY_IAM_INTERNAL_API_TOKEN='<runtime-secret>' \
+   IDENTITY_IAM_ORG_CANDIDATE_MATERIALIZATION_IDEMPOTENCY_KEY='<approved-window-key>' \
+   npm run iam:organization-write:materialization-gate:dist -- \
+     --apply \
+     --adapter-url=http://127.0.0.1:8086 \
+     --legacy-user-id=<approved-positive-legacy-user-id> \
+     --expected-revision=<full-40-character-develop-git-sha> \
+     --expected-snapshot-fingerprint=<reviewed-64-hex-fingerprint> \
+     --since-minutes=60
+   ```
+
+   CLI 会先完成全部只读 preflight，随后至多发送一次 POST，并以
+   `X-Identity-Expected-Revision` 在服务端写入口再次锁定同一 revision。它禁止跨域 redirect，不自动
+   重试，也不得由 operator 换 key 再发。
+
+3. **同步 postcheck**：上一步的同一次 CLI 运行会在 201 后重新 GET health、目标 alignment、ledger
+   summary/recent，并要求 fresh revision 不变、`P0/P1/P2/mismatch=0`、精确一条同 target/同
+   idempotency digest 的 terminal ledger 记录及 Legacy read-only safety。只有
+   `passed=true`、`applyAttempted=true`、`outcomeUnknown=false`、`postcheckIncomplete=false` 才是完整
+   成功证据；不存在需要补发的“postcheck POST”。窗口中 xrteeth 的公开 posture 另行只读核验：
+
+   ```sh
+   npm run iam:organization-write:public-gate:dist -- \
+     --urls=https://identity.d.xrteeth.com/health \
+     --expected-revision=<full-40-character-develop-git-sha> \
+     --expected-candidate-materialization-enabled=true \
+     --expected-candidate-materialization-target-configured=true
+   ```
+
+   同期 tmrpp 必须作为另一条公开请求独立核验，使用它自己的已部署完整 revision，并保持默认的
+   candidate disabled/target unconfigured；不得进入 tmrpp Portainer：
+
+   ```sh
+   npm run iam:organization-write:public-gate:dist -- \
+     --urls=https://identity.d.tmrpp.com/health \
+     --expected-revision=<full-tmrpp-develop-git-sha>
+   ```
+
+4. **不确定或不完整结果**：`outcomeUnknown=true` 表示 POST 传输/redirect/响应结果不可证明；
+   `postcheckIncomplete=true` 表示 POST 已返回 201，但 fresh GET 证据不完整。两种情况都要先立即恢复
+   candidate disabled、target `0` 及其余全部 default-off 配置；不得再次运行 `--apply`、自动重试或生成
+   新 key。随后封存并复用原 key 运行纯 GET outcome verifier：
+
+   ```sh
+   IDENTITY_IAM_INTERNAL_API_TOKEN='<runtime-secret>' \
+   IDENTITY_IAM_ORG_CANDIDATE_MATERIALIZATION_IDEMPOTENCY_KEY='<the-exact-original-window-key>' \
+   npm run iam:organization-write:materialization-gate:dist -- \
+     --verify-outcome \
+     --adapter-url=http://127.0.0.1:8086 \
+     --legacy-user-id=<approved-positive-legacy-user-id> \
+     --expected-revision=<full-40-character-develop-git-sha> \
+     --expected-snapshot-fingerprint=<reviewed-64-hex-fingerprint> \
+     --since-minutes=60
+   ```
+
+   Verifier 要求已恢复的 health/readiness，只发送 health、readiness、目标 alignment、ledger
+   summary/recent GET；原 key 仅在进程内转换为 SHA-256 digest，不作为 GET 参数或 header 发送，也不
+   回显。只有精确一条同 subject/key digest 的 completed terminal 记录、完整
+   `requestFingerprintDigest=SHA-256(reviewed fingerprint)`、匹配的 snapshot/target digest、合法
+   Identity/compensation 配对、Legacy read-only safety、全局零 unresolved ledger 和
+   `P0/P1/P2/mismatch=0` 才能 `passed=true` 且 `outcomeUnknown=false`。missing、pending、failed、
+   required/failed compensation、malformed ledger 或不完整 GET 均返回 `outcomeUnknown=true`；GET
+   不完整时还会返回 `postcheckIncomplete=true`。此时必须停止并另行申请恢复处置，禁止普通
+   `--apply` 绕过，也不得把“可能成功”记为成功。
+
+5. **Restore-check（纯 GET）**：无论成功或失败，先把 candidate enabled 恢复为 false、target 恢复为
+   `0`，并恢复本手册的全部默认姿态，再运行：
+
+   ```sh
+   IDENTITY_IAM_INTERNAL_API_TOKEN='<runtime-secret>' \
+   npm run iam:organization-write:materialization-gate:dist -- \
+     --expect-restored \
+     --adapter-url=http://127.0.0.1:8086 \
+     --expected-revision=<full-40-character-develop-git-sha> \
+     --since-minutes=60
+   ```
+
+   `--expect-restored` 与 subject 无关，不接受 `--legacy-user-id`、`--apply` 或 snapshot fingerprint；它只
+   发送 health/readiness/ledger GET。它要求 candidate disabled/target unconfigured、
+   `canPreview=false`、`canApply=false`、`target-not-configured` 与
+   `candidate-materialization-disabled` blocker、schema ready、全局 ledger 格式有效且 unresolved=0。
+   最后再分别运行本手册开头的 xrteeth 与 tmrpp 默认关闭 public gate；任一失败都不得关闭窗口证据。
 
 建议先只配置精确 target、保持 `...MATERIALIZATION_ENABLED=false` 调用 preview。此时 preview
 必须返回 `mutation=false`、`identityCandidateWritePerformed=false`，并以
@@ -187,7 +306,7 @@ Legacy schema 执行 DDL。
 参数，也不会采集数据或 materialize candidate：
 
 ```sh
-npm run iam:organization-reconciliation:validate -- \
+npm run iam:organization-reconciliation:validate:dist -- \
   --input=<explicit-local-json-file>
 ```
 
@@ -232,19 +351,49 @@ validator 的比较策略固定为 `pairwise-no-union`：Legacy 与 Identity 独
 source version 只使用本次 nonce 的 HMAC/hash，不回显 raw subject、organization ID/name、binding
 或 decision 上下文；nonce 缺失/非法时直接短路敏感比较，不以可预测 key 生成实体 hash。原始输入
 本身仍可能含这些值，必须保留在获批的本地临时边界内，不得提交仓库或复制到报告。参数/文件/
-JSON/schema 错误退出 2。`staticChecksPassed=true` 只表示 envelope 内部一致且没有静态 P0/P1；当前
-实现没有可信 collector attestation verifier，因此固定返回
-`externalProvenanceVerified=false`、`safetyGate.passed=false`、`blocksDualWrite=true`，并以
-`external-provenance-required` 退出 1。输入中不存在可伪造的 provenance 布尔开关；只有未来实现并
-验证外部可信 attestation 后，CLI 才可能退出 0。
+JSON/schema 错误退出 2。`staticChecksPassed=true` 只表示 envelope 内部一致且没有静态 P0/P1；
+snapshot-only 调用没有外部信任根，固定返回 `externalProvenanceVerified=false`、
+`safetyGate.passed=false`、`blocksDualWrite=true`，并以 `external-provenance-required` 退出 1。输入中
+不存在可伪造的 provenance 布尔开关或公钥字段。
+
+可信模式必须同时提供独立本地 attestation 文件、change-controlled trust-policy 文件和已编译的
+trust profile 标识。生产 CLI 只从源码中的 immutable registry 解析 profile；不从 argv、环境变量、
+snapshot、attestation 或 policy 接受 policy pin。当前 registry 故意为空，不包含任何生产 key/pin；
+每个发布产物最多只能 provision 一个 profile，参数必须精确匹配；零个或多个 compiled profile 都
+fail closed，避免调用方挑选较弱环境。新增 profile 必须经代码审查、CI 和正式 release，不能在运行
+窗口临时注入：
+
+```bash
+npm run iam:organization-reconciliation:validate:dist -- \
+  --input=<approved-local-snapshot.json> \
+  --attestation=<approved-local-attestation.json> \
+  --trust-policy=<approved-local-trust-policy.json> \
+  --trust-profile=<reviewed-compiled-profile-id>
+```
+
+Compiled profile 固定 policy SHA-256、预期 environment，以及 required collector/node/key/fingerprint
+集合；policy、签名 payload 与 report hash 同时绑定 profile/environment，避免把合法 Develop profile
+误用为 Production 证据。Policy 只接受 canonical SPKI Ed25519 public key，并逐 key 校验 SPKI SHA-256
+fingerprint；必须要求 2–8 个 collector，collector ID、node ID、key ID 和真实 key fingerprint 均唯一，
+缺任一签名、额外/重复 signer、key/fingerprint 不符均 fail closed。
+每个 domain-separated 签名绑定 canonical 完整 snapshot digest、collector contract hash、logical
+snapshot/window digest、environment、collector/node/key、policy digest、collection window 和签发/
+过期时间。Policy 同时限制 collection window、证据年龄、attestation TTL、key/policy 有效期和 clock
+skew。只有全部 required collector 签名有效且静态门禁通过，才会设置
+`assuranceScope=collector-envelope-with-trusted-external-attestation`、
+`externalProvenanceVerified=true`；report 仍只输出 hash、状态码与签名计数，不回显 key、签名、node、
+environment 或原始业务值。Trusted artifact schema/文件/profile 参数错误或 profile 尚未编译 provision
+时退出 2；compiled policy mismatch、签名失败、证据篡改、过期或窗口不合规返回安全报告并退出 1。
 CLI 的通用 safety gate 允许“已分类 P2”存在，但工作包 4 的 Phase 4 准入更严格：仍要求
 `P0=0、P1=0、P2=0、mismatch=0`，所以 P2 非零即使 CLI 退出 0 也不能推进。
 
-本地 validator 通过只证明所给文件的 collector envelope 内部一致且 pairwise 差异满足上述静态
-规则；nonce/HMAC 不认证 collector，也不能单独证明外部 API/数据库确实返回了这些页。可信采集器、
-首游标与逐页原始响应/签名或等价 provenance、双节点/环境证据仍须另行批准和独立核验。CLI PASS
-（未来具备 verifier 后）也不授权采集、部署、数据库访问或任何运行时写入；当前固定的 fail-closed
-结果更不单独完成 Task 7.2。
+本地代码另提供无 I/O 的 cursor-chain assembler（只接受从 `requestCursor=null` 到
+`nextCursor=null` 的完整有序链）以及可交给 HSM/KMS 的 canonical attestation payload/signature
+组装接口；verifier 本身不读取或持有 private key。仓库仍没有连接 Legacy/Identity runtime 的
+source-specific collector adapter，也没有已批准的公钥 policy、compiled trust profile、签名服务、逐页原始
+响应保管或双节点运行证据。因此本地测试 PASS 只证明 verifier/collector primitives 正确，不证明外部
+API/数据库实际返回这些页，也不单独完成 Task 7.2。任何采集、部署、数据库访问或运行时写入仍需
+另行批准。
 
 ## Phase 3：单次 Develop legacy-proxy 窗口
 

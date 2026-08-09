@@ -427,8 +427,8 @@ export class IamOrganizationWriteService {
         recoverySnapshotFingerprintDigest: shortDigest(actualSnapshotFingerprint)
       } : stalePendingSnapshotRecovery && existing ? {
         recovery: "stale-pending-current-reviewed-legacy-snapshot",
-        recoveryPreviousSnapshotFingerprint: existing.requestFingerprint,
-        recoverySnapshotFingerprint: actualSnapshotFingerprint
+        recoveryPreviousSnapshotFingerprintDigest: shortDigest(existing.requestFingerprint),
+        recoverySnapshotFingerprintDigest: shortDigest(actualSnapshotFingerprint)
       } : existing ? { recovery: "same-idempotency-key-retry" } : {})
     };
     const claimToken = randomBytes(32).toString("hex");
