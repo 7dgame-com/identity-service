@@ -80,7 +80,8 @@ describe("organization reconciliation source-specific MySQL raw adapters", () =>
       "legacy-organization-directory-page/v1": [[directoryRow]],
       "legacy-subject-universe-page/v1": [[{ id: 9, status: 10 }]],
       "legacy-membership-page/v1": [[{ user_id: 9, organization_id: 3 }]],
-      "legacy-role-assignment-page/v1": [[{ user_id: "9", item_name: "manager" }]]
+      "legacy-role-assignment-page/v1": [[{ user_id: "9", item_name: "manager" }]],
+      "legacy-rbac-edge-page/v1": [[{ parent: "manager", child: "organization.update" }]]
     });
     const snapshot = await openLegacyMainMysqlRawSnapshot(optionsFor(fake, "legacy-main-db"));
 
@@ -88,6 +89,7 @@ describe("organization reconciliation source-specific MySQL raw adapters", () =>
     const subjects = await snapshot.readSubjectUniversePage({ requestCursor: null, pageSize: 10 });
     const memberships = await snapshot.readMembershipPage({ requestCursor: null, pageSize: 10 });
     const roles = await snapshot.readRoleAssignmentPage({ requestCursor: null, pageSize: 10 });
+    const edges = await snapshot.readRbacEdgePage({ requestCursor: null, pageSize: 10 });
     directoryRow.title = "mutated-after-read";
 
     expect(directory.records).toEqual([{
@@ -104,13 +106,15 @@ describe("organization reconciliation source-specific MySQL raw adapters", () =>
     expect(subjects.records).toEqual([{ legacyUserId: "9", status: 10 }]);
     expect(memberships.records).toEqual([{ legacyUserId: "9", legacyOrganizationId: "3" }]);
     expect(roles.records).toEqual([{ legacyUserId: "9", roleName: "manager" }]);
-    expect([directory, subjects, memberships, roles].every((page) => page.nextCursor === null)).toBe(true);
+    expect(edges.records).toEqual([{ parentName: "manager", childName: "organization.update" }]);
+    expect([directory, subjects, memberships, roles, edges].every((page) => page.nextCursor === null)).toBe(true);
 
     expect(dataQueries(fake)).toEqual([
       [sql("legacy-organization-directory-page/v1"), [0, 10]],
       [sql("legacy-subject-universe-page/v1"), [0, 10]],
       [sql("legacy-membership-page/v1"), [0, 0, 0, 10]],
-      [sql("legacy-role-assignment-page/v1"), [0, 0, "", 10]]
+      [sql("legacy-role-assignment-page/v1"), [0, 0, "", 10]],
+      [sql("legacy-rbac-edge-page/v1"), ["", "", "", 10]]
     ]);
     await snapshot.close("completed");
     expect(fake.queries.at(-1)?.[0]).toBe("COMMIT");
@@ -259,6 +263,94 @@ describe("organization reconciliation source-specific MySQL raw adapters", () =>
       ["2", "2", "7", "2", "7", "legacy:2", "2", "7", "legacy:2", "legacy:8", 1]
     ]);
     await snapshot.close("completed");
+  });
+
+  it("paginates Legacy RBAC edges by UTF-8 byte tuples and reaches an explicit terminal page", async () => {
+    const bytewiseFirst = "\uE000";
+    const bytewiseSecond = "\u{10000}";
+    // JS UTF-16 orders the supplementary character first; UTF-8 bytes order it second.
+    expect(bytewiseSecond < bytewiseFirst).toBe(true);
+    const fake = fakeConnection({
+      "legacy-rbac-edge-page/v1": [[
+        { parent: bytewiseFirst, child: "child-z" },
+        { parent: bytewiseSecond, child: "child-a" }
+      ], []]
+    });
+    const snapshot = await openLegacyMainMysqlRawSnapshot(optionsFor(fake, "legacy-main-db"));
+
+    const first = await snapshot.readRbacEdgePage({ requestCursor: null, pageSize: 2 });
+    const terminal = await snapshot.readRbacEdgePage({ requestCursor: first.nextCursor, pageSize: 2 });
+
+    expect(first.records).toEqual([
+      { parentName: bytewiseFirst, childName: "child-z" },
+      { parentName: bytewiseSecond, childName: "child-a" }
+    ]);
+    expect(first.nextCursor).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(terminal).toMatchObject({ recordOffset: 2, records: [], nextCursor: null });
+    expect(dataQueries(fake)).toEqual([
+      [sql("legacy-rbac-edge-page/v1"), ["", "", "", 2]],
+      [sql("legacy-rbac-edge-page/v1"), [bytewiseSecond, bytewiseSecond, "child-a", 2]]
+    ]);
+    await snapshot.close("completed");
+    expect(fake.queries.at(-1)?.[0]).toBe("COMMIT");
+  });
+
+  it("fails closed on malformed or non-byte-ordered Legacy RBAC edges", async () => {
+    let getterInvoked = false;
+    const accessor = Object.defineProperty({ child: "child" }, "parent", {
+      enumerable: true,
+      get: () => { getterInvoked = true; return "parent"; }
+    });
+    const symbolic = { parent: "parent", child: "child", [Symbol("hidden")]: true };
+    const extra = { parent: "parent", child: "child", rule: "hidden" };
+    const customPrototype = Object.assign(Object.create({ inherited: true }), {
+      parent: "parent", child: "child"
+    });
+    const malformedRows: readonly unknown[] = [
+      accessor,
+      symbolic,
+      extra,
+      customPrototype,
+      new Proxy({ parent: "parent", child: "child" }, {}),
+      { parent: "", child: "child" },
+      { parent: "parent", child: " child" },
+      { parent: "parent", child: "e\u0301" },
+      { parent: "p".repeat(65), child: "child" }
+    ];
+    for (const row of malformedRows) {
+      const fake = fakeConnection({ "legacy-rbac-edge-page/v1": [[row]] });
+      const snapshot = await openLegacyMainMysqlRawSnapshot(optionsFor(fake, "legacy-main-db"));
+      await expect(snapshot.readRbacEdgePage({ requestCursor: null, pageSize: 10 }))
+        .rejects.toThrow("Reading the Legacy main MySQL reconciliation snapshot page failed");
+      await snapshot.close("failed");
+      expect(fake.queries.at(-1)?.[0]).toBe("ROLLBACK");
+    }
+    expect(getterInvoked).toBe(false);
+
+    const reversed = fakeConnection({
+      "legacy-rbac-edge-page/v1": [[
+        { parent: "\u{10000}", child: "child" },
+        { parent: "\uE000", child: "child" }
+      ]]
+    });
+    const snapshot = await openLegacyMainMysqlRawSnapshot(optionsFor(reversed, "legacy-main-db"));
+    await expect(snapshot.readRbacEdgePage({ requestCursor: null, pageSize: 10 }))
+      .rejects.toThrow("Reading the Legacy main MySQL reconciliation snapshot page failed");
+    await expect(snapshot.close("completed"))
+      .rejects.toThrow("Closing the Legacy main MySQL reconciliation snapshot failed");
+    expect(reversed.queries.at(-1)?.[0]).toBe("ROLLBACK");
+  });
+
+  it("poisons a forged Legacy RBAC edge cursor before SQL", async () => {
+    const fake = fakeConnection();
+    const snapshot = await openLegacyMainMysqlRawSnapshot(optionsFor(fake, "legacy-main-db"));
+
+    await expect(snapshot.readRbacEdgePage({ requestCursor: "forged-cursor", pageSize: 10 }))
+      .rejects.toThrow("Reading the Legacy main MySQL reconciliation snapshot page failed");
+    expect(dataQueries(fake)).toEqual([]);
+    await expect(snapshot.close("completed"))
+      .rejects.toThrow("Closing the Legacy main MySQL reconciliation snapshot failed");
+    expect(fake.queries.at(-1)?.[0]).toBe("ROLLBACK");
   });
 
   it("poisons an invalid cursor chain before SQL and makes a completed close fail after rollback", async () => {

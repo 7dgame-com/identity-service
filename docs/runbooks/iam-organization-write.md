@@ -434,8 +434,11 @@ cursor、精确 count/offset/order/unique key，并在成功、读取失败、�
 snapshot session、dataset-lineage collector，以及可交给 HSM/KMS 的 canonical attestation
 payload/signature 组装接口；外部 provenance verifier 本身不读取或持有 private key。
 
-当前 transaction-owned bridge 已实现固定 11 个 raw dataset：Legacy 4 个、Identity 6 个、plugin 1 个；
-Identity 集合已包含 `identity-subject-universe` raw dataset 的读取实现与固定结构项。每个 component 在各自
+当前 transaction-owned bridge 已实现固定 12 个 raw dataset：Legacy 5 个、Identity 6 个、plugin 1 个；
+Legacy 集合新增 `legacy-rbac-edge`，只读取源码已证明的 `auth_item_child(parent, child)` 关系事实，使用
+MySQL explicit binary keyset 与 Node UTF-8 byte order；这不批准 RBAC item/assignment selector，也不证明
+运行时 schema、collation 或物理 source。Identity 集合已包含 `identity-subject-universe` raw dataset 的
+读取实现与固定结构项。每个 component 在各自
 独立的 repeatable-read transaction 内，按固定 dataset ID 集合与 caller-structured untrusted catalog 扫描。
 adapter 不再缓存完整 raw page 集合：每页通过 canonical transport 写入同一受限本地 spool，并增量计算
 page/dataset/component inventory；seal 后每次只从 spool 读取一个有界页回放。成功初始化后 spool 文件已

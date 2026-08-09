@@ -12,6 +12,9 @@ const DIRECTORY_STATEMENT_ID = "legacy-organization-directory-page/v1" as const;
 const DIRECTORY_SQL = ORGANIZATION_RECONCILIATION_MYSQL_STATEMENTS[DIRECTORY_STATEMENT_ID];
 const SUBJECT_STATEMENT_ID = "legacy-subject-universe-page/v1" as const;
 const SUBJECT_SQL = ORGANIZATION_RECONCILIATION_MYSQL_STATEMENTS[SUBJECT_STATEMENT_ID];
+const RBAC_EDGE_STATEMENT_ID = "legacy-rbac-edge-page/v1" as const;
+const RBAC_EDGE_SQL =
+  "SELECT parent, child FROM auth_item_child WHERE (CAST(parent AS BINARY) > CAST(? AS BINARY)) OR (CAST(parent AS BINARY) = CAST(? AS BINARY) AND CAST(child AS BINARY) > CAST(? AS BINARY)) ORDER BY CAST(parent AS BINARY) ASC, CAST(child AS BINARY) ASC LIMIT ?";
 
 describe("organization reconciliation MySQL repeatable-read snapshot", () => {
   it("keeps setup, reads, commit, and release on one connection in strict order", async () => {
@@ -144,11 +147,31 @@ describe("organization reconciliation MySQL repeatable-read snapshot", () => {
       .toContain("source = 'legacy-shadow' AND status = 'shadow'");
   });
 
+  it("pins the Legacy RBAC edge statement to binary keyset ordering and exact cursor parameters", async () => {
+    expect(ORGANIZATION_RECONCILIATION_MYSQL_STATEMENTS[RBAC_EDGE_STATEMENT_ID]).toBe(RBAC_EDGE_SQL);
+    const fake = fakeConnection();
+    const session = await openMysqlRepeatableReadSnapshot(async () => fake.connection);
+
+    await session.query(RBAC_EDGE_STATEMENT_ID, ["", "", "", 100]);
+    await session.query(RBAC_EDGE_STATEMENT_ID, ["parent", "parent", "child", 100]);
+    await session.close("completed");
+
+    expect(fake.queries.slice(2)).toEqual([
+      [RBAC_EDGE_SQL, ["", "", "", 100]],
+      [RBAC_EDGE_SQL, ["parent", "parent", "child", 100]],
+      ["COMMIT", undefined]
+    ]);
+  });
+
   it.each([
     [DIRECTORY_STATEMENT_ID, [0]],
     [DIRECTORY_STATEMENT_ID, [0, 0]],
     [DIRECTORY_STATEMENT_ID, [0, 5_001]],
     ["legacy-membership-page/v1", [1, 2, 0, 100]],
+    [RBAC_EDGE_STATEMENT_ID, ["parent", "different-parent", "child", 100]],
+    [RBAC_EDGE_STATEMENT_ID, ["parent", "parent", null, 100]],
+    [RBAC_EDGE_STATEMENT_ID, ["p".repeat(65), "p".repeat(65), "child", 100]],
+    [RBAC_EDGE_STATEMENT_ID, ["parent", "parent", "child"]],
     ["identity-membership-candidate-page/v1", [1, 1, 2, 1, 3, "user-a", 1, 2, "user-a", "org-a", 100]],
     [DIRECTORY_STATEMENT_ID, [null, 100]],
     [DIRECTORY_STATEMENT_ID, [{ toSqlString: () => "SLEEP(10)" }, 100]],

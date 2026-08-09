@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import { isProxy } from "node:util/types";
 import {
   ORGANIZATION_RECONCILIATION_PAGINATION_MODE,
   ORGANIZATION_RECONCILIATION_SNAPSHOT_MODE
@@ -68,6 +69,7 @@ export type OrganizationReconciliationMysqlRawSurface =
   | "legacy-subject-universe"
   | "legacy-membership"
   | "legacy-role-assignment"
+  | "legacy-rbac-edge"
   | "identity-subject-universe"
   | "identity-organization-candidate"
   | "identity-organization-id-map"
@@ -129,6 +131,11 @@ export interface LegacyOrganizationMembershipMysqlRawRecord {
 export interface LegacyRoleAssignmentMysqlRawRecord {
   readonly legacyUserId: string;
   readonly roleName: string;
+}
+
+export interface LegacyRbacEdgeMysqlRawRecord {
+  readonly parentName: string;
+  readonly childName: string;
 }
 
 export interface IdentityOrganizationCandidateMysqlRawRecord {
@@ -217,6 +224,12 @@ export interface LegacyMainMysqlRawSnapshot
     "legacy-role-assignment",
     LegacyRoleAssignmentMysqlRawRecord
   >>;
+  readRbacEdgePage(
+    request: OrganizationReconciliationMysqlRawPageRequest
+  ): Promise<OrganizationReconciliationMysqlRawPage<
+    "legacy-rbac-edge",
+    LegacyRbacEdgeMysqlRawRecord
+  >>;
 }
 
 export interface IdentityMysqlRawSnapshot
@@ -274,6 +287,7 @@ type AnyRawRecord =
   | LegacySubjectUniverseMysqlRawRecord
   | LegacyOrganizationMembershipMysqlRawRecord
   | LegacyRoleAssignmentMysqlRawRecord
+  | LegacyRbacEdgeMysqlRawRecord
   | IdentitySubjectUniverseMysqlRawRecord
   | IdentityOrganizationCandidateMysqlRawRecord
   | IdentityOrganizationIdMapMysqlRawRecord
@@ -355,6 +369,19 @@ const LEGACY_ROLES = defineSurface({
   cursorValues: (record) => [record.legacyUserId, record.roleName],
   queryParameters: twoPartStringParameters,
   orderKey: (record) => tupleOrderKey(numericOrderKey(record.legacyUserId), record.roleName)
+});
+
+const LEGACY_RBAC_EDGES = defineSurface({
+  surface: "legacy-rbac-edge",
+  statementId: "legacy-rbac-edge-page/v1",
+  initialCursorValues: ["", ""],
+  decode: decodeLegacyRbacEdge,
+  cursorValues: (record) => [record.parentName, record.childName],
+  queryParameters: twoPartStringParameters,
+  orderKey: (record) => tupleOrderKey(
+    utf8ByteOrderKey(record.parentName),
+    utf8ByteOrderKey(record.childName)
+  )
 });
 
 const IDENTITY_SUBJECTS = defineSurface({
@@ -454,6 +481,8 @@ export async function openLegacyMainMysqlRawSnapshot(
       core.read(LEGACY_MEMBERSHIPS, request),
     readRoleAssignmentPage: (request: OrganizationReconciliationMysqlRawPageRequest) =>
       core.read(LEGACY_ROLES, request),
+    readRbacEdgePage: (request: OrganizationReconciliationMysqlRawPageRequest) =>
+      core.read(LEGACY_RBAC_EDGES, request),
     close: (outcome: MysqlRepeatableReadSnapshotOutcome) => core.close(outcome)
   });
 }
@@ -781,6 +810,17 @@ function decodeLegacyRoleAssignment(candidate: unknown): Readonly<LegacyRoleAssi
   });
 }
 
+function decodeLegacyRbacEdge(candidate: unknown): Readonly<LegacyRbacEdgeMysqlRawRecord> {
+  if (candidate !== null && typeof candidate === "object" && isProxy(candidate)) {
+    throw new Error("invalid row proxy");
+  }
+  const row = exactRecord(candidate, ["parent", "child"]);
+  return Object.freeze({
+    parentName: canonicalText(row.parent, 64),
+    childName: canonicalText(row.child, 64)
+  });
+}
+
 function decodeIdentitySubjectUniverse(candidate: unknown): Readonly<IdentitySubjectUniverseMysqlRawRecord> {
   const row = exactRecord(candidate, ["legacy_user_id", "status", "source"]);
   return Object.freeze({
@@ -951,6 +991,13 @@ function mysqlBoolean(value: unknown): boolean {
 
 function numericOrderKey(value: string): string {
   return `${value.length.toString(10).padStart(3, "0")}:${value}`;
+}
+
+function utf8ByteOrderKey(value: string): string {
+  // Lower-case hexadecimal is an order-preserving ASCII encoding of UTF-8
+  // bytes, including prefix ordering, so the generic string state machine can
+  // verify MySQL CAST(... AS BINARY) order without using JS UTF-16 ordering.
+  return Buffer.from(value, "utf8").toString("hex");
 }
 
 function tupleOrderKey(...values: readonly string[]): string {

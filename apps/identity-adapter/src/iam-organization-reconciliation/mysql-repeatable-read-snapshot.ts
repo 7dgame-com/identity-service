@@ -25,6 +25,8 @@ export const ORGANIZATION_RECONCILIATION_MYSQL_STATEMENTS = Object.freeze({
     "SELECT user_id, organization_id FROM user_organization WHERE (user_id > ?) OR (user_id = ? AND organization_id > ?) ORDER BY user_id ASC, organization_id ASC LIMIT ?",
   "legacy-role-assignment-page/v1":
     "SELECT aa.user_id, aa.item_name FROM auth_assignment AS aa INNER JOIN auth_item AS ai ON ai.name = aa.item_name AND ai.type = 1 WHERE (aa.user_id > ?) OR (aa.user_id = ? AND aa.item_name > ?) ORDER BY aa.user_id ASC, aa.item_name ASC LIMIT ?",
+  "legacy-rbac-edge-page/v1":
+    "SELECT parent, child FROM auth_item_child WHERE (CAST(parent AS BINARY) > CAST(? AS BINARY)) OR (CAST(parent AS BINARY) = CAST(? AS BINARY) AND CAST(child AS BINARY) > CAST(? AS BINARY)) ORDER BY CAST(parent AS BINARY) ASC, CAST(child AS BINARY) ASC LIMIT ?",
   "identity-subject-universe-page/v1":
     "SELECT legacy_user_id, status, source FROM identity_users WHERE legacy_user_id IS NOT NULL AND legacy_user_id > ? ORDER BY legacy_user_id ASC LIMIT ?",
   "identity-organization-candidate-page/v1":
@@ -213,6 +215,13 @@ function resolveReviewedStatement(
       requireRepeatedNonNegativeId(cursorParameters[0], cursorParameters[1]);
       requireCanonicalCursor(cursorParameters[2]);
       break;
+    case "legacy-rbac-edge-page/v1":
+      requireRepeatedValues(
+        [cursorParameters[0], cursorParameters[1]],
+        (value) => requireCanonicalCursor(value, 64)
+      );
+      requireCanonicalCursor(cursorParameters[2], 64);
+      break;
     case "identity-membership-candidate-page/v1":
       requireRepeatedValues([
         cursorParameters[0],
@@ -267,10 +276,10 @@ function requireNonNegativeId(value: MysqlSnapshotParameter | undefined): void {
   throw new Error(SQL_POLICY_FAILURE);
 }
 
-function requireCanonicalCursor(value: MysqlSnapshotParameter | undefined): void {
+function requireCanonicalCursor(value: MysqlSnapshotParameter | undefined, maxLength = 2_048): void {
   if (
     typeof value !== "string" ||
-    value.length > 2_048 ||
+    value.length > maxLength ||
     value.trim() !== value ||
     value.normalize("NFC") !== value ||
     /[\u0000-\u001f\u007f-\u009f]/u.test(value)

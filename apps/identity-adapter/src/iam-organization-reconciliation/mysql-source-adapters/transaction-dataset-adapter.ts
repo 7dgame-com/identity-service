@@ -155,6 +155,7 @@ const COMPONENT_DATASETS: Readonly<Record<OrganizationReconciliationMysqlRawComp
     "legacy-main": Object.freeze([
       "legacy-membership",
       "legacy-organization-directory",
+      "legacy-rbac-edge",
       "legacy-role-assignment",
       "legacy-subject-universe"
     ]),
@@ -603,6 +604,7 @@ function readRawPage(
     switch (datasetId) {
       case "legacy-membership": return legacy.readMembershipPage(request) as Promise<RawPage>;
       case "legacy-organization-directory": return legacy.readOrganizationDirectoryPage(request) as Promise<RawPage>;
+      case "legacy-rbac-edge": return legacy.readRbacEdgePage(request) as Promise<RawPage>;
       case "legacy-role-assignment": return legacy.readRoleAssignmentPage(request) as Promise<RawPage>;
       case "legacy-subject-universe": return legacy.readSubjectUniversePage(request) as Promise<RawPage>;
     }

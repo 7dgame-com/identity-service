@@ -41,6 +41,13 @@ const DIGEST_B = "b".repeat(64);
 const DIGEST_C = "c".repeat(64);
 const DIGEST_D = "d".repeat(64);
 const NONCE = "0123456789abcdef0123456789abcdef";
+const LEGACY_DATASET_IDS = [
+  "legacy-membership",
+  "legacy-organization-directory",
+  "legacy-rbac-edge",
+  "legacy-role-assignment",
+  "legacy-subject-universe"
+] as const;
 
 describe("transaction dataset lineage factory provenance capability", () => {
   it("keeps implementation distinct from every production readiness gate and runtime input", () => {
@@ -112,6 +119,7 @@ describe("transaction dataset lineage factory provenance capability", () => {
     expect(provenance.datasetIds).toEqual([
       "legacy-membership",
       "legacy-organization-directory",
+      "legacy-rbac-edge",
       "legacy-role-assignment",
       "legacy-subject-universe"
     ]);
@@ -271,7 +279,7 @@ describe("transaction dataset lineage factory provenance capability", () => {
     const provenance =
       assertOrganizationReconciliationTransactionDatasetLineageFactoryProvenance(run);
 
-    expect(run.artifacts).toHaveLength(11);
+    expect(run.artifacts).toHaveLength(12);
     expect(provenance).toEqual({
       contract: ORGANIZATION_RECONCILIATION_TRANSACTION_DATASET_LINEAGE_FACTORY_PROVENANCE_CONTRACT,
       trust: "factory-origin-only",
@@ -384,12 +392,7 @@ function factoryBinding(
 
 function catalogFor(componentId: ComponentId): OrganizationReconciliationDatasetCatalog {
   const datasetIds = componentId === "legacy-main"
-    ? [
-        "legacy-membership",
-        "legacy-organization-directory",
-        "legacy-role-assignment",
-        "legacy-subject-universe"
-      ]
+    ? LEGACY_DATASET_IDS
     : componentId === "identity"
       ? [
           "identity-membership-candidate",
@@ -444,6 +447,7 @@ function legacyRows(): Partial<Record<OrganizationReconciliationMysqlStatementId
       created_at: 1,
       updated_at: 1
     }]],
+    "legacy-rbac-edge-page/v1": [[{ parent: "root", child: "organization.update" }]],
     "legacy-role-assignment-page/v1": [[{ user_id: 1, item_name: "root" }]],
     "legacy-subject-universe-page/v1": [[{ id: 1, status: 10 }]]
   };

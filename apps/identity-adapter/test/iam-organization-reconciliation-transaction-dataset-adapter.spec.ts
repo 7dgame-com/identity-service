@@ -24,6 +24,13 @@ const DIGEST_A = "a".repeat(64);
 const DIGEST_B = "b".repeat(64);
 const DIGEST_C = "c".repeat(64);
 const NONCE = "0123456789abcdef0123456789abcdef";
+const LEGACY_DATASET_IDS = [
+  "legacy-membership",
+  "legacy-organization-directory",
+  "legacy-rbac-edge",
+  "legacy-role-assignment",
+  "legacy-subject-universe"
+] as const;
 
 describe("transaction-owned organization reconciliation dataset adapter", () => {
   it("canonicalizes and rejects tampered per-page inventory lineage", () => {
@@ -134,9 +141,7 @@ describe("transaction-owned organization reconciliation dataset adapter", () => 
     const legacy = fakeConnection(legacyRows());
     const identity = fakeConnection(identityRows());
     const plugin = fakeConnection(pluginRows());
-    const legacyCatalog = catalog([
-      "legacy-membership", "legacy-organization-directory", "legacy-role-assignment", "legacy-subject-universe"
-    ]);
+    const legacyCatalog = catalog(LEGACY_DATASET_IDS);
     const identityCatalog = catalog([
       "identity-membership-candidate", "identity-membership-shadow", "identity-organization-candidate",
       "identity-organization-id-map", "identity-role-shadow", "identity-subject-universe"
@@ -167,13 +172,15 @@ describe("transaction-owned organization reconciliation dataset adapter", () => 
       clock: { now: () => new Date(Date.UTC(2026, 7, 9, 8, 0, 0, tick++)) }
     });
 
-    expect(run.artifacts).toHaveLength(11);
+    expect(run.artifacts).toHaveLength(12);
     expect(run.artifacts.map((artifact) => artifact.datasetId)).toEqual([
-      "legacy-membership", "legacy-organization-directory", "legacy-role-assignment", "legacy-subject-universe",
+      ...LEGACY_DATASET_IDS,
       "identity-membership-candidate", "identity-membership-shadow", "identity-organization-candidate",
       "identity-organization-id-map", "identity-role-shadow", "identity-subject-universe", "plugin-registry"
     ]);
-    expect(run.coordinatorManifest.components.map((component) => component.recordCount)).toEqual([4, 6, 1]);
+    expect(run.coordinatorManifest.components.map((component) => component.recordCount)).toEqual([5, 6, 1]);
+    expect(run.artifacts.find((artifact) => artifact.datasetId === "legacy-rbac-edge")?.records)
+      .toEqual([{ parentName: "root", childName: "organization.update" }]);
     for (const fake of [legacy, identity, plugin]) {
       expect(fake.sql.at(-1)).toBe("COMMIT");
       expect(fake.release).toHaveBeenCalledTimes(1);
@@ -184,9 +191,7 @@ describe("transaction-owned organization reconciliation dataset adapter", () => 
     const first = fakeConnection(legacyRows());
     const second = fakeConnection(legacyRows());
     const third = fakeConnection(legacyRows());
-    const legacyCatalog = catalog([
-      "legacy-membership", "legacy-organization-directory", "legacy-role-assignment", "legacy-subject-universe"
-    ]);
+    const legacyCatalog = catalog(LEGACY_DATASET_IDS);
     const create = (fake: ReturnType<typeof fakeConnection>) =>
       createOrganizationReconciliationMysqlTransactionDatasetAdapter({
         componentId: "legacy-main", expectedSourceId: "legacy-db", connectionFactory: fake.factory,
@@ -196,7 +201,7 @@ describe("transaction-owned organization reconciliation dataset adapter", () => 
     const firstSnapshot = await firstAdapter.openSnapshot();
     expect(firstSnapshot.sourceVersion).toMatch(/^[a-f0-9]{64}$/);
     expect(firstSnapshot.snapshotId).toMatch(/^[a-f0-9]{64}$/);
-    expect(firstSnapshot.datasetInventory).toMatchObject({ recordCount: 4, catalogSha256: DIGEST_A });
+    expect(firstSnapshot.datasetInventory).toMatchObject({ recordCount: 5, catalogSha256: DIGEST_A });
     const partialClose = firstAdapter.closeSnapshot(firstSnapshot, "completed");
     await expect(partialClose)
       .rejects.toThrow("not consumed completely");
@@ -225,12 +230,8 @@ describe("transaction-owned organization reconciliation dataset adapter", () => 
     expect(connectionFactory).not.toHaveBeenCalled();
 
     const unboundedCatalog: OrganizationReconciliationDatasetCatalog = {
-      ...catalog([
-        "legacy-membership", "legacy-organization-directory", "legacy-role-assignment", "legacy-subject-universe"
-      ]),
-      datasets: catalog([
-        "legacy-membership", "legacy-organization-directory", "legacy-role-assignment", "legacy-subject-universe"
-      ]).datasets.map((dataset) => ({ ...dataset, maxPages: 3_000 }))
+      ...catalog(LEGACY_DATASET_IDS),
+      datasets: catalog(LEGACY_DATASET_IDS).datasets.map((dataset) => ({ ...dataset, maxPages: 3_000 }))
     };
     expect(() => createOrganizationReconciliationMysqlTransactionDatasetAdapter({
       componentId: "legacy-main", expectedSourceId: "legacy-db", connectionFactory,
@@ -247,9 +248,7 @@ describe("transaction-owned organization reconciliation dataset adapter", () => 
       await connectionGate;
       return first.connection;
     });
-    const legacyCatalog = catalog([
-      "legacy-membership", "legacy-organization-directory", "legacy-role-assignment", "legacy-subject-universe"
-    ]);
+    const legacyCatalog = catalog(LEGACY_DATASET_IDS);
     const adapter = createOrganizationReconciliationMysqlTransactionDatasetAdapter({
       componentId: "legacy-main", expectedSourceId: "legacy-db", connectionFactory: delayedFactory,
       evidenceNonce: NONCE, catalogSha256: DIGEST_A, datasetCatalog: legacyCatalog
@@ -278,9 +277,7 @@ describe("transaction-owned organization reconciliation dataset adapter", () => 
   });
 
   it("clears the factory key on scan failure and still surfaces raw-close failures", async () => {
-    const legacyCatalog = catalog([
-      "legacy-membership", "legacy-organization-directory", "legacy-role-assignment", "legacy-subject-universe"
-    ]);
+    const legacyCatalog = catalog(LEGACY_DATASET_IDS);
     const invalidRows = legacyRows();
     invalidRows["legacy-membership-page/v1"] = [[{ user_id: 0, organization_id: 1 }]];
     const scanFake = fakeConnection(invalidRows);
@@ -309,9 +306,7 @@ describe("transaction-owned organization reconciliation dataset adapter", () => 
   });
 
   it("poisons every active snapshot on verifier misuse without retaining an adapter run key", async () => {
-    const legacyCatalog = catalog([
-      "legacy-membership", "legacy-organization-directory", "legacy-role-assignment", "legacy-subject-universe"
-    ]);
+    const legacyCatalog = catalog(LEGACY_DATASET_IDS);
     for (const mode of [
       "before-exhaust", "wrong-snapshot", "unknown-dataset", "tampered-record", "tampered-cursor", "twice"
     ] as const) {
@@ -353,9 +348,7 @@ describe("transaction-owned organization reconciliation dataset adapter", () => 
 
   it("rolls back when one fixed dataset is omitted from the verified full set", async () => {
     const fake = fakeConnection(legacyRows());
-    const legacyCatalog = catalog([
-      "legacy-membership", "legacy-organization-directory", "legacy-role-assignment", "legacy-subject-universe"
-    ]);
+    const legacyCatalog = catalog(LEGACY_DATASET_IDS);
     const adapter = createOrganizationReconciliationMysqlTransactionDatasetAdapter({
       componentId: "legacy-main", expectedSourceId: "legacy-db", connectionFactory: fake.factory,
       evidenceNonce: NONCE, catalogSha256: DIGEST_A, datasetCatalog: legacyCatalog
@@ -375,9 +368,7 @@ describe("transaction-owned organization reconciliation dataset adapter", () => 
   });
 
   it("rejects descriptor-unsafe or non-ASCII catalogs before calling the connection factory", () => {
-    const required = [
-      "legacy-membership", "legacy-organization-directory", "legacy-role-assignment", "legacy-subject-universe"
-    ];
+    const required = [...LEGACY_DATASET_IDS];
     let getterInvoked = false;
     const getterCatalog = catalog(required) as unknown as Record<string, unknown>;
     Object.defineProperty(getterCatalog, "datasets", {
@@ -436,9 +427,7 @@ async function exerciseSpoolCloseOrdering(mode: "success" | "failure"): Promise<
       "../src/iam-organization-reconciliation/mysql-source-adapters/transaction-dataset-adapter.js"
     );
     const fake = fakeConnection(legacyRows());
-    const legacyCatalog = catalog([
-      "legacy-membership", "legacy-organization-directory", "legacy-role-assignment", "legacy-subject-universe"
-    ]);
+    const legacyCatalog = catalog(LEGACY_DATASET_IDS);
     const adapter = module.createOrganizationReconciliationMysqlTransactionDatasetAdapter({
       componentId: "legacy-main", expectedSourceId: "legacy-db", connectionFactory: fake.factory,
       evidenceNonce: NONCE, catalogSha256: DIGEST_A, datasetCatalog: legacyCatalog
@@ -534,6 +523,7 @@ function legacyRows(): Partial<Record<OrganizationReconciliationMysqlStatementId
     "legacy-organization-directory-page/v1": [[{
       id: 1, name: "root", title: "Root", created_at: 1, updated_at: 1
     }]],
+    "legacy-rbac-edge-page/v1": [[{ parent: "root", child: "organization.update" }]],
     "legacy-role-assignment-page/v1": [[{ user_id: 1, item_name: "root" }]],
     "legacy-subject-universe-page/v1": [[{ id: 1, status: 10 }]]
   };
