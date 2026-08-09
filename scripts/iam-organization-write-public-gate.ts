@@ -1,8 +1,12 @@
-interface GateOptions {
+import { pathToFileURL } from "node:url";
+
+export interface OrganizationWritePublicGateOptions {
   urls: string[];
   expectedMode: "disabled" | "legacy-proxy" | "dual-write" | "identity-native";
   expectedRouteIntegration: boolean;
   expectedDualWriteExecution: boolean;
+  expectedCandidateMaterializationEnabled: boolean;
+  expectedCandidateMaterializationTargetConfigured: boolean;
   expectedRolloutMode: "off" | "allowlist" | "percentage" | "full";
   expectedRolloutPercentage: number;
   expectedAllowlistCount?: number;
@@ -13,6 +17,8 @@ interface OrganizationWritePosture {
   mode: string;
   routeIntegrationEnabled: boolean;
   dualWriteExecutionEnabled: boolean;
+  candidateMaterializationEnabled: boolean;
+  candidateMaterializationTargetConfigured: boolean;
   rolloutMode: string;
   rolloutAllowlistCount: number;
   rolloutPercentage: number;
@@ -21,16 +27,22 @@ interface OrganizationWritePosture {
 }
 
 async function main(): Promise<void> {
-  const options = parseArgs(process.argv.slice(2));
-  const results = await Promise.all(options.urls.map((url) => inspect(url, options)));
-  const failures = results.flatMap((result) => result.failures.map((failure) => `${result.url}: ${failure}`));
-
-  console.log(JSON.stringify({ passed: failures.length === 0, results, failures }, null, 2));
-  if (failures.length > 0) process.exitCode = 1;
+  const result = await runOrganizationWritePublicGate(parseOrganizationWritePublicGateArgs(process.argv.slice(2)));
+  console.log(JSON.stringify(result, null, 2));
+  if (!result.passed) process.exitCode = 1;
 }
 
-async function inspect(url: string, options: GateOptions) {
-  const response = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+export async function runOrganizationWritePublicGate(
+  options: OrganizationWritePublicGateOptions,
+  fetcher: typeof fetch = fetch
+) {
+  const results = await Promise.all(options.urls.map((url) => inspect(fetcher, url, options)));
+  const failures = results.flatMap((result) => result.failures.map((failure) => `${result.url}: ${failure}`));
+  return { passed: failures.length === 0, results, failures };
+}
+
+async function inspect(fetcher: typeof fetch, url: string, options: OrganizationWritePublicGateOptions) {
+  const response = await fetcher(url, { signal: AbortSignal.timeout(10_000) });
   const body = await response.json() as Record<string, any>;
   const posture = body.capabilities?.organizationWrite as OrganizationWritePosture | undefined;
   const failures: string[] = [];
@@ -44,6 +56,18 @@ async function inspect(url: string, options: GateOptions) {
     compare(failures, "mode", posture.mode, options.expectedMode);
     compare(failures, "routeIntegrationEnabled", posture.routeIntegrationEnabled, options.expectedRouteIntegration);
     compare(failures, "dualWriteExecutionEnabled", posture.dualWriteExecutionEnabled, options.expectedDualWriteExecution);
+    compare(
+      failures,
+      "candidateMaterializationEnabled",
+      posture.candidateMaterializationEnabled,
+      options.expectedCandidateMaterializationEnabled
+    );
+    compare(
+      failures,
+      "candidateMaterializationTargetConfigured",
+      posture.candidateMaterializationTargetConfigured,
+      options.expectedCandidateMaterializationTargetConfigured
+    );
     compare(failures, "rolloutMode", posture.rolloutMode, options.expectedRolloutMode);
     compare(failures, "rolloutPercentage", posture.rolloutPercentage, options.expectedRolloutPercentage);
     if (options.expectedAllowlistCount !== undefined) {
@@ -60,12 +84,14 @@ function compare(failures: string[], field: string, actual: unknown, expected: u
   if (actual !== expected) failures.push(`${field} expected ${String(expected)}, got ${String(actual)}`);
 }
 
-function parseArgs(argv: string[]): GateOptions {
-  const options: GateOptions = {
+export function parseOrganizationWritePublicGateArgs(argv: string[]): OrganizationWritePublicGateOptions {
+  const options: OrganizationWritePublicGateOptions = {
     urls: ["https://identity.d.xrteeth.com/health", "https://identity.d.tmrpp.com/health"],
     expectedMode: "disabled",
     expectedRouteIntegration: false,
     expectedDualWriteExecution: false,
+    expectedCandidateMaterializationEnabled: false,
+    expectedCandidateMaterializationTargetConfigured: false,
     expectedRolloutMode: "off",
     expectedRolloutPercentage: 0,
     expectedAllowlistCount: 0
@@ -76,7 +102,14 @@ function parseArgs(argv: string[]): GateOptions {
     else if (arg.startsWith("--expected-mode=")) options.expectedMode = enumValue(arg, "--expected-mode=", ["disabled", "legacy-proxy", "dual-write", "identity-native"]);
     else if (arg.startsWith("--expected-route-integration=")) options.expectedRouteIntegration = booleanValue(arg, "--expected-route-integration=");
     else if (arg.startsWith("--expected-dual-write-execution=")) options.expectedDualWriteExecution = booleanValue(arg, "--expected-dual-write-execution=");
-    else if (arg.startsWith("--expected-rollout-mode=")) options.expectedRolloutMode = enumValue(arg, "--expected-rollout-mode=", ["off", "allowlist", "percentage", "full"]);
+    else if (arg.startsWith("--expected-candidate-materialization-enabled=")) {
+      options.expectedCandidateMaterializationEnabled = booleanValue(arg, "--expected-candidate-materialization-enabled=");
+    } else if (arg.startsWith("--expected-candidate-materialization-target-configured=")) {
+      options.expectedCandidateMaterializationTargetConfigured = booleanValue(
+        arg,
+        "--expected-candidate-materialization-target-configured="
+      );
+    } else if (arg.startsWith("--expected-rollout-mode=")) options.expectedRolloutMode = enumValue(arg, "--expected-rollout-mode=", ["off", "allowlist", "percentage", "full"]);
     else if (arg.startsWith("--expected-rollout-percentage=")) options.expectedRolloutPercentage = integerValue(arg, "--expected-rollout-percentage=", 0, 100);
     else if (arg.startsWith("--expected-allowlist-count=")) options.expectedAllowlistCount = integerValue(arg, "--expected-allowlist-count=", 0, 10_000);
     else if (arg === "--ignore-allowlist-count") options.expectedAllowlistCount = undefined;
@@ -116,4 +149,4 @@ function integerValue(arg: string, prefix: string, min: number, max: number): nu
   return value;
 }
 
-await main();
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await main();

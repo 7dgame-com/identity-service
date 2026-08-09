@@ -66,6 +66,19 @@ describe("IAM organization-write read-only window gate", () => {
     expect(fetcher).toHaveBeenCalledTimes(6);
   });
 
+  it("fails closed while candidate materialization or its target remains configured", async () => {
+    const result = await runOrganizationWriteWindowGate(options(), fixtureFetch({
+      candidateMaterializationEnabled: true,
+      candidateMaterializationTargetConfigured: true
+    }));
+
+    expect(result.passed).toBe(false);
+    expect(result.failures).toEqual(expect.arrayContaining([
+      "health.organizationWrite.candidateMaterializationEnabled expected false, got true",
+      "health.organizationWrite.candidateMaterializationTargetConfigured expected false, got true"
+    ]));
+  });
+
   it("accepts tokens only from the environment and validates explicit target input", () => {
     expect(() => parseOrganizationWriteWindowGateArgs(["--legacy-user-id=24", "--token=secret"], {})).toThrow(
       "Do not pass tokens on the command line"
@@ -96,6 +109,8 @@ function options(): OrganizationWriteWindowGateOptions {
 function fixtureFetch(overrides: {
   mode?: "legacy-proxy" | "dual-write";
   dualWriteExecutionEnabled?: boolean;
+  candidateMaterializationEnabled?: boolean;
+  candidateMaterializationTargetConfigured?: boolean;
   decision?: Record<string, unknown>;
   summaryOperations?: Record<string, unknown>[];
   alignment?: Record<string, unknown>;
@@ -106,6 +121,8 @@ function fixtureFetch(overrides: {
     mode,
     routeIntegrationEnabled: true,
     dualWriteExecutionEnabled,
+    candidateMaterializationEnabled: overrides.candidateMaterializationEnabled ?? false,
+    candidateMaterializationTargetConfigured: overrides.candidateMaterializationTargetConfigured ?? false,
     rolloutMode: "allowlist",
     rolloutAllowlistCount: 1,
     rolloutPercentage: 0,

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   BadRequestException,
   ConflictException,
@@ -15,11 +15,16 @@ import {
 } from "./iam-organization-write-evidence.js";
 import {
   IamOrganizationWriteRepository,
+  ORGANIZATION_CANDIDATE_MATERIALIZATION_PENDING_LEASE_MS,
+  type OrganizationCandidateSnapshot,
+  type OrganizationWriteOperationRecord,
+  organizationCandidateMaterializationOperationKey,
+  organizationCandidateSnapshotFingerprint,
   organizationWriteOperationKey,
   organizationWriteRequestFingerprint
 } from "./iam-organization-write.repository.js";
 import { JwtIssuerService, VerifiedAccessToken } from "./jwt-issuer.service.js";
-import { LegacyIdentityReader, LegacyOrganization } from "./legacy-identity.reader.js";
+import { LegacyIdentityReader, LegacyOrganization, LegacyUserReadModel } from "./legacy-identity.reader.js";
 import { PluginUserWriteRequest, PluginUserWriteService } from "./plugin-user-write.service.js";
 
 export interface IamOrganizationWriteProxyResponse {
@@ -41,8 +46,9 @@ export class IamOrganizationWriteService {
     private readonly jwtIssuer: JwtIssuerService
   ) {}
 
-  readiness() {
+  async readiness() {
     const { iam } = this.config;
+    const materializationSchema = await this.candidateMaterializationSchemaState();
     const rollout = organizationRolloutReadiness(iam);
     const pluginUserOwner = this.pluginUserWrite.readiness();
     const legacyOwnerExecutable =
@@ -76,6 +82,16 @@ export class IamOrganizationWriteService {
         ...(!rollout.selectionConfigured ? ["scoped-rollout-selector"] : [])
       ]
     };
+    const candidateMaterializationPreviewBlockers = uniqueStrings([
+      ...(iam.organizationWriteCandidateMaterializationTargetLegacyUserId <= 0 ? ["target-not-configured"] : []),
+      ...(!this.repository.isConfigured() ? ["identity-organization-candidate-repository"] : []),
+      ...(materializationSchema.blocker ? [materializationSchema.blocker] : [])
+    ]);
+    const candidateMaterializationApplyBlockers = uniqueStrings([
+      ...candidateMaterializationPreviewBlockers,
+      ...(!iam.organizationWriteCandidateMaterializationEnabled ? ["candidate-materialization-disabled"] : []),
+      ...this.candidateMaterializationPostureBlockedReasons()
+    ]);
     return {
       enabled: iam.organizationWriteMode !== "disabled",
       mode: iam.organizationWriteMode,
@@ -94,6 +110,22 @@ export class IamOrganizationWriteService {
       legacyProxyGate,
       dualWriteExecutionEnabled: iam.organizationWriteDualWriteExecutionEnabled,
       dualWriteGate,
+      candidateMaterialization: {
+        enabled: iam.organizationWriteCandidateMaterializationEnabled,
+        targetConfigured: iam.organizationWriteCandidateMaterializationTargetLegacyUserId > 0,
+        schemaReady: materializationSchema.ready,
+        canPreview: candidateMaterializationPreviewBlockers.length === 0,
+        canApply: candidateMaterializationApplyBlockers.length === 0,
+        blockers: candidateMaterializationApplyBlockers,
+        previewEndpoint: "/internal/iam/organization-write/subjects/:legacyUserId/materialization-preview",
+        endpoint: "/internal/iam/organization-write/subjects/:legacyUserId/materialize-candidate",
+        requiresInternalToken: true,
+        requiresExpectedSnapshotFingerprint: true,
+        requiresIdempotencyKey: true,
+        sourceOfTruth: "legacy",
+        mutatesLegacy: false,
+        writeScope: "identity-candidate-only"
+      },
       identityNativeSupported: false,
       rollout,
       redactionPolicy: "metadata-only-no-request-or-token-payloads",
@@ -141,7 +173,7 @@ export class IamOrganizationWriteService {
       throw new ServiceUnavailableException({
         code: "IAM_ORGANIZATION_WRITE_DUAL_WRITE_NOT_READY",
         message: "Organization dual-write execution gates are not satisfied.",
-        missingCapabilities: this.readiness().dualWriteGate.missingCapabilities
+        missingCapabilities: (await this.readiness()).dualWriteGate.missingCapabilities
       });
     }
 
@@ -155,9 +187,9 @@ export class IamOrganizationWriteService {
     return this.dualWrite(request, parsed, idempotencyKey, evidence);
   }
 
-  previewMembershipRollout(legacyUserId: number) {
+  async previewMembershipRollout(legacyUserId: number) {
     const { iam } = this.config;
-    const readiness = this.readiness();
+    const readiness = await this.readiness();
     const decision = organizationRolloutDecision(iam, legacyUserId, null);
     const modeGateExecutable = iam.organizationWriteMode === "legacy-proxy"
       ? readiness.legacyProxyGate.executable
@@ -182,48 +214,379 @@ export class IamOrganizationWriteService {
 
   async operationLedgerSummary(input: { sinceMinutes?: number }) {
     const sinceMinutes = normalizeNumber(input.sinceMinutes, 60, 1, 1440);
-    return this.repository.isConfigured()
-      ? { configured: true, sinceMinutes, operations: await this.repository.summarizeRecent(sinceMinutes) }
-      : { configured: false, sinceMinutes, operations: [] };
+    if (!this.repository.isConfigured()) return { configured: false, schemaReady: false, sinceMinutes, operations: [] };
+    const schema = await this.candidateMaterializationSchemaState();
+    return schema.ready
+      ? { configured: true, schemaReady: true, sinceMinutes, operations: await this.repository.summarizeRecent(sinceMinutes) }
+      : { configured: true, schemaReady: false, sinceMinutes, operations: [] };
   }
 
   async operationLedgerRecent(input: { sinceMinutes?: number; limit?: number }) {
     const sinceMinutes = normalizeNumber(input.sinceMinutes, 60, 1, 1440);
     const limit = normalizeNumber(input.limit, 50, 1, 200);
-    return this.repository.isConfigured()
-      ? { configured: true, sinceMinutes, limit, operations: await this.repository.listRecentSafe(sinceMinutes, limit) }
-      : { configured: false, sinceMinutes, limit, operations: [] };
+    if (!this.repository.isConfigured()) return { configured: false, schemaReady: false, sinceMinutes, limit, operations: [] };
+    const schema = await this.candidateMaterializationSchemaState();
+    return schema.ready
+      ? { configured: true, schemaReady: true, sinceMinutes, limit, operations: await this.repository.listRecentSafe(sinceMinutes, limit) }
+      : { configured: true, schemaReady: false, sinceMinutes, limit, operations: [] };
   }
 
   async subjectAlignment(legacyUserId: number) {
     this.requireRepository();
+    await this.assertCandidateMaterializationSchemaReady();
     const [legacyUser, candidate] = await Promise.all([
       this.legacy.getUserById(legacyUserId),
       this.repository.candidateForLegacyUser(legacyUserId)
     ]);
-    if (!legacyUser) {
-      return { legacyUserId, aligned: false, mismatch: 1, P0: 1, P1: 0, P2: 0, reason: "legacy-user-not-found" };
+    return organizationAlignment(legacyUserId, legacyUser, candidate);
+  }
+
+  async previewCandidateMaterialization(legacyUserId: number) {
+    const { iam } = this.config;
+    if (
+      iam.organizationWriteCandidateMaterializationTargetLegacyUserId <= 0 ||
+      iam.organizationWriteCandidateMaterializationTargetLegacyUserId !== legacyUserId
+    ) {
+      throw new ConflictException({
+        code: "IAM_ORGANIZATION_CANDIDATE_MATERIALIZATION_TARGET_MISMATCH",
+        message: "Organization candidate materialization preview is not enabled for the requested subject."
+      });
     }
-    if (!candidate) {
-      return {
-        legacyUserId,
-        aligned: false,
-        mismatch: Math.max(1, legacyUser.organizations.length),
-        P0: 0,
-        P1: Math.max(1, legacyUser.organizations.length),
-        P2: 0,
-        reason: "identity-candidate-snapshot-missing",
-        sourceOfTruth: "legacy"
-      };
+    this.requireRepository();
+    const schema = await this.candidateMaterializationSchemaState();
+    if (!schema.ready) {
+      return candidateMaterializationBlockedPreview(legacyUserId, schema.blocker ?? "schema-not-ready");
     }
-    const comparison = compareOrganizations(legacyUser.organizations, candidate.organizations);
-    return { legacyUserId, aligned: comparison.mismatch === 0, ...comparison, sourceOfTruth: "legacy" };
+    const [legacyUser, candidate] = await Promise.all([
+      this.legacy.getUserById(legacyUserId),
+      this.repository.candidateForLegacyUser(legacyUserId)
+    ]);
+    const alignment = organizationAlignment(legacyUserId, legacyUser, candidate);
+    const unresolvedCount = legacyUser
+      ? await this.repository.countUnresolvedForLegacyUser(legacyUserId)
+      : 0;
+    const blockedReasons = [
+      ...(!iam.organizationWriteCandidateMaterializationEnabled ? ["candidate-materialization-disabled"] : []),
+      ...(iam.organizationWriteCandidateMaterializationTargetLegacyUserId !== legacyUserId ? ["target-not-selected"] : []),
+      ...this.candidateMaterializationPostureBlockedReasons(),
+      ...(!legacyUser ? ["legacy-user-not-found"] : []),
+      ...(legacyUser && legacyUser.status !== 10 ? ["inactive-subject"] : []),
+      ...(legacyUser && isProtectedOrganizationSubject(legacyUser) ? ["protected-subject"] : []),
+      ...(alignment.reason !== "identity-candidate-snapshot-missing" ? ["candidate-snapshot-not-missing"] : []),
+      ...(alignment.P0 !== 0 || alignment.P2 !== 0 ? ["alignment-not-materializable"] : []),
+      ...(unresolvedCount !== 0 ? ["unresolved-organization-operation"] : [])
+    ];
+    return {
+      mutation: false,
+      executable: blockedReasons.length === 0,
+      targetFingerprint: organizationWriteFingerprint(`legacy:${legacyUserId}`),
+      expectedSnapshotFingerprint: alignment.legacySnapshotFingerprint,
+      organizationCount: alignment.organizationCount,
+      alignment: alignmentSummary(alignment),
+      unresolvedOperationCount: unresolvedCount,
+      sourceOfTruth: "legacy",
+      legacyWritePerformed: false,
+      identityCandidateWritePerformed: false,
+      blockedReasons
+    };
+  }
+
+  async materializeCandidate(input: {
+    legacyUserId: number;
+    expectedSnapshotFingerprint?: string;
+    idempotencyKey?: string;
+  }) {
+    const { iam } = this.config;
+    if (!iam.organizationWriteCandidateMaterializationEnabled) {
+      throw new NotFoundException({
+        code: "IAM_ORGANIZATION_CANDIDATE_MATERIALIZATION_DISABLED",
+        message: "Organization candidate materialization is disabled."
+      });
+    }
+    if (iam.organizationWriteCandidateMaterializationTargetLegacyUserId !== input.legacyUserId) {
+      throw new ConflictException({
+        code: "IAM_ORGANIZATION_CANDIDATE_MATERIALIZATION_TARGET_MISMATCH",
+        message: "Organization candidate materialization is not enabled for the requested subject."
+      });
+    }
+    this.assertCandidateMaterializationPosture();
+    this.requireRepository();
+
+    const expectedSnapshotFingerprint = candidateSnapshotFingerprintInput(input.expectedSnapshotFingerprint);
+    const idempotencyKey = candidateMaterializationIdempotencyKey(input.idempotencyKey);
+    const lock = await this.repository.withCandidateMaterializationSubjectLock(input.legacyUserId, async () => {
+      await this.assertCandidateMaterializationSchemaReady();
+      return this.materializeCandidateWhileLocked({
+        legacyUserId: input.legacyUserId,
+        expectedSnapshotFingerprint,
+        idempotencyKey
+      });
+    });
+    if (!lock.acquired) {
+      throw new ConflictException({
+        code: "IAM_ORGANIZATION_CANDIDATE_MATERIALIZATION_SUBJECT_BUSY",
+        message: "Another organization materialization operation is active for the selected subject."
+      });
+    }
+    return lock.value;
+  }
+
+  private async materializeCandidateWhileLocked(input: {
+    legacyUserId: number;
+    expectedSnapshotFingerprint: string;
+    idempotencyKey: string;
+  }) {
+    const legacyUser = this.requireCandidateMaterializationInitialSubject(
+      await this.legacy.getUserById(input.legacyUserId)
+    );
+    const organizations = normalizeOrganizations(legacyUser.organizations);
+    const actualSnapshotFingerprint = organizationCandidateSnapshotFingerprint(input.legacyUserId, organizations);
+    if (actualSnapshotFingerprint !== input.expectedSnapshotFingerprint) {
+      throw new ConflictException({
+        code: "IAM_ORGANIZATION_CANDIDATE_MATERIALIZATION_SNAPSHOT_CHANGED",
+        message: "The current Legacy organization snapshot does not match the reviewed fingerprint."
+      });
+    }
+
+    const operationKey = organizationCandidateMaterializationOperationKey(input.legacyUserId, input.idempotencyKey);
+    const [candidate, existing] = await Promise.all([
+      this.repository.candidateForLegacyUser(input.legacyUserId),
+      this.repository.find(operationKey)
+    ]);
+    const before = organizationAlignment(input.legacyUserId, legacyUser, candidate);
+    if (existing && (existing.mode !== "candidate-materialization" || existing.legacyUserId !== input.legacyUserId)) {
+      throw new ConflictException({
+        code: "IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_REQUEST",
+        message: "The candidate materialization idempotency key belongs to a different operation."
+      });
+    }
+    if (existing) assertCandidateMaterializationLedgerState(existing);
+    const compensationRecovery = existing?.status === "failed" &&
+      (existing.compensationStatus === "required" || existing.compensationStatus === "failed");
+    const existingFingerprintMatches = existing?.requestFingerprint === actualSnapshotFingerprint;
+    const pendingOperation = existing?.status === "pending";
+    const stalePending = pendingOperation && existing
+      ? candidateMaterializationPendingLeaseStale(existing.requestedAt)
+      : false;
+    const stalePendingSnapshotRecovery = stalePending && !existingFingerprintMatches;
+    if (existing && !existingFingerprintMatches && !compensationRecovery && !stalePendingSnapshotRecovery) {
+      if (pendingOperation) {
+        throw new ConflictException({
+          code: "IAM_ORGANIZATION_CANDIDATE_MATERIALIZATION_OPERATION_IN_PROGRESS",
+          message: "Another worker owns the candidate materialization lease."
+        });
+      }
+      throw new ConflictException({
+        code: "IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_REQUEST",
+        message: "The candidate materialization idempotency key was already used for a different request."
+      });
+    }
+
+    if (existing?.status === "completed") {
+      const after = await this.candidateMaterializationFreshPostcheck(
+        input.legacyUserId,
+        input.expectedSnapshotFingerprint
+      );
+      return candidateMaterializationResult({
+        operationKey,
+        before,
+        after,
+        organizationCount: organizations.length,
+        replay: true
+      });
+    }
+    const recovering = existing?.status === "failed" || pendingOperation;
+    if (
+      before.P0 !== 0 ||
+      (!recovering && (before.reason !== "identity-candidate-snapshot-missing" || before.P2 !== 0)) ||
+      (!recovering && before.aligned)
+    ) {
+      throw new ConflictException({
+        code: "IAM_ORGANIZATION_CANDIDATE_MATERIALIZATION_NOT_APPLICABLE",
+        message: "Only a missing snapshot or this operation's recoverable candidate state can be materialized."
+      });
+    }
+
+    const unresolvedCount = await this.repository.countUnresolvedForLegacyUser(input.legacyUserId, operationKey);
+    if (unresolvedCount !== 0) {
+      throw new ConflictException({
+        code: "IAM_ORGANIZATION_CANDIDATE_MATERIALIZATION_UNRESOLVED_OPERATION",
+        message: "An unresolved organization operation blocks candidate materialization."
+      });
+    }
+
+    const metadata = {
+      targetFingerprint: organizationWriteFingerprint(`legacy:${input.legacyUserId}`),
+      snapshotFingerprint: shortDigest(actualSnapshotFingerprint),
+      organizationCount: organizations.length,
+      source: "current-legacy-read",
+      legacyWritePerformed: false,
+      ...(compensationRecovery ? {
+        recovery: "current-reviewed-legacy-snapshot",
+        recoveryPreviousSnapshotFingerprintDigest: shortDigest(existing.requestFingerprint),
+        recoverySnapshotFingerprintDigest: shortDigest(actualSnapshotFingerprint)
+      } : stalePendingSnapshotRecovery && existing ? {
+        recovery: "stale-pending-current-reviewed-legacy-snapshot",
+        recoveryPreviousSnapshotFingerprint: existing.requestFingerprint,
+        recoverySnapshotFingerprint: actualSnapshotFingerprint
+      } : existing ? { recovery: "same-idempotency-key-retry" } : {})
+    };
+    const claimToken = randomBytes(32).toString("hex");
+    let claimed = false;
+    if (existing?.status === "failed") {
+      claimed = (await this.repository.resumeCandidateMaterialization(
+        operationKey,
+        existing.requestFingerprint,
+        actualSnapshotFingerprint,
+        claimToken,
+        metadata
+      )).claimed;
+    } else if (pendingOperation && existing) {
+      claimed = (await this.repository.reclaimStaleCandidateMaterialization({
+        operationKey,
+        expectedRequestFingerprint: existing.requestFingerprint,
+        requestFingerprint: actualSnapshotFingerprint,
+        claimToken,
+        staleBefore: candidateMaterializationLeaseCutoff(),
+        metadata
+      })).claimed;
+    } else {
+      const begun = await this.repository.beginCandidateMaterialization({
+        operationKey,
+        idempotencyKeyDigest: createHash("sha256").update(input.idempotencyKey).digest("hex"),
+        requestFingerprint: actualSnapshotFingerprint,
+        legacyUserId: input.legacyUserId,
+        claimToken,
+        metadata
+      });
+      claimed = !begun.duplicate;
+    }
+    if (!claimed) {
+      return this.candidateMaterializationClaimRaceResult({
+        operationKey,
+        legacyUserId: input.legacyUserId,
+        expectedSnapshotFingerprint: actualSnapshotFingerprint,
+        before,
+        organizationCount: organizations.length
+      });
+    }
+
+    let candidateWriteAttempted = false;
+    let candidateWriteCompleted = false;
+    try {
+      candidateWriteAttempted = true;
+      await this.repository.replaceCandidate({
+        operationKey,
+        legacyUserId: input.legacyUserId,
+        organizations,
+        materializationClaim: {
+          claimToken,
+          leaseValidAfter: candidateMaterializationLeaseCutoff()
+        }
+      });
+      candidateWriteCompleted = true;
+      const after = await this.candidateMaterializationFreshPostcheck(
+        input.legacyUserId,
+        input.expectedSnapshotFingerprint
+      );
+      const completed = await this.repository.finalizeCandidateMaterialization({
+        operationKey,
+        status: "completed",
+        legacyStatus: "read-only",
+        identityStatus: compensationRecovery ? "candidate-recovered-from-current-legacy" : "candidate-materialized",
+        compensationStatus: compensationRecovery ? "completed" : "none",
+        claimToken,
+        leaseValidAfter: candidateMaterializationLeaseCutoff(),
+        metadata
+      });
+      if (!completed.updated) throw candidateMaterializationLedgerCasFailure();
+      this.logger.log(JSON.stringify({
+        event: "identity.iam.organization_candidate.materialized",
+        targetFingerprint: metadata.targetFingerprint,
+        snapshotFingerprint: metadata.snapshotFingerprint,
+        organizationCount: organizations.length,
+        operationKeyDigest: shortDigest(operationKey)
+      }));
+      return candidateMaterializationResult({
+        operationKey,
+        before,
+        after,
+        organizationCount: organizations.length,
+        replay: false
+      });
+    } catch (error) {
+      let failed;
+      try {
+        failed = await this.repository.finalizeCandidateMaterialization({
+          operationKey,
+          status: "failed",
+          legacyStatus: "read-only",
+          identityStatus: candidateWriteCompleted
+            ? "candidate-postcheck-failed"
+            : candidateWriteAttempted
+              ? "candidate-write-outcome-unknown"
+              : "candidate-materialization-failed",
+          compensationStatus: candidateWriteAttempted ? "required" : "none",
+          claimToken,
+          leaseValidAfter: candidateMaterializationLeaseCutoff(),
+          errorCode: errorName(error),
+          metadata
+        });
+      } catch {
+        throw candidateMaterializationLedgerCasFailure();
+      }
+      if (!failed.updated) throw candidateMaterializationLedgerCasFailure();
+      throw error;
+    }
+  }
+
+  private async candidateMaterializationClaimRaceResult(input: {
+    operationKey: string;
+    legacyUserId: number;
+    expectedSnapshotFingerprint: string;
+    before: OrganizationAlignment;
+    organizationCount: number;
+  }) {
+    const raced = await this.repository.find(input.operationKey);
+    if (
+      raced?.mode === "candidate-materialization" &&
+      raced.status === "completed" &&
+      raced.requestFingerprint === input.expectedSnapshotFingerprint
+    ) {
+      const after = await this.candidateMaterializationFreshPostcheck(
+        input.legacyUserId,
+        input.expectedSnapshotFingerprint
+      );
+      return candidateMaterializationResult({
+        operationKey: input.operationKey,
+        before: input.before,
+        after,
+        organizationCount: input.organizationCount,
+        replay: true
+      });
+    }
+    if (raced && raced.requestFingerprint !== input.expectedSnapshotFingerprint) {
+      throw new ConflictException({
+        code: "IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_REQUEST",
+        message: "The candidate materialization idempotency key is already reserved for another snapshot."
+      });
+    }
+    throw new ConflictException({
+      code: "IAM_ORGANIZATION_CANDIDATE_MATERIALIZATION_OPERATION_IN_PROGRESS",
+      message: "Another worker owns the candidate materialization lease."
+    });
   }
 
   async retryIdentityCandidate(operationKey: string) {
     this.requireRepository();
     const operation = await this.repository.find(operationKey);
     if (!operation) throw new NotFoundException({ code: "IAM_ORGANIZATION_WRITE_OPERATION_NOT_FOUND" });
+    if (operation.mode !== "dual-write") {
+      throw new ConflictException({
+        code: "IAM_ORGANIZATION_WRITE_RECOVERY_NOT_APPLICABLE",
+        message: "Candidate materialization recovery must use its guarded single-subject endpoint."
+      });
+    }
     if (operation.compensationStatus !== "required") {
       throw new ConflictException({ code: "IAM_ORGANIZATION_WRITE_RECOVERY_NOT_REQUIRED" });
     }
@@ -269,7 +632,7 @@ export class IamOrganizationWriteService {
         message: "The selected target could not be verified from Legacy before mutation."
       });
     }
-    if (before.username?.trim().toLowerCase() === "root" || before.roles.some((role) => role.trim().toLowerCase() === "root")) {
+    if (isProtectedOrganizationSubject(before)) {
       throw new ConflictException({
         code: "IAM_ORGANIZATION_WRITE_PROTECTED_SUBJECT",
         message: "Organization membership writes are not allowed for a protected root subject."
@@ -415,6 +778,142 @@ export class IamOrganizationWriteService {
     }
   }
 
+  private assertCandidateMaterializationPosture(): void {
+    const blockedReasons = this.candidateMaterializationPostureBlockedReasons();
+    if (blockedReasons.length > 0) {
+      throw new ConflictException({
+        code: "IAM_ORGANIZATION_CANDIDATE_MATERIALIZATION_UNSAFE_POSTURE",
+        message: "Candidate materialization requires a default-off, Legacy-authoritative IAM posture.",
+        blockedReasons
+      });
+    }
+  }
+
+  private candidateMaterializationPostureBlockedReasons(): string[] {
+    const { iam } = this.config;
+    return [
+      ...(!iam.enabled ? ["iam-enabled-required"] : []),
+      ...(iam.mode !== "readonly" ? ["iam-readonly-required"] : []),
+      ...(!iam.fallbackEnabled ? ["iam-fallback-must-remain-enabled"] : []),
+      ...(iam.reconciliationEnabled ? ["iam-reconciliation-must-be-disabled"] : []),
+      ...(iam.rolePermissionMaterializationEnabled ? ["role-permission-materialization-must-be-disabled"] : []),
+      ...(iam.permissionModelImportEnabled ? ["permission-model-import-must-be-disabled"] : []),
+      ...(iam.organizationWriteMode !== "disabled" ? ["organization-write-disabled-required"] : []),
+      ...(iam.organizationWriteRouteIntegrationEnabled ? ["organization-route-integration-must-be-disabled"] : []),
+      ...(iam.organizationWriteDualWriteExecutionEnabled ? ["organization-dual-write-must-be-disabled"] : []),
+      ...(iam.organizationWriteRolloutMode !== "off" ? ["organization-rollout-must-be-off"] : []),
+      ...(iam.organizationWriteRolloutAllowlist.trim() !== "" ? ["organization-rollout-allowlist-must-be-empty"] : []),
+      ...(iam.organizationWriteRolloutPercentage !== 0 ? ["organization-rollout-percentage-must-be-zero"] : []),
+      ...(iam.roleWriteMode !== "disabled" ? ["role-write-disabled-required"] : []),
+      ...(iam.roleWriteDualWriteExecutionEnabled ? ["role-dual-write-must-be-disabled"] : []),
+      ...(iam.roleWriteIdentityNativeExecutionEnabled ? ["role-identity-native-must-be-disabled"] : []),
+      ...(iam.roleWriteIdentityNativeTargetMode !== "single-target" ? ["role-native-target-mode-must-be-single-target"] : []),
+      ...(iam.roleWriteRolloutMode !== "off" ? ["role-rollout-must-be-off"] : []),
+      ...(iam.roleWriteRolloutAllowlist.trim() !== "" ? ["role-rollout-allowlist-must-be-empty"] : []),
+      ...(iam.roleWriteRolloutPercentage !== 0 ? ["role-rollout-percentage-must-be-zero"] : []),
+      ...(Boolean(iam.roleWritePolicyChecksum) ? ["role-policy-checksum-must-be-empty"] : []),
+      ...(iam.roleWriteCandidateRestoreEnabled ? ["role-candidate-restore-must-be-disabled"] : []),
+      ...(iam.roleWriteCandidateRestoreTargetLegacyUserId !== 0 ? ["role-candidate-restore-target-must-be-zero"] : []),
+      ...(iam.roleWriteRecoveryDrillEnabled ? ["role-recovery-drill-must-be-disabled"] : []),
+      ...(iam.roleWriteRecoveryDrillTargetLegacyUserId !== 0 ? ["role-recovery-drill-target-must-be-zero"] : []),
+      ...(iam.roleWriteIdentityNativeTargetLegacyUserId !== 0 ? ["role-native-target-must-be-zero"] : []),
+      ...(iam.roleWriteIdentityNativeTargetAllowlist.trim() !== "" ? ["role-native-target-allowlist-must-be-empty"] : []),
+      ...(iam.authzReadMode !== "legacy" ? ["authz-read-must-remain-legacy"] : []),
+      ...(iam.authzRolloutMode !== "off" ? ["authz-rollout-must-be-off"] : []),
+      ...(iam.authzRolloutAllowlist.trim() !== "" ? ["authz-rollout-allowlist-must-be-empty"] : []),
+      ...(iam.authzRetainedLegacyAllowlist.trim() !== "" ? ["authz-retained-allowlist-must-be-empty"] : []),
+      ...(iam.authzRolloutPercentage !== 0 ? ["authz-rollout-percentage-must-be-zero"] : []),
+      ...(!iam.authzFallbackEnabled ? ["authz-fallback-must-remain-enabled"] : [])
+    ];
+  }
+
+  private async candidateMaterializationSchemaState(): Promise<{ ready: boolean; blocker: string | null }> {
+    if (!this.repository.isConfigured()) return { ready: false, blocker: "identity-organization-candidate-repository" };
+    try {
+      const readiness = await this.repository.materializationSchemaReadiness();
+      return readiness.ready
+        ? { ready: true, blocker: null }
+        : { ready: false, blocker: "schema-not-ready" };
+    } catch {
+      return { ready: false, blocker: "schema-readiness-unavailable" };
+    }
+  }
+
+  private async assertCandidateMaterializationSchemaReady(): Promise<void> {
+    const schema = await this.candidateMaterializationSchemaState();
+    if (!schema.ready) {
+      throw new ServiceUnavailableException({
+        code: "IAM_ORGANIZATION_CANDIDATE_MATERIALIZATION_SCHEMA_NOT_READY",
+        message: "Organization candidate materialization requires the existing read-only verified schema.",
+        blocker: schema.blocker
+      });
+    }
+  }
+
+  private requireCandidateMaterializationInitialSubject(legacyUser: LegacyUserReadModel | null): LegacyUserReadModel {
+    if (!legacyUser) {
+      throw new NotFoundException({
+        code: "IAM_ORGANIZATION_CANDIDATE_MATERIALIZATION_LEGACY_USER_NOT_FOUND",
+        message: "The materialization target was not found in Legacy."
+      });
+    }
+    if (legacyUser.status !== 10) {
+      throw new ConflictException({
+        code: "IAM_ORGANIZATION_CANDIDATE_MATERIALIZATION_INACTIVE_SUBJECT",
+        message: "Organization candidate materialization requires an active dedicated subject."
+      });
+    }
+    if (isProtectedOrganizationSubject(legacyUser)) {
+      throw new ConflictException({
+        code: "IAM_ORGANIZATION_CANDIDATE_MATERIALIZATION_PROTECTED_SUBJECT",
+        message: "Organization candidate materialization is not allowed for a protected root subject."
+      });
+    }
+    return legacyUser;
+  }
+
+  private async candidateMaterializationFreshPostcheck(
+    legacyUserId: number,
+    expectedSnapshotFingerprint: string
+  ): Promise<OrganizationAlignment> {
+    const legacyUser = await this.legacy.getUserById(legacyUserId);
+    if (!legacyUser) {
+      throw new ServiceUnavailableException({
+        code: "IAM_ORGANIZATION_CANDIDATE_MATERIALIZATION_POSTCHECK_LEGACY_USER_MISSING",
+        message: "The Legacy subject disappeared after the candidate write."
+      });
+    }
+    if (legacyUser.status !== 10) {
+      throw new ServiceUnavailableException({
+        code: "IAM_ORGANIZATION_CANDIDATE_MATERIALIZATION_POSTCHECK_INACTIVE_SUBJECT",
+        message: "The Legacy subject became inactive during candidate materialization."
+      });
+    }
+    if (isProtectedOrganizationSubject(legacyUser)) {
+      throw new ServiceUnavailableException({
+        code: "IAM_ORGANIZATION_CANDIDATE_MATERIALIZATION_POSTCHECK_PROTECTED_SUBJECT",
+        message: "The Legacy subject became protected during candidate materialization."
+      });
+    }
+    const freshOrganizations = normalizeOrganizations(legacyUser.organizations);
+    const freshSnapshotFingerprint = organizationCandidateSnapshotFingerprint(legacyUserId, freshOrganizations);
+    if (freshSnapshotFingerprint !== expectedSnapshotFingerprint) {
+      throw new ServiceUnavailableException({
+        code: "IAM_ORGANIZATION_CANDIDATE_MATERIALIZATION_POSTCHECK_SNAPSHOT_CHANGED",
+        message: "The Legacy organization snapshot changed during candidate materialization."
+      });
+    }
+    const candidate = await this.repository.candidateForLegacyUser(legacyUserId);
+    const alignment = organizationAlignment(legacyUserId, legacyUser, candidate);
+    if (!alignment.aligned || alignment.P0 !== 0 || alignment.P1 !== 0 || alignment.P2 !== 0 || alignment.mismatch !== 0) {
+      throw new ServiceUnavailableException({
+        code: "IAM_ORGANIZATION_CANDIDATE_MATERIALIZATION_POSTCHECK_FAILED",
+        message: "Candidate materialization completed but the alignment postcheck did not pass."
+      });
+    }
+    return alignment;
+  }
+
   private logDecision(evidence: IamOrganizationWriteEvidence, legacyUserId: number, organizationCount: number): void {
     this.logger.log(JSON.stringify({
       event: "identity.iam.organization_write.decision",
@@ -430,6 +929,71 @@ export class IamOrganizationWriteService {
 }
 
 interface SelectedMembershipReplace { selected: true; legacyUserId: number; organizationIds: number[]; }
+
+interface OrganizationAlignment {
+  legacyUserId: number;
+  aligned: boolean;
+  mismatch: number;
+  P0: number;
+  P1: number;
+  P2: number;
+  reason?: string;
+  sourceOfTruth: "legacy";
+  legacySnapshotFingerprint: string | null;
+  organizationCount: number;
+  membershipMismatch?: number[];
+  metadataMismatch?: number[];
+}
+
+function candidateMaterializationLeaseCutoff(now = Date.now()): Date {
+  return new Date(now - ORGANIZATION_CANDIDATE_MATERIALIZATION_PENDING_LEASE_MS);
+}
+
+function candidateMaterializationPendingLeaseStale(requestedAt: string | null, now = Date.now()): boolean {
+  const requestedAtMs = Date.parse(requestedAt ?? "");
+  return Number.isFinite(requestedAtMs) && requestedAtMs <= candidateMaterializationLeaseCutoff(now).getTime();
+}
+
+function candidateMaterializationLedgerCasFailure(): ServiceUnavailableException {
+  return new ServiceUnavailableException({
+    code: "IAM_ORGANIZATION_CANDIDATE_MATERIALIZATION_LEDGER_CAS_FAILED",
+    message: "The candidate materialization ledger lease or expected pending state was lost."
+  });
+}
+
+function assertCandidateMaterializationLedgerState(operation: OrganizationWriteOperationRecord): void {
+  const valid =
+    (operation.status === "completed" && ["none", "completed"].includes(operation.compensationStatus)) ||
+    (operation.status === "pending" && operation.compensationStatus === "none") ||
+    (operation.status === "failed" && ["none", "required", "failed"].includes(operation.compensationStatus));
+  if (!valid) {
+    throw new ServiceUnavailableException({
+      code: "IAM_ORGANIZATION_CANDIDATE_MATERIALIZATION_LEDGER_STATE_INVALID",
+      message: "The candidate materialization ledger contains an invalid mode-specific state combination."
+    });
+  }
+}
+
+function candidateMaterializationBlockedPreview(legacyUserId: number, blocker: string) {
+  return {
+    mutation: false,
+    executable: false,
+    schemaReady: false,
+    targetFingerprint: organizationWriteFingerprint(`legacy:${legacyUserId}`),
+    expectedSnapshotFingerprint: null,
+    organizationCount: null,
+    alignment: null,
+    unresolvedOperationCount: null,
+    sourceOfTruth: "legacy",
+    legacyWritePerformed: false,
+    identityCandidateWritePerformed: false,
+    blockedReasons: [blocker]
+  };
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values)];
+}
 
 function parseMembershipReplace(body: unknown): SelectedMembershipReplace | { selected: false } {
   if (!body || typeof body !== "object" || Array.isArray(body)) return { selected: false };
@@ -487,7 +1051,121 @@ function compareOrganizations(legacy: LegacyOrganization[], candidate: LegacyOrg
 }
 
 function normalizeOrganizations(value: LegacyOrganization[]): LegacyOrganization[] {
-  return [...value].sort((a, b) => a.id - b.id).map((item) => ({ ...item, name: item.name.toLowerCase() }));
+  return [...value].sort((a, b) => a.id - b.id).map((item) => ({ ...item }));
+}
+
+function organizationAlignment(
+  legacyUserId: number,
+  legacyUser: LegacyUserReadModel | null,
+  candidate: OrganizationCandidateSnapshot | null
+): OrganizationAlignment {
+  if (!legacyUser) {
+    return {
+      legacyUserId,
+      aligned: false,
+      mismatch: 1,
+      P0: 1,
+      P1: 0,
+      P2: 0,
+      reason: "legacy-user-not-found",
+      sourceOfTruth: "legacy",
+      legacySnapshotFingerprint: null,
+      organizationCount: 0
+    };
+  }
+  const organizations = normalizeOrganizations(legacyUser.organizations);
+  const legacySnapshotFingerprint = organizationCandidateSnapshotFingerprint(legacyUserId, organizations);
+  if (!candidate) {
+    return {
+      legacyUserId,
+      aligned: false,
+      mismatch: Math.max(1, organizations.length),
+      P0: 0,
+      P1: Math.max(1, organizations.length),
+      P2: 0,
+      reason: "identity-candidate-snapshot-missing",
+      sourceOfTruth: "legacy",
+      legacySnapshotFingerprint,
+      organizationCount: organizations.length
+    };
+  }
+  const comparison = compareOrganizations(organizations, candidate.organizations);
+  return {
+    legacyUserId,
+    aligned: comparison.mismatch === 0,
+    ...comparison,
+    sourceOfTruth: "legacy",
+    legacySnapshotFingerprint,
+    organizationCount: organizations.length
+  };
+}
+
+function candidateSnapshotFingerprintInput(value: string | undefined): string {
+  const normalized = value?.trim().toLowerCase() ?? "";
+  if (!/^[a-f0-9]{64}$/.test(normalized)) {
+    throw new BadRequestException({
+      code: "IAM_ORGANIZATION_CANDIDATE_MATERIALIZATION_FINGERPRINT_REQUIRED",
+      message: "A reviewed 64-character Legacy snapshot fingerprint is required."
+    });
+  }
+  return normalized;
+}
+
+function candidateMaterializationIdempotencyKey(value: string | undefined): string {
+  const normalized = value?.trim() ?? "";
+  if (!normalized || normalized.length > 180) {
+    throw new BadRequestException({
+      code: "IAM_ORGANIZATION_CANDIDATE_MATERIALIZATION_IDEMPOTENCY_KEY_REQUIRED",
+      message: "A 1-180 character Idempotency-Key is required."
+    });
+  }
+  return normalized;
+}
+
+function candidateMaterializationResult(input: {
+  operationKey: string;
+  before: OrganizationAlignment;
+  after: OrganizationAlignment;
+  organizationCount: number;
+  replay: boolean;
+}) {
+  return {
+    materialized: !input.replay,
+    idempotentReplay: input.replay,
+    operationKeyDigest: shortDigest(input.operationKey),
+    subjectFingerprint: organizationWriteFingerprint(`legacy:${input.before.legacyUserId}`),
+    snapshotFingerprint: input.before.legacySnapshotFingerprint
+      ? shortDigest(input.before.legacySnapshotFingerprint)
+      : null,
+    organizationCount: input.organizationCount,
+    before: alignmentSummary(input.before),
+    after: alignmentSummary(input.after),
+    safety: {
+      legacyWritePerformed: false,
+      identityCandidateWritePerformed: !input.replay,
+      historicalMutationReplayed: false,
+      legacyRemainsAuthoritative: true,
+      authzInputChanged: false,
+      writeScope: "identity-candidate-only"
+    }
+  };
+}
+
+function alignmentSummary(value: OrganizationAlignment) {
+  return {
+    aligned: value.aligned,
+    mismatch: value.mismatch,
+    P0: value.P0,
+    P1: value.P1,
+    P2: value.P2,
+    reason: value.reason ?? null,
+    organizationCount: value.organizationCount
+  };
+}
+
+function isProtectedOrganizationSubject(user: LegacyUserReadModel): boolean {
+  return user.username?.trim().toLowerCase() === "root" ||
+    user.roles.some((role) => role.trim().toLowerCase() === "root");
 }
 function sameIds(left: number[], right: number[]): boolean { return left.length === right.length && [...left].sort((a, b) => a - b).every((id, index) => id === [...right].sort((a, b) => a - b)[index]); }
 function clientIdempotencyKey(headers: PluginUserWriteRequest["headers"]): string | null {

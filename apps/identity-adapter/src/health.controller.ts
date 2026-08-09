@@ -51,6 +51,10 @@ export class HealthController {
             mode: this.config.iam.organizationWriteMode,
             routeIntegrationEnabled: this.config.iam.organizationWriteRouteIntegrationEnabled,
             dualWriteExecutionEnabled: this.config.iam.organizationWriteDualWriteExecutionEnabled,
+            candidateMaterializationEnabled:
+              this.config.iam.organizationWriteCandidateMaterializationEnabled,
+            candidateMaterializationTargetConfigured:
+              this.config.iam.organizationWriteCandidateMaterializationTargetLegacyUserId > 0,
             rolloutMode: this.config.iam.organizationWriteRolloutMode,
             rolloutAllowlistCount: this.config.iam.organizationWriteRolloutAllowlist
               .split(",")

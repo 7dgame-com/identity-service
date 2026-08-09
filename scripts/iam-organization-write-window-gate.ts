@@ -54,6 +54,13 @@ export async function runOrganizationWriteWindowGate(
   compare(failures, "health.organizationWrite.mode", posture?.mode, options.expectedMode);
   compare(failures, "health.organizationWrite.routeIntegrationEnabled", posture?.routeIntegrationEnabled, true);
   compare(failures, "health.organizationWrite.dualWriteExecutionEnabled", posture?.dualWriteExecutionEnabled, options.expectedMode === "dual-write");
+  compare(failures, "health.organizationWrite.candidateMaterializationEnabled", posture?.candidateMaterializationEnabled, false);
+  compare(
+    failures,
+    "health.organizationWrite.candidateMaterializationTargetConfigured",
+    posture?.candidateMaterializationTargetConfigured,
+    false
+  );
   compare(failures, "health.organizationWrite.rolloutMode", posture?.rolloutMode, "allowlist");
   compare(failures, "health.organizationWrite.rolloutAllowlistCount", posture?.rolloutAllowlistCount, options.expectedAllowlistCount);
   compare(failures, "health.organizationWrite.rolloutPercentage", posture?.rolloutPercentage, 0);

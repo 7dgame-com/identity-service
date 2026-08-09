@@ -2328,6 +2328,8 @@ describe("identity-adapter readonly API", () => {
       mode: "disabled",
       routeIntegrationEnabled: false,
       dualWriteExecutionEnabled: false,
+      candidateMaterializationEnabled: false,
+      candidateMaterializationTargetConfigured: false,
       rolloutMode: "off",
       rolloutAllowlistCount: 0,
       rolloutPercentage: 0,
