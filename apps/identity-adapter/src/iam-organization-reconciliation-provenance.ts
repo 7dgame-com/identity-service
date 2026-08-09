@@ -6,11 +6,12 @@ import {
   type KeyObject
 } from "node:crypto";
 import { z } from "zod";
+import type { OrganizationReconciliationInput } from "./iam-organization-reconciliation-validator.js";
 
 export const ORGANIZATION_RECONCILIATION_PROVENANCE_CONTRACT =
-  "iam-organization-reconciliation-provenance/v2";
+  "iam-organization-reconciliation-provenance/v3";
 export const ORGANIZATION_RECONCILIATION_TRUST_POLICY_CONTRACT =
-  "iam-organization-reconciliation-trust-policy/v2";
+  "iam-organization-reconciliation-trust-policy/v3";
 export const ORGANIZATION_RECONCILIATION_PROVENANCE_AUDIENCE =
   "identity-service/iam-organization-reconciliation";
 export const ORGANIZATION_RECONCILIATION_PROVENANCE_ALGORITHM = "Ed25519";
@@ -143,7 +144,7 @@ export interface OrganizationReconciliationProvenanceVerification {
   readonly environment?: string;
 }
 
-const SIGNATURE_DOMAIN = Buffer.from("iam-organization-reconciliation:provenance:v2\u001f", "utf8");
+const SIGNATURE_DOMAIN = Buffer.from("iam-organization-reconciliation:provenance:v3\u001f", "utf8");
 
 /**
  * Verifies a complete evidence digest against a separately pinned trust policy.
@@ -358,6 +359,30 @@ export function createOrganizationReconciliationProvenanceBinding(
     windowStartedAt,
     windowEndedAt
   });
+}
+
+/**
+ * Builds the provenance binding for one canonical, validated reconciliation
+ * input. The signed time range is the physical composite-manifest window, not
+ * the narrower logical collection-envelope window nested inside the evidence.
+ */
+export function createOrganizationReconciliationProvenanceBindingFromInput(
+  input: OrganizationReconciliationInput
+): OrganizationReconciliationProvenanceBinding {
+  const envelope = input.collectionEnvelope;
+  const componentManifest = input.componentManifest;
+  if (!envelope || !componentManifest) {
+    throw new Error("Canonical reconciliation input requires an envelope and component manifest.");
+  }
+  return createOrganizationReconciliationProvenanceBinding(
+    input,
+    envelope.collectorContractHash,
+    envelope.collectorBuildRevision,
+    envelope.logicalSnapshotId,
+    envelope.windowId,
+    componentManifest.windowStartedAt,
+    componentManifest.windowEndedAt
+  );
 }
 
 export function createCanonicalSha256(value: unknown): string {

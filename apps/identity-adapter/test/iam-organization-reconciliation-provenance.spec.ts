@@ -17,31 +17,39 @@ import {
 } from "../src/iam-organization-reconciliation-validator.js";
 import {
   createOrganizationReconciliationProvenanceBinding,
+  createOrganizationReconciliationProvenanceBindingFromInput,
   ORGANIZATION_RECONCILIATION_PROVENANCE_CONTRACT,
   ORGANIZATION_RECONCILIATION_TRUST_POLICY_CONTRACT,
   serializeOrganizationReconciliationProvenancePayload,
   verifyOrganizationReconciliationProvenance,
   type OrganizationReconciliationTrustPolicy
 } from "../src/iam-organization-reconciliation-provenance.js";
+import {
+  createOrganizationReconciliationCompositeManifestSha256,
+  type OrganizationReconciliationCompositeManifestUnsigned
+} from "../src/iam-organization-reconciliation-component-manifest.js";
+import {
+  attachTestOrganizationReconciliationComponentManifest
+} from "./fixtures/iam-organization-reconciliation-component-manifest.js";
 
 describe("trusted external provenance for organization reconciliation", () => {
-  it("pins the v2 contracts and rejects a signature made for the v1 domain", () => {
+  it("pins the v3 contracts and rejects a signature made for the v2 domain", () => {
     expect(ORGANIZATION_RECONCILIATION_PROVENANCE_CONTRACT)
-      .toBe("iam-organization-reconciliation-provenance/v2");
+      .toBe("iam-organization-reconciliation-provenance/v3");
     expect(ORGANIZATION_RECONCILIATION_TRUST_POLICY_CONTRACT)
-      .toBe("iam-organization-reconciliation-trust-policy/v2");
+      .toBe("iam-organization-reconciliation-trust-policy/v3");
 
     const fixture = provenanceFixture();
     const attestations = [...fixture.context.attestationBundle.attestations];
     const first = attestations[0]!;
+    const v3Domain = Buffer.from("iam-organization-reconciliation:provenance:v3\u001f", "utf8");
     const v2Domain = Buffer.from("iam-organization-reconciliation:provenance:v2\u001f", "utf8");
-    const v1Domain = Buffer.from("iam-organization-reconciliation:provenance:v1\u001f", "utf8");
-    const v2Payload = serializeOrganizationReconciliationProvenancePayload(first.payload);
-    expect(v2Payload.subarray(0, v2Domain.length)).toEqual(v2Domain);
-    const v1Payload = Buffer.concat([v1Domain, v2Payload.subarray(v2Domain.length)]);
+    const v3Payload = serializeOrganizationReconciliationProvenancePayload(first.payload);
+    expect(v3Payload.subarray(0, v3Domain.length)).toEqual(v3Domain);
+    const v2Payload = Buffer.concat([v2Domain, v3Payload.subarray(v3Domain.length)]);
     attestations[0] = {
       ...first,
-      signature: sign(null, v1Payload, fixture.privateKeys[0]!).toString("base64url")
+      signature: sign(null, v2Payload, fixture.privateKeys[0]!).toString("base64url")
     };
 
     expect(verifyOrganizationReconciliationProvenance(fixture.binding, {
@@ -77,6 +85,46 @@ describe("trusted external provenance for organization reconciliation", () => {
     });
     expect(report.provenanceVerification.trustPolicyHash).toMatch(/^[a-f0-9]{24}$/);
     expectNoRawProvenance(report);
+  });
+
+  it("signs the physical outer window and rejects the legacy inner-window binding", () => {
+    const input = withWiderPhysicalWindow(alignedInput());
+    const fixture = provenanceFixture(input);
+    expect(fixture.binding).toMatchObject({
+      windowStartedAt: "2026-08-09T00:04:30.000Z",
+      windowEndedAt: "2026-08-09T00:06:15.000Z"
+    });
+    expect(validateOrganizationReconciliation(input, {
+      trustedProvenance: fixture.context
+    }).provenanceVerification).toMatchObject({ verified: true, reasonCode: "verified" });
+
+    const envelope = input.collectionEnvelope!;
+    const legacyInnerWindowBinding = createOrganizationReconciliationProvenanceBinding(
+      input,
+      envelope.collectorContractHash,
+      envelope.collectorBuildRevision,
+      envelope.logicalSnapshotId,
+      envelope.windowId,
+      envelope.windowStartedAt,
+      envelope.windowEndedAt
+    );
+    const legacyInnerWindowBundle = createOrganizationReconciliationAttestationBundleForTest(
+      legacyInnerWindowBinding,
+      fixture.context.trustPolicy,
+      fixture.privateKeys.map((privateKey, index) => ({
+        keyId: `trusted-key-${index + 1}`,
+        privateKey
+      }))
+    );
+    expect(validateOrganizationReconciliation(input, {
+      trustedProvenance: {
+        ...fixture.context,
+        attestationBundle: legacyInnerWindowBundle
+      }
+    }).provenanceVerification).toMatchObject({
+      verified: false,
+      reasonCode: "attestation-binding-mismatch"
+    });
   });
 
   it("keeps the default path fail closed without any trusted context", () => {
@@ -116,13 +164,13 @@ describe("trusted external provenance for organization reconciliation", () => {
 
   it("rejects a changed collector build even when the evidence is otherwise complete", () => {
     const fixture = provenanceFixture();
-    const changedBuildInput: OrganizationReconciliationInput = {
+    const changedBuildInput = attachTestOrganizationReconciliationComponentManifest({
       ...fixture.input,
       collectionEnvelope: {
         ...fixture.input.collectionEnvelope!,
         collectorBuildRevision: "b".repeat(40)
       }
-    };
+    });
     const report = validateOrganizationReconciliation(changedBuildInput, {
       trustedProvenance: fixture.context
     });
@@ -296,7 +344,7 @@ describe("trusted external provenance for organization reconciliation", () => {
 
   it("never lets a valid external attestation override a changed per-side revision or P0 gate", () => {
     const revisionInput = alignedInput();
-    const revisionMismatch: OrganizationReconciliationInput = {
+    const revisionMismatch = attachTestOrganizationReconciliationComponentManifest({
       ...revisionInput,
       collectionEnvelope: {
         ...revisionInput.collectionEnvelope!,
@@ -305,7 +353,7 @@ describe("trusted external provenance for organization reconciliation", () => {
           sourceVersion: "different-private-source-version"
         }
       }
-    };
+    });
     const revisionFixture = provenanceFixture(revisionMismatch);
     const revisionReport = validateOrganizationReconciliation(revisionMismatch, {
       trustedProvenance: revisionFixture.context
@@ -325,7 +373,7 @@ describe("trusted external provenance for organization reconciliation", () => {
     const unsafeInput = alignedInput();
     const unsafeDecisions = unsafeInput.effectiveDecisions!;
     const legacyDecision = unsafeDecisions.legacy!.records[0]!;
-    const p0Input: OrganizationReconciliationInput = {
+    const p0Input = attachTestOrganizationReconciliationComponentManifest({
       ...unsafeInput,
       effectiveDecisions: {
         legacy: createOrganizationReconciliationCollectedSnapshot(
@@ -340,7 +388,7 @@ describe("trusted external provenance for organization reconciliation", () => {
         ),
         identity: unsafeDecisions.identity
       }
-    };
+    });
     const p0Fixture = provenanceFixture(p0Input);
     const p0Report = validateOrganizationReconciliation(p0Input, { trustedProvenance: p0Fixture.context });
     expect(p0Report.provenanceVerification.verified).toBe(true);
@@ -472,16 +520,36 @@ function provenanceFixture(input: OrganizationReconciliationInput = alignedInput
 }
 
 function bindingFor(input: OrganizationReconciliationInput) {
-  const envelope = input.collectionEnvelope!;
-  return createOrganizationReconciliationProvenanceBinding(
-    input,
-    envelope.collectorContractHash,
-    envelope.collectorBuildRevision,
-    envelope.logicalSnapshotId,
-    envelope.windowId,
-    envelope.windowStartedAt,
-    envelope.windowEndedAt
-  );
+  return createOrganizationReconciliationProvenanceBindingFromInput(input);
+}
+
+function withWiderPhysicalWindow(
+  input: OrganizationReconciliationInput
+): OrganizationReconciliationInput {
+  const manifest = input.componentManifest!;
+  const { manifestSha256: _manifestSha256, ...unsignedManifest } = manifest;
+  const widenedUnsigned: OrganizationReconciliationCompositeManifestUnsigned = {
+    ...unsignedManifest,
+    windowStartedAt: "2026-08-09T00:04:30.000Z",
+    windowEndedAt: "2026-08-09T00:06:15.000Z",
+    maxWindowMilliseconds: 105_000,
+    components: unsignedManifest.components.map((component) => ({
+      ...component,
+      openedAt: component.componentId === "legacy-main"
+        ? "2026-08-09T00:04:30.000Z"
+        : component.openedAt,
+      closedAt: component.componentId === "legacy-main"
+        ? "2026-08-09T00:06:15.000Z"
+        : component.closedAt
+    }))
+  };
+  return {
+    ...input,
+    componentManifest: {
+      ...widenedUnsigned,
+      manifestSha256: createOrganizationReconciliationCompositeManifestSha256(widenedUnsigned)
+    }
+  };
 }
 
 function alignedInput(organizationName = "private-organization"): OrganizationReconciliationInput {
@@ -493,7 +561,7 @@ function alignedInput(organizationName = "private-organization"): OrganizationRe
       { requestCursor: null, nextCursor: null, records }
     ])
   });
-  return {
+  return attachTestOrganizationReconciliationComponentManifest({
     collectionEnvelope: {
       collectorContract: ORGANIZATION_RECONCILIATION_COLLECTOR_CONTRACT,
       collectorContractHash: ORGANIZATION_RECONCILIATION_COLLECTOR_CONTRACT_HASH,
@@ -518,13 +586,13 @@ function alignedInput(organizationName = "private-organization"): OrganizationRe
     },
     organizationDirectory: pair([{ legacyOrganizationId: 1, name: organizationName, title: null, active: true }]),
     organizationMappings: pair([{ legacyOrganizationId: 1, identityOrganizationId: "private-identity-org", active: true }]),
-    memberships: pair([{ subjectRef: "private-subject", legacyOrganizationId: 1, active: true }]),
-    organizationScopedRoles: pair([{ subjectRef: "private-subject", legacyOrganizationId: 1, roleRef: "private-role", active: true }]),
-    pluginBindings: pair([{ pluginRef: "private-plugin", bindingRef: "private-binding", organizationRef: organizationName, active: true }]),
-    pluginVisibility: pair([{ subjectRef: "private-subject", pluginRef: "private-plugin", organizationRef: organizationName, decision: "allow" }]),
-    campusContexts: pair([{ subjectRef: "private-subject", campusRef: "private-campus", organizationRef: organizationName, decision: "allow" }]),
-    effectiveDecisions: pair([{ subjectRef: "private-subject", organizationRef: organizationName, resourceRef: "private-resource", capabilityRef: "private-capability", decision: "allow" }])
-  };
+    memberships: pair([{ subjectRef: "legacy-user:581", legacyOrganizationId: 1, active: true }]),
+    organizationScopedRoles: pair([{ subjectRef: "legacy-user:581", legacyOrganizationId: 1, roleRef: "private-role", active: true }]),
+    pluginBindings: pair([{ pluginRef: "plugin:private", bindingRef: "private-binding", organizationRef: ORGANIZATION_REF, active: true }]),
+    pluginVisibility: pair([{ subjectRef: "legacy-user:581", pluginRef: "plugin:private", organizationRef: ORGANIZATION_REF, decision: "allow" }]),
+    campusContexts: pair([{ subjectRef: "legacy-user:581", campusRef: "private-campus", organizationRef: ORGANIZATION_REF, decision: "allow" }]),
+    effectiveDecisions: pair([{ subjectRef: "legacy-user:581", organizationRef: ORGANIZATION_REF, resourceRef: "private-resource", capabilityRef: "private-capability", decision: "allow" }])
+  });
 }
 
 function expectNoRawProvenance(report: unknown): void {
@@ -539,7 +607,8 @@ function expectNoRawProvenance(report: unknown): void {
     "test-dual-node",
     "trusted-develop-environment",
     "private-organization",
-    "private-subject"
+    ORGANIZATION_REF,
+    "legacy-user:581"
   ]) expect(serialized).not.toContain(value);
 }
 
@@ -548,28 +617,30 @@ const LEGACY_SOURCE_VERSION = "private-legacy-source-version";
 const IDENTITY_SOURCE_VERSION = "private-identity-source-version";
 const LEGACY_SNAPSHOT = "legacy-private-snapshot";
 const IDENTITY_SNAPSHOT = "identity-private-snapshot";
+const ORGANIZATION_REF = "legacy-org:1";
 const SUBJECT_UNIVERSE_HASH = createOrganizationReconciliationEvidenceHash(
   EVIDENCE_NONCE,
-  ["private-subject"]
+  ["legacy-user:581"]
 );
 
-function decisionUniverses(organizationName: string) {
+function decisionUniverses(_organizationName: string) {
   return {
     pluginVisibility: decisionUniverse(
-      [["private-subject", "private-plugin", organizationName]],
-      { subjects: ["private-subject"], plugins: ["private-plugin"], organizations: [organizationName] }
+      [["legacy-user:581", "plugin:private", ORGANIZATION_REF]],
+      { subjects: ["legacy-user:581"], plugins: ["plugin:private"], organizations: [ORGANIZATION_REF] }
     ),
     campusContexts: decisionUniverse(
-      [["private-subject", "private-campus"]],
-      { subjects: ["private-subject"], campuses: ["private-campus"], organizations: [organizationName] }
+      [["legacy-user:581", "private-campus"]],
+      { subjects: ["legacy-user:581"], campuses: ["private-campus"], organizations: [ORGANIZATION_REF] }
     ),
     effectiveDecisions: decisionUniverse([
-      ["private-subject", organizationName, "private-resource", "private-capability"]
+      ["legacy-user:581", ORGANIZATION_REF, "private-resource", "private-capability"]
     ], {
-      subjects: ["private-subject"],
-      organizations: [organizationName],
+      subjects: ["legacy-user:581"],
+      organizations: [ORGANIZATION_REF],
       resources: ["private-resource"],
-      capabilities: ["private-capability"]
+      capabilities: ["private-capability"],
+      rulePairs: [JSON.stringify(["private-resource", "private-capability"])]
     })
   };
 }

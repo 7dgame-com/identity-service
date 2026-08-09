@@ -14,7 +14,7 @@ import {
   TEST_COLLECTOR_BUILD_REVISION
 } from "./iam-organization-reconciliation-provenance.test-fixture.js";
 import {
-  createOrganizationReconciliationProvenanceBinding,
+  createOrganizationReconciliationProvenanceBindingFromInput,
   type OrganizationReconciliationTrustedProfile
 } from "../src/iam-organization-reconciliation-provenance.js";
 import {
@@ -28,6 +28,9 @@ import {
   parseOrganizationReconciliationJson,
   runOrganizationReconciliationCli
 } from "../../../scripts/iam-organization-reconciliation-validate.js";
+import {
+  attachTestOrganizationReconciliationComponentManifest
+} from "./fixtures/iam-organization-reconciliation-component-manifest.js";
 
 describe("offline IAM organization reconciliation CLI", () => {
   it("accepts one explicit local JSON input and provides help", () => {
@@ -202,8 +205,8 @@ describe("offline IAM organization reconciliation CLI", () => {
     const unsafe: OrganizationReconciliationInput = {
       ...input,
       effectiveDecisions: pair(
-        [{ subjectRef: "private-subject", organizationRef: "private-org-name", resourceRef: "private-resource", capabilityRef: "private-capability", decision: "deny" }],
-        [{ subjectRef: "private-subject", organizationRef: "private-org-name", resourceRef: "private-resource", capabilityRef: "private-capability", decision: "allow" }]
+        [{ subjectRef: "legacy-user:581", organizationRef: "legacy-org:1", resourceRef: "private-resource", capabilityRef: "private-capability", decision: "deny" }],
+        [{ subjectRef: "legacy-user:581", organizationRef: "legacy-org:1", resourceRef: "private-resource", capabilityRef: "private-capability", decision: "allow" }]
       )
     };
     const io = memoryIo(JSON.stringify(unsafe));
@@ -219,13 +222,14 @@ describe("offline IAM organization reconciliation CLI", () => {
         blockedReasons: ["coverage-incomplete", "p0-findings", "external-provenance-required"]
       }
     });
-    expect(io.stdout).not.toContain("private-subject");
+    expect(io.stdout).not.toContain("legacy-user:581");
     expect(io.stdout).not.toContain("private-resource");
     expect(io.stdout).not.toContain("private-capability");
   });
 
   it("treats coverage blockers as a valid report with non-zero safety exit", async () => {
-    const { pluginVisibility: _missing, ...incomplete } = alignedInput();
+    const { pluginVisibility: _missing, ...incompleteBody } = alignedInput();
+    const incomplete = attachTestOrganizationReconciliationComponentManifest(incompleteBody);
     const io = memoryIo(JSON.stringify(incomplete));
     const exitCode = await runOrganizationReconciliationCli(["--input=/tmp/incomplete.json"], io);
 
@@ -279,6 +283,16 @@ describe("offline IAM organization reconciliation CLI", () => {
     expect(() => parseOrganizationReconciliationJson(JSON.stringify(missingBuild)))
       .toThrow(OrganizationReconciliationCliError);
 
+    const missingManifest = structuredClone(alignedInput()) as unknown as Record<string, any>;
+    delete missingManifest.componentManifest;
+    expect(() => parseOrganizationReconciliationJson(JSON.stringify(missingManifest)))
+      .toThrow(OrganizationReconciliationCliError);
+
+    const invalidManifestWindow = structuredClone(alignedInput()) as unknown as Record<string, any>;
+    invalidManifestWindow.componentManifest.windowEndedAt = "not-a-timestamp";
+    expect(() => parseOrganizationReconciliationJson(JSON.stringify(invalidManifestWindow)))
+      .toThrow(OrganizationReconciliationCliError);
+
     const missingSubjectUniverse = structuredClone(alignedInput()) as unknown as Record<string, any>;
     delete missingSubjectUniverse.collectionEnvelope.identity.subjectUniverse;
     expect(() => parseOrganizationReconciliationJson(JSON.stringify(missingSubjectUniverse)))
@@ -302,10 +316,69 @@ describe("offline IAM organization reconciliation CLI", () => {
     expect(() => parseOrganizationReconciliationJson(JSON.stringify(extraDimension)))
       .toThrow(OrganizationReconciliationCliError);
 
-    const v1Contract = structuredClone(alignedInput()) as unknown as Record<string, any>;
-    v1Contract.collectionEnvelope.collectorContract = "iam-organization-reconciliation-collector/v1";
-    expect(() => parseOrganizationReconciliationJson(JSON.stringify(v1Contract)))
+    const v2Contract = structuredClone(alignedInput()) as unknown as Record<string, any>;
+    v2Contract.collectionEnvelope.collectorContract = "iam-organization-reconciliation-collector/v2";
+    expect(() => parseOrganizationReconciliationJson(JSON.stringify(v2Contract)))
       .toThrow(OrganizationReconciliationCliError);
+
+    for (const subjectRef of [
+      "private-subject",
+      "legacy-user:0",
+      "legacy-user:01",
+      "identity-user:581",
+      "legacy-user:legacy-user:581",
+      " legacy-user:581",
+      "legacy-user:581 ",
+      "legacy-user:\u0001581"
+    ]) {
+      const invalidSubject = structuredClone(alignedInput()) as unknown as Record<string, any>;
+      invalidSubject.memberships.legacy.records[0].subjectRef = subjectRef;
+      expect(() => parseOrganizationReconciliationJson(JSON.stringify(invalidSubject)))
+        .toThrow(OrganizationReconciliationCliError);
+    }
+
+    for (const pluginRef of [
+      "private-plugin",
+      "",
+      " plugin:private",
+      "plugin:private ",
+      "plugin:private tool",
+      "plugin:private:tool",
+      "plugin:private/tool",
+      "plugin:private.tool",
+      "plugin:private_tool",
+      "plugin:privé",
+      "plugin:cafe\u0301",
+      "plugin:private\u0000",
+      "plugin:plugin:private",
+      `plugin:${"a".repeat(65)}`
+    ]) {
+      const invalidPlugin = structuredClone(alignedInput()) as unknown as Record<string, any>;
+      invalidPlugin.pluginBindings.identity.records[0].pluginRef = pluginRef;
+      expect(() => parseOrganizationReconciliationJson(JSON.stringify(invalidPlugin)))
+        .toThrow(OrganizationReconciliationCliError);
+    }
+
+    for (const legacyOrganizationId of ["01", " 1", 0, Number.MAX_SAFE_INTEGER + 1]) {
+      const invalidOrganizationId = structuredClone(alignedInput()) as unknown as Record<string, any>;
+      invalidOrganizationId.organizationDirectory.legacy.records[0].legacyOrganizationId = legacyOrganizationId;
+      expect(() => parseOrganizationReconciliationJson(JSON.stringify(invalidOrganizationId)))
+        .toThrow(OrganizationReconciliationCliError);
+    }
+
+    for (const organizationRef of ["private-org", "legacy-org:01", " legacy-org:1", "org:public"]) {
+      const invalidOrganizationRef = structuredClone(alignedInput()) as unknown as Record<string, any>;
+      invalidOrganizationRef.campusContexts.legacy.records[0].organizationRef = organizationRef;
+      expect(() => parseOrganizationReconciliationJson(JSON.stringify(invalidOrganizationRef)))
+        .toThrow(OrganizationReconciliationCliError);
+    }
+
+    for (const roleRef of [" private-role", "private-role ", "cafe\u0301", "private\u0000role"]) {
+      const invalidRole = structuredClone(alignedInput()) as unknown as Record<string, any>;
+      invalidRole.organizationScopedRoles.legacy.records[0].roleRef = roleRef;
+      expect(() => parseOrganizationReconciliationJson(JSON.stringify(invalidRole)))
+        .toThrow(OrganizationReconciliationCliError);
+    }
   });
 
   it("sanitizes file-read failures without echoing the path or underlying error", async () => {
@@ -395,16 +468,7 @@ function artifactIo(
 
 function trustedCliFixture() {
   const input = alignedInput();
-  const envelope = input.collectionEnvelope!;
-  const binding = createOrganizationReconciliationProvenanceBinding(
-    input,
-    envelope.collectorContractHash,
-    envelope.collectorBuildRevision,
-    envelope.logicalSnapshotId,
-    envelope.windowId,
-    envelope.windowStartedAt,
-    envelope.windowEndedAt
-  );
+  const binding = createOrganizationReconciliationProvenanceBindingFromInput(input);
   const keys = [generateKeyPairSync("ed25519"), generateKeyPairSync("ed25519")];
   const policy = createOrganizationReconciliationPolicyForTest(keys.map(({ publicKey }, index) => ({
     collectorId: `trusted-cli-collector-${index + 1}`,
@@ -428,7 +492,7 @@ function trustedCliFixture() {
 }
 
 function alignedInput(): OrganizationReconciliationInput {
-  return {
+  return attachTestOrganizationReconciliationComponentManifest({
     collectionEnvelope: collectionEnvelope(),
     organizationDirectory: pair(
       [{ legacyOrganizationId: 1, name: "private-org-name", title: "private-org-title", active: true }],
@@ -439,30 +503,30 @@ function alignedInput(): OrganizationReconciliationInput {
       [{ legacyOrganizationId: 1, identityOrganizationId: "private-identity-org", active: true }]
     ),
     memberships: pair(
-      [{ subjectRef: "private-subject", legacyOrganizationId: 1, active: true }],
-      [{ subjectRef: "private-subject", legacyOrganizationId: 1, active: true }]
+      [{ subjectRef: "legacy-user:581", legacyOrganizationId: 1, active: true }],
+      [{ subjectRef: "legacy-user:581", legacyOrganizationId: 1, active: true }]
     ),
     organizationScopedRoles: pair(
-      [{ subjectRef: "private-subject", legacyOrganizationId: 1, roleRef: "private-role", active: true }],
-      [{ subjectRef: "private-subject", legacyOrganizationId: 1, roleRef: "private-role", active: true }]
+      [{ subjectRef: "legacy-user:581", legacyOrganizationId: 1, roleRef: "private-role", active: true }],
+      [{ subjectRef: "legacy-user:581", legacyOrganizationId: 1, roleRef: "private-role", active: true }]
     ),
     pluginBindings: pair(
-      [{ pluginRef: "private-plugin", bindingRef: "private-binding", organizationRef: "private-org-name", active: true }],
-      [{ pluginRef: "private-plugin", bindingRef: "private-binding", organizationRef: "private-org-name", active: true }]
+      [{ pluginRef: "plugin:private", bindingRef: "private-binding", organizationRef: "legacy-org:1", active: true }],
+      [{ pluginRef: "plugin:private", bindingRef: "private-binding", organizationRef: "legacy-org:1", active: true }]
     ),
     pluginVisibility: pair(
-      [{ subjectRef: "private-subject", pluginRef: "private-plugin", organizationRef: "private-org-name", decision: "allow" }],
-      [{ subjectRef: "private-subject", pluginRef: "private-plugin", organizationRef: "private-org-name", decision: "allow" }]
+      [{ subjectRef: "legacy-user:581", pluginRef: "plugin:private", organizationRef: "legacy-org:1", decision: "allow" }],
+      [{ subjectRef: "legacy-user:581", pluginRef: "plugin:private", organizationRef: "legacy-org:1", decision: "allow" }]
     ),
     campusContexts: pair(
-      [{ subjectRef: "private-subject", campusRef: "private-campus", organizationRef: "private-org-name", decision: "allow" }],
-      [{ subjectRef: "private-subject", campusRef: "private-campus", organizationRef: "private-org-name", decision: "allow" }]
+      [{ subjectRef: "legacy-user:581", campusRef: "private-campus", organizationRef: "legacy-org:1", decision: "allow" }],
+      [{ subjectRef: "legacy-user:581", campusRef: "private-campus", organizationRef: "legacy-org:1", decision: "allow" }]
     ),
     effectiveDecisions: pair(
-      [{ subjectRef: "private-subject", organizationRef: "private-org-name", resourceRef: "private-resource", capabilityRef: "private-capability", decision: "allow" }],
-      [{ subjectRef: "private-subject", organizationRef: "private-org-name", resourceRef: "private-resource", capabilityRef: "private-capability", decision: "allow" }]
+      [{ subjectRef: "legacy-user:581", organizationRef: "legacy-org:1", resourceRef: "private-resource", capabilityRef: "private-capability", decision: "allow" }],
+      [{ subjectRef: "legacy-user:581", organizationRef: "legacy-org:1", resourceRef: "private-resource", capabilityRef: "private-capability", decision: "allow" }]
     )
-  };
+  });
 }
 
 function pair<T>(legacy: readonly T[], identity: readonly T[]) {
@@ -525,24 +589,25 @@ function collectionEnvelope() {
 
 const SUBJECT_UNIVERSE_HASH = createOrganizationReconciliationEvidenceHash(
   EVIDENCE_NONCE,
-  ["private-subject"]
+  ["legacy-user:581"]
 );
 const DECISION_UNIVERSES = {
   pluginVisibility: decisionUniverse(
-    [["private-subject", "private-plugin", "private-org-name"]],
-    { subjects: ["private-subject"], plugins: ["private-plugin"], organizations: ["private-org-name"] }
+    [["legacy-user:581", "plugin:private", "legacy-org:1"]],
+    { subjects: ["legacy-user:581"], plugins: ["plugin:private"], organizations: ["legacy-org:1"] }
   ),
   campusContexts: decisionUniverse(
-    [["private-subject", "private-campus"]],
-    { subjects: ["private-subject"], campuses: ["private-campus"], organizations: ["private-org-name"] }
+    [["legacy-user:581", "private-campus"]],
+    { subjects: ["legacy-user:581"], campuses: ["private-campus"], organizations: ["legacy-org:1"] }
   ),
   effectiveDecisions: decisionUniverse([
-    ["private-subject", "private-org-name", "private-resource", "private-capability"]
+    ["legacy-user:581", "legacy-org:1", "private-resource", "private-capability"]
   ], {
-    subjects: ["private-subject"],
-    organizations: ["private-org-name"],
+    subjects: ["legacy-user:581"],
+    organizations: ["legacy-org:1"],
     resources: ["private-resource"],
-    capabilities: ["private-capability"]
+    capabilities: ["private-capability"],
+    rulePairs: [JSON.stringify(["private-resource", "private-capability"])]
   })
 };
 
@@ -569,11 +634,12 @@ function decisionUniverse(
 function expectNoRawEvidence(serialized: string): void {
   for (const rawValue of [
     "private-org-name",
+    "legacy-org:1",
     "private-org-title",
     "private-identity-org",
-    "private-subject",
+    "legacy-user:581",
     "private-role",
-    "private-plugin",
+    "plugin:private",
     "private-binding",
     "private-campus",
     "private-resource",

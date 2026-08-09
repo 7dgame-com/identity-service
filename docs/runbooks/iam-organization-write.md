@@ -311,7 +311,7 @@ npm run iam:organization-reconciliation:validate:dist -- \
 ```
 
 输入上限 16 MiB，CLI 在读取前先验证路径为普通本地文件并检查大小，读取后再次校验 byte count。
-根输入必须包含 v2 collector contract/hash、每次运行随机的高熵 `evidenceNonce`、logical snapshot/window、
+根输入必须包含 v3 collector contract/hash、每次运行随机的高熵 `evidenceNonce`、logical snapshot/window、
 两侧各自非空的 source revision 与各自 snapshot ID；异构 source revision 不要求字面相同。必须完整包含以下八个 surface；每个 surface 必须同时
 提供 `legacy` 与 `identity` 两侧，每侧必须包含 `records`、与根 envelope 一致的非空
 `sourceVersion`/snapshot ID，以及显式终止的 `nextCursor: null`。空字符串、空白字符串和非空 cursor
@@ -359,6 +359,17 @@ JSON/schema 错误退出 2。当前因真实 adapter blocker，`staticChecksPass
 `safetyGate.passed=false`、`blocksDualWrite=true`，并以 `external-provenance-required` 退出 1。输入中
 不存在可伪造的 provenance 布尔开关或公钥字段。
 
+根输入还必须携带一个 v2 composite component manifest。该清单固定列出 `legacy-main`、`identity`、
+`plugin` 三个独立 immutable snapshot，明确 `crossDatabaseAtomic=false`，并记录各自 source/version/
+snapshot、schema/catalog/build digest、subject-universe scope、实际打开/关闭时间以及有界复合窗口。
+manifest 的 domain-separated operation-evidence digest 必须绑定“移除 manifest 后的完整 v3 输入”，
+manifest 自身再由 canonical digest 固定；外部 provenance 则签署包含 manifest 在内的最终输入。因此
+缺 manifest、manifest digest 不符、清单 A 配数据 B、清单窗口未覆盖 envelope 窗口、Legacy/Identity
+sourceVersion/snapshotId、subject count 或 subject-universe digest 不一致都属于 coverage blocker。由于物理快照的关闭时间晚于
+记录组装，manifest 的实际外层窗口可以包含 envelope 的读取窗口；可信 policy 校验的是这个更宽的
+物理复合窗口。manifest 中的 source/schema/catalog/build 值在 compiled owner-approved pin 完成前仍
+只是受绑定声明，不能单独视为权威。
+
 可信模式必须同时提供独立本地 attestation 文件、change-controlled trust-policy 文件和已编译的
 trust profile 标识。生产 CLI 只从源码中的 immutable registry 解析 profile；不从 argv、环境变量、
 snapshot、attestation 或 policy 接受 policy pin。当前 registry 故意为空，不包含任何生产 key/pin；
@@ -388,10 +399,12 @@ skew。只有全部 required collector 签名有效且静态门禁通过，才�
 `externalProvenanceVerified=true`；report 仍只输出 hash、状态码与签名计数，不回显 key、签名、node、
 environment 或原始业务值。Trusted artifact schema/文件/profile 参数错误或 profile 尚未编译 provision
 时退出 2；compiled policy mismatch、签名失败、证据篡改、过期或窗口不合规返回安全报告并退出 1。
-CLI 的通用 safety gate 允许“已分类 P2”存在，但工作包 4 的 Phase 4 准入更严格：仍要求
-`P0=0、P1=0、P2=0、mismatch=0`，所以 P2 非零即使 CLI 退出 0 也不能推进。
+CLI 的 safety gate 与工作包 4 的 Phase 4 准入口径一致：只有
+`P0=0、P1=0、P2=0、mismatch=0` 才可能通过；任一 P2 非零都会阻断并以非零状态退出。
 
-collector、provenance、trust-policy 与签名 domain 均为 v2；v1 evidence/policy/signature 不兼容且必须拒绝。
+collector、decision-universe、provenance、trust-policy、report hash 与签名 domain 均为 v3；v2
+evidence/policy/signature 不兼容且必须拒绝。Composite manifest 与 operation-evidence 子协议为 v2；
+其 v1 manifest/evidence 不兼容且必须拒绝。
 Collector build revision 只能由受审 artifact 注入的 build-revision provider 产生并随 evidence 携带；
 source adapter、调用参数与 evidence 均不能把自身字段作为权威来源，也不能覆盖 compiled trust
 profile/policy 对该完整 40 位 revision 的外部 pin。
@@ -400,23 +413,34 @@ Legacy 与 Identity 使用不同版本命名空间时，二者的 source-owned o
 每侧 page 必须与本侧 envelope 的 version/snapshot 精确一致，跨源同窗由 `logicalSnapshotId`、有界
 collection window 和 trusted attestation 证明，不能伪造相同版本字符串。Envelope 还要求两侧相同的
 完整 subject universe count/HMAC，以及 plugin visibility、campus context、effective decision 各自的
-版本化 canonical key universe count/HMAC。每个 decision universe 还必须携带 v2 derivation contract、
+版本化 canonical key universe count/HMAC。每个 decision universe 还必须携带 v3 derivation contract、
 与 collector artifact 相同的 build revision，以及严格的权威维度 count/HMAC：plugin visibility 为
 subject/plugin/organization，campus context 为 subject/campus/organization，effective decision 为
-subject/organization/resource/capability。逐页记录必须精确覆盖 key 与所有非空维度；非空 surface 必须
+subject/organization/resource/capability/reviewed rule-pair。逐页记录必须精确覆盖 key 与所有非空维度；非空 surface 必须
 覆盖完整 subject universe。只有至少一个非 subject 权威维度被 adapter 证明为零时，keyCount=0 才合法；
 不得用空 memberships 推导 subject universe、由调用方自报“真实空”，或静默省略零成员主体。
 
 本地代码另提供严格 source-adapter collector primitive：只接受 immutable snapshot、snapshot-bound opaque
 cursor、精确 count/offset/order/unique key，并在成功、读取失败、解码失败或顺序失败后 exactly-once
 释放私有 snapshot/事务；close 失败同样拒绝证据，私有 source token 不进入 public evidence。它继续提供
-无 I/O 的 cursor-chain assembler（只接受从 `requestCursor=null` 到 `nextCursor=null` 的完整有序链）以及
+三源 deterministic coordinator（按 `legacy-main → identity → plugin` 打开、反向关闭、明确非分布式
+原子快照并把 exact operation body 绑定到 composite manifest）、只读 MySQL repeatable-read consistent-
+snapshot session，以及无 I/O 的 cursor-chain assembler（只接受从 `requestCursor=null` 到
+`nextCursor=null` 的完整有序链）和
 可交给 HSM/KMS 的 canonical attestation payload/signature 组装接口；verifier 本身不读取或持有 private key。
-仓库仍没有连接 Legacy/Identity runtime 的
-source-specific collector adapter，也没有已批准的公钥 policy、compiled trust profile、签名服务、逐页原始
+该 MySQL session 不接受运行时 SQL，只接受源码内 immutable statement ID/catalog，固定 keyset
+cursor 参数契约、Legacy RBAC `auth_item.type=1` 以及 Identity shadow 的
+`source=legacy-shadow/status=shadow`；policy/参数/查询失败都会 poison 当前 session，只能 rollback。
+这些 coordinator/session 仍是生命周期与内容绑定 primitive：通用 operation 尚未被限制为从已打开
+snapshot 的 `readSnapshotPage` 构造八个 surface；campus/rule-pair/plugin catalog 也尚未与 compiled
+owner-approved pins 绑定。仓库仍没有连接 Legacy/Identity/plugin runtime 的完整 source-specific
+collector adapter，也没有已批准的公钥 policy、compiled trust profile、签名服务、逐页原始
 响应保管或双节点运行证据。因此本地测试 PASS 只证明 verifier/collector primitives 正确，不证明外部
 API/数据库实际返回这些页，也不单独完成 Task 7.2。任何采集、部署、数据库访问或运行时写入仍需
 另行批准。
+协调器产物只能通过 `assembleCoordinatedOrganizationReconciliationInput` 进入 validator/CLI；该 assembler
+会重验 manifest/body digest、拒绝调用方嵌套 manifest，并冻结最终输入。这只关闭产物形状与 A/B
+拼接空档，不能替代上述页级来源门禁。
 
 ## Phase 3：单次 Develop legacy-proxy 窗口
 

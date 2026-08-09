@@ -17,6 +17,21 @@ import {
 import {
   resolveCompiledOrganizationReconciliationTrustProfile
 } from "../apps/identity-adapter/src/iam-organization-reconciliation-trust-profiles.js";
+import {
+  isCanonicalLegacyOrganizationId,
+  isCanonicalLegacyUserSubjectRef,
+  isCanonicalOrganizationRef,
+  isCanonicalPluginRef,
+  isCanonicalReconciliationToken
+} from "../apps/identity-adapter/src/iam-organization-reconciliation-refs.js";
+import {
+  ORGANIZATION_RECONCILIATION_COMPOSITE_CONSISTENCY_MODEL,
+  ORGANIZATION_RECONCILIATION_COMPOSITE_MANIFEST_CONTRACT,
+  ORGANIZATION_RECONCILIATION_OPERATION_EVIDENCE_CONTRACT,
+  ORGANIZATION_RECONCILIATION_PAGINATION_MODE,
+  ORGANIZATION_RECONCILIATION_SNAPSHOT_MODE,
+  validateOrganizationReconciliationCompositeManifest
+} from "../apps/identity-adapter/src/iam-organization-reconciliation-component-manifest.js";
 
 export type OrganizationReconciliationCliOptions =
   | { readonly mode: "help" }
@@ -60,7 +75,9 @@ Options:
   --help                     Show this help.
 
 The command performs no network or database access. URL, token, stdin, and
-network parameters are not supported. This artifact intentionally reports
+network parameters are not supported. Input requires the v3 collector envelope
+plus a v2 three-source composite manifest whose operation-evidence digest binds
+the exact manifest-free input body. This artifact intentionally reports
 realSourceAdaptersReady=false and a coverage blocker until every reviewed
 authoritative adapter is registered in source; caller JSON cannot override it.
 The trusted-provenance verifier cannot override this compiled blocker. Trusted
@@ -76,56 +93,61 @@ JSON, schema, or unknown/unprovisioned-profile errors exit with status 2.
 const MAX_INPUT_BYTES = 16 * 1024 * 1024;
 const MAX_TRUSTED_ARTIFACT_BYTES = 1024 * 1024;
 const nonBlankString = z.string().min(1).refine((value) => value.trim().length > 0);
-const organizationId = z.union([z.number().int().positive(), nonBlankString]);
+const canonicalRecordString = z.string().refine(isCanonicalReconciliationToken);
+const subjectRef = z.string().refine(isCanonicalLegacyUserSubjectRef);
+const pluginRef = z.string().refine(isCanonicalPluginRef);
+const organizationId = z.union([z.number(), z.string()]).refine(isCanonicalLegacyOrganizationId);
+const organizationRef = z.string().refine((value) => isCanonicalOrganizationRef(value, false));
+const publicOrganizationRef = z.string().refine((value) => isCanonicalOrganizationRef(value, true));
 const decision = z.enum(["allow", "deny"]);
 const hash = z.string().regex(/^[a-f0-9]{64}$/i);
 const cursor = z.string().nullable();
 
 const directoryRecord = z.object({
   legacyOrganizationId: organizationId,
-  name: nonBlankString,
-  title: z.string().nullable(),
+  name: canonicalRecordString,
+  title: canonicalRecordString.nullable(),
   active: z.boolean()
 }).strict();
 const mappingRecord = z.object({
   legacyOrganizationId: organizationId,
-  identityOrganizationId: nonBlankString,
+  identityOrganizationId: canonicalRecordString,
   active: z.boolean()
 }).strict();
 const membershipRecord = z.object({
-  subjectRef: nonBlankString,
+  subjectRef,
   legacyOrganizationId: organizationId,
   active: z.boolean()
 }).strict();
 const scopedRoleRecord = z.object({
-  subjectRef: nonBlankString,
+  subjectRef,
   legacyOrganizationId: organizationId,
-  roleRef: nonBlankString,
+  roleRef: canonicalRecordString,
   active: z.boolean()
 }).strict();
 const pluginBindingRecord = z.object({
-  pluginRef: nonBlankString,
-  bindingRef: nonBlankString,
-  organizationRef: nonBlankString,
+  pluginRef,
+  bindingRef: canonicalRecordString,
+  organizationRef: publicOrganizationRef,
   active: z.boolean()
 }).strict();
 const pluginVisibilityRecord = z.object({
-  subjectRef: nonBlankString,
-  pluginRef: nonBlankString,
-  organizationRef: nonBlankString,
+  subjectRef,
+  pluginRef,
+  organizationRef: publicOrganizationRef,
   decision
 }).strict();
 const campusContextRecord = z.object({
-  subjectRef: nonBlankString,
-  campusRef: nonBlankString,
-  organizationRef: nonBlankString,
+  subjectRef,
+  campusRef: canonicalRecordString,
+  organizationRef,
   decision
 }).strict();
 const effectiveDecisionRecord = z.object({
-  subjectRef: nonBlankString,
-  organizationRef: nonBlankString,
-  resourceRef: nonBlankString,
-  capabilityRef: nonBlankString,
+  subjectRef,
+  organizationRef,
+  resourceRef: canonicalRecordString,
+  capabilityRef: canonicalRecordString,
   decision
 }).strict();
 
@@ -187,7 +209,8 @@ const decisionUniverses = z.object({
     subjects: decisionDimension,
     organizations: decisionDimension,
     resources: decisionDimension,
-    capabilities: decisionDimension
+    capabilities: decisionDimension,
+    rulePairs: decisionDimension
   })
 }).strict();
 
@@ -220,7 +243,39 @@ const collectionEnvelope = z.object({
   }).strict()
 }).strict();
 
+const componentManifest = z.object({
+  contract: z.literal(ORGANIZATION_RECONCILIATION_COMPOSITE_MANIFEST_CONTRACT),
+  consistencyModel: z.literal(ORGANIZATION_RECONCILIATION_COMPOSITE_CONSISTENCY_MODEL),
+  crossDatabaseAtomic: z.literal(false),
+  windowStartedAt: nonBlankString,
+  windowEndedAt: nonBlankString,
+  maxWindowMilliseconds: z.number().int().positive(),
+  evidenceContract: z.literal(ORGANIZATION_RECONCILIATION_OPERATION_EVIDENCE_CONTRACT),
+  evidenceSha256: hash,
+  components: z.array(z.object({
+    componentId: z.enum(["legacy-main", "identity", "plugin"]),
+    sourceId: nonBlankString,
+    sourceVersion: nonBlankString,
+    snapshotId: nonBlankString,
+    recordCount: z.number().int().nonnegative(),
+    subjectUniverseScope: z.enum(["complete", "not-applicable"]),
+    subjectUniverse: z.object({
+      count: z.number().int().nonnegative(),
+      sha256: z.union([hash, z.literal("")])
+    }).strict(),
+    snapshotMode: z.literal(ORGANIZATION_RECONCILIATION_SNAPSHOT_MODE),
+    paginationMode: z.literal(ORGANIZATION_RECONCILIATION_PAGINATION_MODE),
+    schemaSha256: hash,
+    catalogSha256: hash,
+    buildSha256: hash,
+    openedAt: nonBlankString,
+    closedAt: nonBlankString
+  }).strict()).length(3),
+  manifestSha256: hash
+}).strict();
+
 const organizationReconciliationInputSchema = z.object({
+  componentManifest,
   collectionEnvelope,
   organizationDirectory: pairSchema(directoryRecord).optional(),
   organizationMappings: pairSchema(mappingRecord).optional(),
@@ -360,6 +415,14 @@ export function parseOrganizationReconciliationJson(raw: string): OrganizationRe
   }
   const result = organizationReconciliationInputSchema.safeParse(parsed);
   if (!result.success) {
+    throw new OrganizationReconciliationCliError(
+      "input-schema-invalid",
+      "Input JSON does not match the organization reconciliation snapshot schema."
+    );
+  }
+  try {
+    validateOrganizationReconciliationCompositeManifest(result.data.componentManifest);
+  } catch {
     throw new OrganizationReconciliationCliError(
       "input-schema-invalid",
       "Input JSON does not match the organization reconciliation snapshot schema."
