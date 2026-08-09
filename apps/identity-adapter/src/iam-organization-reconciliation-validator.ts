@@ -22,10 +22,17 @@ export type OrganizationReconciliationSurface =
   | "effective-decision";
 
 export const ORGANIZATION_RECONCILIATION_COLLECTOR_CONTRACT =
-  "iam-organization-reconciliation-collector/v1";
+  "iam-organization-reconciliation-collector/v2";
 export const ORGANIZATION_RECONCILIATION_COLLECTOR_CONTRACT_HASH = createHash("sha256")
   .update(ORGANIZATION_RECONCILIATION_COLLECTOR_CONTRACT)
   .digest("hex");
+export const ORGANIZATION_RECONCILIATION_DECISION_DERIVATION_CONTRACT =
+  "iam-organization-reconciliation-decision-universe/v2";
+/**
+ * Deliberate production blocker. A reviewed change may set this true only when
+ * every authoritative Legacy/Identity/plugin/rule adapter is registered.
+ */
+export const ORGANIZATION_RECONCILIATION_REAL_SOURCE_ADAPTERS_READY = false as const;
 
 export interface OrganizationReconciliationPageEvidence {
   readonly pageNumber: number;
@@ -49,7 +56,10 @@ export interface OrganizationReconciliationPageCollection {
 
 export interface ReconciliationPage<T> {
   readonly records: readonly T[];
-  /** A source-owned opaque version. It is only emitted as a digest. */
+  /**
+   * A source-owned opaque version. It is only emitted as a digest. Legacy and
+   * Identity versions may differ; each must match its own envelope side.
+   */
   readonly sourceVersion?: string | null;
   /** Only null means that the supplied page set is complete. */
   readonly nextCursor?: string | null;
@@ -123,9 +133,28 @@ export interface EffectiveOrganizationDecisionRecord {
   readonly decision: OrganizationDecision;
 }
 
+export interface OrganizationReconciliationDecisionUniverseEvidence {
+  readonly keyCount: number;
+  /** HMAC-SHA256 over sorted canonical decision keys, including deny rows. */
+  readonly keysHash: string;
+  readonly derivationContract: typeof ORGANIZATION_RECONCILIATION_DECISION_DERIVATION_CONTRACT;
+  /** Reviewed projection implementation; it must match the collector artifact. */
+  readonly derivationBuildRevision: string;
+  /** Strict surface-specific authoritative input dimensions. */
+  readonly dimensions: Readonly<Record<string, OrganizationReconciliationDimensionEvidence>>;
+}
+
+export interface OrganizationReconciliationDimensionEvidence {
+  readonly count: number;
+  /** HMAC-SHA256 over the sorted complete canonical values for this dimension. */
+  readonly hash: string;
+}
+
 export interface OrganizationReconciliationCollectionEnvelope {
   readonly collectorContract: typeof ORGANIZATION_RECONCILIATION_COLLECTOR_CONTRACT;
   readonly collectorContractHash: string;
+  /** Exact reviewed collector binary revision; trusted policy pins this value. */
+  readonly collectorBuildRevision: string;
   /** Per-run high-entropy value used as the HMAC key; it is never emitted raw. */
   readonly evidenceNonce: string;
   readonly logicalSnapshotId: string;
@@ -135,10 +164,30 @@ export interface OrganizationReconciliationCollectionEnvelope {
   readonly legacy: {
     readonly sourceVersion: string;
     readonly snapshotId: string;
+    readonly subjectUniverse: {
+      readonly subjectCount: number;
+      /** HMAC-SHA256 over the sorted complete subject reference set. */
+      readonly subjectsHash: string;
+    };
+    readonly decisionUniverses: {
+      readonly pluginVisibility: OrganizationReconciliationDecisionUniverseEvidence;
+      readonly campusContexts: OrganizationReconciliationDecisionUniverseEvidence;
+      readonly effectiveDecisions: OrganizationReconciliationDecisionUniverseEvidence;
+    };
   };
   readonly identity: {
     readonly sourceVersion: string;
     readonly snapshotId: string;
+    readonly subjectUniverse: {
+      readonly subjectCount: number;
+      /** HMAC-SHA256 over the sorted complete subject reference set. */
+      readonly subjectsHash: string;
+    };
+    readonly decisionUniverses: {
+      readonly pluginVisibility: OrganizationReconciliationDecisionUniverseEvidence;
+      readonly campusContexts: OrganizationReconciliationDecisionUniverseEvidence;
+      readonly effectiveDecisions: OrganizationReconciliationDecisionUniverseEvidence;
+    };
   };
 }
 
@@ -168,10 +217,11 @@ export interface OrganizationReconciliationCoverageBlocker {
   readonly code:
     | "collection-envelope-missing"
     | "collector-contract-invalid"
+    | "collector-build-revision-invalid"
+    | "real-source-adapters-not-ready"
     | "evidence-nonce-invalid"
     | "logical-snapshot-invalid"
     | "collection-window-invalid"
-    | "source-revision-mismatch"
     | "surface-missing"
     | "source-side-missing"
     | "source-version-missing"
@@ -188,7 +238,15 @@ export interface OrganizationReconciliationCoverageBlocker {
     | "pagination-incomplete"
     | "duplicate-key"
     | "mapping-target-reused"
-    | "cross-surface-reference-invalid";
+    | "cross-surface-reference-invalid"
+    | "subject-universe-invalid"
+    | "subject-universe-side-mismatch"
+    | "decision-universe-invalid"
+    | "decision-universe-derivation-invalid"
+    | "decision-universe-side-mismatch"
+    | "decision-universe-coverage-mismatch"
+    | "decision-dimension-coverage-mismatch"
+    | "decision-subject-universe-coverage-mismatch";
   readonly side?: "legacy" | "identity";
   readonly entityHash?: string;
 }
@@ -210,6 +268,7 @@ export interface OrganizationReconciliationReport {
     | "collector-envelope-self-consistency"
     | "collector-envelope-with-trusted-external-attestation";
   readonly externalProvenanceRequired: true;
+  readonly realSourceAdaptersReady: false;
   readonly comparisonPolicy: "pairwise-no-union";
   /** True only when the caller-supplied envelope is internally consistent. */
   readonly staticChecksPassed: boolean;
@@ -402,6 +461,7 @@ export function validateOrganizationReconciliation(
     }
   );
   validateCrossSurfaceReferences(accumulator, input);
+  validateDecisionUniverseCoverage(accumulator, input);
 
   return finalizeReport(accumulator);
 }
@@ -457,6 +517,7 @@ function finalizeReport(accumulator: ValidationAccumulator): OrganizationReconci
       ? "collector-envelope-with-trusted-external-attestation"
       : "collector-envelope-self-consistency",
     externalProvenanceRequired: true,
+    realSourceAdaptersReady: ORGANIZATION_RECONCILIATION_REAL_SOURCE_ADAPTERS_READY,
     staticChecksPassed,
     ...reportCore,
     safetyGate: {
@@ -485,6 +546,7 @@ function verifyTrustedProvenance(
     const binding = createOrganizationReconciliationProvenanceBinding(
       input,
       envelope.collectorContractHash,
+      envelope.collectorBuildRevision,
       envelope.logicalSnapshotId,
       envelope.windowId,
       envelope.windowStartedAt,
@@ -790,6 +852,9 @@ function validateCollectionEnvelope(
   const block = (code: OrganizationReconciliationCoverageBlocker["code"]): void => {
     accumulator.blockers.push({ surface: "collection-envelope", code });
   };
+  if (!ORGANIZATION_RECONCILIATION_REAL_SOURCE_ADAPTERS_READY) {
+    block("real-source-adapters-not-ready");
+  }
   if (!envelope) {
     block("collection-envelope-missing");
     block("evidence-nonce-invalid");
@@ -800,6 +865,9 @@ function validateCollectionEnvelope(
     !hashesEqual(envelope.collectorContractHash, ORGANIZATION_RECONCILIATION_COLLECTOR_CONTRACT_HASH)
   ) {
     block("collector-contract-invalid");
+  }
+  if (!/^[a-f0-9]{40}$/.test(envelope.collectorBuildRevision)) {
+    block("collector-build-revision-invalid");
   }
   if (!validEvidenceNonce(envelope.evidenceNonce)) block("evidence-nonce-invalid");
   if (!hasVersion(envelope.logicalSnapshotId) || !hasVersion(envelope.windowId)) {
@@ -818,8 +886,203 @@ function validateCollectionEnvelope(
   ) {
     block("logical-snapshot-invalid");
   }
-  if (envelope.legacy.sourceVersion !== envelope.identity.sourceVersion) {
-    block("source-revision-mismatch");
+  for (const side of ["legacy", "identity"] as const) {
+    const universe = envelope[side].subjectUniverse;
+    if (
+      !Number.isSafeInteger(universe.subjectCount) ||
+      universe.subjectCount < 1 ||
+      !/^[a-f0-9]{64}$/.test(universe.subjectsHash)
+    ) {
+      accumulator.blockers.push({ surface: "collection-envelope", code: "subject-universe-invalid", side });
+    }
+  }
+  if (
+    envelope.legacy.subjectUniverse.subjectCount !== envelope.identity.subjectUniverse.subjectCount ||
+    !hashesEqual(
+      envelope.legacy.subjectUniverse.subjectsHash,
+      envelope.identity.subjectUniverse.subjectsHash
+    )
+  ) {
+    block("subject-universe-side-mismatch");
+  }
+  const dimensionsByUniverse = {
+    pluginVisibility: ["organizations", "plugins", "subjects"],
+    campusContexts: ["campuses", "organizations", "subjects"],
+    effectiveDecisions: ["capabilities", "organizations", "resources", "subjects"]
+  } as const;
+  for (const name of ["pluginVisibility", "campusContexts", "effectiveDecisions"] as const) {
+    const requiredDimensions = [...dimensionsByUniverse[name]].sort();
+    for (const side of ["legacy", "identity"] as const) {
+      const universe = envelope[side].decisionUniverses[name];
+      const actualDimensions = Object.keys(universe.dimensions).sort();
+      let derivationInvalid =
+        universe.derivationContract !== ORGANIZATION_RECONCILIATION_DECISION_DERIVATION_CONTRACT ||
+        universe.derivationBuildRevision !== envelope.collectorBuildRevision ||
+        stableSerialize(actualDimensions) !== stableSerialize(requiredDimensions);
+      if (
+        !Number.isSafeInteger(universe.keyCount) ||
+        universe.keyCount < 0 ||
+        !/^[a-f0-9]{64}$/.test(universe.keysHash)
+      ) {
+        accumulator.blockers.push({ surface: "collection-envelope", code: "decision-universe-invalid", side });
+      }
+      for (const dimensionName of requiredDimensions) {
+        const dimension = universe.dimensions[dimensionName];
+        if (
+          !dimension ||
+          !Number.isSafeInteger(dimension.count) ||
+          dimension.count < 0 ||
+          !/^[a-f0-9]{64}$/.test(dimension.hash)
+        ) {
+          derivationInvalid = true;
+        }
+      }
+      const subjectDimension = universe.dimensions.subjects;
+      if (
+        !subjectDimension ||
+        subjectDimension.count !== envelope[side].subjectUniverse.subjectCount ||
+        !hashesEqual(subjectDimension.hash, envelope[side].subjectUniverse.subjectsHash)
+      ) {
+        derivationInvalid = true;
+      }
+      const nonSubjectDimensions = requiredDimensions
+        .filter((dimensionName) => dimensionName !== "subjects")
+        .map((dimensionName) => universe.dimensions[dimensionName]);
+      const mustBeEmpty = nonSubjectDimensions.some((dimension) => dimension?.count === 0);
+      if ((universe.keyCount === 0) !== mustBeEmpty) derivationInvalid = true;
+      if (derivationInvalid) {
+        accumulator.blockers.push({
+          surface: "collection-envelope",
+          code: "decision-universe-derivation-invalid",
+          side
+        });
+      }
+    }
+    const legacy = envelope.legacy.decisionUniverses[name];
+    const identity = envelope.identity.decisionUniverses[name];
+    if (
+      stableSerialize(legacy as unknown as JsonValue) !==
+      stableSerialize(identity as unknown as JsonValue)
+    ) {
+      block("decision-universe-side-mismatch");
+    }
+  }
+  // Heterogeneous sources do not share a native revision namespace. Each page
+  // is bound to its own side above; logicalSnapshotId, the bounded window, and
+  // trusted provenance attest that the two immutable snapshots belong to one
+  // comparison run.
+}
+
+function validateDecisionUniverseCoverage(
+  accumulator: ValidationAccumulator,
+  input: OrganizationReconciliationInput
+): void {
+  const decisionSurfaces: readonly [
+    OrganizationReconciliationSurface,
+    "pluginVisibility" | "campusContexts" | "effectiveDecisions",
+    ReconciliationPair<PluginVisibilityRecord | CampusContextRecord | EffectiveOrganizationDecisionRecord> | undefined,
+    (record: PluginVisibilityRecord | CampusContextRecord | EffectiveOrganizationDecisionRecord) => JsonValue,
+    (record: PluginVisibilityRecord | CampusContextRecord | EffectiveOrganizationDecisionRecord) => Readonly<Record<string, string>>
+  ][] = [
+    [
+      "plugin-visibility",
+      "pluginVisibility",
+      input.pluginVisibility,
+      (record) => {
+        const value = record as PluginVisibilityRecord;
+        return [value.subjectRef, value.pluginRef, value.organizationRef];
+      },
+      (record) => {
+        const value = record as PluginVisibilityRecord;
+        return { subjects: value.subjectRef, plugins: value.pluginRef, organizations: value.organizationRef };
+      }
+    ],
+    [
+      "campus-context",
+      "campusContexts",
+      input.campusContexts,
+      (record) => {
+        const value = record as CampusContextRecord;
+        return [value.subjectRef, value.campusRef];
+      },
+      (record) => {
+        const value = record as CampusContextRecord;
+        return { subjects: value.subjectRef, campuses: value.campusRef, organizations: value.organizationRef };
+      }
+    ],
+    [
+      "effective-decision",
+      "effectiveDecisions",
+      input.effectiveDecisions,
+      (record) => {
+        const value = record as EffectiveOrganizationDecisionRecord;
+        return [value.subjectRef, value.organizationRef, value.resourceRef, value.capabilityRef];
+      },
+      (record) => {
+        const value = record as EffectiveOrganizationDecisionRecord;
+        return {
+          subjects: value.subjectRef,
+          organizations: value.organizationRef,
+          resources: value.resourceRef,
+          capabilities: value.capabilityRef
+        };
+      }
+    ]
+  ];
+  for (const side of ["legacy", "identity"] as const) {
+    for (const [surface, universeName, pair, keyFor, dimensionsFor] of decisionSurfaces) {
+      const universe = input.collectionEnvelope?.[side].decisionUniverses[universeName];
+      if (!universe) continue;
+      const page = pair?.[side];
+      if (!page) continue;
+      const keys = [...new Set(page.records.map((record) => stableSerialize(keyFor(record))))].sort();
+      const keysHash = createOrganizationReconciliationEvidenceHash(
+        accumulator.evidenceNonce,
+        keys
+      );
+      if (keys.length !== universe.keyCount || !hashesEqual(universe.keysHash, keysHash)) {
+        accumulator.blockers.push({ surface, code: "decision-universe-coverage-mismatch", side });
+      }
+      if (universe.keyCount > 0) {
+        const dimensionValues = new Map<string, Set<string>>();
+        for (const record of page.records) {
+          for (const [dimensionName, value] of Object.entries(dimensionsFor(record))) {
+            const values = dimensionValues.get(dimensionName) ?? new Set<string>();
+            values.add(value);
+            dimensionValues.set(dimensionName, values);
+          }
+        }
+        for (const [dimensionName, dimension] of Object.entries(universe.dimensions)) {
+          const values = [...(dimensionValues.get(dimensionName) ?? [])].sort();
+          const hash = createOrganizationReconciliationEvidenceHash(accumulator.evidenceNonce, values);
+          if (values.length !== dimension.count || !hashesEqual(hash, dimension.hash)) {
+            accumulator.blockers.push({
+              surface,
+              code: "decision-dimension-coverage-mismatch",
+              side
+            });
+            break;
+          }
+        }
+        const subjects = [...new Set(page.records.map((record) => record.subjectRef))].sort();
+        const subjectsHash = createOrganizationReconciliationEvidenceHash(
+          accumulator.evidenceNonce,
+          subjects
+        );
+        const subjectUniverse = input.collectionEnvelope?.[side].subjectUniverse;
+        if (
+          !subjectUniverse ||
+          subjects.length !== subjectUniverse.subjectCount ||
+          !hashesEqual(subjectsHash, subjectUniverse.subjectsHash)
+        ) {
+          accumulator.blockers.push({
+            surface,
+            code: "decision-subject-universe-coverage-mismatch",
+            side
+          });
+        }
+      }
+    }
   }
 }
 

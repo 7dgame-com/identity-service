@@ -8,15 +8,16 @@ import {
 import { z } from "zod";
 
 export const ORGANIZATION_RECONCILIATION_PROVENANCE_CONTRACT =
-  "iam-organization-reconciliation-provenance/v1";
+  "iam-organization-reconciliation-provenance/v2";
 export const ORGANIZATION_RECONCILIATION_TRUST_POLICY_CONTRACT =
-  "iam-organization-reconciliation-trust-policy/v1";
+  "iam-organization-reconciliation-trust-policy/v2";
 export const ORGANIZATION_RECONCILIATION_PROVENANCE_AUDIENCE =
   "identity-service/iam-organization-reconciliation";
 export const ORGANIZATION_RECONCILIATION_PROVENANCE_ALGORITHM = "Ed25519";
 
 const identifier = z.string().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9._:-]*$/);
 const sha256 = z.string().regex(/^[a-f0-9]{64}$/);
+const fullBuildRevision = z.string().regex(/^[a-f0-9]{40}$/);
 const canonicalTimestamp = z.string().refine((value) => {
   const timestamp = Date.parse(value);
   return Number.isFinite(timestamp) && new Date(timestamp).toISOString() === value;
@@ -26,6 +27,7 @@ const publicKeyPem = z.string().min(1).max(8192);
 const provenanceBindingSchema = z.object({
   evidenceSha256: sha256,
   collectorContractHash: sha256,
+  collectorBuildRevision: fullBuildRevision,
   logicalSnapshotIdHash: sha256,
   windowIdHash: sha256,
   windowStartedAt: canonicalTimestamp,
@@ -39,6 +41,7 @@ const trustedCollectorSchema = z.object({
   algorithm: z.literal(ORGANIZATION_RECONCILIATION_PROVENANCE_ALGORITHM),
   publicKeyPem,
   publicKeySha256: sha256,
+  buildRevision: fullBuildRevision,
   validFrom: canonicalTimestamp,
   validUntil: canonicalTimestamp
 }).strict();
@@ -85,7 +88,8 @@ const trustedProfileCollectorSchema = z.object({
   collectorId: identifier,
   nodeId: identifier,
   keyId: identifier,
-  publicKeySha256: sha256
+  publicKeySha256: sha256,
+  buildRevision: fullBuildRevision
 }).strict();
 
 const trustedProfileSchema = z.object({
@@ -139,7 +143,7 @@ export interface OrganizationReconciliationProvenanceVerification {
   readonly environment?: string;
 }
 
-const SIGNATURE_DOMAIN = Buffer.from("iam-organization-reconciliation:provenance:v1\u001f", "utf8");
+const SIGNATURE_DOMAIN = Buffer.from("iam-organization-reconciliation:provenance:v2\u001f", "utf8");
 
 /**
  * Verifies a complete evidence digest against a separately pinned trust policy.
@@ -225,6 +229,7 @@ export function verifyOrganizationReconciliationProvenance(
       payload.nodeId !== collector.nodeId ||
       payload.keyId !== collector.keyId ||
       payload.algorithm !== collector.algorithm ||
+      payload.collectorBuildRevision !== collector.buildRevision ||
       !safeHexEqual(payload.trustPolicySha256, policySha256) ||
       !payloadMatchesBinding(payload, evidence)
     ) {
@@ -283,6 +288,9 @@ export function createOrganizationReconciliationProvenancePayload(
   const parsedPolicy = trustPolicySchema.parse(policy);
   const collector = parsedPolicy.requiredCollectors.find((candidate) => candidate.keyId === collectorKeyId);
   if (!collector) throw new Error("Collector key is not present in the trusted policy.");
+  if (collector.buildRevision !== parsedBinding.collectorBuildRevision) {
+    throw new Error("Collector build revision is not pinned by the trusted policy.");
+  }
   const trustPolicySha256 = createOrganizationReconciliationTrustPolicySha256(parsedPolicy);
   return provenancePayloadSchema.parse({
     ...parsedBinding,
@@ -335,6 +343,7 @@ export function createOrganizationReconciliationTrustPolicySha256(
 export function createOrganizationReconciliationProvenanceBinding(
   evidence: unknown,
   collectorContractHash: string,
+  collectorBuildRevision: string,
   logicalSnapshotId: string,
   windowId: string,
   windowStartedAt: string,
@@ -343,6 +352,7 @@ export function createOrganizationReconciliationProvenanceBinding(
   return provenanceBindingSchema.parse({
     evidenceSha256: createCanonicalSha256(evidence),
     collectorContractHash: collectorContractHash.toLowerCase(),
+    collectorBuildRevision,
     logicalSnapshotIdHash: createSha256(logicalSnapshotId),
     windowIdHash: createSha256(windowId),
     windowStartedAt,
@@ -439,6 +449,7 @@ function trustedProfileMatchesPolicy(
       !actual ||
       actual.collectorId !== expected.collectorId ||
       actual.nodeId !== expected.nodeId ||
+      actual.buildRevision !== expected.buildRevision ||
       !safeHexEqual(actual.publicKeySha256, expected.publicKeySha256)
     ) return false;
   }
@@ -451,6 +462,7 @@ function payloadMatchesBinding(
 ): boolean {
   return safeHexEqual(payload.evidenceSha256, binding.evidenceSha256) &&
     safeHexEqual(payload.collectorContractHash, binding.collectorContractHash) &&
+    payload.collectorBuildRevision === binding.collectorBuildRevision &&
     safeHexEqual(payload.logicalSnapshotIdHash, binding.logicalSnapshotIdHash) &&
     safeHexEqual(payload.windowIdHash, binding.windowIdHash) &&
     payload.windowStartedAt === binding.windowStartedAt &&

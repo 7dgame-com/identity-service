@@ -4,12 +4,14 @@ import {
   createOrganizationReconciliationEvidenceHash,
   ORGANIZATION_RECONCILIATION_COLLECTOR_CONTRACT,
   ORGANIZATION_RECONCILIATION_COLLECTOR_CONTRACT_HASH,
+  ORGANIZATION_RECONCILIATION_DECISION_DERIVATION_CONTRACT,
   type OrganizationReconciliationInput
 } from "../src/iam-organization-reconciliation-validator.js";
 import {
   createOrganizationReconciliationAttestationBundleForTest,
   createOrganizationReconciliationPolicyForTest,
-  createOrganizationReconciliationTrustedProfileForTest
+  createOrganizationReconciliationTrustedProfileForTest,
+  TEST_COLLECTOR_BUILD_REVISION
 } from "./iam-organization-reconciliation-provenance.test-fixture.js";
 import {
   createOrganizationReconciliationProvenanceBinding,
@@ -50,7 +52,7 @@ describe("offline IAM organization reconciliation CLI", () => {
     });
     expect(organizationReconciliationCliHelp).toContain("--input=<local-json-file>");
     expect(organizationReconciliationCliHelp).toContain("no network or database access");
-    expect(organizationReconciliationCliHelp).toContain("staticChecksPassed=true");
+    expect(organizationReconciliationCliHelp).toContain("realSourceAdaptersReady=false");
     expect(organizationReconciliationCliHelp).toContain("trusted-provenance verifier");
     expect(organizationReconciliationCliHelp).toContain("--trust-profile=<identifier>");
     expect(organizationReconciliationCliHelp).toContain("immutable compiled trust");
@@ -94,7 +96,7 @@ describe("offline IAM organization reconciliation CLI", () => {
     expect(parseOrganizationReconciliationJson(JSON.stringify(input))).toEqual(input);
   });
 
-  it("returns a hash-only static pass but exits one without trusted external provenance", async () => {
+  it("returns hash-only evidence but retains provenance and real-adapter blockers", async () => {
     const io = memoryIo(JSON.stringify(alignedInput()));
     const exitCode = await runOrganizationReconciliationCli(["--input=/tmp/full-scope.json"], io);
 
@@ -108,21 +110,22 @@ describe("offline IAM organization reconciliation CLI", () => {
       evidencePolicy: "hash-only",
       assuranceScope: "collector-envelope-self-consistency",
       externalProvenanceRequired: true,
-      staticChecksPassed: true,
+      realSourceAdaptersReady: false,
+      staticChecksPassed: false,
       comparisonPolicy: "pairwise-no-union",
       safetyGate: {
         passed: false,
         blocksDualWrite: true,
         unionForbidden: true,
         externalProvenanceVerified: false,
-        blockedReasons: ["external-provenance-required"]
+        blockedReasons: ["coverage-incomplete", "external-provenance-required"]
       }
     });
     expect(report.reportHash).toMatch(/^[a-f0-9]{24}$/);
     expectNoRawEvidence(io.stdout);
   });
 
-  it("returns zero only with a separately pinned, complete trusted attestation set", async () => {
+  it("verifies a pinned attestation set but cannot pass before real adapters are registered", async () => {
     const fixture = trustedCliFixture();
     const io = artifactIo(fixture.files, fixture.trustedProfile);
     const exitCode = await runOrganizationReconciliationCli([
@@ -132,11 +135,11 @@ describe("offline IAM organization reconciliation CLI", () => {
       "--trust-profile=test-dual-node"
     ], io);
 
-    expect(exitCode).toBe(0);
+    expect(exitCode).toBe(1);
     expect(io.stderr).toBe("");
     expect(JSON.parse(io.stdout)).toMatchObject({
       assuranceScope: "collector-envelope-with-trusted-external-attestation",
-      staticChecksPassed: true,
+      staticChecksPassed: false,
       provenanceVerification: {
         verified: true,
         reasonCode: "verified",
@@ -146,10 +149,10 @@ describe("offline IAM organization reconciliation CLI", () => {
         environmentHash: expect.stringMatching(/^[a-f0-9]{24}$/)
       },
       safetyGate: {
-        passed: true,
-        blocksDualWrite: false,
+        passed: false,
+        blocksDualWrite: true,
         externalProvenanceVerified: true,
-        blockedReasons: []
+        blockedReasons: ["coverage-incomplete"]
       }
     });
     expectNoRawEvidence(io.stdout);
@@ -184,12 +187,12 @@ describe("offline IAM organization reconciliation CLI", () => {
     });
     expect(await runOrganizationReconciliationCli(args, wrongPin)).toBe(1);
     expect(JSON.parse(wrongPin.stdout)).toMatchObject({
-      staticChecksPassed: true,
+      staticChecksPassed: false,
       provenanceVerification: { verified: false, reasonCode: "trust-policy-pin-mismatch" },
       safetyGate: {
         passed: false,
         blocksDualWrite: true,
-        blockedReasons: ["external-provenance-required"]
+        blockedReasons: ["coverage-incomplete", "external-provenance-required"]
       }
     });
   });
@@ -213,7 +216,7 @@ describe("offline IAM organization reconciliation CLI", () => {
       safetyGate: {
         passed: false,
         blocksDualWrite: true,
-        blockedReasons: ["p0-findings", "external-provenance-required"]
+        blockedReasons: ["coverage-incomplete", "p0-findings", "external-provenance-required"]
       }
     });
     expect(io.stdout).not.toContain("private-subject");
@@ -228,7 +231,10 @@ describe("offline IAM organization reconciliation CLI", () => {
 
     expect(exitCode).toBe(1);
     expect(JSON.parse(io.stdout)).toMatchObject({
-      coverageBlockers: [{ surface: "plugin-visibility", code: "surface-missing" }],
+      coverageBlockers: [
+        { surface: "collection-envelope", code: "real-source-adapters-not-ready" },
+        { surface: "plugin-visibility", code: "surface-missing" }
+      ],
       safetyGate: {
         passed: false,
         coverageComplete: false,
@@ -266,6 +272,39 @@ describe("offline IAM organization reconciliation CLI", () => {
     const arbitraryMetadata = alignedInput() as unknown as Record<string, any>;
     arbitraryMetadata.memberships.legacy.records[0].metadata = { authorizationScope: "raw-secret-scope" };
     expect(() => parseOrganizationReconciliationJson(JSON.stringify(arbitraryMetadata)))
+      .toThrow(OrganizationReconciliationCliError);
+
+    const missingBuild = structuredClone(alignedInput()) as unknown as Record<string, any>;
+    delete missingBuild.collectionEnvelope.collectorBuildRevision;
+    expect(() => parseOrganizationReconciliationJson(JSON.stringify(missingBuild)))
+      .toThrow(OrganizationReconciliationCliError);
+
+    const missingSubjectUniverse = structuredClone(alignedInput()) as unknown as Record<string, any>;
+    delete missingSubjectUniverse.collectionEnvelope.identity.subjectUniverse;
+    expect(() => parseOrganizationReconciliationJson(JSON.stringify(missingSubjectUniverse)))
+      .toThrow(OrganizationReconciliationCliError);
+
+    const missingDecisionUniverse = structuredClone(alignedInput()) as unknown as Record<string, any>;
+    delete missingDecisionUniverse.collectionEnvelope.legacy.decisionUniverses.effectiveDecisions;
+    expect(() => parseOrganizationReconciliationJson(JSON.stringify(missingDecisionUniverse)))
+      .toThrow(OrganizationReconciliationCliError);
+
+    const missingDimension = structuredClone(alignedInput()) as unknown as Record<string, any>;
+    delete missingDimension.collectionEnvelope.legacy.decisionUniverses.pluginVisibility.dimensions.plugins;
+    expect(() => parseOrganizationReconciliationJson(JSON.stringify(missingDimension)))
+      .toThrow(OrganizationReconciliationCliError);
+
+    const extraDimension = structuredClone(alignedInput()) as unknown as Record<string, any>;
+    extraDimension.collectionEnvelope.identity.decisionUniverses.campusContexts.dimensions.resources = {
+      count: 1,
+      hash: "b".repeat(64)
+    };
+    expect(() => parseOrganizationReconciliationJson(JSON.stringify(extraDimension)))
+      .toThrow(OrganizationReconciliationCliError);
+
+    const v1Contract = structuredClone(alignedInput()) as unknown as Record<string, any>;
+    v1Contract.collectionEnvelope.collectorContract = "iam-organization-reconciliation-collector/v1";
+    expect(() => parseOrganizationReconciliationJson(JSON.stringify(v1Contract)))
       .toThrow(OrganizationReconciliationCliError);
   });
 
@@ -360,6 +399,7 @@ function trustedCliFixture() {
   const binding = createOrganizationReconciliationProvenanceBinding(
     input,
     envelope.collectorContractHash,
+    envelope.collectorBuildRevision,
     envelope.logicalSnapshotId,
     envelope.windowId,
     envelope.windowStartedAt,
@@ -427,16 +467,16 @@ function alignedInput(): OrganizationReconciliationInput {
 
 function pair<T>(legacy: readonly T[], identity: readonly T[]) {
   return {
-    legacy: page(legacy, "legacy-private-snapshot"),
-    identity: page(identity, "identity-private-snapshot")
+    legacy: page(legacy, "legacy-private-source-version", "legacy-private-snapshot"),
+    identity: page(identity, "identity-private-source-version", "identity-private-snapshot")
   };
 }
 
-function page<T>(records: readonly T[], snapshotId: string) {
+function page<T>(records: readonly T[], sourceVersion: string, snapshotId: string) {
   const recordsHash = createOrganizationReconciliationEvidenceHash(EVIDENCE_NONCE, records as never);
   return {
     records,
-    sourceVersion: "private-source-version",
+    sourceVersion,
     nextCursor: null,
     collection: {
       snapshotId,
@@ -462,13 +502,67 @@ function collectionEnvelope() {
   return {
     collectorContract: ORGANIZATION_RECONCILIATION_COLLECTOR_CONTRACT,
     collectorContractHash: ORGANIZATION_RECONCILIATION_COLLECTOR_CONTRACT_HASH,
+    collectorBuildRevision: TEST_COLLECTOR_BUILD_REVISION,
     evidenceNonce: EVIDENCE_NONCE,
     logicalSnapshotId: "private-logical-snapshot",
     windowId: "private-window",
     windowStartedAt: "2026-08-09T00:00:00.000Z",
     windowEndedAt: "2026-08-09T00:05:00.000Z",
-    legacy: { sourceVersion: "private-source-version", snapshotId: "legacy-private-snapshot" },
-    identity: { sourceVersion: "private-source-version", snapshotId: "identity-private-snapshot" }
+    legacy: {
+      sourceVersion: "legacy-private-source-version",
+      snapshotId: "legacy-private-snapshot",
+      subjectUniverse: { subjectCount: 1, subjectsHash: SUBJECT_UNIVERSE_HASH },
+      decisionUniverses: DECISION_UNIVERSES
+    },
+    identity: {
+      sourceVersion: "identity-private-source-version",
+      snapshotId: "identity-private-snapshot",
+      subjectUniverse: { subjectCount: 1, subjectsHash: SUBJECT_UNIVERSE_HASH },
+      decisionUniverses: DECISION_UNIVERSES
+    }
+  } as const;
+}
+
+const SUBJECT_UNIVERSE_HASH = createOrganizationReconciliationEvidenceHash(
+  EVIDENCE_NONCE,
+  ["private-subject"]
+);
+const DECISION_UNIVERSES = {
+  pluginVisibility: decisionUniverse(
+    [["private-subject", "private-plugin", "private-org-name"]],
+    { subjects: ["private-subject"], plugins: ["private-plugin"], organizations: ["private-org-name"] }
+  ),
+  campusContexts: decisionUniverse(
+    [["private-subject", "private-campus"]],
+    { subjects: ["private-subject"], campuses: ["private-campus"], organizations: ["private-org-name"] }
+  ),
+  effectiveDecisions: decisionUniverse([
+    ["private-subject", "private-org-name", "private-resource", "private-capability"]
+  ], {
+    subjects: ["private-subject"],
+    organizations: ["private-org-name"],
+    resources: ["private-resource"],
+    capabilities: ["private-capability"]
+  })
+};
+
+function decisionUniverse(
+  keys: readonly (readonly string[])[],
+  dimensions: Readonly<Record<string, readonly string[]>>
+) {
+  const canonicalKeys = [...new Set(keys.map((key) => JSON.stringify(key)))].sort();
+  return {
+    keyCount: canonicalKeys.length,
+    keysHash: createOrganizationReconciliationEvidenceHash(EVIDENCE_NONCE, canonicalKeys),
+    derivationContract: ORGANIZATION_RECONCILIATION_DECISION_DERIVATION_CONTRACT,
+    derivationBuildRevision: TEST_COLLECTOR_BUILD_REVISION,
+    dimensions: Object.fromEntries(Object.entries(dimensions).map(([name, values]) => {
+      const canonicalValues = [...new Set(values)].sort();
+      return [name, {
+        count: canonicalValues.length,
+        hash: createOrganizationReconciliationEvidenceHash(EVIDENCE_NONCE, canonicalValues)
+      }];
+    }))
   } as const;
 }
 

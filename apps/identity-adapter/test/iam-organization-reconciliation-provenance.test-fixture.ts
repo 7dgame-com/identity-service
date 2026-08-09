@@ -14,6 +14,8 @@ import {
   type OrganizationReconciliationTrustedProfile
 } from "../src/iam-organization-reconciliation-provenance.js";
 
+export const TEST_COLLECTOR_BUILD_REVISION = "a".repeat(40);
+
 export function createOrganizationReconciliationPolicyForTest(
   collectors: readonly {
     readonly collectorId: string;
@@ -43,6 +45,7 @@ export function createOrganizationReconciliationPolicyForTest(
         algorithm: ORGANIZATION_RECONCILIATION_PROVENANCE_ALGORITHM,
         publicKeyPem,
         publicKeySha256: createHash("sha256").update(publicKeyDer).digest("hex"),
+        buildRevision: TEST_COLLECTOR_BUILD_REVISION,
         validFrom: "2026-08-09T00:00:00.000Z",
         validUntil: "2026-08-09T00:30:00.000Z"
       };
@@ -61,7 +64,8 @@ export function createOrganizationReconciliationTrustedProfileForTest(
       collectorId: collector.collectorId,
       nodeId: collector.nodeId,
       keyId: collector.keyId,
-      publicKeySha256: collector.publicKeySha256
+      publicKeySha256: collector.publicKeySha256,
+      buildRevision: collector.buildRevision
     }))
   };
 }

@@ -1,32 +1,64 @@
-import { generateKeyPairSync } from "node:crypto";
+import { generateKeyPairSync, sign } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   createOrganizationReconciliationAttestationBundleForTest,
   createOrganizationReconciliationPolicyForTest,
-  createOrganizationReconciliationTrustedProfileForTest
+  createOrganizationReconciliationTrustedProfileForTest,
+  TEST_COLLECTOR_BUILD_REVISION
 } from "./iam-organization-reconciliation-provenance.test-fixture.js";
 import {
   createOrganizationReconciliationCollectedSnapshot,
+  createOrganizationReconciliationEvidenceHash,
   ORGANIZATION_RECONCILIATION_COLLECTOR_CONTRACT,
   ORGANIZATION_RECONCILIATION_COLLECTOR_CONTRACT_HASH,
+  ORGANIZATION_RECONCILIATION_DECISION_DERIVATION_CONTRACT,
   type OrganizationReconciliationInput,
   validateOrganizationReconciliation
 } from "../src/iam-organization-reconciliation-validator.js";
 import {
   createOrganizationReconciliationProvenanceBinding,
+  ORGANIZATION_RECONCILIATION_PROVENANCE_CONTRACT,
+  ORGANIZATION_RECONCILIATION_TRUST_POLICY_CONTRACT,
+  serializeOrganizationReconciliationProvenancePayload,
   verifyOrganizationReconciliationProvenance,
   type OrganizationReconciliationTrustPolicy
 } from "../src/iam-organization-reconciliation-provenance.js";
 
 describe("trusted external provenance for organization reconciliation", () => {
-  it("promotes only complete aligned evidence signed by every pinned collector", () => {
+  it("pins the v2 contracts and rejects a signature made for the v1 domain", () => {
+    expect(ORGANIZATION_RECONCILIATION_PROVENANCE_CONTRACT)
+      .toBe("iam-organization-reconciliation-provenance/v2");
+    expect(ORGANIZATION_RECONCILIATION_TRUST_POLICY_CONTRACT)
+      .toBe("iam-organization-reconciliation-trust-policy/v2");
+
+    const fixture = provenanceFixture();
+    const attestations = [...fixture.context.attestationBundle.attestations];
+    const first = attestations[0]!;
+    const v2Domain = Buffer.from("iam-organization-reconciliation:provenance:v2\u001f", "utf8");
+    const v1Domain = Buffer.from("iam-organization-reconciliation:provenance:v1\u001f", "utf8");
+    const v2Payload = serializeOrganizationReconciliationProvenancePayload(first.payload);
+    expect(v2Payload.subarray(0, v2Domain.length)).toEqual(v2Domain);
+    const v1Payload = Buffer.concat([v1Domain, v2Payload.subarray(v2Domain.length)]);
+    attestations[0] = {
+      ...first,
+      signature: sign(null, v1Payload, fixture.privateKeys[0]!).toString("base64url")
+    };
+
+    expect(verifyOrganizationReconciliationProvenance(fixture.binding, {
+      ...fixture.context,
+      attestationBundle: { ...fixture.context.attestationBundle, attestations }
+    })).toMatchObject({ verified: false, code: "signature-invalid", verifiedAttestationCount: 0 });
+  });
+
+  it("verifies complete aligned evidence but retains the compiled real-adapter blocker", () => {
     const fixture = provenanceFixture();
     const report = validateOrganizationReconciliation(fixture.input, {
       trustedProvenance: fixture.context
     });
 
     expect(report).toMatchObject({
-      staticChecksPassed: true,
+      realSourceAdaptersReady: false,
+      staticChecksPassed: false,
       assuranceScope: "collector-envelope-with-trusted-external-attestation",
       provenanceVerification: {
         verified: true,
@@ -37,10 +69,10 @@ describe("trusted external provenance for organization reconciliation", () => {
         environmentHash: expect.stringMatching(/^[a-f0-9]{24}$/)
       },
       safetyGate: {
-        passed: true,
-        blocksDualWrite: false,
+        passed: false,
+        blocksDualWrite: true,
         externalProvenanceVerified: true,
-        blockedReasons: []
+        blockedReasons: ["coverage-incomplete"]
       }
     });
     expect(report.provenanceVerification.trustPolicyHash).toMatch(/^[a-f0-9]{24}$/);
@@ -51,7 +83,7 @@ describe("trusted external provenance for organization reconciliation", () => {
     const report = validateOrganizationReconciliation(alignedInput());
 
     expect(report).toMatchObject({
-      staticChecksPassed: true,
+      staticChecksPassed: false,
       provenanceVerification: {
         verified: false,
         reasonCode: "trusted-context-missing",
@@ -62,7 +94,7 @@ describe("trusted external provenance for organization reconciliation", () => {
         passed: false,
         blocksDualWrite: true,
         externalProvenanceVerified: false,
-        blockedReasons: ["external-provenance-required"]
+        blockedReasons: ["coverage-incomplete", "external-provenance-required"]
       }
     });
   });
@@ -72,14 +104,30 @@ describe("trusted external provenance for organization reconciliation", () => {
     const changed = alignedInput("changed-private-organization");
     const report = validateOrganizationReconciliation(changed, { trustedProvenance: fixture.context });
 
-    expect(report.staticChecksPassed).toBe(true);
+    expect(report.staticChecksPassed).toBe(false);
     expect(report.provenanceVerification.reasonCode).toBe("attestation-binding-mismatch");
     expect(report.safetyGate).toMatchObject({
       passed: false,
       externalProvenanceVerified: false,
-      blockedReasons: ["external-provenance-required"]
+      blockedReasons: ["coverage-incomplete", "external-provenance-required"]
     });
     expect(JSON.stringify(report)).not.toContain("changed-private-organization");
+  });
+
+  it("rejects a changed collector build even when the evidence is otherwise complete", () => {
+    const fixture = provenanceFixture();
+    const changedBuildInput: OrganizationReconciliationInput = {
+      ...fixture.input,
+      collectionEnvelope: {
+        ...fixture.input.collectionEnvelope!,
+        collectorBuildRevision: "b".repeat(40)
+      }
+    };
+    const report = validateOrganizationReconciliation(changedBuildInput, {
+      trustedProvenance: fixture.context
+    });
+    expect(report.provenanceVerification.reasonCode).toBe("attestation-binding-mismatch");
+    expect(report.safetyGate.passed).toBe(false);
   });
 
   it("rejects a self-selected policy, a missing required node, and an invalid signature", () => {
@@ -246,7 +294,7 @@ describe("trusted external provenance for organization reconciliation", () => {
     })).toMatchObject({ verified: false, code: "attestation-window-invalid" });
   });
 
-  it("never lets a valid external attestation override a source-revision or P0 gate", () => {
+  it("never lets a valid external attestation override a changed per-side revision or P0 gate", () => {
     const revisionInput = alignedInput();
     const revisionMismatch: OrganizationReconciliationInput = {
       ...revisionInput,
@@ -264,7 +312,8 @@ describe("trusted external provenance for organization reconciliation", () => {
     });
     expect(revisionReport.provenanceVerification.verified).toBe(true);
     expect(revisionReport.coverageBlockers).toEqual(expect.arrayContaining([
-      { surface: "collection-envelope", code: "source-revision-mismatch" }
+      { surface: "organization-directory", code: "source-version-envelope-mismatch", side: "identity" },
+      { surface: "effective-decision", code: "source-version-envelope-mismatch", side: "identity" }
     ]));
     expect(revisionReport.safetyGate).toMatchObject({
       passed: false,
@@ -281,7 +330,7 @@ describe("trusted external provenance for organization reconciliation", () => {
       effectiveDecisions: {
         legacy: createOrganizationReconciliationCollectedSnapshot(
           EVIDENCE_NONCE,
-          SOURCE_VERSION,
+          LEGACY_SOURCE_VERSION,
           LEGACY_SNAPSHOT,
           [{
             requestCursor: null,
@@ -299,7 +348,7 @@ describe("trusted external provenance for organization reconciliation", () => {
     expect(p0Report.safetyGate).toMatchObject({
       passed: false,
       blocksDualWrite: true,
-      blockedReasons: ["p0-findings"]
+      blockedReasons: ["coverage-incomplete", "p0-findings"]
     });
   });
 
@@ -356,7 +405,7 @@ describe("trusted external provenance for organization reconciliation", () => {
   it("assembles only a complete, ordered, terminal cursor chain", () => {
     const snapshot = createOrganizationReconciliationCollectedSnapshot(
       EVIDENCE_NONCE,
-      SOURCE_VERSION,
+      LEGACY_SOURCE_VERSION,
       "legacy-snapshot",
       [
         { requestCursor: null, nextCursor: "cursor-2", records: [{ value: "first" }] },
@@ -365,7 +414,7 @@ describe("trusted external provenance for organization reconciliation", () => {
     );
 
     expect(snapshot).toMatchObject({
-      sourceVersion: SOURCE_VERSION,
+      sourceVersion: LEGACY_SOURCE_VERSION,
       nextCursor: null,
       collection: {
         firstCursor: null,
@@ -379,13 +428,13 @@ describe("trusted external provenance for organization reconciliation", () => {
     });
     expect(() => createOrganizationReconciliationCollectedSnapshot(
       EVIDENCE_NONCE,
-      SOURCE_VERSION,
+      LEGACY_SOURCE_VERSION,
       "legacy-snapshot",
       [{ requestCursor: null, nextCursor: "not-terminal", records: [] }]
     )).toThrow(/complete cursor chain/);
     expect(() => createOrganizationReconciliationCollectedSnapshot(
       EVIDENCE_NONCE,
-      SOURCE_VERSION,
+      LEGACY_SOURCE_VERSION,
       "legacy-snapshot",
       [
         { requestCursor: null, nextCursor: "cursor-2", records: [] },
@@ -427,6 +476,7 @@ function bindingFor(input: OrganizationReconciliationInput) {
   return createOrganizationReconciliationProvenanceBinding(
     input,
     envelope.collectorContractHash,
+    envelope.collectorBuildRevision,
     envelope.logicalSnapshotId,
     envelope.windowId,
     envelope.windowStartedAt,
@@ -436,10 +486,10 @@ function bindingFor(input: OrganizationReconciliationInput) {
 
 function alignedInput(organizationName = "private-organization"): OrganizationReconciliationInput {
   const pair = <T>(records: readonly T[]) => ({
-    legacy: createOrganizationReconciliationCollectedSnapshot(EVIDENCE_NONCE, SOURCE_VERSION, LEGACY_SNAPSHOT, [
+    legacy: createOrganizationReconciliationCollectedSnapshot(EVIDENCE_NONCE, LEGACY_SOURCE_VERSION, LEGACY_SNAPSHOT, [
       { requestCursor: null, nextCursor: null, records }
     ]),
-    identity: createOrganizationReconciliationCollectedSnapshot(EVIDENCE_NONCE, SOURCE_VERSION, IDENTITY_SNAPSHOT, [
+    identity: createOrganizationReconciliationCollectedSnapshot(EVIDENCE_NONCE, IDENTITY_SOURCE_VERSION, IDENTITY_SNAPSHOT, [
       { requestCursor: null, nextCursor: null, records }
     ])
   });
@@ -447,13 +497,24 @@ function alignedInput(organizationName = "private-organization"): OrganizationRe
     collectionEnvelope: {
       collectorContract: ORGANIZATION_RECONCILIATION_COLLECTOR_CONTRACT,
       collectorContractHash: ORGANIZATION_RECONCILIATION_COLLECTOR_CONTRACT_HASH,
+      collectorBuildRevision: TEST_COLLECTOR_BUILD_REVISION,
       evidenceNonce: EVIDENCE_NONCE,
       logicalSnapshotId: "private-logical-snapshot",
       windowId: "private-window",
       windowStartedAt: "2026-08-09T00:05:00.000Z",
       windowEndedAt: "2026-08-09T00:06:00.000Z",
-      legacy: { sourceVersion: SOURCE_VERSION, snapshotId: LEGACY_SNAPSHOT },
-      identity: { sourceVersion: SOURCE_VERSION, snapshotId: IDENTITY_SNAPSHOT }
+      legacy: {
+        sourceVersion: LEGACY_SOURCE_VERSION,
+        snapshotId: LEGACY_SNAPSHOT,
+        subjectUniverse: { subjectCount: 1, subjectsHash: SUBJECT_UNIVERSE_HASH },
+        decisionUniverses: decisionUniverses(organizationName)
+      },
+      identity: {
+        sourceVersion: IDENTITY_SOURCE_VERSION,
+        snapshotId: IDENTITY_SNAPSHOT,
+        subjectUniverse: { subjectCount: 1, subjectsHash: SUBJECT_UNIVERSE_HASH },
+        decisionUniverses: decisionUniverses(organizationName)
+      }
     },
     organizationDirectory: pair([{ legacyOrganizationId: 1, name: organizationName, title: null, active: true }]),
     organizationMappings: pair([{ legacyOrganizationId: 1, identityOrganizationId: "private-identity-org", active: true }]),
@@ -483,6 +544,52 @@ function expectNoRawProvenance(report: unknown): void {
 }
 
 const EVIDENCE_NONCE = "c3".repeat(32);
-const SOURCE_VERSION = "private-source-version";
+const LEGACY_SOURCE_VERSION = "private-legacy-source-version";
+const IDENTITY_SOURCE_VERSION = "private-identity-source-version";
 const LEGACY_SNAPSHOT = "legacy-private-snapshot";
 const IDENTITY_SNAPSHOT = "identity-private-snapshot";
+const SUBJECT_UNIVERSE_HASH = createOrganizationReconciliationEvidenceHash(
+  EVIDENCE_NONCE,
+  ["private-subject"]
+);
+
+function decisionUniverses(organizationName: string) {
+  return {
+    pluginVisibility: decisionUniverse(
+      [["private-subject", "private-plugin", organizationName]],
+      { subjects: ["private-subject"], plugins: ["private-plugin"], organizations: [organizationName] }
+    ),
+    campusContexts: decisionUniverse(
+      [["private-subject", "private-campus"]],
+      { subjects: ["private-subject"], campuses: ["private-campus"], organizations: [organizationName] }
+    ),
+    effectiveDecisions: decisionUniverse([
+      ["private-subject", organizationName, "private-resource", "private-capability"]
+    ], {
+      subjects: ["private-subject"],
+      organizations: [organizationName],
+      resources: ["private-resource"],
+      capabilities: ["private-capability"]
+    })
+  };
+}
+
+function decisionUniverse(
+  keys: readonly (readonly string[])[],
+  dimensions: Readonly<Record<string, readonly string[]>>
+) {
+  const canonicalKeys = [...new Set(keys.map((key) => JSON.stringify(key)))].sort();
+  return {
+    keyCount: canonicalKeys.length,
+    keysHash: createOrganizationReconciliationEvidenceHash(EVIDENCE_NONCE, canonicalKeys),
+    derivationContract: ORGANIZATION_RECONCILIATION_DECISION_DERIVATION_CONTRACT,
+    derivationBuildRevision: TEST_COLLECTOR_BUILD_REVISION,
+    dimensions: Object.fromEntries(Object.entries(dimensions).map(([name, values]) => {
+      const canonicalValues = [...new Set(values)].sort();
+      return [name, {
+        count: canonicalValues.length,
+        hash: createOrganizationReconciliationEvidenceHash(EVIDENCE_NONCE, canonicalValues)
+      }];
+    }))
+  } as const;
+}

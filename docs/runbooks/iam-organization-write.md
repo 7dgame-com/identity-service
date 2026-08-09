@@ -311,8 +311,8 @@ npm run iam:organization-reconciliation:validate:dist -- \
 ```
 
 输入上限 16 MiB，CLI 在读取前先验证路径为普通本地文件并检查大小，读取后再次校验 byte count。
-根输入必须包含 collector contract/hash、每次运行随机的高熵 `evidenceNonce`、logical snapshot/window、
-两侧共同 source revision 与各自 snapshot ID。必须完整包含以下八个 surface；每个 surface 必须同时
+根输入必须包含 v2 collector contract/hash、每次运行随机的高熵 `evidenceNonce`、logical snapshot/window、
+两侧各自非空的 source revision 与各自 snapshot ID；异构 source revision 不要求字面相同。必须完整包含以下八个 surface；每个 surface 必须同时
 提供 `legacy` 与 `identity` 两侧，每侧必须包含 `records`、与根 envelope 一致的非空
 `sourceVersion`/snapshot ID，以及显式终止的 `nextCursor: null`。空字符串、空白字符串和非空 cursor
 均不是终止证据：
@@ -328,7 +328,7 @@ npm run iam:organization-reconciliation:validate:dist -- \
 | `campusContexts` | subject + campus + organization context 的 allow/deny |
 | `effectiveDecisions` | subject + organization context + resource + capability 的最终 allow/deny |
 
-surface、任一侧、collector envelope、共同 source revision、snapshot ID 或 pagination state 缺失，
+surface、任一侧、collector envelope、本侧 source revision、snapshot ID 或 pagination state 缺失，
 `nextCursor` 非 null，或同一侧出现重复业务键，均为 coverage blocker。每侧 collection 必须从
 `requestCursor=null` 开始，连续证明 page number、request/next cursor、record offset/count、page
 count、总 record count、逐页及聚合 HMAC，并以 `nextCursor=null` 结束；任一断链、截断、hash
@@ -344,15 +344,18 @@ validator 的比较策略固定为 `pairwise-no-union`：Legacy 与 Identity 独
 - P1：Identity 缺记录/决策、directory/member/scoped-role 语义冲突，以及
   `Legacy allow / Identity deny`；
 - P2：仅限显式 allowlist 的 organization directory `title` 展示差异；任意通用 metadata 已从输入
-  契约移除，source revision 不一致属于 coverage blocker，不得降级成 P2/info。
+  契约移除；page source revision 与本侧 envelope 不一致属于 coverage blocker，不得降级成 P2/info。
 
-输出固定声明 `dryRun=true`、`writeSideEffects=none`、`evidencePolicy=hash-only`、
-`assuranceScope=collector-envelope-self-consistency`、`externalProvenanceRequired=true`。实体、两侧值和
+当前构建还固定声明 `realSourceAdaptersReady=false` 并输出 coverage blocker；该值来自受审源码，不能由
+输入 JSON、argv、环境变量、source adapter 或签名覆盖。在全部真实 adapter 注册并经源码审核前，即使
+静态 envelope 与签名均有效也不得把 Task 7.2 判为 PASS。输出同时固定声明 `dryRun=true`、
+`writeSideEffects=none`、`evidencePolicy=hash-only`、`externalProvenanceRequired=true`；snapshot-only
+时 `assuranceScope=collector-envelope-self-consistency`，仅完整可信签名通过时才升级为 external attestation。实体、两侧值和
 source version 只使用本次 nonce 的 HMAC/hash，不回显 raw subject、organization ID/name、binding
 或 decision 上下文；nonce 缺失/非法时直接短路敏感比较，不以可预测 key 生成实体 hash。原始输入
 本身仍可能含这些值，必须保留在获批的本地临时边界内，不得提交仓库或复制到报告。参数/文件/
-JSON/schema 错误退出 2。`staticChecksPassed=true` 只表示 envelope 内部一致且没有静态 P0/P1；
-snapshot-only 调用没有外部信任根，固定返回 `externalProvenanceVerified=false`、
+JSON/schema 错误退出 2。当前因真实 adapter blocker，`staticChecksPassed=false`；未来只有经审核注册全部
+真实 adapter 且 envelope 内部一致、没有静态 P0/P1 时才可能为 true。snapshot-only 调用没有外部信任根，固定返回 `externalProvenanceVerified=false`、
 `safetyGate.passed=false`、`blocksDualWrite=true`，并以 `external-provenance-required` 退出 1。输入中
 不存在可伪造的 provenance 布尔开关或公钥字段。
 
@@ -371,12 +374,13 @@ npm run iam:organization-reconciliation:validate:dist -- \
   --trust-profile=<reviewed-compiled-profile-id>
 ```
 
-Compiled profile 固定 policy SHA-256、预期 environment，以及 required collector/node/key/fingerprint
+Compiled profile 固定 policy SHA-256、预期 environment，以及 required collector/node/key/fingerprint/build revision
 集合；policy、签名 payload 与 report hash 同时绑定 profile/environment，避免把合法 Develop profile
 误用为 Production 证据。Policy 只接受 canonical SPKI Ed25519 public key，并逐 key 校验 SPKI SHA-256
 fingerprint；必须要求 2–8 个 collector，collector ID、node ID、key ID 和真实 key fingerprint 均唯一，
 缺任一签名、额外/重复 signer、key/fingerprint 不符均 fail closed。
-每个 domain-separated 签名绑定 canonical 完整 snapshot digest、collector contract hash、logical
+每个 domain-separated 签名绑定 canonical 完整 snapshot digest、collector contract hash、受审 collector
+完整 40 位 build revision、logical
 snapshot/window digest、environment、collector/node/key、policy digest、collection window 和签发/
 过期时间。Policy 同时限制 collection window、证据年龄、attestation TTL、key/policy 有效期和 clock
 skew。只有全部 required collector 签名有效且静态门禁通过，才会设置
@@ -387,9 +391,28 @@ environment 或原始业务值。Trusted artifact schema/文件/profile 参数�
 CLI 的通用 safety gate 允许“已分类 P2”存在，但工作包 4 的 Phase 4 准入更严格：仍要求
 `P0=0、P1=0、P2=0、mismatch=0`，所以 P2 非零即使 CLI 退出 0 也不能推进。
 
-本地代码另提供无 I/O 的 cursor-chain assembler（只接受从 `requestCursor=null` 到
-`nextCursor=null` 的完整有序链）以及可交给 HSM/KMS 的 canonical attestation payload/signature
-组装接口；verifier 本身不读取或持有 private key。仓库仍没有连接 Legacy/Identity runtime 的
+collector、provenance、trust-policy 与签名 domain 均为 v2；v1 evidence/policy/signature 不兼容且必须拒绝。
+Collector build revision 只能由受审 artifact 注入的 build-revision provider 产生并随 evidence 携带；
+source adapter、调用参数与 evidence 均不能把自身字段作为权威来源，也不能覆盖 compiled trust
+profile/policy 对该完整 40 位 revision 的外部 pin。
+
+Legacy 与 Identity 使用不同版本命名空间时，二者的 source-owned opaque `sourceVersion` 允许不同；
+每侧 page 必须与本侧 envelope 的 version/snapshot 精确一致，跨源同窗由 `logicalSnapshotId`、有界
+collection window 和 trusted attestation 证明，不能伪造相同版本字符串。Envelope 还要求两侧相同的
+完整 subject universe count/HMAC，以及 plugin visibility、campus context、effective decision 各自的
+版本化 canonical key universe count/HMAC。每个 decision universe 还必须携带 v2 derivation contract、
+与 collector artifact 相同的 build revision，以及严格的权威维度 count/HMAC：plugin visibility 为
+subject/plugin/organization，campus context 为 subject/campus/organization，effective decision 为
+subject/organization/resource/capability。逐页记录必须精确覆盖 key 与所有非空维度；非空 surface 必须
+覆盖完整 subject universe。只有至少一个非 subject 权威维度被 adapter 证明为零时，keyCount=0 才合法；
+不得用空 memberships 推导 subject universe、由调用方自报“真实空”，或静默省略零成员主体。
+
+本地代码另提供严格 source-adapter collector primitive：只接受 immutable snapshot、snapshot-bound opaque
+cursor、精确 count/offset/order/unique key，并在成功、读取失败、解码失败或顺序失败后 exactly-once
+释放私有 snapshot/事务；close 失败同样拒绝证据，私有 source token 不进入 public evidence。它继续提供
+无 I/O 的 cursor-chain assembler（只接受从 `requestCursor=null` 到 `nextCursor=null` 的完整有序链）以及
+可交给 HSM/KMS 的 canonical attestation payload/signature 组装接口；verifier 本身不读取或持有 private key。
+仓库仍没有连接 Legacy/Identity runtime 的
 source-specific collector adapter，也没有已批准的公钥 policy、compiled trust profile、签名服务、逐页原始
 响应保管或双节点运行证据。因此本地测试 PASS 只证明 verifier/collector primitives 正确，不证明外部
 API/数据库实际返回这些页，也不单独完成 Task 7.2。任何采集、部署、数据库访问或运行时写入仍需

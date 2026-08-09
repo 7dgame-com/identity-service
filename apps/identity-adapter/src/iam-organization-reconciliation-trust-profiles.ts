@@ -57,6 +57,7 @@ function compiledProfileIsValid(
       !TRUST_PROFILE_ID.test(collector.collectorId) ||
       !TRUST_PROFILE_ID.test(collector.nodeId) ||
       !TRUST_PROFILE_ID.test(collector.keyId) ||
+      !/^[a-f0-9]{40}$/.test(collector.buildRevision) ||
       !/^[a-f0-9]{64}$/.test(collector.publicKeySha256) ||
       collectorIds.has(collector.collectorId) ||
       nodeIds.has(collector.nodeId) ||

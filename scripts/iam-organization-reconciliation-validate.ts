@@ -5,6 +5,7 @@ import { z } from "zod";
 import {
   ORGANIZATION_RECONCILIATION_COLLECTOR_CONTRACT,
   ORGANIZATION_RECONCILIATION_COLLECTOR_CONTRACT_HASH,
+  ORGANIZATION_RECONCILIATION_DECISION_DERIVATION_CONTRACT,
   OrganizationReconciliationInput,
   validateOrganizationReconciliation
 } from "../apps/identity-adapter/src/iam-organization-reconciliation-validator.js";
@@ -59,9 +60,11 @@ Options:
   --help                     Show this help.
 
 The command performs no network or database access. URL, token, stdin, and
-network parameters are not supported. Snapshot-only mode may set
-staticChecksPassed=true but remains safetyGate.passed=false because no
-trusted-provenance verifier input was supplied. Trusted mode additionally
+network parameters are not supported. This artifact intentionally reports
+realSourceAdaptersReady=false and a coverage blocker until every reviewed
+authoritative adapter is registered in source; caller JSON cannot override it.
+The trusted-provenance verifier cannot override this compiled blocker. Trusted
+mode additionally
 requires a provisioned compiled trust profile; no policy pin is accepted from
 arguments, environment, evidence, attestations, or policy JSON. It verifies
 every policy-required Ed25519 collector against
@@ -154,16 +157,67 @@ function pairSchema<T extends z.ZodTypeAny>(record: T) {
   return z.object({ legacy: page.optional(), identity: page.optional() }).strict();
 }
 
+const decisionDimension = z.object({
+  count: z.number().int().nonnegative(),
+  hash
+}).strict();
+
+function decisionUniverseSchema<T extends z.ZodRawShape>(dimensions: T) {
+  return z.object({
+    keyCount: z.number().int().nonnegative(),
+    keysHash: hash,
+    derivationContract: z.literal(ORGANIZATION_RECONCILIATION_DECISION_DERIVATION_CONTRACT),
+    derivationBuildRevision: z.string().regex(/^[a-f0-9]{40}$/),
+    dimensions: z.object(dimensions).strict()
+  }).strict();
+}
+
+const decisionUniverses = z.object({
+  pluginVisibility: decisionUniverseSchema({
+    subjects: decisionDimension,
+    plugins: decisionDimension,
+    organizations: decisionDimension
+  }),
+  campusContexts: decisionUniverseSchema({
+    subjects: decisionDimension,
+    campuses: decisionDimension,
+    organizations: decisionDimension
+  }),
+  effectiveDecisions: decisionUniverseSchema({
+    subjects: decisionDimension,
+    organizations: decisionDimension,
+    resources: decisionDimension,
+    capabilities: decisionDimension
+  })
+}).strict();
+
 const collectionEnvelope = z.object({
   collectorContract: z.literal(ORGANIZATION_RECONCILIATION_COLLECTOR_CONTRACT),
   collectorContractHash: z.literal(ORGANIZATION_RECONCILIATION_COLLECTOR_CONTRACT_HASH),
+  collectorBuildRevision: z.string().regex(/^[a-f0-9]{40}$/),
   evidenceNonce: z.string().regex(/^[a-f0-9]{32,128}$/i),
   logicalSnapshotId: nonBlankString,
   windowId: nonBlankString,
   windowStartedAt: nonBlankString,
   windowEndedAt: nonBlankString,
-  legacy: z.object({ sourceVersion: nonBlankString, snapshotId: nonBlankString }).strict(),
-  identity: z.object({ sourceVersion: nonBlankString, snapshotId: nonBlankString }).strict()
+  legacy: z.object({
+    sourceVersion: nonBlankString,
+    snapshotId: nonBlankString,
+    subjectUniverse: z.object({
+      subjectCount: z.number().int().positive(),
+      subjectsHash: hash
+    }).strict(),
+    decisionUniverses
+  }).strict(),
+  identity: z.object({
+    sourceVersion: nonBlankString,
+    snapshotId: nonBlankString,
+    subjectUniverse: z.object({
+      subjectCount: z.number().int().positive(),
+      subjectsHash: hash
+    }).strict(),
+    decisionUniverses
+  }).strict()
 }).strict();
 
 const organizationReconciliationInputSchema = z.object({
