@@ -359,16 +359,22 @@ JSON/schema 错误退出 2。当前因真实 adapter blocker，`staticChecksPass
 `safetyGate.passed=false`、`blocksDualWrite=true`，并以 `external-provenance-required` 退出 1。输入中
 不存在可伪造的 provenance 布尔开关或公钥字段。
 
-根输入还必须携带一个 v2 composite component manifest。该清单固定列出 `legacy-main`、`identity`、
+根输入还必须携带一个 v3 composite component manifest。该清单固定列出 `legacy-main`、`identity`、
 `plugin` 三个独立 immutable snapshot，明确 `crossDatabaseAtomic=false`，并记录各自 source/version/
 snapshot、schema/catalog/build digest、subject-universe scope、实际打开/关闭时间以及有界复合窗口。
-manifest 的 domain-separated operation-evidence digest 必须绑定“移除 manifest 后的完整 v3 输入”，
+每个 component 还必须绑定 v2 dataset inventory；inventory 使用
+`hmac-sha256-run-secret/v1`，以每次 component/run 新生成且不进入公共产物的 32-byte 私有 secret，分别绑定
+cursor、page records、dataset records 与 canonical lineage。这里的 commitment 是同一次 run 内的防篡改
+承诺，不是可跨运行关联原始记录的稳定 digest。manifest 的 v2 domain-separated operation-evidence digest
+必须绑定“移除 manifest 后的完整 v3 输入”，
 manifest 自身再由 canonical digest 固定；外部 provenance 则签署包含 manifest 在内的最终输入。因此
 缺 manifest、manifest digest 不符、清单 A 配数据 B、清单窗口未覆盖 envelope 窗口、Legacy/Identity
 sourceVersion/snapshotId、subject count 或 subject-universe digest 不一致都属于 coverage blocker。由于物理快照的关闭时间晚于
 记录组装，manifest 的实际外层窗口可以包含 envelope 的读取窗口；可信 policy 校验的是这个更宽的
-物理复合窗口。manifest 中的 source/schema/catalog/build 值在 compiled owner-approved pin 完成前仍
-只是受绑定声明，不能单独视为权威。
+物理复合窗口。transaction adapter 生成的 `sourceVersion`/`snapshotId` 是从本次 run 的 dataset inventory
+派生的内容绑定；它们既不是数据库物理 revision，也不证明 adapter 确实连接了声明的物理 source。
+manifest 中的 source/schema/catalog/build 值在 compiled owner-approved pin 完成前也仍只是受绑定声明，
+不能单独视为权威或 physical-source attestation。
 
 可信模式必须同时提供独立本地 attestation 文件、change-controlled trust-policy 文件和已编译的
 trust profile 标识。生产 CLI 只从源码中的 immutable registry 解析 profile；不从 argv、环境变量、
@@ -403,8 +409,8 @@ CLI 的 safety gate 与工作包 4 的 Phase 4 准入口径一致：只有
 `P0=0、P1=0、P2=0、mismatch=0` 才可能通过；任一 P2 非零都会阻断并以非零状态退出。
 
 collector、decision-universe、provenance、trust-policy、report hash 与签名 domain 均为 v3；v2
-evidence/policy/signature 不兼容且必须拒绝。Composite manifest 与 operation-evidence 子协议为 v2；
-其 v1 manifest/evidence 不兼容且必须拒绝。
+evidence/policy/signature 不兼容且必须拒绝。Composite manifest 子协议为 v3，operation-evidence 与
+dataset inventory 子协议为 v2；旧 manifest/evidence/inventory 版本不兼容且必须拒绝。
 Collector build revision 只能由受审 artifact 注入的 build-revision provider 产生并随 evidence 携带；
 source adapter、调用参数与 evidence 均不能把自身字段作为权威来源，也不能覆盖 compiled trust
 profile/policy 对该完整 40 位 revision 的外部 pin。
@@ -425,22 +431,44 @@ cursor、精确 count/offset/order/unique key，并在成功、读取失败、�
 释放私有 snapshot/事务；close 失败同样拒绝证据，私有 source token 不进入 public evidence。它继续提供
 三源 deterministic coordinator（按 `legacy-main → identity → plugin` 打开、反向关闭、明确非分布式
 原子快照并把 exact operation body 绑定到 composite manifest）、只读 MySQL repeatable-read consistent-
-snapshot session，以及无 I/O 的 cursor-chain assembler（只接受从 `requestCursor=null` 到
-`nextCursor=null` 的完整有序链）和
-可交给 HSM/KMS 的 canonical attestation payload/signature 组装接口；verifier 本身不读取或持有 private key。
+snapshot session、dataset-lineage collector，以及可交给 HSM/KMS 的 canonical attestation
+payload/signature 组装接口；外部 provenance verifier 本身不读取或持有 private key。
+
+当前 transaction-owned bridge 已实现固定 11 个 raw dataset：Legacy 4 个、Identity 6 个、plugin 1 个；
+Identity 集合已包含 `identity-subject-universe` raw dataset 的读取实现与固定结构项。每个 component 在各自
+独立的 repeatable-read transaction 内，按固定 dataset ID 集合与 caller-structured untrusted catalog 先完整
+扫描，累计 component/dataset/page/record totals，以有界内存缓存原始页，
+再从缓存按 cursor chain 回放；私有 verifier 使用仅由该 transaction 持有的 run secret 逐 dataset 重算
+commitment。对每个 component，只有分配给它的固定 dataset 集合全部回放并验证，该 component 的 close
+gate 才可能接受 completed；失败或不完整消费必须 rollback。三个事务仍然独立，不能据此声称跨数据库
+原子提交。私有 secret 不进入 snapshot、manifest、lineage artifact 或 CLI 输入，销毁仅是 JavaScript
+进程内的 best-effort overwrite，不构成强内存擦除保证。
+
+上述 bridge 仍没有 runtime wiring。64 MiB component cache、page/record 上限与 serialized-byte 预算只是
+当前默认关闭实现的显式资源门禁；它不是 production streaming projector，也不是 JavaScript heap 上界或
+内存安全证明。generic dataset-lineage 的 WeakMap brand 只证明 artifact 来自同一进程内同一次结构化
+collection run，并阻止 clone/cross-run/replay；它不认证物理 source、transaction adapter factory、owner
+catalog 或外部 attestation。
+
 该 MySQL session 不接受运行时 SQL，只接受源码内 immutable statement ID/catalog，固定 keyset
 cursor 参数契约、Legacy RBAC `auth_item.type=1` 以及 Identity shadow 的
 `source=legacy-shadow/status=shadow`；policy/参数/查询失败都会 poison 当前 session，只能 rollback。
-这些 coordinator/session 仍是生命周期与内容绑定 primitive：通用 operation 尚未被限制为从已打开
-snapshot 的 `readSnapshotPage` 构造八个 surface；campus/rule-pair/plugin catalog 也尚未与 compiled
-owner-approved pins 绑定。仓库仍没有连接 Legacy/Identity/plugin runtime 的完整 source-specific
-collector adapter，也没有已批准的公钥 policy、compiled trust profile、签名服务、逐页原始
-响应保管或双节点运行证据。因此本地测试 PASS 只证明 verifier/collector primitives 正确，不证明外部
-API/数据库实际返回这些页，也不单独完成 Task 7.2。任何采集、部署、数据库访问或运行时写入仍需
-另行批准。
-协调器产物只能通过 `assembleCoordinatedOrganizationReconciliationInput` 进入 validator/CLI；该 assembler
-会重验 manifest/body digest、拒绝调用方嵌套 manifest，并冻结最终输入。这只关闭产物形状与 A/B
-拼接空档，不能替代上述页级来源门禁。
+当前 semantic registry 的 compiled production table 故意为空，且不接受 argv、环境变量、JSON 或 evidence
+注入。Identity shadow/candidate owner selectors、organization role scopes、plugin overlay、campus public
+context 与 capability catalog 五项 owner decision 均未批准；Legacy/Identity 两侧独立 semantic projector、
+projector artifact provenance 和 compiled pipeline registration 也均未注册。
+
+因此 raw-source capability、transaction-adapter factory capability、transaction adapter、dataset lineage、
+surface projector、operation-evidence projector、compiled pipeline 和 semantic registry readiness 当前统一为
+`false`。`assembleCoordinatedOrganizationReconciliationInput` 不是可用入口：它在 dedicated branded
+operation-evidence projector readiness 为 false 时无条件硬拒，不能进入 validator/CLI；不存在调用参数、
+环境变量或普通 adapter 可以打开这条路径。仓库也没有已批准的公钥 policy、compiled trust profile、签名
+服务、逐页原始响应保管或双节点运行证据。因此本地测试 PASS 只证明这些默认关闭 primitive 的契约，
+不证明外部 API/数据库实际返回完整页，也不单独完成 Task 7.2。
+
+Task 7.2 当前结论明确为 **NO-GO**。任何真实采集、runtime wiring、语义 owner 决策、pipeline 注册、部署、
+数据库访问或运行时写入都必须另行批准；Legacy 继续是唯一事实源，全部组织写入配置继续 default-off，
+不得据此切换 identity-primary、开启组织 native write 或进入 tmrpp Portainer。
 
 ## Phase 3：单次 Develop legacy-proxy 窗口
 

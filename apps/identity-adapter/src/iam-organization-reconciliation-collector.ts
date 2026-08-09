@@ -2,6 +2,10 @@ import {
   createOrganizationReconciliationCollectedSnapshot,
   type ReconciliationPage
 } from "./iam-organization-reconciliation-validator.js";
+import {
+  validateOrganizationReconciliationComponentDatasetInventory,
+  type OrganizationReconciliationComponentDatasetInventory
+} from "./iam-organization-reconciliation-dataset-inventory.js";
 
 export const ORGANIZATION_RECONCILIATION_SNAPSHOT_MODE = "immutable-snapshot" as const;
 export const ORGANIZATION_RECONCILIATION_PAGINATION_MODE = "snapshot-bound-opaque-cursor" as const;
@@ -21,6 +25,8 @@ export interface OrganizationReconciliationSourceSnapshot {
   readonly subjectUniverseHash: string;
   readonly snapshotMode: typeof ORGANIZATION_RECONCILIATION_SNAPSHOT_MODE;
   readonly paginationMode: typeof ORGANIZATION_RECONCILIATION_PAGINATION_MODE;
+  /** Present only for transaction-materialized multi-dataset adapters. */
+  readonly datasetInventory?: OrganizationReconciliationComponentDatasetInventory;
 }
 
 export interface OrganizationReconciliationSourcePage<TRawRecord> {
@@ -94,6 +100,11 @@ export interface CollectedOrganizationReconciliationSource<TRecord> {
   readonly page: ReconciliationPage<TRecord>;
 }
 
+interface CapturedOrganizationReconciliationSourceSnapshot {
+  readonly rawMetadata: Readonly<Record<string, unknown>>;
+  readonly publicSnapshot: Readonly<OrganizationReconciliationSourceSnapshot>;
+}
+
 /**
  * Collects exactly one source-owned immutable snapshot. The function has no
  * transport or database assumptions: concrete adapters own those details, but
@@ -111,15 +122,22 @@ export async function collectOrganizationReconciliationSource<TRawRecord, TRecor
   const expectedSourceId = requireOpaqueMetadata(options.expectedSourceId, "expected source ID");
   if (adapterSourceId !== expectedSourceId) throw new Error("The collector adapter is bound to an unexpected source.");
 
-  let snapshot: OrganizationReconciliationSourceSnapshot;
+  let rawSnapshot: OrganizationReconciliationSourceSnapshot;
   try {
-    snapshot = await options.adapter.openSnapshot();
+    rawSnapshot = await options.adapter.openSnapshot();
   } catch {
     throw new Error("Opening the authoritative source snapshot failed.");
   }
   let outcome: "completed" | "failed" = "failed";
+  let capturedSnapshot: CapturedOrganizationReconciliationSourceSnapshot | null = null;
   try {
-    validateSnapshot(snapshot, expectedSourceId, options.maxRecords);
+    capturedSnapshot = captureSnapshot(rawSnapshot, expectedSourceId, options.maxRecords);
+    try {
+      Object.freeze(rawSnapshot);
+    } catch {
+      throw new Error("The authoritative source snapshot handle could not be made immutable.");
+    }
+    const snapshot = capturedSnapshot.publicSnapshot;
 
     const records: TRecord[] = [];
     const collectedPages: Array<{
@@ -139,15 +157,17 @@ export async function collectOrganizationReconciliationSource<TRawRecord, TRecor
 
       const pageNumber = collectedPages.length + 1;
       let rawPage: OrganizationReconciliationSourcePage<TRawRecord>;
+      assertRawSnapshotMetadataUnchanged(rawSnapshot, capturedSnapshot, expectedSourceId, options.maxRecords);
       try {
         rawPage = await options.adapter.readSnapshotPage({
-          snapshot,
+          snapshot: rawSnapshot,
           requestCursor,
           pageSize: options.pageSize
         });
       } catch {
         throw new Error(`Reading authoritative source page ${pageNumber} failed.`);
       }
+      assertRawSnapshotMetadataUnchanged(rawSnapshot, capturedSnapshot, expectedSourceId, options.maxRecords);
 
       validatePageBinding(rawPage, snapshot, requestCursor, records.length, options.pageSize);
       if (records.length + rawPage.records.length > options.maxRecords) {
@@ -190,6 +210,7 @@ export async function collectOrganizationReconciliationSource<TRawRecord, TRecor
       requestCursor = nextCursor;
     }
 
+    assertRawSnapshotMetadataUnchanged(rawSnapshot, capturedSnapshot, expectedSourceId, options.maxRecords);
     if (records.length !== snapshot.recordCount) {
       throw new Error("The terminal source record count does not match the opened snapshot.");
     }
@@ -204,13 +225,37 @@ export async function collectOrganizationReconciliationSource<TRawRecord, TRecor
         collectedPages
       )
     };
+    assertRawSnapshotMetadataUnchanged(rawSnapshot, capturedSnapshot, expectedSourceId, options.maxRecords);
     outcome = "completed";
     return result;
   } finally {
+    let metadataDrifted = false;
+    if (capturedSnapshot !== null) {
+      try {
+        assertRawSnapshotMetadataUnchanged(rawSnapshot, capturedSnapshot, expectedSourceId, options.maxRecords);
+      } catch {
+        metadataDrifted = true;
+        outcome = "failed";
+      }
+    }
+    let closeFailed = false;
     try {
-      await options.adapter.closeSnapshot(snapshot, outcome);
+      await options.adapter.closeSnapshot(rawSnapshot, outcome);
     } catch {
+      closeFailed = true;
+    }
+    if (capturedSnapshot !== null) {
+      try {
+        assertRawSnapshotMetadataUnchanged(rawSnapshot, capturedSnapshot, expectedSourceId, options.maxRecords);
+      } catch {
+        metadataDrifted = true;
+      }
+    }
+    if (closeFailed) {
       throw new Error("Closing the authoritative source snapshot failed; collection evidence was rejected.");
+    }
+    if (metadataDrifted) {
+      throw new Error("The authoritative source snapshot metadata changed; collection evidence was rejected.");
     }
   }
 }
@@ -231,32 +276,102 @@ function validateCollectionLimits(options: {
   }
 }
 
-function validateSnapshot(
-  snapshot: OrganizationReconciliationSourceSnapshot,
+function captureSnapshot(
+  candidate: unknown,
   expectedSourceId: string,
   maxRecords: number
-): void {
-  if (requireOpaqueMetadata(snapshot.sourceId, "snapshot source ID") !== expectedSourceId) {
+): CapturedOrganizationReconciliationSourceSnapshot {
+  const rawMetadata = captureSnapshotOwnData(candidate);
+  const sourceId = requireOpaqueMetadata(rawMetadata.sourceId as string, "snapshot source ID");
+  if (sourceId !== expectedSourceId) {
     throw new Error("The opened snapshot belongs to an unexpected source.");
   }
-  requireOpaqueMetadata(snapshot.sourceVersion, "snapshot source version");
-  requireOpaqueMetadata(snapshot.snapshotId, "snapshot ID");
+  const sourceVersion = requireOpaqueMetadata(rawMetadata.sourceVersion as string, "snapshot source version");
+  const snapshotId = requireOpaqueMetadata(rawMetadata.snapshotId as string, "snapshot ID");
+  const recordCount = rawMetadata.recordCount;
   if (
-    !Number.isSafeInteger(snapshot.recordCount) ||
-    snapshot.recordCount < 0 ||
-    snapshot.recordCount > maxRecords
+    !Number.isSafeInteger(recordCount) ||
+    (recordCount as number) < 0 ||
+    (recordCount as number) > maxRecords
   ) {
     throw new Error("The authoritative snapshot record count is invalid or exceeds the approved bound.");
   }
-  if (!Number.isSafeInteger(snapshot.subjectUniverseCount) || snapshot.subjectUniverseCount < 1) {
+  const subjectUniverseCount = rawMetadata.subjectUniverseCount;
+  if (!Number.isSafeInteger(subjectUniverseCount) || (subjectUniverseCount as number) < 1) {
     throw new Error("The authoritative subject universe count is invalid.");
   }
-  requireSha256(snapshot.subjectUniverseHash, "subject universe hash");
-  if (snapshot.snapshotMode !== ORGANIZATION_RECONCILIATION_SNAPSHOT_MODE) {
+  const subjectUniverseHash = requireSha256(rawMetadata.subjectUniverseHash as string, "subject universe hash");
+  if (rawMetadata.snapshotMode !== ORGANIZATION_RECONCILIATION_SNAPSHOT_MODE) {
     throw new Error("The source does not provide an immutable snapshot.");
   }
-  if (snapshot.paginationMode !== ORGANIZATION_RECONCILIATION_PAGINATION_MODE) {
+  if (rawMetadata.paginationMode !== ORGANIZATION_RECONCILIATION_PAGINATION_MODE) {
     throw new Error("The source does not provide snapshot-bound opaque cursors.");
+  }
+  let datasetInventory: OrganizationReconciliationComponentDatasetInventory | undefined;
+  if (Object.prototype.hasOwnProperty.call(rawMetadata, "datasetInventory")) {
+    datasetInventory = validateOrganizationReconciliationComponentDatasetInventory(rawMetadata.datasetInventory);
+  }
+  const publicSnapshot = Object.freeze({
+    sourceId,
+    sourceVersion,
+    snapshotId,
+    recordCount: recordCount as number,
+    subjectUniverseCount: subjectUniverseCount as number,
+    subjectUniverseHash,
+    snapshotMode: ORGANIZATION_RECONCILIATION_SNAPSHOT_MODE,
+    paginationMode: ORGANIZATION_RECONCILIATION_PAGINATION_MODE,
+    ...(datasetInventory === undefined ? {} : { datasetInventory })
+  });
+  return Object.freeze({ rawMetadata, publicSnapshot });
+}
+
+function captureSnapshotOwnData(candidate: unknown): Readonly<Record<string, unknown>> {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate) ||
+    (Object.getPrototypeOf(candidate) !== Object.prototype && Object.getPrototypeOf(candidate) !== null) ||
+    Object.getOwnPropertySymbols(candidate).length > 0) {
+    throw new Error("The authoritative snapshot metadata is invalid.");
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(candidate);
+  const requiredKeys = [
+    "sourceId", "sourceVersion", "snapshotId", "recordCount", "subjectUniverseCount",
+    "subjectUniverseHash", "snapshotMode", "paginationMode"
+  ];
+  const hasDatasetInventory = Object.prototype.hasOwnProperty.call(descriptors, "datasetInventory");
+  const expectedKeys = hasDatasetInventory ? [...requiredKeys, "datasetInventory"] : requiredKeys;
+  if (Object.keys(descriptors).sort().join("\u001f") !== [...expectedKeys].sort().join("\u001f")) {
+    throw new Error("The authoritative snapshot metadata has missing or unknown fields.");
+  }
+  const output = Object.create(null) as Record<string, unknown>;
+  for (const key of expectedKeys) {
+    const descriptor = descriptors[key]!;
+    if (!descriptor.enumerable || !("value" in descriptor)) {
+      throw new Error("The authoritative snapshot metadata contains an accessor or hidden field.");
+    }
+    output[key] = descriptor.value;
+  }
+  return Object.freeze(output);
+}
+
+function assertRawSnapshotMetadataUnchanged(
+  rawSnapshot: OrganizationReconciliationSourceSnapshot,
+  captured: CapturedOrganizationReconciliationSourceSnapshot,
+  expectedSourceId: string,
+  maxRecords: number
+): void {
+  let observed: CapturedOrganizationReconciliationSourceSnapshot;
+  try {
+    observed = captureSnapshot(rawSnapshot, expectedSourceId, maxRecords);
+  } catch {
+    throw new Error("The authoritative source snapshot metadata changed during collection.");
+  }
+  const originalKeys = Object.keys(captured.rawMetadata).sort();
+  const observedKeys = Object.keys(observed.rawMetadata).sort();
+  if (originalKeys.length !== observedKeys.length ||
+    originalKeys.some((key, index) => key !== observedKeys[index] ||
+      !Object.is(captured.rawMetadata[key], observed.rawMetadata[key])) ||
+    captured.publicSnapshot.datasetInventory?.inventorySha256 !==
+      observed.publicSnapshot.datasetInventory?.inventorySha256) {
+    throw new Error("The authoritative source snapshot metadata changed during collection.");
   }
 }
 

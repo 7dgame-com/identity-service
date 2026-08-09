@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   ORGANIZATION_RECONCILIATION_PAGINATION_MODE,
   ORGANIZATION_RECONCILIATION_SNAPSHOT_MODE
@@ -33,12 +33,12 @@ export interface OrganizationReconciliationMysqlRawAdapterReadiness {
   readonly ready: false;
   readonly blockers: readonly [
     "runtime-source-adapter-wiring-disabled",
-    "transaction-owned-source-version-provider-not-implemented",
-    "identity-complete-subject-universe-statement-missing",
-    "snapshot-record-count-statements-missing",
+    "compiled-owner-dataset-catalog-not-registered",
+    "trusted-physical-source-binding-not-registered",
     "identity-dataset-source-status-selectors-not-owner-approved",
     "identity-shadow-versus-candidate-read-model-not-owner-approved",
     "plugin-registry-schema-version-not-owner-approved",
+    "plugin-static-overlay-precedence-not-owner-approved",
     "mysql-collation-and-ordering-not-owner-approved"
   ];
 }
@@ -49,12 +49,12 @@ OrganizationReconciliationMysqlRawAdapterReadiness {
     ready: ORGANIZATION_RECONCILIATION_MYSQL_RAW_SOURCE_ADAPTERS_READY,
     blockers: Object.freeze([
       "runtime-source-adapter-wiring-disabled",
-      "transaction-owned-source-version-provider-not-implemented",
-      "identity-complete-subject-universe-statement-missing",
-      "snapshot-record-count-statements-missing",
+      "compiled-owner-dataset-catalog-not-registered",
+      "trusted-physical-source-binding-not-registered",
       "identity-dataset-source-status-selectors-not-owner-approved",
       "identity-shadow-versus-candidate-read-model-not-owner-approved",
       "plugin-registry-schema-version-not-owner-approved",
+      "plugin-static-overlay-precedence-not-owner-approved",
       "mysql-collation-and-ordering-not-owner-approved"
     ] as const)
   });
@@ -68,6 +68,7 @@ export type OrganizationReconciliationMysqlRawSurface =
   | "legacy-subject-universe"
   | "legacy-membership"
   | "legacy-role-assignment"
+  | "identity-subject-universe"
   | "identity-organization-candidate"
   | "identity-organization-id-map"
   | "identity-membership-shadow"
@@ -75,42 +76,16 @@ export type OrganizationReconciliationMysqlRawSurface =
   | "identity-role-shadow"
   | "plugin-registry";
 
-export interface OrganizationReconciliationMysqlSnapshotBinding {
-  readonly sourceVersion: string;
-  readonly snapshotId: string;
-}
-
-/**
- * Runtime-owned provider invoked only after the repeatable-read transaction is
- * open. No implementation is supplied here because the current tables/catalog
- * do not expose an owner-approved transaction revision or snapshot identifier.
- * Invocation order alone does not prove that returned metadata belongs to the
- * transaction; that remains an explicit readiness blocker until a reviewed
- * transaction-owned provider is implemented and pinned by runtime wiring.
- */
-export interface OrganizationReconciliationMysqlSnapshotBindingProvider {
-  captureSnapshotBinding(context: Readonly<{
-    contract: typeof ORGANIZATION_RECONCILIATION_MYSQL_RAW_ADAPTER_CONTRACT;
-    componentId: OrganizationReconciliationMysqlRawComponentId;
-    /** Opaque reviewed wiring ID; it is not inferred from the component name. */
-    sourceId: string;
-    statementCatalogSha256: string;
-  }>): Promise<unknown>;
-}
-
 export interface OpenOrganizationReconciliationMysqlRawSnapshotOptions {
   /** Opaque physical source ID expected by the coordinator wiring. */
   readonly expectedSourceId: string;
   readonly connectionFactory: MysqlRepeatableReadSnapshotConnectionFactory;
-  readonly bindingProvider: OrganizationReconciliationMysqlSnapshotBindingProvider;
 }
 
 export interface OrganizationReconciliationMysqlRawSnapshotMetadata {
   readonly contract: typeof ORGANIZATION_RECONCILIATION_MYSQL_RAW_ADAPTER_CONTRACT;
   readonly componentId: OrganizationReconciliationMysqlRawComponentId;
   readonly sourceId: string;
-  readonly sourceVersion: string;
-  readonly snapshotId: string;
   readonly snapshotMode: typeof ORGANIZATION_RECONCILIATION_SNAPSHOT_MODE;
   readonly paginationMode: typeof ORGANIZATION_RECONCILIATION_PAGINATION_MODE;
   readonly statementCatalogSha256: string;
@@ -162,6 +137,12 @@ export interface IdentityOrganizationCandidateMysqlRawRecord {
   readonly name: string;
   readonly title: string;
   readonly candidateStatus: "candidate";
+}
+
+export interface IdentitySubjectUniverseMysqlRawRecord {
+  readonly legacyUserId: string;
+  readonly status: string;
+  readonly source: string;
 }
 
 export interface IdentityOrganizationIdMapMysqlRawRecord {
@@ -240,6 +221,12 @@ export interface LegacyMainMysqlRawSnapshot
 
 export interface IdentityMysqlRawSnapshot
   extends OrganizationReconciliationMysqlRawSnapshotBase {
+  readSubjectUniversePage(
+    request: OrganizationReconciliationMysqlRawPageRequest
+  ): Promise<OrganizationReconciliationMysqlRawPage<
+    "identity-subject-universe",
+    IdentitySubjectUniverseMysqlRawRecord
+  >>;
   readOrganizationCandidatePage(
     request: OrganizationReconciliationMysqlRawPageRequest
   ): Promise<OrganizationReconciliationMysqlRawPage<
@@ -287,6 +274,7 @@ type AnyRawRecord =
   | LegacySubjectUniverseMysqlRawRecord
   | LegacyOrganizationMembershipMysqlRawRecord
   | LegacyRoleAssignmentMysqlRawRecord
+  | IdentitySubjectUniverseMysqlRawRecord
   | IdentityOrganizationCandidateMysqlRawRecord
   | IdentityOrganizationIdMapMysqlRawRecord
   | IdentityOrganizationMembershipShadowMysqlRawRecord
@@ -324,7 +312,6 @@ interface SurfaceState {
 interface ValidatedOpenDependencies {
   readonly sourceId: string;
   readonly connectionFactory: MysqlRepeatableReadSnapshotConnectionFactory;
-  readonly captureSnapshotBinding: OrganizationReconciliationMysqlSnapshotBindingProvider["captureSnapshotBinding"];
 }
 
 const LEGACY_DIRECTORY = defineSurface({
@@ -368,6 +355,16 @@ const LEGACY_ROLES = defineSurface({
   cursorValues: (record) => [record.legacyUserId, record.roleName],
   queryParameters: twoPartStringParameters,
   orderKey: (record) => tupleOrderKey(numericOrderKey(record.legacyUserId), record.roleName)
+});
+
+const IDENTITY_SUBJECTS = defineSurface({
+  surface: "identity-subject-universe",
+  statementId: "identity-subject-universe-page/v1",
+  initialCursorValues: [0],
+  decode: decodeIdentitySubjectUniverse,
+  cursorValues: (record) => [record.legacyUserId],
+  queryParameters: singleKeyParameters,
+  orderKey: (record) => numericOrderKey(record.legacyUserId)
 });
 
 const IDENTITY_ORGANIZATIONS = defineSurface({
@@ -467,6 +464,8 @@ export async function openIdentityMysqlRawSnapshot(
   const core = await openRawSnapshot(ORGANIZATION_RECONCILIATION_MYSQL_RAW_COMPONENT_IDS.identity, options);
   return Object.freeze({
     metadata: core.metadata,
+    readSubjectUniversePage: (request: OrganizationReconciliationMysqlRawPageRequest) =>
+      core.read(IDENTITY_SUBJECTS, request),
     readOrganizationCandidatePage: (request: OrganizationReconciliationMysqlRawPageRequest) =>
       core.read(IDENTITY_ORGANIZATIONS, request),
     readOrganizationIdMapPage: (request: OrganizationReconciliationMysqlRawPageRequest) =>
@@ -503,7 +502,8 @@ class MysqlRawSnapshotCore {
 
   constructor(
     private readonly session: MysqlRepeatableReadSnapshotSession,
-    metadata: OrganizationReconciliationMysqlRawSnapshotMetadata
+    metadata: OrganizationReconciliationMysqlRawSnapshotMetadata,
+    private readonly transactionHandleId: string
   ) {
     this.metadata = Object.freeze({ ...metadata });
   }
@@ -573,7 +573,7 @@ class MysqlRawSnapshotCore {
       ? definition.cursorValues(records.at(-1)!)
       : state.cursorValues;
     const nextCursor = hasContinuation
-      ? createOpaqueCursor(this.metadata, definition.surface, nextOffset, nextCursorValues)
+      ? createOpaqueCursor(this.metadata, this.transactionHandleId, definition.surface, nextOffset, nextCursorValues)
       : null;
 
     const page = Object.freeze({
@@ -637,23 +637,14 @@ async function openRawSnapshot(
   try {
     const dependencies = validateOpenDependencies(options);
     session = await openMysqlRepeatableReadSnapshot(dependencies.connectionFactory);
-    const candidate = await dependencies.captureSnapshotBinding(Object.freeze({
-      contract: ORGANIZATION_RECONCILIATION_MYSQL_RAW_ADAPTER_CONTRACT,
-      componentId,
-      sourceId: dependencies.sourceId,
-      statementCatalogSha256: ORGANIZATION_RECONCILIATION_MYSQL_STATEMENT_CATALOG_SHA256
-    }));
-    const binding = validateSnapshotBinding(candidate);
     return new MysqlRawSnapshotCore(session, {
       contract: ORGANIZATION_RECONCILIATION_MYSQL_RAW_ADAPTER_CONTRACT,
       componentId,
       sourceId: dependencies.sourceId,
-      sourceVersion: binding.sourceVersion,
-      snapshotId: binding.snapshotId,
       snapshotMode: ORGANIZATION_RECONCILIATION_SNAPSHOT_MODE,
       paginationMode: ORGANIZATION_RECONCILIATION_PAGINATION_MODE,
       statementCatalogSha256: ORGANIZATION_RECONCILIATION_MYSQL_STATEMENT_CATALOG_SHA256
-    });
+    }, randomBytes(32).toString("hex"));
   } catch {
     if (session !== null) await session.close("failed").catch(() => undefined);
     throw new Error(openFailure(componentId));
@@ -661,25 +652,13 @@ async function openRawSnapshot(
 }
 
 function validateOpenDependencies(candidate: unknown): ValidatedOpenDependencies {
-  const options = exactRecord(candidate, ["expectedSourceId", "connectionFactory", "bindingProvider"]);
-  const bindingProvider = exactRecord(options.bindingProvider, ["captureSnapshotBinding"]);
-  if (typeof options.connectionFactory !== "function" ||
-    typeof bindingProvider.captureSnapshotBinding !== "function") {
+  const options = exactRecord(candidate, ["expectedSourceId", "connectionFactory"]);
+  if (typeof options.connectionFactory !== "function") {
     throw new Error("invalid dependencies");
   }
   return Object.freeze({
     sourceId: canonicalMetadata(options.expectedSourceId),
-    connectionFactory: options.connectionFactory as MysqlRepeatableReadSnapshotConnectionFactory,
-    captureSnapshotBinding:
-      bindingProvider.captureSnapshotBinding as OrganizationReconciliationMysqlSnapshotBindingProvider["captureSnapshotBinding"]
-  });
-}
-
-function validateSnapshotBinding(candidate: unknown): OrganizationReconciliationMysqlSnapshotBinding {
-  const row = exactRecord(candidate, ["sourceVersion", "snapshotId"]);
-  return Object.freeze({
-    sourceVersion: canonicalMetadata(row.sourceVersion),
-    snapshotId: canonicalMetadata(row.snapshotId)
+    connectionFactory: options.connectionFactory as MysqlRepeatableReadSnapshotConnectionFactory
   });
 }
 
@@ -696,6 +675,7 @@ function validatePageRequest(candidate: unknown): OrganizationReconciliationMysq
 
 function createOpaqueCursor(
   metadata: OrganizationReconciliationMysqlRawSnapshotMetadata,
+  transactionHandleId: string,
   surface: OrganizationReconciliationMysqlRawSurface,
   offset: number,
   cursorValues: readonly MysqlSnapshotParameter[]
@@ -705,8 +685,7 @@ function createOpaqueCursor(
     .update(JSON.stringify({
       contract: metadata.contract,
       sourceId: metadata.sourceId,
-      sourceVersion: metadata.sourceVersion,
-      snapshotId: metadata.snapshotId,
+      transactionHandleId,
       statementCatalogSha256: metadata.statementCatalogSha256,
       surface,
       offset,
@@ -799,6 +778,15 @@ function decodeLegacyRoleAssignment(candidate: unknown): Readonly<LegacyRoleAssi
   return Object.freeze({
     legacyUserId: positiveId(row.user_id),
     roleName: canonicalText(row.item_name, 128)
+  });
+}
+
+function decodeIdentitySubjectUniverse(candidate: unknown): Readonly<IdentitySubjectUniverseMysqlRawRecord> {
+  const row = exactRecord(candidate, ["legacy_user_id", "status", "source"]);
+  return Object.freeze({
+    legacyUserId: positiveId(row.legacy_user_id),
+    status: canonicalText(row.status, 32),
+    source: canonicalText(row.source, 64)
   });
 }
 

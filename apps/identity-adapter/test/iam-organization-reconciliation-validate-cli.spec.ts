@@ -327,6 +327,22 @@ describe("offline IAM organization reconciliation CLI", () => {
     expect(() => parseOrganizationReconciliationJson(JSON.stringify(v2DecisionContract)))
       .toThrow(OrganizationReconciliationCliError);
 
+    for (const mutate of [
+      (input: Record<string, any>) => { input.componentManifest.contract =
+        "iam-organization-reconciliation-composite-manifest/v2"; },
+      (input: Record<string, any>) => { input.componentManifest.components[0].datasetInventory.contract =
+        "iam-organization-reconciliation-dataset-inventory/v1"; },
+      (input: Record<string, any>) => { input.componentManifest.components[0].datasetInventory.datasets[0].datasetId =
+        "legacy-fixturé"; }
+    ]) {
+      const invalid = structuredClone(alignedInput()) as unknown as Record<string, any>;
+      mutate(invalid);
+      const io = memoryIo(JSON.stringify(invalid));
+      expect(await runOrganizationReconciliationCli(["--input=/tmp/old-or-invalid-contract.json"], io)).toBe(2);
+      expect(JSON.parse(io.stderr)).toMatchObject({ code: "input-schema-invalid" });
+      expect(io.stdout).toBe("");
+    }
+
     for (const subjectRef of [
       "private-subject",
       "legacy-user:0",

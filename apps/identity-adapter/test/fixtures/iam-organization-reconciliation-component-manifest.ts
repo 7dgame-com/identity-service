@@ -13,6 +13,12 @@ import type {
   OrganizationReconciliationInput,
   ReconciliationPair
 } from "../../src/iam-organization-reconciliation-validator.js";
+import { createOrganizationReconciliationComponentDatasetInventory } from
+  "../../src/iam-organization-reconciliation-dataset-inventory.js";
+import {
+  createOrganizationReconciliationContentSnapshotId,
+  createOrganizationReconciliationContentSourceVersion
+} from "../../src/iam-organization-reconciliation-dataset-inventory.js";
 
 const SCHEMA_SHA256 = "d".repeat(64);
 const CATALOG_SHA256 = "e".repeat(64);
@@ -31,6 +37,29 @@ export function attachTestOrganizationReconciliationComponentManifest(
   const buildSha256 = createHash("sha256")
     .update(envelope.collectorBuildRevision, "utf8")
     .digest("hex");
+  const legacyRecordCount = sideRecordCount(evidenceBody, "legacy");
+  const identityRecordCount = sideRecordCount(evidenceBody, "identity");
+  const pluginRecordCount = sideRecordCount(evidenceBody, "legacy", ["pluginBindings", "pluginVisibility"]);
+  const legacySourceId = "test-legacy-main";
+  const identitySourceId = "test-identity";
+  const pluginSourceId = "test-plugin";
+  const legacyInventory = testInventory("legacy-main", legacySourceId, "legacy-fixture", legacyRecordCount, 1);
+  const identityInventory = testInventory("identity", identitySourceId, "identity-fixture", identityRecordCount, 2);
+  const pluginInventory = testInventory("plugin", pluginSourceId, "plugin-fixture", pluginRecordCount, 3);
+  const boundEnvelope = {
+    ...envelope,
+    legacy: {
+      ...envelope.legacy,
+      sourceVersion: createOrganizationReconciliationContentSourceVersion(legacySourceId, legacyInventory),
+      snapshotId: createOrganizationReconciliationContentSnapshotId(legacySourceId, legacyInventory)
+    },
+    identity: {
+      ...envelope.identity,
+      sourceVersion: createOrganizationReconciliationContentSourceVersion(identitySourceId, identityInventory),
+      snapshotId: createOrganizationReconciliationContentSnapshotId(identitySourceId, identityInventory)
+    }
+  };
+  const boundEvidenceBody = bindSurfaceMetadata(evidenceBody, envelope, boundEnvelope);
   const unsigned = {
     contract: ORGANIZATION_RECONCILIATION_COMPOSITE_MANIFEST_CONTRACT,
     consistencyModel: ORGANIZATION_RECONCILIATION_COMPOSITE_CONSISTENCY_MODEL,
@@ -42,14 +71,14 @@ export function attachTestOrganizationReconciliationComponentManifest(
       Date.parse(envelope.windowEndedAt) - Date.parse(envelope.windowStartedAt)
     ),
     evidenceContract: ORGANIZATION_RECONCILIATION_OPERATION_EVIDENCE_CONTRACT,
-    evidenceSha256: createOrganizationReconciliationOperationEvidenceSha256(evidenceBody),
+    evidenceSha256: createOrganizationReconciliationOperationEvidenceSha256(boundEvidenceBody),
     components: [
       {
         componentId: "legacy-main",
-        sourceId: "test-legacy-main",
-        sourceVersion: envelope.legacy.sourceVersion,
-        snapshotId: envelope.legacy.snapshotId,
-        recordCount: sideRecordCount(evidenceBody, "legacy"),
+        sourceId: legacySourceId,
+        sourceVersion: boundEnvelope.legacy.sourceVersion,
+        snapshotId: boundEnvelope.legacy.snapshotId,
+        recordCount: legacyRecordCount,
         subjectUniverseScope: "complete",
         subjectUniverse: {
           count: envelope.legacy.subjectUniverse.subjectCount,
@@ -60,15 +89,16 @@ export function attachTestOrganizationReconciliationComponentManifest(
         schemaSha256: SCHEMA_SHA256,
         catalogSha256: CATALOG_SHA256,
         buildSha256,
+        datasetInventory: legacyInventory,
         openedAt: envelope.windowStartedAt,
         closedAt: envelope.windowEndedAt
       },
       {
         componentId: "identity",
-        sourceId: "test-identity",
-        sourceVersion: envelope.identity.sourceVersion,
-        snapshotId: envelope.identity.snapshotId,
-        recordCount: sideRecordCount(evidenceBody, "identity"),
+        sourceId: identitySourceId,
+        sourceVersion: boundEnvelope.identity.sourceVersion,
+        snapshotId: boundEnvelope.identity.snapshotId,
+        recordCount: identityRecordCount,
         subjectUniverseScope: "complete",
         subjectUniverse: {
           count: envelope.identity.subjectUniverse.subjectCount,
@@ -79,15 +109,16 @@ export function attachTestOrganizationReconciliationComponentManifest(
         schemaSha256: SCHEMA_SHA256,
         catalogSha256: CATALOG_SHA256,
         buildSha256,
+        datasetInventory: identityInventory,
         openedAt: envelope.windowStartedAt,
         closedAt: envelope.windowEndedAt
       },
       {
         componentId: "plugin",
-        sourceId: "test-plugin",
-        sourceVersion: "test-plugin-source-version",
-        snapshotId: "test-plugin-snapshot",
-        recordCount: sideRecordCount(evidenceBody, "legacy", ["pluginBindings", "pluginVisibility"]),
+        sourceId: pluginSourceId,
+        sourceVersion: createOrganizationReconciliationContentSourceVersion(pluginSourceId, pluginInventory),
+        snapshotId: createOrganizationReconciliationContentSnapshotId(pluginSourceId, pluginInventory),
+        recordCount: pluginRecordCount,
         subjectUniverseScope: "not-applicable",
         subjectUniverse: { count: 0, sha256: "" },
         snapshotMode: ORGANIZATION_RECONCILIATION_SNAPSHOT_MODE,
@@ -95,6 +126,7 @@ export function attachTestOrganizationReconciliationComponentManifest(
         schemaSha256: SCHEMA_SHA256,
         catalogSha256: CATALOG_SHA256,
         buildSha256,
+        datasetInventory: pluginInventory,
         openedAt: envelope.windowStartedAt,
         closedAt: envelope.windowEndedAt
       }
@@ -102,12 +134,78 @@ export function attachTestOrganizationReconciliationComponentManifest(
   } as const satisfies OrganizationReconciliationCompositeManifestUnsigned;
 
   return {
-    ...evidenceBody,
+    ...boundEvidenceBody,
     componentManifest: {
       ...unsigned,
       manifestSha256: createOrganizationReconciliationCompositeManifestSha256(unsigned)
     }
   };
+}
+
+function bindSurfaceMetadata(
+  evidenceBody: Omit<OrganizationReconciliationInput, "componentManifest">,
+  originalEnvelope: NonNullable<OrganizationReconciliationInput["collectionEnvelope"]>,
+  boundEnvelope: NonNullable<OrganizationReconciliationInput["collectionEnvelope"]>
+): Omit<OrganizationReconciliationInput, "componentManifest"> {
+  const output = { ...evidenceBody, collectionEnvelope: boundEnvelope } as Record<string, unknown>;
+  for (const key of [
+    "organizationDirectory", "organizationMappings", "memberships", "organizationScopedRoles",
+    "pluginBindings", "pluginVisibility", "campusContexts", "effectiveDecisions"
+  ] as const) {
+    const pair = evidenceBody[key];
+    if (!pair) continue;
+    output[key] = {
+      ...(pair.legacy ? { legacy: {
+        ...pair.legacy,
+        ...((pair.legacy.sourceVersion === originalEnvelope.legacy.sourceVersion ||
+          pair.legacy.sourceVersion === "legacy-source-v1") ? {
+          sourceVersion: boundEnvelope.legacy.sourceVersion
+        } : {}),
+        ...((pair.legacy.collection?.snapshotId === originalEnvelope.legacy.snapshotId ||
+          pair.legacy.collection?.snapshotId === "legacy-snapshot-v1") ? { collection: {
+          ...pair.legacy.collection,
+          snapshotId: boundEnvelope.legacy.snapshotId
+        } } : {})
+      } } : {}),
+      ...(pair.identity ? { identity: {
+        ...pair.identity,
+        ...((pair.identity.sourceVersion === originalEnvelope.identity.sourceVersion ||
+          pair.identity.sourceVersion === "identity-source-v1") ? {
+          sourceVersion: boundEnvelope.identity.sourceVersion
+        } : {}),
+        ...((pair.identity.collection?.snapshotId === originalEnvelope.identity.snapshotId ||
+          pair.identity.collection?.snapshotId === "identity-snapshot-v1") ? { collection: {
+          ...pair.identity.collection,
+          snapshotId: boundEnvelope.identity.snapshotId
+        } } : {})
+      } } : {})
+    };
+  }
+  return output as Omit<OrganizationReconciliationInput, "componentManifest">;
+}
+
+function testInventory(
+  componentId: "legacy-main" | "identity" | "plugin",
+  sourceId: string,
+  datasetId: string,
+  recordCount: number,
+  keyByte: number
+) {
+  return createOrganizationReconciliationComponentDatasetInventory({
+    componentId,
+    sourceId,
+    catalogSha256: CATALOG_SHA256,
+    datasets: [{
+      datasetId,
+      pages: [{
+      requestCursor: null,
+      nextCursor: null,
+      recordOffset: 0,
+      records: Array.from({ length: recordCount }, (_, index) => ({ index }))
+      }]
+    }],
+    commitmentKey: Buffer.alloc(32, keyByte)
+  });
 }
 
 function sideRecordCount(

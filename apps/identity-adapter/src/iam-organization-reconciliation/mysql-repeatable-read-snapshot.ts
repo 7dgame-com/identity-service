@@ -25,6 +25,8 @@ export const ORGANIZATION_RECONCILIATION_MYSQL_STATEMENTS = Object.freeze({
     "SELECT user_id, organization_id FROM user_organization WHERE (user_id > ?) OR (user_id = ? AND organization_id > ?) ORDER BY user_id ASC, organization_id ASC LIMIT ?",
   "legacy-role-assignment-page/v1":
     "SELECT aa.user_id, aa.item_name FROM auth_assignment AS aa INNER JOIN auth_item AS ai ON ai.name = aa.item_name AND ai.type = 1 WHERE (aa.user_id > ?) OR (aa.user_id = ? AND aa.item_name > ?) ORDER BY aa.user_id ASC, aa.item_name ASC LIMIT ?",
+  "identity-subject-universe-page/v1":
+    "SELECT legacy_user_id, status, source FROM identity_users WHERE legacy_user_id IS NOT NULL AND legacy_user_id > ? ORDER BY legacy_user_id ASC LIMIT ?",
   "identity-organization-candidate-page/v1":
     "SELECT legacy_organization_id, identity_organization_id, name, title, candidate_status FROM identity_organizations_candidate WHERE legacy_organization_id > ? ORDER BY legacy_organization_id ASC LIMIT ?",
   "identity-organization-id-map-page/v1":
@@ -196,6 +198,7 @@ function resolveReviewedStatement(
   switch (statementId) {
     case "legacy-organization-directory-page/v1":
     case "legacy-subject-universe-page/v1":
+    case "identity-subject-universe-page/v1":
     case "identity-organization-candidate-page/v1":
     case "identity-organization-id-map-page/v1":
       requireNonNegativeId(cursorParameters[0]);

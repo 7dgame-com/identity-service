@@ -20,6 +20,12 @@ import {
 } from "../src/iam-organization-reconciliation-collector.js";
 import type { OrganizationReconciliationPhysicalSource } from
   "../src/iam-organization-reconciliation-component-manifest.js";
+import {
+  createOrganizationReconciliationComponentDatasetInventory,
+  createOrganizationReconciliationContentSnapshotId,
+  createOrganizationReconciliationContentSourceVersion
+} from
+  "../src/iam-organization-reconciliation-dataset-inventory.js";
 
 interface RawRecord { readonly id: string }
 type Mutable<T> = { -readonly [K in keyof T]: T[K] };
@@ -50,9 +56,12 @@ describe("organization reconciliation dataset page lineage", () => {
         "real-dataset-adapters-not-registered",
         "compiled-owner-catalog-not-registered",
         "trusted-physical-source-binding-not-registered",
-        "transaction-owned-dataset-counts-not-implemented",
+        "transaction-owned-inventory-bridge-not-production-registered",
         "dataset-unique-order-contract-not-registered",
-        "operation-evidence-projector-not-implemented"
+        "bounded-streaming-projector-not-implemented",
+        "operation-evidence-projector-not-implemented",
+        "factory-created-transaction-adapter-capability-not-registered",
+        "compiled-reconciliation-pipeline-not-registered"
       ]
     });
     expect(run).toMatchObject({
@@ -76,7 +85,7 @@ describe("organization reconciliation dataset page lineage", () => {
       recordOffset: 0,
       recordCount: 1
     });
-    expect(run.artifacts[0]!.pages[0]!.recordsSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(run.artifacts[0]!.pages[0]!.recordsCommitment).toMatch(/^[a-f0-9]{64}$/);
     expect(run.artifacts[0]!.lineageSha256).toMatch(/^[a-f0-9]{64}$/);
     expect(run.artifacts[0]!.pages[0]!.structuralCatalogSha256).not.toBe(
       run.artifacts[0]!.pages[0]!.declaredCatalogSha256
@@ -177,6 +186,14 @@ describe("organization reconciliation dataset page lineage", () => {
     }
   });
 
+  it("rejects a short page before a nonterminal cursor", async () => {
+    const fixtures = fixturesFor([]);
+    const pages = fixtures[0]!.pages.get("directory")!;
+    pages[0] = { ...pages[0]!, records: [] };
+    await expect(collect(fixtures)).rejects.toThrow("coordinated snapshot operation failed");
+    assertClosedOnce(fixtures, "failed");
+  });
+
   it("rejects a non-null first request cursor for another dataset", async () => {
     const fixtures = fixturesFor([]);
     const membership = firstPage(fixtures, "legacy-main", "membership");
@@ -194,8 +211,11 @@ describe("organization reconciliation dataset page lineage", () => {
         pages[index] = { ...pages[index]!, snapshotRecordCount: legacy.snapshot.recordCount };
       }
     }
-    await expect(collect(fixtures)).rejects.toThrow("coordinated snapshot operation failed");
-    assertClosedOnce(fixtures, "failed");
+    await expect(collect(fixtures)).rejects.toThrow("record count does not match its dataset inventory");
+    expect(legacy.adapter.closeSnapshot).toHaveBeenCalledTimes(1);
+    expect(legacy.adapter.closeSnapshot).toHaveBeenCalledWith(legacy.snapshot, "failed");
+    expect(fixtures[1]!.adapter.closeSnapshot).not.toHaveBeenCalled();
+    expect(fixtures[2]!.adapter.closeSnapshot).not.toHaveBeenCalled();
   });
 
   it("rejects read-method TOCTOU before accepting a page", async () => {
@@ -207,6 +227,37 @@ describe("organization reconciliation dataset page lineage", () => {
     });
     await expect(collect(fixtures)).rejects.toThrow("coordinated snapshot operation failed");
     assertClosedOnce(fixtures, "failed");
+  });
+
+  it("captures snapshot metadata once and rejects raw-handle mutation during a read", async () => {
+    const fixtures = fixturesFor([]);
+    const legacy = fixtures[0]!;
+    const originalRead = legacy.adapter.readSnapshotPage;
+    legacy.adapter.readSnapshotPage = vi.fn(async (request: {
+      snapshot: OrganizationReconciliationSourceSnapshot;
+      datasetId: string;
+      requestCursor: string | null;
+      pageSize: number;
+    }) => {
+      legacy.snapshot.sourceVersion = "mutated-after-open";
+      const page = await originalRead(request);
+      return { ...page, sourceVersion: "mutated-after-open" };
+    });
+    await expect(collect(fixtures)).rejects.toThrow(/operation failed|finalizing/);
+    expect(legacy.adapter.closeSnapshot).toHaveBeenCalledWith(legacy.snapshot, "failed");
+  });
+
+  it("rejects snapshot metadata accessors without invoking them and closes the raw handle", async () => {
+    const fixtures = fixturesFor([]);
+    const legacy = fixtures[0]!;
+    let invoked = false;
+    Object.defineProperty(legacy.snapshot, "sourceVersion", {
+      enumerable: true,
+      get: () => { invoked = true; return "private-accessor"; }
+    });
+    await expect(collect(fixtures)).rejects.toThrow("Opening a coordinated authoritative source snapshot failed");
+    expect(invoked).toBe(false);
+    expect(legacy.adapter.closeSnapshot).toHaveBeenCalledWith(legacy.snapshot, "failed");
   });
 
   it("redacts read failures, closes in reverse exactly once, and rejects any close failure", async () => {
@@ -258,7 +309,7 @@ describe("organization reconciliation dataset page lineage", () => {
     const run = await collect(mutationFixtures);
     mutable.id = "mutated-after-read";
     expect(run.artifacts[0]!.records[0]).toEqual({ id: "legacy-main-directory-1" });
-    expect(run.artifacts[0]!.recordsSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(run.artifacts[0]!.recordsCommitment).toMatch(/^[a-f0-9]{64}$/);
   });
 });
 
@@ -290,6 +341,31 @@ function fixturesFor(events: string[]): Fixture[] {
           ]
         : [datasetPage(snapshot, datasetId, count, records, null, null, 0)]);
     }
+    const catalogSha256 = String(componentIndex + 7).repeat(64);
+    const commitmentKey = Buffer.alloc(32, componentIndex + 1);
+    snapshot.datasetInventory = createOrganizationReconciliationComponentDatasetInventory({
+      componentId: id,
+      sourceId,
+      catalogSha256,
+      datasets: [...pages.entries()].map(([datasetId, datasetPages]) => ({
+        datasetId,
+        pages: datasetPages.map((page) => ({
+          requestCursor: page.requestCursor,
+          nextCursor: page.nextCursor,
+          recordOffset: page.recordOffset,
+          records: page.records as unknown as readonly import("../src/iam-organization-reconciliation-dataset-inventory.js").OrganizationReconciliationInventoryJsonValue[]
+        }))
+      })),
+      commitmentKey
+    });
+    snapshot.sourceVersion = createOrganizationReconciliationContentSourceVersion(sourceId, snapshot.datasetInventory);
+    snapshot.snapshotId = createOrganizationReconciliationContentSnapshotId(sourceId, snapshot.datasetInventory);
+    for (const datasetPages of pages.values()) {
+      for (const page of datasetPages) {
+        (page as Mutable<typeof page>).sourceVersion = snapshot.sourceVersion;
+        (page as Mutable<typeof page>).snapshotId = snapshot.snapshotId;
+      }
+    }
     const adapter = {
       sourceId,
       openSnapshot: vi.fn(async () => {
@@ -300,6 +376,22 @@ function fixturesFor(events: string[]): Fixture[] {
         events.push(`read:${id}:${request.datasetId}`);
         return pages.get(request.datasetId)!.shift()!;
       }),
+      verifySnapshotDatasetReplay: vi.fn((request: {
+        snapshot: OrganizationReconciliationSourceSnapshot;
+        datasetId: string;
+        pages: readonly import("../src/iam-organization-reconciliation-dataset-inventory.js").OrganizationReconciliationDatasetInventoryPageInput[];
+      }) => {
+        if (request.snapshot !== snapshot) throw new Error("wrong snapshot");
+        const observed = createOrganizationReconciliationComponentDatasetInventory({
+          componentId: id,
+          sourceId,
+          catalogSha256,
+          datasets: [{ datasetId: request.datasetId, pages: request.pages }],
+          commitmentKey
+        }).datasets[0]!;
+        const expected = snapshot.datasetInventory!.datasets.find((dataset) => dataset.datasetId === request.datasetId);
+        if (!expected || observed.lineageSha256 !== expected.lineageSha256) throw new Error("mismatch");
+      }),
       closeSnapshot: vi.fn(async (_snapshot: OrganizationReconciliationSourceSnapshot, outcome: "completed" | "failed") => {
         events.push(`close:${id}:${outcome}`);
       })
@@ -307,7 +399,7 @@ function fixturesFor(events: string[]): Fixture[] {
     const datasetCatalog: OrganizationReconciliationDatasetCatalog = {
       contract: ORGANIZATION_RECONCILIATION_DATASET_LINEAGE_CONTRACT,
       trust: ORGANIZATION_RECONCILIATION_DATASET_CATALOG_TRUST,
-      datasets: datasets.map(([datasetId]) => ({ datasetId, pageSize: 10, maxPages: 10, maxRecords: 100 }))
+      datasets: datasets.map(([datasetId]) => ({ datasetId, pageSize: 1, maxPages: 10, maxRecords: 100 }))
     };
     return {
       id,
@@ -318,7 +410,7 @@ function fixturesFor(events: string[]): Fixture[] {
         componentId: id,
         expectedSourceId: sourceId,
         schemaSha256: String(componentIndex + 4).repeat(64),
-        catalogSha256: String(componentIndex + 7).repeat(64),
+        catalogSha256,
         buildSha256: ["a", "b", "c"][componentIndex]!.repeat(64),
         adapter,
         datasetCatalog

@@ -19,6 +19,12 @@ import {
   ORGANIZATION_RECONCILIATION_SNAPSHOT_MODE,
   type OrganizationReconciliationSourceSnapshot
 } from "../src/iam-organization-reconciliation-collector.js";
+import {
+  createOrganizationReconciliationComponentDatasetInventory,
+  createOrganizationReconciliationContentSnapshotId,
+  createOrganizationReconciliationContentSourceVersion
+} from
+  "../src/iam-organization-reconciliation-dataset-inventory.js";
 
 type Mutable<T> = { -readonly [K in keyof T]: T[K] };
 type MutableSnapshot = Mutable<OrganizationReconciliationSourceSnapshot>;
@@ -85,8 +91,8 @@ describe("organization reconciliation multi-source coordinator", () => {
         {
           componentId: "legacy-main",
           sourceId: "legacy-main-db",
-          sourceVersion: "legacy-main-version-1",
-          snapshotId: "legacy-main-snapshot-1",
+          sourceVersion: expect.stringMatching(/^[a-f0-9]{64}$/),
+          snapshotId: expect.stringMatching(/^[a-f0-9]{64}$/),
           recordCount: 11,
           subjectUniverseScope: "complete",
           subjectUniverse: { count: 101, sha256: "1".repeat(64) },
@@ -146,9 +152,41 @@ describe("organization reconciliation multi-source coordinator", () => {
       ...unsigned,
       evidenceSha256: "f".repeat(64)
     } satisfies OrganizationReconciliationCompositeManifestUnsigned;
-    expect(createOrganizationReconciliationCompositeManifestSha256(changedRecordCount)).not.toBe(manifestSha256);
+    const changedInventory = {
+      ...unsigned,
+      components: unsigned.components.map((component, index) => index === 2 ? (() => {
+        const datasetInventory = createOrganizationReconciliationComponentDatasetInventory({
+          componentId: component.componentId,
+          sourceId: component.sourceId,
+          catalogSha256: component.catalogSha256,
+          datasets: [{
+            datasetId: "plugin-fixture-changed",
+            pages: [{
+              requestCursor: null,
+              nextCursor: null,
+              recordOffset: 0,
+              records: Array.from({ length: component.recordCount }, (_, recordIndex) => ({ changed: recordIndex }))
+            }]
+          }],
+          commitmentKey: Buffer.alloc(32, 9)
+        });
+        return {
+          ...component,
+          sourceVersion: createOrganizationReconciliationContentSourceVersion(component.sourceId, datasetInventory),
+          snapshotId: createOrganizationReconciliationContentSnapshotId(component.sourceId, datasetInventory),
+          datasetInventory
+        };
+      })() : component)
+    } satisfies OrganizationReconciliationCompositeManifestUnsigned;
+    expect(() => createOrganizationReconciliationCompositeManifestSha256(changedRecordCount))
+      .toThrow("not bound to its dataset inventory");
     expect(createOrganizationReconciliationCompositeManifestSha256(changedSchema)).not.toBe(manifestSha256);
     expect(createOrganizationReconciliationCompositeManifestSha256(changedEvidence)).not.toBe(manifestSha256);
+    expect(createOrganizationReconciliationCompositeManifestSha256(changedInventory)).not.toBe(manifestSha256);
+    expect(() => validateOrganizationReconciliationCompositeManifestUnsigned({
+      ...unsigned,
+      contract: "iam-organization-reconciliation-composite-manifest/v2"
+    })).toThrow("cross-database atomic consistency");
     expect(validateOrganizationReconciliationCompositeManifestUnsigned(reordered).components
       .map((component) => component.componentId)).toEqual(["legacy-main", "identity", "plugin"]);
   });
@@ -320,12 +358,59 @@ describe("organization reconciliation multi-source coordinator", () => {
         else fixtures[1]!.binding.catalogSha256 = "f".repeat(64);
         return null;
       });
-      await expect(failure).rejects.toThrow("changed metadata");
+      await expect(failure).rejects.toThrow(/changed metadata|content binding/);
       for (const fixture of fixtures) {
         expect(fixture.adapter.closeSnapshot).toHaveBeenCalledTimes(1);
         expect(fixture.adapter.closeSnapshot).toHaveBeenCalledWith(fixture.snapshot, "failed");
       }
     }
+  });
+
+  it("rejects A/B inventory identity before operation and closes every opened handle as failed", async () => {
+    for (const mismatch of ["component", "source"] as const) {
+      const fixtures = fixturesFor([]);
+      const legacy = fixtures[0]!;
+      legacy.snapshot.datasetInventory = createOrganizationReconciliationComponentDatasetInventory({
+        componentId: mismatch === "component" ? "identity" : "legacy-main",
+        sourceId: mismatch === "source" ? "other-legacy-db" : legacy.snapshot.sourceId,
+        catalogSha256: legacy.binding.catalogSha256,
+        datasets: [{ datasetId: "legacy-main-fixture", pages: [{
+          requestCursor: null,
+          nextCursor: null,
+          recordOffset: 0,
+          records: Array.from({ length: legacy.snapshot.recordCount }, (_, recordIndex) => ({ recordIndex }))
+        }] }],
+        commitmentKey: Buffer.alloc(32, 8)
+      });
+      const operation = vi.fn(async () => null);
+      await expect(coordinateOrganizationReconciliationSnapshots({
+        components: fixtures.map((fixture) => fixture.binding),
+        maxWindowMilliseconds: 1_000,
+        clock: clockAt(0, 10)
+      }, operation)).rejects.toThrow("inventory is invalid or untrusted");
+      expect(operation).not.toHaveBeenCalled();
+      expect(legacy.adapter.closeSnapshot).toHaveBeenCalledWith(legacy.snapshot, "failed");
+      expect(fixtures[1]!.adapter.openSnapshot).not.toHaveBeenCalled();
+      expect(fixtures[2]!.adapter.openSnapshot).not.toHaveBeenCalled();
+    }
+  });
+
+  it("rejects snapshot metadata accessors without invoking them", async () => {
+    const fixtures = fixturesFor([]);
+    let invoked = false;
+    Object.defineProperty(fixtures[0]!.snapshot, "sourceVersion", {
+      enumerable: true,
+      get: () => { invoked = true; return "private-accessor"; }
+    });
+    const operation = vi.fn(async () => null);
+    await expect(coordinateOrganizationReconciliationSnapshots({
+      components: fixtures.map((fixture) => fixture.binding),
+      maxWindowMilliseconds: 1_000,
+      clock: clockAt(0, 10)
+    }, operation)).rejects.toThrow("accessor or hidden field");
+    expect(invoked).toBe(false);
+    expect(operation).not.toHaveBeenCalled();
+    expect(fixtures[0]!.adapter.closeSnapshot).toHaveBeenCalledWith(fixtures[0]!.snapshot, "failed");
   });
 
   it("continues closing all sources when one close fails and rejects the entire manifest", async () => {
@@ -470,15 +555,33 @@ const COMPONENT_IDS: readonly OrganizationReconciliationPhysicalSource[] = [
 function fixturesFor(events: string[]): ComponentFixture[] {
   return COMPONENT_IDS.map((id, index) => {
     const sourceId = `${id}-db`;
+    const catalogSha256 = String(index + 7).repeat(64);
+    const recordCount = 11 + index;
+    const datasetInventory = createOrganizationReconciliationComponentDatasetInventory({
+      componentId: id,
+      sourceId,
+      catalogSha256,
+      datasets: [{
+        datasetId: `${id}-fixture`,
+        pages: [{
+          requestCursor: null,
+          nextCursor: null,
+          recordOffset: 0,
+          records: Array.from({ length: recordCount }, (_, recordIndex) => ({ recordIndex }))
+        }]
+      }],
+      commitmentKey: Buffer.alloc(32, index + 1)
+    });
     const snapshot: MutableSnapshot = {
       sourceId,
-      sourceVersion: `${id}-version-1`,
-      snapshotId: `${id}-snapshot-1`,
-      recordCount: 11 + index,
+      sourceVersion: createOrganizationReconciliationContentSourceVersion(sourceId, datasetInventory),
+      snapshotId: createOrganizationReconciliationContentSnapshotId(sourceId, datasetInventory),
+      recordCount,
       subjectUniverseCount: index === 2 ? 0 : 101,
       subjectUniverseHash: index === 2 ? "" : "1".repeat(64),
       snapshotMode: ORGANIZATION_RECONCILIATION_SNAPSHOT_MODE,
-      paginationMode: ORGANIZATION_RECONCILIATION_PAGINATION_MODE
+      paginationMode: ORGANIZATION_RECONCILIATION_PAGINATION_MODE,
+      datasetInventory
     };
     const adapter: TestAdapter = {
       sourceId,
@@ -494,7 +597,7 @@ function fixturesFor(events: string[]): ComponentFixture[] {
       componentId: id,
       expectedSourceId: sourceId,
       schemaSha256: String(index + 4).repeat(64),
-      catalogSha256: String(index + 7).repeat(64),
+      catalogSha256,
       buildSha256: ["a", "b", "c"][index]!.repeat(64),
       adapter
     };

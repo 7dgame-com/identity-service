@@ -1,7 +1,13 @@
 import { createHash, timingSafeEqual } from "node:crypto";
+import {
+  createOrganizationReconciliationContentSnapshotId,
+  createOrganizationReconciliationContentSourceVersion,
+  validateOrganizationReconciliationComponentDatasetInventory,
+  type OrganizationReconciliationComponentDatasetInventory
+} from "./iam-organization-reconciliation-dataset-inventory.js";
 
 export const ORGANIZATION_RECONCILIATION_COMPOSITE_MANIFEST_CONTRACT =
-  "iam-organization-reconciliation-composite-manifest/v2" as const;
+  "iam-organization-reconciliation-composite-manifest/v3" as const;
 export const ORGANIZATION_RECONCILIATION_COMPOSITE_CONSISTENCY_MODEL =
   "independent-immutable-snapshots-bounded-window" as const;
 export const ORGANIZATION_RECONCILIATION_OPERATION_EVIDENCE_CONTRACT =
@@ -43,6 +49,7 @@ export interface OrganizationReconciliationComponentManifest {
   readonly schemaSha256: string;
   readonly catalogSha256: string;
   readonly buildSha256: string;
+  readonly datasetInventory: OrganizationReconciliationComponentDatasetInventory;
   readonly openedAt: string;
   readonly closedAt: string;
 }
@@ -65,7 +72,7 @@ export interface OrganizationReconciliationCompositeManifest
 }
 
 const MANIFEST_HASH_DOMAIN = Buffer.from(
-  "iam-organization-reconciliation:composite-manifest:v2\u001f",
+  "iam-organization-reconciliation:composite-manifest:v3\u001f",
   "utf8"
 );
 const OPERATION_EVIDENCE_HASH_DOMAIN = Buffer.from(
@@ -141,6 +148,7 @@ export function validateOrganizationReconciliationCompositeManifestUnsigned(
       "schemaSha256",
       "catalogSha256",
       "buildSha256",
+      "datasetInventory",
       "openedAt",
       "closedAt"
     ], "component manifest");
@@ -189,19 +197,44 @@ export function validateOrganizationReconciliationCompositeManifestUnsigned(
         "A composite manifest component window is invalid or unbounded."
       );
     }
+    const catalogSha256 = requireSha256(component.catalogSha256, "component catalog digest");
+    let datasetInventory: OrganizationReconciliationComponentDatasetInventory;
+    try {
+      datasetInventory = validateOrganizationReconciliationComponentDatasetInventory(component.datasetInventory);
+    } catch {
+      throw new OrganizationReconciliationComponentManifestError(
+        "A composite manifest component dataset inventory is invalid."
+      );
+    }
+    const recordCount = requireNonNegativeSafeInteger(component.recordCount, "component record count");
+    if (datasetInventory.componentId !== component.componentId || datasetInventory.sourceId !== sourceId ||
+      datasetInventory.catalogSha256 !== catalogSha256 || datasetInventory.recordCount !== recordCount) {
+      throw new OrganizationReconciliationComponentManifestError(
+        "A composite manifest component is not bound to its dataset inventory."
+      );
+    }
+    const sourceVersion = requireOpaqueMetadata(component.sourceVersion, "component source version");
+    const snapshotId = requireOpaqueMetadata(component.snapshotId, "component snapshot ID");
+    if (sourceVersion !== createOrganizationReconciliationContentSourceVersion(sourceId, datasetInventory) ||
+      snapshotId !== createOrganizationReconciliationContentSnapshotId(sourceId, datasetInventory)) {
+      throw new OrganizationReconciliationComponentManifestError(
+        "A composite manifest component content binding is invalid."
+      );
+    }
     byComponent.set(component.componentId, Object.freeze({
       componentId: component.componentId,
       sourceId,
-      sourceVersion: requireOpaqueMetadata(component.sourceVersion, "component source version"),
-      snapshotId: requireOpaqueMetadata(component.snapshotId, "component snapshot ID"),
-      recordCount: requireNonNegativeSafeInteger(component.recordCount, "component record count"),
+      sourceVersion,
+      snapshotId,
+      recordCount,
       subjectUniverseScope: subjectUniverseScope.scope,
       subjectUniverse: subjectUniverseScope.subjectUniverse,
       snapshotMode: ORGANIZATION_RECONCILIATION_SNAPSHOT_MODE,
       paginationMode: ORGANIZATION_RECONCILIATION_PAGINATION_MODE,
       schemaSha256: requireSha256(component.schemaSha256, "component schema digest"),
-      catalogSha256: requireSha256(component.catalogSha256, "component catalog digest"),
+      catalogSha256,
       buildSha256: requireSha256(component.buildSha256, "component build digest"),
+      datasetInventory,
       openedAt,
       closedAt
     }));

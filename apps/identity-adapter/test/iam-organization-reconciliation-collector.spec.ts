@@ -61,6 +61,69 @@ describe("organization reconciliation source collector", () => {
     expect(result.page.collection).toMatchObject({ pageCount: 1, recordCount: 0 });
   });
 
+  it("returns frozen captured metadata while retaining the raw snapshot handle for adapter lifecycle calls", async () => {
+    const rawSnapshot = snapshot(1);
+    const adapter = adapterFor([page(null, null, 0, [{ id: 1, value: "one" }], 1)], 1);
+    adapter.openSnapshot.mockResolvedValue(rawSnapshot);
+
+    const result = await collect(adapter);
+
+    expect(result.source).toEqual(rawSnapshot);
+    expect(result.source).not.toBe(rawSnapshot);
+    expect(Object.isFrozen(result.source)).toBe(true);
+    expect(Object.isFrozen(rawSnapshot)).toBe(true);
+    expect(adapter.readSnapshotPage.mock.calls[0]![0].snapshot).toBe(rawSnapshot);
+    expect(adapter.closeSnapshot.mock.calls[0]![0]).toBe(rawSnapshot);
+  });
+
+  it("rejects raw snapshot mutation during read and closes the original handle as failed", async () => {
+    const rawSnapshot = snapshot(1);
+    const adapter = adapterFor([page(null, null, 0, [{ id: 1, value: "one" }], 1)], 1);
+    adapter.openSnapshot.mockResolvedValue(rawSnapshot);
+    adapter.readSnapshotPage.mockImplementationOnce(async (request) => {
+      expect(request.snapshot).toBe(rawSnapshot);
+      (rawSnapshot as { sourceVersion: string }).sourceVersion = "mutated-during-read";
+      return page(null, null, 0, [{ id: 1, value: "one" }], 1);
+    });
+
+    await expect(collect(adapter)).rejects.toThrow("Reading authoritative source page 1 failed");
+    expect(adapter.closeSnapshot).toHaveBeenCalledTimes(1);
+    expect(adapter.closeSnapshot.mock.calls[0]![0]).toBe(rawSnapshot);
+    expect(adapter.closeSnapshot.mock.calls[0]![1]).toBe("failed");
+  });
+
+  it("rejects a close implementation that attempts to mutate the frozen raw snapshot handle", async () => {
+    const rawSnapshot = snapshot(0);
+    const adapter = adapterFor([page(null, null, 0, [], 0)], 0);
+    adapter.openSnapshot.mockResolvedValue(rawSnapshot);
+    adapter.closeSnapshot.mockImplementationOnce(async (handle) => {
+      (handle as { snapshotId: string }).snapshotId = "mutated-during-close";
+    });
+
+    await expect(collect(adapter)).rejects.toThrow("Closing the authoritative source snapshot failed");
+    expect(rawSnapshot.snapshotId).toBe(SNAPSHOT_ID);
+    expect(adapter.closeSnapshot).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects snapshot metadata accessors without invoking them", async () => {
+    const rawSnapshot = snapshot(0);
+    let invoked = false;
+    Object.defineProperty(rawSnapshot, "sourceVersion", {
+      enumerable: true,
+      get: () => {
+        invoked = true;
+        return "private-source-version";
+      }
+    });
+    const adapter = adapterFor([page(null, null, 0, [], 0)], 0);
+    adapter.openSnapshot.mockResolvedValue(rawSnapshot);
+
+    await expect(collect(adapter)).rejects.toThrow("accessor");
+    expect(invoked).toBe(false);
+    expect(adapter.readSnapshotPage).not.toHaveBeenCalled();
+    expect(adapter.closeSnapshot).toHaveBeenCalledWith(rawSnapshot, "failed");
+  });
+
   it.each([
     ["source version", { sourceVersion: "changed-version" }],
     ["snapshot ID", { snapshotId: "changed-snapshot" }],
@@ -261,9 +324,15 @@ function adapterFor(pages: readonly OrganizationReconciliationSourcePage<RawReco
   let pageIndex = 0;
   return {
     sourceId: SOURCE_ID,
-    openSnapshot: vi.fn(async () => snapshot(recordCount)),
-    readSnapshotPage: vi.fn(async () => pages[pageIndex++]!),
-    closeSnapshot: vi.fn(async () => undefined)
+    openSnapshot: vi.fn<OrganizationReconciliationSourceAdapter<RawRecord>["openSnapshot"]>(
+      async () => snapshot(recordCount)
+    ),
+    readSnapshotPage: vi.fn<OrganizationReconciliationSourceAdapter<RawRecord>["readSnapshotPage"]>(
+      async () => pages[pageIndex++]!
+    ),
+    closeSnapshot: vi.fn<OrganizationReconciliationSourceAdapter<RawRecord>["closeSnapshot"]>(
+      async () => undefined
+    )
   } satisfies OrganizationReconciliationSourceAdapter<RawRecord>;
 }
 

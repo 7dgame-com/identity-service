@@ -76,7 +76,7 @@ Options:
 
 The command performs no network or database access. URL, token, stdin, and
 network parameters are not supported. Input requires the v3 collector envelope
-plus a v2 three-source composite manifest whose operation-evidence digest binds
+plus a v3 three-source composite manifest whose operation-evidence digest binds
 the exact manifest-free input body. This artifact intentionally reports
 realSourceAdaptersReady=false and a coverage blocker until every reviewed
 authoritative adapter is registered in source; caller JSON cannot override it.
@@ -268,6 +268,30 @@ const componentManifest = z.object({
     schemaSha256: hash,
     catalogSha256: hash,
     buildSha256: hash,
+    datasetInventory: z.object({
+      contract: z.literal("iam-organization-reconciliation-dataset-inventory/v2"),
+      recordCommitmentScheme: z.literal("hmac-sha256-run-secret/v1"),
+      componentId: z.string().regex(/^[a-z0-9][a-z0-9-]{0,127}$/),
+      sourceId: nonBlankString,
+      catalogSha256: hash,
+      recordCount: z.number().int().nonnegative(),
+      datasets: z.array(z.object({
+        datasetId: nonBlankString,
+        recordCount: z.number().int().nonnegative(),
+        recordsCommitment: hash,
+        pageCount: z.number().int().positive(),
+        pages: z.array(z.object({
+          pageNumber: z.number().int().positive(),
+          requestCursorCommitment: hash.nullable(),
+          nextCursorCommitment: hash.nullable(),
+          recordOffset: z.number().int().nonnegative(),
+          recordCount: z.number().int().nonnegative(),
+          recordsCommitment: hash
+        }).strict()).nonempty(),
+        lineageSha256: hash
+      }).strict()).nonempty(),
+      inventorySha256: hash
+    }).strict(),
     openedAt: nonBlankString,
     closedAt: nonBlankString
   }).strict()).length(3),

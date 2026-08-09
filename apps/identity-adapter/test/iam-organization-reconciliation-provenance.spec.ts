@@ -354,10 +354,17 @@ describe("trusted external provenance for organization reconciliation", () => {
     const revisionInput = alignedInput();
     const revisionMismatch = attachTestOrganizationReconciliationComponentManifest({
       ...revisionInput,
-      collectionEnvelope: {
-        ...revisionInput.collectionEnvelope!,
+      organizationDirectory: {
+        ...revisionInput.organizationDirectory!,
         identity: {
-          ...revisionInput.collectionEnvelope!.identity,
+          ...revisionInput.organizationDirectory!.identity!,
+          sourceVersion: "different-private-source-version"
+        }
+      },
+      effectiveDecisions: {
+        ...revisionInput.effectiveDecisions!,
+        identity: {
+          ...revisionInput.effectiveDecisions!.identity!,
           sourceVersion: "different-private-source-version"
         }
       }

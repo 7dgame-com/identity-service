@@ -21,6 +21,11 @@ import {
 import type {
   OrganizationReconciliationInput
 } from "./iam-organization-reconciliation-validator.js";
+import {
+  createOrganizationReconciliationContentSnapshotId,
+  createOrganizationReconciliationContentSourceVersion,
+  validateOrganizationReconciliationComponentDatasetInventory
+} from "./iam-organization-reconciliation-dataset-inventory.js";
 
 export * from "./iam-organization-reconciliation-component-manifest.js";
 
@@ -72,16 +77,24 @@ export interface CoordinatedOrganizationReconciliationResult<
   readonly manifest: OrganizationReconciliationCompositeManifest;
 }
 
+/** A dedicated branded operation-evidence projector is not implemented. */
+export const ORGANIZATION_RECONCILIATION_OPERATION_EVIDENCE_PROJECTOR_READY = false as const;
+
 /**
- * The only supported projection from a coordinated result into validator/CLI
- * input. It revalidates the manifest-to-body digest, rejects a nested caller
- * manifest, and freezes one exact final input. This binds content and lifecycle;
- * it deliberately does not claim page lineage for the still-unimplemented
- * production source adapters.
+ * Reserved fail-closed boundary for a future branded operation-evidence
+ * projector. Generic coordinator output is only a lifecycle primitive and is
+ * not supported validator/CLI input. No caller input or environment value can
+ * enable this boundary.
  */
 export function assembleCoordinatedOrganizationReconciliationInput(
   result: CoordinatedOrganizationReconciliationResult<OrganizationReconciliationEvidenceJsonValue>
 ): OrganizationReconciliationInput {
+  void result;
+  if (!ORGANIZATION_RECONCILIATION_OPERATION_EVIDENCE_PROJECTOR_READY) {
+    throw new CoordinatorFailure(
+      "Assembling validator input is disabled until a branded operation-evidence projector is implemented."
+    );
+  }
   try {
     const evidence = canonicalizeOrganizationReconciliationEvidenceValue(result?.value);
     if (evidence === null || typeof evidence !== "object" || Array.isArray(evidence)) {
@@ -324,24 +337,35 @@ function copyAndValidateSnapshot(
   snapshot: OrganizationReconciliationSourceSnapshot,
   binding: ValidatedBinding
 ): OrganizationReconciliationSourceSnapshot {
-  if (!snapshot || typeof snapshot !== "object") {
-    throw new CoordinatorFailure("A coordinated source returned invalid snapshot metadata.");
-  }
+  const captured = exactOwnDataObject(snapshot, [
+    "sourceId", "sourceVersion", "snapshotId", "recordCount", "subjectUniverseCount",
+    "subjectUniverseHash", "snapshotMode", "paginationMode", "datasetInventory"
+  ], "snapshot metadata");
   const copy = {
-    sourceId: requireOpaqueMetadata(snapshot.sourceId, "snapshot source ID"),
-    sourceVersion: requireOpaqueMetadata(snapshot.sourceVersion, "snapshot source version"),
-    snapshotId: requireOpaqueMetadata(snapshot.snapshotId, "snapshot ID"),
-    recordCount: requireNonNegativeSafeInteger(snapshot.recordCount, "snapshot record count"),
+    sourceId: requireOpaqueMetadata(captured.sourceId as string, "snapshot source ID"),
+    sourceVersion: requireOpaqueMetadata(captured.sourceVersion as string, "snapshot source version"),
+    snapshotId: requireOpaqueMetadata(captured.snapshotId as string, "snapshot ID"),
+    recordCount: requireNonNegativeSafeInteger(captured.recordCount as number, "snapshot record count"),
     subjectUniverseCount: requireNonNegativeSafeInteger(
-      snapshot.subjectUniverseCount,
+      captured.subjectUniverseCount as number,
       "snapshot subject universe count"
     ),
-    subjectUniverseHash: snapshot.subjectUniverseHash,
-    snapshotMode: snapshot.snapshotMode,
-    paginationMode: snapshot.paginationMode
+    subjectUniverseHash: captured.subjectUniverseHash as string,
+    snapshotMode: captured.snapshotMode as OrganizationReconciliationSourceSnapshot["snapshotMode"],
+    paginationMode: captured.paginationMode as OrganizationReconciliationSourceSnapshot["paginationMode"],
+    datasetInventory: validateSnapshotDatasetInventory(
+      captured.datasetInventory as OrganizationReconciliationSourceSnapshot["datasetInventory"], binding
+    )
   };
   if (copy.sourceId !== binding.expectedSourceId) {
     throw new CoordinatorFailure("A coordinated snapshot belongs to an unexpected source.");
+  }
+  if (copy.datasetInventory.recordCount !== copy.recordCount) {
+    throw new CoordinatorFailure("A coordinated snapshot record count does not match its dataset inventory.");
+  }
+  if (copy.sourceVersion !== createOrganizationReconciliationContentSourceVersion(copy.sourceId, copy.datasetInventory) ||
+    copy.snapshotId !== createOrganizationReconciliationContentSnapshotId(copy.sourceId, copy.datasetInventory)) {
+    throw new CoordinatorFailure("A coordinated snapshot content binding is invalid.");
   }
   if (copy.snapshotMode !== ORGANIZATION_RECONCILIATION_SNAPSHOT_MODE) {
     throw new CoordinatorFailure("A coordinated source does not provide an immutable snapshot.");
@@ -360,6 +384,31 @@ function copyAndValidateSnapshot(
     requireSha256(copy.subjectUniverseHash, "subject universe digest");
   }
   return copy;
+}
+
+function exactOwnDataObject(
+  candidate: unknown,
+  keys: readonly string[],
+  label: string
+): Record<string, unknown> {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate) ||
+    (Object.getPrototypeOf(candidate) !== Object.prototype && Object.getPrototypeOf(candidate) !== null) ||
+    Object.getOwnPropertySymbols(candidate).length > 0) {
+    throw new CoordinatorFailure(`A coordinated ${label} object is invalid.`);
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(candidate);
+  if (Object.keys(descriptors).sort().join("\u001f") !== [...keys].sort().join("\u001f")) {
+    throw new CoordinatorFailure(`A coordinated ${label} object has missing or unknown fields.`);
+  }
+  const output: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+  for (const key of keys) {
+    const descriptor = descriptors[key]!;
+    if (!descriptor.enumerable || !("value" in descriptor)) {
+      throw new CoordinatorFailure(`A coordinated ${label} object contains an accessor or hidden field.`);
+    }
+    output[key] = descriptor.value;
+  }
+  return output;
 }
 
 function createOperationContext(opened: readonly OpenedComponent[]): OrganizationReconciliationCoordinatorContext {
@@ -487,6 +536,7 @@ function createUnsignedManifest(
     schemaSha256: component.binding.schemaSha256,
     catalogSha256: component.binding.catalogSha256,
     buildSha256: component.binding.buildSha256,
+    datasetInventory: component.snapshot!.datasetInventory!,
     openedAt: component.openedAt,
     closedAt: component.closedAt!
   })));
@@ -503,6 +553,26 @@ function createUnsignedManifest(
     evidenceSha256,
     components
   });
+}
+
+function validateSnapshotDatasetInventory(
+  candidate: OrganizationReconciliationSourceSnapshot["datasetInventory"],
+  binding: ValidatedBinding
+) {
+  if (!candidate) {
+    throw new CoordinatorFailure("A coordinated source did not provide transaction-owned dataset inventory.");
+  }
+  try {
+    const inventory = validateOrganizationReconciliationComponentDatasetInventory(candidate);
+    if (inventory.componentId !== binding.componentId ||
+      inventory.sourceId !== binding.expectedSourceId ||
+      inventory.catalogSha256 !== binding.catalogSha256) {
+      throw new Error("catalog mismatch");
+    }
+    return inventory;
+  } catch {
+    throw new CoordinatorFailure("A coordinated source dataset inventory is invalid or untrusted.");
+  }
 }
 
 function isRequiredPhysicalSource(value: unknown): value is OrganizationReconciliationPhysicalSource {

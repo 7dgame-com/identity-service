@@ -23,6 +23,17 @@ import {
   validateOrganizationReconciliationCompositeManifestEvidenceBinding,
   type OrganizationReconciliationCompositeManifest
 } from "./iam-organization-reconciliation-component-manifest.js";
+import {
+  ORGANIZATION_RECONCILIATION_OPERATION_EVIDENCE_PROJECTOR_READY
+} from "./iam-organization-reconciliation-coordinator.js";
+import {
+  ORGANIZATION_RECONCILIATION_DATASET_LINEAGE_PRODUCTION_READY
+} from "./iam-organization-reconciliation-dataset-lineage.js";
+import {
+  ORGANIZATION_RECONCILIATION_COMPILED_PIPELINE_REGISTRATION_READY,
+  ORGANIZATION_RECONCILIATION_RAW_SOURCE_CAPABILITY_READY,
+  ORGANIZATION_RECONCILIATION_TRANSACTION_ADAPTER_FACTORY_CAPABILITY_READY
+} from "./iam-organization-reconciliation-runtime-readiness.js";
 
 export type OrganizationReconciliationSeverity = "P0" | "P1" | "P2" | "info";
 export type OrganizationDecision = "allow" | "deny";
@@ -50,10 +61,13 @@ export const ORGANIZATION_RECONCILIATION_DECISION_DERIVATION_CONTRACT =
  * Deliberate production blocker. A reviewed change may set this true only when
  * every authoritative Legacy/Identity/plugin/rule adapter is registered.
  */
-const ORGANIZATION_RECONCILIATION_RAW_SOURCE_ADAPTERS_READY = false as const;
 export const ORGANIZATION_RECONCILIATION_REAL_SOURCE_ADAPTERS_READY =
-  ORGANIZATION_RECONCILIATION_RAW_SOURCE_ADAPTERS_READY &&
-  ORGANIZATION_RECONCILIATION_PROJECTION_CATALOGS_READY;
+  ORGANIZATION_RECONCILIATION_RAW_SOURCE_CAPABILITY_READY &&
+  ORGANIZATION_RECONCILIATION_PROJECTION_CATALOGS_READY &&
+  ORGANIZATION_RECONCILIATION_DATASET_LINEAGE_PRODUCTION_READY &&
+  ORGANIZATION_RECONCILIATION_TRANSACTION_ADAPTER_FACTORY_CAPABILITY_READY &&
+  ORGANIZATION_RECONCILIATION_OPERATION_EVIDENCE_PROJECTOR_READY &&
+  ORGANIZATION_RECONCILIATION_COMPILED_PIPELINE_REGISTRATION_READY;
 
 export interface OrganizationReconciliationPageEvidence {
   readonly pageNumber: number;

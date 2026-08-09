@@ -10,8 +10,7 @@ import {
   openLegacyMainMysqlRawSnapshot,
   openPluginRegistryMysqlRawSnapshot,
   organizationReconciliationMysqlRawAdapterReadiness,
-  type OpenOrganizationReconciliationMysqlRawSnapshotOptions,
-  type OrganizationReconciliationMysqlSnapshotBindingProvider
+  type OpenOrganizationReconciliationMysqlRawSnapshotOptions
 } from "../src/iam-organization-reconciliation/mysql-source-adapters/raw-source-snapshots.js";
 import {
   ORGANIZATION_RECONCILIATION_MYSQL_STATEMENTS,
@@ -30,12 +29,12 @@ describe("organization reconciliation source-specific MySQL raw adapters", () =>
       ready: false,
       blockers: [
         "runtime-source-adapter-wiring-disabled",
-        "transaction-owned-source-version-provider-not-implemented",
-        "identity-complete-subject-universe-statement-missing",
-        "snapshot-record-count-statements-missing",
+        "compiled-owner-dataset-catalog-not-registered",
+        "trusted-physical-source-binding-not-registered",
         "identity-dataset-source-status-selectors-not-owner-approved",
         "identity-shadow-versus-candidate-read-model-not-owner-approved",
         "plugin-registry-schema-version-not-owner-approved",
+        "plugin-static-overlay-precedence-not-owner-approved",
         "mysql-collation-and-ordering-not-owner-approved"
       ]
     });
@@ -43,32 +42,16 @@ describe("organization reconciliation source-specific MySQL raw adapters", () =>
 
   it("opens only through injected dependencies and keeps component and opaque source IDs distinct", async () => {
     const fake = fakeConnection();
-    const captureSnapshotBinding = vi.fn(async () => {
-      expect(fake.queries.map(([sql]) => sql)).toEqual([
-        SET_REPEATABLE_READ,
-        START_READ_ONLY_SNAPSHOT
-      ]);
-      return { sourceVersion: "legacy-schema-v1", snapshotId: "legacy-snapshot-001" };
-    });
 
     const snapshot = await openLegacyMainMysqlRawSnapshot({
       expectedSourceId: "legacy-main-db",
-      connectionFactory: async () => fake.connection,
-      bindingProvider: { captureSnapshotBinding }
+      connectionFactory: async () => fake.connection
     });
 
-    expect(captureSnapshotBinding).toHaveBeenCalledWith({
-      contract: ORGANIZATION_RECONCILIATION_MYSQL_RAW_ADAPTER_CONTRACT,
-      componentId: "legacy-main",
-      sourceId: "legacy-main-db",
-      statementCatalogSha256: ORGANIZATION_RECONCILIATION_MYSQL_STATEMENT_CATALOG_SHA256
-    });
     expect(snapshot.metadata).toEqual({
       contract: ORGANIZATION_RECONCILIATION_MYSQL_RAW_ADAPTER_CONTRACT,
       componentId: "legacy-main",
       sourceId: "legacy-main-db",
-      sourceVersion: "legacy-schema-v1",
-      snapshotId: "legacy-snapshot-001",
       snapshotMode: ORGANIZATION_RECONCILIATION_SNAPSHOT_MODE,
       paginationMode: ORGANIZATION_RECONCILIATION_PAGINATION_MODE,
       statementCatalogSha256: ORGANIZATION_RECONCILIATION_MYSQL_STATEMENT_CATALOG_SHA256
@@ -293,21 +276,17 @@ describe("organization reconciliation source-specific MySQL raw adapters", () =>
     expect(fake.release).toHaveBeenCalledTimes(1);
   });
 
-  it("redacts binding-provider and driver secrets and rolls every uncertain snapshot back", async () => {
+  it("redacts connection-factory and driver secrets and rolls every uncertain snapshot back", async () => {
     const bindingFake = fakeConnection();
     const bindingFailure = await openIdentityMysqlRawSnapshot({
       expectedSourceId: "identity-candidate-db",
-      connectionFactory: async () => bindingFake.connection,
-      bindingProvider: {
-        async captureSnapshotBinding() {
-          throw new Error("mysql://private-user:private-binding-secret@identity-db");
-        }
+      async connectionFactory() {
+        throw new Error("mysql://private-user:private-binding-secret@identity-db");
       }
     }).catch((error: unknown) => error);
     expect(bindingFailure).toEqual(new Error("Opening the Identity MySQL reconciliation snapshot failed."));
     expect(JSON.stringify(bindingFailure)).not.toContain("private-binding-secret");
-    expect(bindingFake.queries.at(-1)?.[0]).toBe("ROLLBACK");
-    expect(bindingFake.release).toHaveBeenCalledTimes(1);
+    expect(bindingFake.queries).toEqual([]);
 
     const queryFake = fakeConnection({}, {
       failSql: sql("legacy-subject-universe-page/v1"),
@@ -327,8 +306,7 @@ describe("organization reconciliation source-specific MySQL raw adapters", () =>
     const sourceIdGetter = vi.fn(() => "legacy-main-db");
     const connectionFactory = vi.fn(async () => fakeConnection().connection);
     const getterOptions = Object.defineProperty({
-      connectionFactory,
-      bindingProvider: bindingProviderFor("legacy-main-db")
+      connectionFactory
     }, "expectedSourceId", {
       enumerable: true,
       get: sourceIdGetter
@@ -340,27 +318,9 @@ describe("organization reconciliation source-specific MySQL raw adapters", () =>
     expect(sourceIdGetter).not.toHaveBeenCalled();
     expect(connectionFactory).not.toHaveBeenCalled();
 
-    const providerGetter = vi.fn(() => async () => ({
-      sourceVersion: "legacy-v1",
-      snapshotId: "legacy-snapshot-001"
-    }));
-    const bindingProvider = Object.defineProperty({}, "captureSnapshotBinding", {
-      enumerable: true,
-      get: providerGetter
-    });
-    const providerFailure = await openLegacyMainMysqlRawSnapshot({
-      expectedSourceId: "legacy-main-db",
-      connectionFactory,
-      bindingProvider: bindingProvider as never
-    }).catch((error: unknown) => error);
-    expect(providerFailure).toEqual(new Error("Opening the Legacy main MySQL reconciliation snapshot failed."));
-    expect(providerGetter).not.toHaveBeenCalled();
-    expect(connectionFactory).not.toHaveBeenCalled();
-
     const extraFieldFailure = await openLegacyMainMysqlRawSnapshot({
       expectedSourceId: "legacy-main-db",
       connectionFactory,
-      bindingProvider: bindingProviderFor("legacy-main-db"),
       unexpectedDatabase: "must-not-be-read"
     } as never).catch((error: unknown) => error);
     expect(extraFieldFailure).toEqual(new Error("Opening the Legacy main MySQL reconciliation snapshot failed."));
@@ -503,19 +463,7 @@ function optionsFor(
 ): OpenOrganizationReconciliationMysqlRawSnapshotOptions {
   return {
     expectedSourceId,
-    connectionFactory: async () => fake.connection,
-    bindingProvider: bindingProviderFor(expectedSourceId)
-  };
-}
-
-function bindingProviderFor(sourceId: string): OrganizationReconciliationMysqlSnapshotBindingProvider {
-  return {
-    async captureSnapshotBinding() {
-      return {
-        sourceVersion: `${sourceId}-schema-v1`,
-        snapshotId: `${sourceId}-snapshot-001`
-      };
-    }
+    connectionFactory: async () => fake.connection
   };
 }
 

@@ -5,6 +5,7 @@ import {
   ORGANIZATION_RECONCILIATION_COLLECTOR_CONTRACT,
   ORGANIZATION_RECONCILIATION_COLLECTOR_CONTRACT_HASH,
   ORGANIZATION_RECONCILIATION_DECISION_DERIVATION_CONTRACT,
+  ORGANIZATION_RECONCILIATION_REAL_SOURCE_ADAPTERS_READY,
   OrganizationReconciliationInput,
   ReconciliationPair,
   validateOrganizationReconciliation as validateOrganizationReconciliationRaw,
@@ -22,10 +23,31 @@ import {
 } from "../src/iam-organization-reconciliation-component-manifest.js";
 import {
   assembleCoordinatedOrganizationReconciliationInput,
-  coordinateOrganizationReconciliationSnapshots
+  coordinateOrganizationReconciliationSnapshots,
+  ORGANIZATION_RECONCILIATION_OPERATION_EVIDENCE_PROJECTOR_READY
 } from "../src/iam-organization-reconciliation-coordinator.js";
+import { ORGANIZATION_RECONCILIATION_DATASET_LINEAGE_PRODUCTION_READY } from
+  "../src/iam-organization-reconciliation-dataset-lineage.js";
+import { ORGANIZATION_RECONCILIATION_PROJECTION_CATALOGS_READY } from
+  "../src/iam-organization-reconciliation-refs.js";
+import {
+  ORGANIZATION_RECONCILIATION_COMPILED_PIPELINE_REGISTRATION_READY,
+  ORGANIZATION_RECONCILIATION_RAW_SOURCE_CAPABILITY_READY,
+  ORGANIZATION_RECONCILIATION_TRANSACTION_ADAPTER_FACTORY_CAPABILITY_READY
+} from "../src/iam-organization-reconciliation-runtime-readiness.js";
 
 describe("work-package 4 full-scope organization reconciliation validator", () => {
+  it("keeps the total compiled readiness conjunction fail-closed", () => {
+    expect([
+      ORGANIZATION_RECONCILIATION_RAW_SOURCE_CAPABILITY_READY,
+      ORGANIZATION_RECONCILIATION_PROJECTION_CATALOGS_READY,
+      ORGANIZATION_RECONCILIATION_DATASET_LINEAGE_PRODUCTION_READY,
+      ORGANIZATION_RECONCILIATION_TRANSACTION_ADAPTER_FACTORY_CAPABILITY_READY,
+      ORGANIZATION_RECONCILIATION_OPERATION_EVIDENCE_PROJECTOR_READY,
+      ORGANIZATION_RECONCILIATION_COMPILED_PIPELINE_REGISTRATION_READY
+    ]).toEqual([false, false, false, false, false, false]);
+    expect(ORGANIZATION_RECONCILIATION_REAL_SOURCE_ADAPTERS_READY).toBe(false);
+  });
   it("passes only when every required surface is complete and pairwise aligned", () => {
     const report = validateOrganizationReconciliation(alignedInput());
 
@@ -121,17 +143,18 @@ describe("work-package 4 full-scope organization reconciliation validator", () =
           : component
       )
     } satisfies OrganizationReconciliationCompositeManifestUnsigned;
-    const envelopeMismatch = validateOrganizationReconciliationRaw({
-      ...evidenceBody,
-      componentManifest: {
-        ...wrongSourceManifest,
-        manifestSha256: createOrganizationReconciliationCompositeManifestSha256(wrongSourceManifest)
-      }
-    });
-    expect(envelopeMismatch.coverageBlockers).toContainEqual({
-      surface: "collection-envelope",
-      code: "component-manifest-envelope-mismatch"
-    });
+    expect(() => createOrganizationReconciliationCompositeManifestSha256(wrongSourceManifest))
+      .toThrow("content binding is invalid");
+    const wrongSnapshotManifest = {
+      ...unsignedManifest,
+      components: unsignedManifest.components.map((component) =>
+        component.componentId === "identity"
+          ? { ...component, snapshotId: "other-identity-snapshot" }
+          : component
+      )
+    } satisfies OrganizationReconciliationCompositeManifestUnsigned;
+    expect(() => createOrganizationReconciliationCompositeManifestSha256(wrongSnapshotManifest))
+      .toThrow("content binding is invalid");
 
     const wrongSubjectManifest = {
       ...unsignedManifest,
@@ -185,21 +208,22 @@ describe("work-package 4 full-scope organization reconciliation validator", () =
     const components = componentIds.map((componentId, index) => {
       const original = originalComponents.get(componentId)!;
       const snapshot = {
-        sourceId: `coordinated-${componentId}`,
+        sourceId: original.sourceId,
         sourceVersion: original.sourceVersion,
         snapshotId: original.snapshotId,
         recordCount: original.recordCount,
         subjectUniverseCount: original.subjectUniverse.count,
         subjectUniverseHash: original.subjectUniverse.sha256,
         snapshotMode: ORGANIZATION_RECONCILIATION_SNAPSHOT_MODE,
-        paginationMode: ORGANIZATION_RECONCILIATION_PAGINATION_MODE
+        paginationMode: ORGANIZATION_RECONCILIATION_PAGINATION_MODE,
+        datasetInventory: original.datasetInventory
       } as const;
       return {
         componentId,
         expectedSourceId: snapshot.sourceId,
-        schemaSha256: String(index + 4).repeat(64),
-        catalogSha256: String(index + 7).repeat(64),
-        buildSha256: ["a", "b", "c"][index]!.repeat(64),
+        schemaSha256: original.schemaSha256,
+        catalogSha256: original.catalogSha256,
+        buildSha256: original.buildSha256,
         adapter: {
           sourceId: snapshot.sourceId,
           openSnapshot: async () => snapshot,
@@ -222,17 +246,8 @@ describe("work-package 4 full-scope organization reconciliation validator", () =
       clock: { now: () => new Date(timestamps[clockIndex++]!) }
     }, async () => evidenceBody as unknown as OrganizationReconciliationEvidenceJsonValue);
 
-    const assembled = assembleCoordinatedOrganizationReconciliationInput(coordinated);
-    expect(assembled.componentManifest).toEqual(coordinated.manifest);
-    expect(Object.isFrozen(assembled)).toBe(true);
-    const report = validateOrganizationReconciliationRaw(assembled);
-    expect(report.coverageBlockers).toEqual([
-      { surface: "collection-envelope", code: "real-source-adapters-not-ready" }
-    ]);
-    expect(report.safetyGate).toMatchObject({
-      passed: false,
-      blockedReasons: ["coverage-incomplete", "external-provenance-required"]
-    });
+    expect(() => assembleCoordinatedOrganizationReconciliationInput(coordinated))
+      .toThrow("disabled until a branded operation-evidence projector is implemented");
   });
 
   it("rejects accessor evidence without invoking it", () => {
@@ -719,7 +734,7 @@ describe("work-package 4 full-scope organization reconciliation validator", () =
     ]));
 
     const input = alignedInput();
-    const report = validateOrganizationReconciliation({
+    const report = validateOrganizationReconciliationRaw({
       ...input,
       collectionEnvelope: {
         ...input.collectionEnvelope!,

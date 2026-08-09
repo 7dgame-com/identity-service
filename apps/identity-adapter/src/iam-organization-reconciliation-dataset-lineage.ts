@@ -14,6 +14,11 @@ import type {
   OrganizationReconciliationSourceAdapter,
   OrganizationReconciliationSourceSnapshot
 } from "./iam-organization-reconciliation-collector.js";
+import {
+  validateOrganizationReconciliationComponentDatasetInventory,
+  type OrganizationReconciliationComponentDatasetInventory,
+  type OrganizationReconciliationDatasetInventoryPageInput
+} from "./iam-organization-reconciliation-dataset-inventory.js";
 
 export const ORGANIZATION_RECONCILIATION_DATASET_LINEAGE_CONTRACT =
   "iam-organization-reconciliation-snapshot-dataset-lineage/v1" as const;
@@ -61,6 +66,14 @@ export interface OrganizationReconciliationDatasetPage<TRawRecord> {
   readonly records: readonly TRawRecord[];
 }
 
+export interface OrganizationReconciliationDatasetReplayVerificationRequest<TRawRecord> {
+  readonly snapshot: OrganizationReconciliationSourceSnapshot;
+  readonly datasetId: string;
+  readonly pages: readonly (Omit<OrganizationReconciliationDatasetInventoryPageInput, "records"> & {
+    readonly records: readonly TRawRecord[];
+  })[];
+}
+
 /**
  * Future bridge contract only. Existing raw MySQL adapters do not yet emit the
  * transaction-owned `datasetRecordCount` required here and are not wired in.
@@ -70,6 +83,10 @@ export interface OrganizationReconciliationDatasetSourceAdapter<TRawRecord>
   readSnapshotPage(
     request: OrganizationReconciliationDatasetPageRequest
   ): Promise<OrganizationReconciliationDatasetPage<TRawRecord>>;
+  /** Snapshot-bound verifier; it never exposes the run commitment secret. */
+  verifySnapshotDatasetReplay(
+    request: OrganizationReconciliationDatasetReplayVerificationRequest<TRawRecord>
+  ): Promise<void> | void;
 }
 
 export interface OrganizationReconciliationDatasetComponentBinding
@@ -88,7 +105,7 @@ export interface OrganizationReconciliationDatasetPageLineage {
   readonly nextCursor: string | null;
   readonly recordOffset: number;
   readonly recordCount: number;
-  readonly recordsSha256: string;
+  readonly recordsCommitment: string;
   /** Caller-declared component catalog digest; not verified as an owner pin here. */
   readonly declaredCatalogSha256: string;
   /** Process-generated digest of the explicitly untrusted structural catalog. */
@@ -101,7 +118,7 @@ export interface OrganizationReconciliationDatasetLineageArtifact {
   readonly snapshotId: string;
   readonly datasetId: string;
   readonly recordCount: number;
-  readonly recordsSha256: string;
+  readonly recordsCommitment: string;
   readonly records: readonly OrganizationReconciliationEvidenceJsonValue[];
   readonly pages: readonly OrganizationReconciliationDatasetPageLineage[];
   readonly lineageSha256: string;
@@ -113,9 +130,12 @@ export interface OrganizationReconciliationDatasetLineageReadiness {
     "real-dataset-adapters-not-registered",
     "compiled-owner-catalog-not-registered",
     "trusted-physical-source-binding-not-registered",
-    "transaction-owned-dataset-counts-not-implemented",
+    "transaction-owned-inventory-bridge-not-production-registered",
     "dataset-unique-order-contract-not-registered",
-    "operation-evidence-projector-not-implemented"
+    "bounded-streaming-projector-not-implemented",
+    "operation-evidence-projector-not-implemented",
+    "factory-created-transaction-adapter-capability-not-registered",
+    "compiled-reconciliation-pipeline-not-registered"
   ];
 }
 
@@ -139,10 +159,15 @@ interface PreparedComponent {
   readonly originalAdapter: OrganizationReconciliationDatasetSourceAdapter<unknown>;
   readonly sourceId: string;
   readonly readSnapshotPage: OrganizationReconciliationDatasetSourceAdapter<unknown>["readSnapshotPage"];
+  readonly verifySnapshotDatasetReplay:
+    OrganizationReconciliationDatasetSourceAdapter<unknown>["verifySnapshotDatasetReplay"];
   readonly declaredCatalogSha256: string;
   readonly structuralCatalogSha256: string;
   readonly datasets: readonly OrganizationReconciliationDatasetSpec[];
-  readonly snapshotHandle: { value?: OrganizationReconciliationSourceSnapshot };
+  readonly snapshotHandle: {
+    raw?: OrganizationReconciliationSourceSnapshot;
+    public?: Readonly<OrganizationReconciliationSourceSnapshot>;
+  };
 }
 
 interface RunBrand {
@@ -153,8 +178,6 @@ interface RunBrand {
 
 const runBrands = new WeakMap<object, RunBrand>();
 const artifactBrands = new WeakMap<object, { readonly run: OrganizationReconciliationDatasetLineageRun }>();
-const PAGE_HASH_DOMAIN = Buffer.from("iam-organization-reconciliation:raw-dataset-page:v1\u001f", "utf8");
-const RECORDS_HASH_DOMAIN = Buffer.from("iam-organization-reconciliation:raw-dataset-records:v1\u001f", "utf8");
 const LINEAGE_HASH_DOMAIN = Buffer.from("iam-organization-reconciliation:dataset-lineage:v1\u001f", "utf8");
 const CATALOG_HASH_DOMAIN = Buffer.from("iam-organization-reconciliation:untrusted-dataset-catalog:v1\u001f", "utf8");
 const MAX_TOTAL_DATASET_PAGES = 10_000;
@@ -167,9 +190,12 @@ export function organizationReconciliationDatasetLineageReadiness(): Organizatio
       "real-dataset-adapters-not-registered",
       "compiled-owner-catalog-not-registered",
       "trusted-physical-source-binding-not-registered",
-      "transaction-owned-dataset-counts-not-implemented",
+      "transaction-owned-inventory-bridge-not-production-registered",
       "dataset-unique-order-contract-not-registered",
-      "operation-evidence-projector-not-implemented"
+      "bounded-streaming-projector-not-implemented",
+      "operation-evidence-projector-not-implemented",
+      "factory-created-transaction-adapter-capability-not-registered",
+      "compiled-reconciliation-pipeline-not-registered"
     ] as const)
   });
 }
@@ -230,7 +256,12 @@ export async function collectOrganizationReconciliationDatasetLineage(
   return run;
 }
 
-/** Rejects clones, look-alikes, and artifacts from another collection run. */
+/**
+ * Rejects clones, look-alikes, and artifacts from another collection run.
+ * This in-process brand proves only structural collection identity; it does
+ * not authenticate a physical source or replace compiled registration and
+ * external attestation.
+ */
 export function assertOrganizationReconciliationDatasetArtifactBelongsToRun(
   run: OrganizationReconciliationDatasetLineageRun,
   artifact: OrganizationReconciliationDatasetLineageArtifact
@@ -282,22 +313,41 @@ function prepareComponents(candidates: readonly OrganizationReconciliationDatase
     if (sourceId !== expectedSourceId) throw new DatasetLineageFailure("A dataset adapter is bound to an unexpected source.");
     const openSnapshot = requireFunction(adapter, "openSnapshot") as OrganizationReconciliationDatasetSourceAdapter<unknown>["openSnapshot"];
     const readSnapshotPage = requireFunction(adapter, "readSnapshotPage") as OrganizationReconciliationDatasetSourceAdapter<unknown>["readSnapshotPage"];
+    const verifySnapshotDatasetReplay = requireFunction(adapter, "verifySnapshotDatasetReplay") as
+      OrganizationReconciliationDatasetSourceAdapter<unknown>["verifySnapshotDatasetReplay"];
     const closeSnapshot = requireFunction(adapter, "closeSnapshot") as OrganizationReconciliationDatasetSourceAdapter<unknown>["closeSnapshot"];
     const catalog = canonicalCatalog(strictCandidate.datasetCatalog);
     const declaredCatalogSha256 = requireSha256(strictCandidate.catalogSha256, "declared catalog digest");
-    const snapshotHandle: { value?: OrganizationReconciliationSourceSnapshot } = {};
+    const snapshotHandle: PreparedComponent["snapshotHandle"] = {};
     const facade: OrganizationReconciliationComponentBinding["adapter"] = Object.freeze({
       sourceId,
       openSnapshot: async () => {
-        const snapshot = await openSnapshot.call(adapter);
-        snapshotHandle.value = snapshot;
-        return snapshot;
+        const rawSnapshot = await openSnapshot.call(adapter);
+        let publicSnapshot: Readonly<OrganizationReconciliationSourceSnapshot>;
+        try {
+          publicSnapshot = captureDatasetSnapshot(rawSnapshot);
+        } catch {
+          await closeSnapshot.call(adapter, rawSnapshot, "failed");
+          throw new DatasetLineageFailure("Capturing dataset snapshot metadata failed.");
+        }
+        snapshotHandle.raw = rawSnapshot;
+        snapshotHandle.public = publicSnapshot;
+        return publicSnapshot;
       },
-      closeSnapshot: (snapshot: OrganizationReconciliationSourceSnapshot, outcome: "completed" | "failed") => {
-        if (snapshotHandle.value !== snapshot) {
+      closeSnapshot: async (snapshot: OrganizationReconciliationSourceSnapshot, outcome: "completed" | "failed") => {
+        const rawSnapshot = snapshotHandle.raw;
+        const publicSnapshot = snapshotHandle.public;
+        if (!rawSnapshot || publicSnapshot !== snapshot) {
           throw new DatasetLineageFailure("The coordinator attempted to close an unexpected snapshot handle.");
         }
-        return closeSnapshot.call(adapter, snapshot, outcome);
+        let drifted = false;
+        try {
+          drifted = snapshotMetadataJson(captureDatasetSnapshot(rawSnapshot)) !== snapshotMetadataJson(publicSnapshot);
+        } catch {
+          drifted = true;
+        }
+        await closeSnapshot.call(adapter, rawSnapshot, drifted ? "failed" : outcome);
+        if (drifted) throw new DatasetLineageFailure("The raw dataset snapshot metadata changed during collection.");
       }
     });
     const binding = Object.freeze({
@@ -314,6 +364,7 @@ function prepareComponents(candidates: readonly OrganizationReconciliationDatase
       originalAdapter: adapter,
       sourceId,
       readSnapshotPage,
+      verifySnapshotDatasetReplay,
       declaredCatalogSha256,
       structuralCatalogSha256: sha256(CATALOG_HASH_DOMAIN, catalog),
       datasets: catalog.datasets,
@@ -347,7 +398,7 @@ function canonicalCatalog(candidate: unknown): OrganizationReconciliationDataset
       maxPages: requireLimit(entry.maxPages, 1, 10_000, "dataset page count"),
       maxRecords: requireLimit(entry.maxRecords, 0, 10_000_000, "dataset record count")
     });
-  }).sort((left, right) => left.datasetId.localeCompare(right.datasetId));
+  }).sort((left, right) => left.datasetId < right.datasetId ? -1 : left.datasetId > right.datasetId ? 1 : 0);
   const aggregatePages = datasets.reduce((sum, dataset) => sum + dataset.maxPages, 0);
   const aggregateRecords = datasets.reduce((sum, dataset) => sum + dataset.maxRecords, 0);
   if (
@@ -370,11 +421,14 @@ async function collectDataset(
 ): Promise<OrganizationReconciliationDatasetLineageArtifact> {
   const records: OrganizationReconciliationEvidenceJsonValue[] = [];
   const pages: OrganizationReconciliationDatasetPageLineage[] = [];
+  const replayPages: OrganizationReconciliationDatasetInventoryPageInput[] = [];
   const cursors = new Set<string>();
   let requestCursor: string | null = null;
   let expectedDatasetCount: number | undefined;
-  const snapshotHandle = component.snapshotHandle.value;
+  const snapshotHandle = component.snapshotHandle.raw;
   if (!snapshotHandle) throw new DatasetLineageFailure("The coordinator-owned snapshot handle is unavailable.");
+  const inventoryDataset = snapshot.datasetInventory?.datasets.find((entry) => entry.datasetId === dataset.datasetId);
+  if (!inventoryDataset) throw new DatasetLineageFailure("The opened snapshot dataset inventory is incomplete.");
   while (true) {
     if (pages.length >= dataset.maxPages) throw new DatasetLineageFailure("A dataset cursor chain exceeded its page bound.");
     assertReadStable(component);
@@ -396,7 +450,8 @@ async function collectDataset(
     if (records.length + page.records.length > dataset.maxRecords) {
       throw new DatasetLineageFailure("A dataset exceeded its raw record bound.");
     }
-    const pageRecordsHash = sha256(PAGE_HASH_DOMAIN, page.records);
+    const inventoryPage = inventoryDataset.pages[pages.length];
+    if (!inventoryPage) throw new DatasetLineageFailure("The opened snapshot page inventory is incomplete.");
     pages.push(Object.freeze({
       pageNumber: pages.length + 1,
       sourceId: page.sourceId,
@@ -407,9 +462,15 @@ async function collectDataset(
       nextCursor: page.nextCursor,
       recordOffset: page.recordOffset,
       recordCount: page.records.length,
-      recordsSha256: pageRecordsHash,
+      recordsCommitment: inventoryPage.recordsCommitment,
       declaredCatalogSha256: component.declaredCatalogSha256,
       structuralCatalogSha256: component.structuralCatalogSha256
+    }));
+    replayPages.push(Object.freeze({
+      requestCursor: page.requestCursor,
+      nextCursor: page.nextCursor,
+      recordOffset: page.recordOffset,
+      records: page.records
     }));
     records.push(...page.records);
     if (page.nextCursor === null) break;
@@ -423,13 +484,27 @@ async function collectDataset(
   if (expectedDatasetCount === undefined || records.length !== expectedDatasetCount) {
     throw new DatasetLineageFailure("A dataset cursor chain is incomplete.");
   }
+  if (pages.length !== inventoryDataset.pageCount || records.length !== inventoryDataset.recordCount) {
+    throw new DatasetLineageFailure("Dataset replay does not cover its transaction-owned inventory.");
+  }
+  assertReadStable(component);
+  try {
+    await component.verifySnapshotDatasetReplay.call(component.originalAdapter, {
+      snapshot: snapshotHandle,
+      datasetId: dataset.datasetId,
+      pages: Object.freeze(replayPages)
+    });
+  } catch {
+    throw new DatasetLineageFailure("Dataset replay commitment verification failed.");
+  }
+  assertReadStable(component);
   const artifactBody = Object.freeze({
     componentId: component.componentId,
     sourceVersion: snapshot.sourceVersion,
     snapshotId: snapshot.snapshotId,
     datasetId: dataset.datasetId,
     recordCount: records.length,
-    recordsSha256: sha256(RECORDS_HASH_DOMAIN, records),
+    recordsCommitment: inventoryDataset.recordsCommitment,
     records: Object.freeze(records),
     pages: Object.freeze(pages)
   });
@@ -472,14 +547,54 @@ function validatePage(
   if (!Array.isArray(page.records) || page.records.length > dataset.pageSize) {
     throw new DatasetLineageFailure("A dataset page exceeds its page size.");
   }
+  if (page.nextCursor !== null && page.records.length < dataset.pageSize) {
+    throw new DatasetLineageFailure("A dataset page is short before its terminal cursor.");
+  }
   if (page.nextCursor !== null) requireCursor(page.nextCursor);
 }
 
 function assertReadStable(component: PreparedComponent): void {
   if (
     readData(component.originalAdapter, "sourceId") !== component.sourceId ||
-    requireFunction(component.originalAdapter, "readSnapshotPage") !== component.readSnapshotPage
+    requireFunction(component.originalAdapter, "readSnapshotPage") !== component.readSnapshotPage ||
+    requireFunction(component.originalAdapter, "verifySnapshotDatasetReplay") !== component.verifySnapshotDatasetReplay
   ) throw new DatasetLineageFailure("A dataset adapter changed during collection.");
+  const rawSnapshot = component.snapshotHandle.raw;
+  const publicSnapshot = component.snapshotHandle.public;
+  if (!rawSnapshot || !publicSnapshot ||
+    snapshotMetadataJson(captureDatasetSnapshot(rawSnapshot)) !== snapshotMetadataJson(publicSnapshot)) {
+    throw new DatasetLineageFailure("The raw dataset snapshot metadata changed during collection.");
+  }
+}
+
+function snapshotMetadataJson(snapshot: Readonly<OrganizationReconciliationSourceSnapshot>): string {
+  return canonicalJson(canonicalizeOrganizationReconciliationEvidenceValue(snapshot));
+}
+
+function captureDatasetSnapshot(candidate: unknown): Readonly<OrganizationReconciliationSourceSnapshot> {
+  const snapshot = exactObject(candidate, [
+    "sourceId", "sourceVersion", "snapshotId", "recordCount", "subjectUniverseCount",
+    "subjectUniverseHash", "snapshotMode", "paginationMode", "datasetInventory"
+  ], "dataset snapshot metadata");
+  let datasetInventory: OrganizationReconciliationComponentDatasetInventory;
+  try {
+    datasetInventory = validateOrganizationReconciliationComponentDatasetInventory(snapshot.datasetInventory);
+  } catch {
+    throw new DatasetLineageFailure("The dataset snapshot inventory is invalid.");
+  }
+  return Object.freeze({
+    sourceId: requireMetadata(snapshot.sourceId, "snapshot source ID"),
+    sourceVersion: requireMetadata(snapshot.sourceVersion, "snapshot source version"),
+    snapshotId: requireMetadata(snapshot.snapshotId, "snapshot ID"),
+    recordCount: requireLimit(snapshot.recordCount, 0, MAX_TOTAL_DATASET_RECORDS, "snapshot record count"),
+    subjectUniverseCount: requireLimit(
+      snapshot.subjectUniverseCount, 0, MAX_TOTAL_DATASET_RECORDS, "snapshot subject universe count"
+    ),
+    subjectUniverseHash: typeof snapshot.subjectUniverseHash === "string" ? snapshot.subjectUniverseHash : "",
+    snapshotMode: snapshot.snapshotMode as OrganizationReconciliationSourceSnapshot["snapshotMode"],
+    paginationMode: snapshot.paginationMode as OrganizationReconciliationSourceSnapshot["paginationMode"],
+    datasetInventory
+  });
 }
 
 function exactObject(candidate: unknown, keys: readonly string[], label: string): Record<string, unknown> {
