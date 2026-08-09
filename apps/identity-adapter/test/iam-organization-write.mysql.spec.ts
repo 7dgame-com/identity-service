@@ -326,9 +326,10 @@ describe.skipIf(!enabled)("IAM organization write MySQL integration", () => {
         compensationStatus: "required",
         errorCode: "InjectedCandidateFailure"
       });
+      await expect(first.countUnresolvedForLegacyUser(unresolvedUserId)).resolves.toBe(2);
       await setOperationMode(target, failedCompletedOperationKey, "future-mode");
       await expect(first.find(failedCompletedOperationKey)).rejects.toThrow("Unknown organization write operation mode");
-      await expect(first.countUnresolvedForLegacyUser(unresolvedUserId)).resolves.toBe(1);
+      await expect(first.countUnresolvedForLegacyUser(unresolvedUserId)).resolves.toBe(2);
     } finally {
       await cleanup(target, {
         operationKeys: [
