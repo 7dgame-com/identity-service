@@ -129,7 +129,7 @@ export class IamOrganizationWriteService {
       const upstream = await this.pluginUserWrite.proxy(request, "/v1/plugin-user/update-user");
       const readbackEvidence = await this.legacyProxyReadbackEvidence(upstream.status, parsed, evidence);
       this.logDecision(readbackEvidence, parsed.legacyUserId, parsed.organizationIds.length);
-      return { ...upstream, evidence: readbackEvidence };
+      return { ...upstream, mode: "legacy-proxy", evidence: readbackEvidence };
     }
     if (iam.organizationWriteMode !== "dual-write") {
       throw new NotFoundException({
