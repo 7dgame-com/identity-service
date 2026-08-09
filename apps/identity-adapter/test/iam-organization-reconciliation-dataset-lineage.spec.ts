@@ -23,9 +23,13 @@ import type { OrganizationReconciliationPhysicalSource } from
 import {
   createOrganizationReconciliationComponentDatasetInventory,
   createOrganizationReconciliationContentSnapshotId,
-  createOrganizationReconciliationContentSourceVersion
+  createOrganizationReconciliationContentSourceVersion,
+  type OrganizationReconciliationDatasetInventoryPageInput,
+  type OrganizationReconciliationInventoryJsonValue
 } from
   "../src/iam-organization-reconciliation-dataset-inventory.js";
+import { openOrganizationReconciliationTransactionDatasetSpool } from
+  "../src/iam-organization-reconciliation-transaction-dataset-spool.js";
 
 interface RawRecord { readonly id: string }
 type Mutable<T> = { -readonly [K in keyof T]: T[K] };
@@ -36,6 +40,7 @@ interface Fixture {
   readonly adapter: Mutable<OrganizationReconciliationDatasetSourceAdapter<unknown>> & {
     openSnapshot: ReturnType<typeof vi.fn>;
     readSnapshotPage: ReturnType<typeof vi.fn>;
+    verifySnapshotDatasetReplay: ReturnType<typeof vi.fn>;
     closeSnapshot: ReturnType<typeof vi.fn>;
   };
   readonly binding: OrganizationReconciliationDatasetComponentBinding;
@@ -292,15 +297,99 @@ describe("organization reconciliation dataset page lineage", () => {
     ]);
   });
 
+  it("preserves exact spool replay identities privately while publishing only canonical clones", async () => {
+    const system = await spoolBackedLegacyFixtures();
+    try {
+      const run = await collect(system.fixtures);
+      const artifact = run.artifacts.find((candidate) =>
+        candidate.componentId === "legacy-main" && candidate.datasetId === "directory")!;
+      const [verificationRequest] = system.legacy.adapter.verifySnapshotDatasetReplay.mock.calls[0]!;
+
+      expect(system.replayRecords).toHaveLength(2);
+      expect(verificationRequest.pages[0].records).toBe(system.replayRecords[0]);
+      expect(verificationRequest.pages[1].records).toBe(system.replayRecords[1]);
+      expect(artifact.records).toEqual([
+        { id: "legacy-main-directory-spool-1" },
+        { id: "legacy-main-directory-spool-2" }
+      ]);
+      expect(artifact.records).not.toBe(system.replayRecords[0]);
+      expect(artifact.records[0]).not.toBe(system.replayRecords[0]![0]);
+      expect(artifact.records[1]).not.toBe(system.replayRecords[1]![0]);
+      expect(Object.isFrozen(artifact.records[0])).toBe(true);
+      expect(await system.spool.close("completed")).toBe("completed");
+    } finally {
+      await system.spool.close("failed").catch(() => undefined);
+    }
+  });
+
+  it.each(["clone", "page-a-b", "component-a-b", "proxy"] as const)(
+    "rejects %s replacement of an exact spool replay records identity",
+    async (mode) => {
+      const system = await spoolBackedLegacyFixtures(({ records, pageIndex, fixtures, replayRecords }) => {
+        if (mode === "clone" && pageIndex === 0) return Object.freeze([...records]);
+        if (mode === "page-a-b" && pageIndex === 1) return replayRecords[0]!;
+        if (mode === "component-a-b" && pageIndex === 0) {
+          return firstPage(fixtures, "identity", "directory").records as unknown as
+            readonly OrganizationReconciliationInventoryJsonValue[];
+        }
+        if (mode === "proxy" && pageIndex === 0) return new Proxy(records, {});
+        return records;
+      });
+      try {
+        const failure = await collect(system.fixtures).catch((error: unknown) => error);
+        expect(failure).toEqual(new Error("The coordinated snapshot operation failed."));
+        expect(system.legacy.adapter.verifySnapshotDatasetReplay).toHaveBeenCalledTimes(
+          mode === "proxy" ? 0 : 1
+        );
+        assertClosedOnce(system.fixtures, "failed");
+      } finally {
+        await system.spool.close("failed").catch(() => undefined);
+      }
+    }
+  );
+
+  it.each(["hidden", "symbol", "custom-prototype", "index-accessor"] as const)(
+    "rejects a %s records array before replay verification",
+    async (mode) => {
+      const fixtures = fixturesFor([]);
+      const page = firstPage(fixtures, "legacy-main", "directory");
+      const records = page.records as RawRecord[];
+      let getterInvoked = false;
+      if (mode === "hidden") Object.defineProperty(records, "hidden", { value: true });
+      if (mode === "symbol") (records as unknown as Record<symbol, unknown>)[Symbol("hidden")] = true;
+      if (mode === "custom-prototype") Object.setPrototypeOf(records, { attacker: true });
+      if (mode === "index-accessor") {
+        Object.defineProperty(records, "0", {
+          enumerable: true,
+          get: () => {
+            getterInvoked = true;
+            return { id: "private-index-getter" };
+          }
+        });
+      }
+
+      const failure = await collect(fixtures).catch((error: unknown) => error);
+      expect(failure).toEqual(new Error("The coordinated snapshot operation failed."));
+      expect(getterInvoked).toBe(false);
+      expect(fixtures[0]!.adapter.verifySnapshotDatasetReplay).not.toHaveBeenCalled();
+      assertClosedOnce(fixtures, "failed");
+    }
+  );
+
   it("rejects record getters and snapshots mutable page records before hashing", async () => {
     const getterFixtures = fixturesFor([]);
     const page = firstPage(getterFixtures, "legacy-main", "directory") as unknown as Record<string, unknown>;
+    let getterInvoked = false;
     Object.defineProperty(page, "records", {
       enumerable: true,
-      get: () => [{ id: "private-getter-record" }]
+      get: () => {
+        getterInvoked = true;
+        return [{ id: "private-getter-record" }];
+      }
     });
     const failure = await collect(getterFixtures).catch((error: unknown) => error);
     expect(failure).toEqual(new Error("The coordinated snapshot operation failed."));
+    expect(getterInvoked).toBe(false);
     expect(JSON.stringify(failure)).not.toContain("private-getter-record");
     assertClosedOnce(getterFixtures, "failed");
 
@@ -312,6 +401,109 @@ describe("organization reconciliation dataset page lineage", () => {
     expect(run.artifacts[0]!.recordsCommitment).toMatch(/^[a-f0-9]{64}$/);
   });
 });
+
+interface SpoolReplayTransformContext {
+  readonly records: readonly OrganizationReconciliationInventoryJsonValue[];
+  readonly pageIndex: number;
+  readonly fixtures: Fixture[];
+  readonly replayRecords: readonly (readonly OrganizationReconciliationInventoryJsonValue[])[];
+}
+
+async function spoolBackedLegacyFixtures(
+  transform?: (context: SpoolReplayTransformContext) => readonly OrganizationReconciliationInventoryJsonValue[]
+) {
+  const fixtures = fixturesFor([]);
+  const legacy = fixtures[0]!;
+  const datasetCatalog: OrganizationReconciliationDatasetCatalog = {
+    contract: ORGANIZATION_RECONCILIATION_DATASET_LINEAGE_CONTRACT,
+    trust: ORGANIZATION_RECONCILIATION_DATASET_CATALOG_TRUST,
+    datasets: [{ datasetId: "directory", pageSize: 1, maxPages: 2, maxRecords: 2 }]
+  };
+  const spool = await openOrganizationReconciliationTransactionDatasetSpool({
+    componentId: "legacy-main",
+    sourceId: legacy.snapshot.sourceId,
+    catalogSha256: legacy.binding.catalogSha256,
+    datasetCatalog,
+    commitmentKey: Buffer.alloc(32, 9),
+    subjectUniverse: null
+  });
+  try {
+    await spool.appendPage({
+      datasetId: "directory",
+      requestCursor: null,
+      nextCursor: "directory-cursor-1",
+      recordOffset: 0,
+      records: [{ id: "legacy-main-directory-spool-1" }]
+    });
+    await spool.appendPage({
+      datasetId: "directory",
+      requestCursor: "directory-cursor-1",
+      nextCursor: null,
+      recordOffset: 1,
+      records: [{ id: "legacy-main-directory-spool-2" }]
+    });
+    const inventory = await spool.seal();
+    legacy.snapshot.recordCount = 2;
+    legacy.snapshot.datasetInventory = inventory;
+    legacy.snapshot.sourceVersion = createOrganizationReconciliationContentSourceVersion(
+      legacy.snapshot.sourceId,
+      inventory
+    );
+    legacy.snapshot.snapshotId = createOrganizationReconciliationContentSnapshotId(
+      legacy.snapshot.sourceId,
+      inventory
+    );
+    (legacy.binding as Mutable<OrganizationReconciliationDatasetComponentBinding>).datasetCatalog = datasetCatalog;
+
+    const replayRecords: Array<readonly OrganizationReconciliationInventoryJsonValue[]> = [];
+    legacy.adapter.readSnapshotPage = vi.fn(async (
+      request: Parameters<OrganizationReconciliationDatasetSourceAdapter<unknown>["readSnapshotPage"]>[0]
+    ) => {
+      const page = await spool.readPage({
+        datasetId: request.datasetId,
+        requestCursor: request.requestCursor,
+        pageSize: request.pageSize
+      });
+      const pageIndex = replayRecords.length;
+      replayRecords.push(page.records);
+      const records = transform?.({ records: page.records, pageIndex, fixtures, replayRecords }) ?? page.records;
+      return {
+        sourceId: legacy.snapshot.sourceId,
+        sourceVersion: legacy.snapshot.sourceVersion,
+        snapshotId: legacy.snapshot.snapshotId,
+        snapshotRecordCount: legacy.snapshot.recordCount,
+        subjectUniverseCount: legacy.snapshot.subjectUniverseCount,
+        subjectUniverseHash: legacy.snapshot.subjectUniverseHash,
+        datasetId: page.datasetId,
+        datasetRecordCount: page.datasetRecordCount,
+        requestCursor: page.requestCursor,
+        nextCursor: page.nextCursor,
+        recordOffset: page.recordOffset,
+        records
+      } satisfies OrganizationReconciliationDatasetPage<OrganizationReconciliationInventoryJsonValue>;
+    });
+    legacy.adapter.verifySnapshotDatasetReplay = vi.fn((
+      request: Parameters<
+        OrganizationReconciliationDatasetSourceAdapter<unknown>["verifySnapshotDatasetReplay"]
+      >[0]
+    ) => {
+      spool.verifyDatasetReplay({
+        datasetId: request.datasetId,
+        pages: request.pages as readonly OrganizationReconciliationDatasetInventoryPageInput[]
+      });
+    });
+    legacy.adapter.closeSnapshot = vi.fn(async (
+      _snapshot: OrganizationReconciliationSourceSnapshot,
+      outcome: "completed" | "failed"
+    ) => {
+      await spool.close(outcome);
+    });
+    return { fixtures, legacy, spool, replayRecords };
+  } catch (error) {
+    await spool.close("failed").catch(() => undefined);
+    throw error;
+  }
+}
 
 function fixturesFor(events: string[]): Fixture[] {
   const definitions: readonly [OrganizationReconciliationPhysicalSource, readonly [string, number][]][] = [

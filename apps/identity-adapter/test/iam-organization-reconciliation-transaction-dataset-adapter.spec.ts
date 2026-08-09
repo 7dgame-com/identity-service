@@ -124,6 +124,7 @@ describe("transaction-owned organization reconciliation dataset adapter", () => 
         "identity-shadow-versus-candidate-read-model-not-owner-approved",
         "plugin-registry-and-static-overlay-contract-not-owner-approved",
         "mysql-collation-and-unique-order-contract-not-owner-approved",
+        "bounded-transaction-spool-not-production-ready",
         "operation-evidence-projector-not-production-registered",
         "bounded-streaming-projector-not-implemented",
         "compiled-reconciliation-pipeline-not-registered",
@@ -196,10 +197,7 @@ describe("transaction-owned organization reconciliation dataset adapter", () => 
     expect(firstSnapshot.sourceVersion).toMatch(/^[a-f0-9]{64}$/);
     expect(firstSnapshot.snapshotId).toMatch(/^[a-f0-9]{64}$/);
     expect(firstSnapshot.datasetInventory).toMatchObject({ recordCount: 4, catalogSha256: DIGEST_A });
-    const partialFill = vi.spyOn(Buffer.prototype, "fill");
     const partialClose = firstAdapter.closeSnapshot(firstSnapshot, "completed");
-    expect(partialFill).toHaveBeenCalled();
-    partialFill.mockRestore();
     await expect(partialClose)
       .rejects.toThrow("not consumed completely");
     expect(first.sql.at(-1)).toBe("ROLLBACK");
@@ -208,18 +206,12 @@ describe("transaction-owned organization reconciliation dataset adapter", () => 
     const secondSnapshot = await secondAdapter.openSnapshot();
     expect(secondSnapshot.sourceVersion).not.toBe(firstSnapshot.sourceVersion);
     expect(secondSnapshot.snapshotId).not.toBe(firstSnapshot.snapshotId);
-    const failedFill = vi.spyOn(Buffer.prototype, "fill");
     const failedClose = secondAdapter.closeSnapshot(secondSnapshot, "failed");
-    expect(failedFill).toHaveBeenCalled();
-    failedFill.mockRestore();
     await failedClose;
 
     const thirdAdapter = create(third);
     const thirdSnapshot = await thirdAdapter.openSnapshot();
-    const invalidFill = vi.spyOn(Buffer.prototype, "fill");
     const invalidClose = thirdAdapter.closeSnapshot(thirdSnapshot, "invalid" as never);
-    expect(invalidFill).toHaveBeenCalled();
-    invalidFill.mockRestore();
     await expect(invalidClose)
       .rejects.toThrow("close outcome is invalid");
     expect(third.sql.at(-1)).toBe("ROLLBACK");
@@ -285,7 +277,7 @@ describe("transaction-owned organization reconciliation dataset adapter", () => 
     expect(recoveringFactory).toHaveBeenCalledTimes(2);
   });
 
-  it("best-effort clears the run key on scan and raw-close failures", async () => {
+  it("clears the factory key on scan failure and still surfaces raw-close failures", async () => {
     const legacyCatalog = catalog([
       "legacy-membership", "legacy-organization-directory", "legacy-role-assignment", "legacy-subject-universe"
     ]);
@@ -312,14 +304,11 @@ describe("transaction-owned organization reconciliation dataset adapter", () => 
       evidenceNonce: NONCE, catalogSha256: DIGEST_A, datasetCatalog: legacyCatalog
     });
     const snapshot = await closeAdapter.openSnapshot();
-    const closeFill = vi.spyOn(Buffer.prototype, "fill");
     const closePromise = closeAdapter.closeSnapshot(snapshot, "failed");
-    expect(closeFill).toHaveBeenCalled();
-    closeFill.mockRestore();
     await expect(closePromise).rejects.toThrow("Closing the materialized transaction snapshot failed");
   });
 
-  it("poisons and synchronously clears the run key on every active verifier misuse", async () => {
+  it("poisons every active snapshot on verifier misuse without retaining an adapter run key", async () => {
     const legacyCatalog = catalog([
       "legacy-membership", "legacy-organization-directory", "legacy-role-assignment", "legacy-subject-universe"
     ]);
@@ -346,14 +335,11 @@ describe("transaction-owned organization reconciliation dataset adapter", () => 
       if (mode === "tampered-cursor") {
         (candidatePages[0] as { requestCursor: string | null }).requestCursor = "forged-cursor";
       }
-      const fillSpy = vi.spyOn(Buffer.prototype, "fill");
       expect(() => adapter.verifySnapshotDatasetReplay({
         snapshot: mode === "wrong-snapshot" ? { ...snapshot } : snapshot,
         datasetId: mode === "unknown-dataset" ? "unknown-dataset" : spec.datasetId,
         pages: candidatePages
       })).toThrow("transaction-owned commitment");
-      expect(fillSpy).toHaveBeenCalled();
-      fillSpy.mockRestore();
       await expect(adapter.readSnapshotPage({
         snapshot, datasetId: legacyCatalog.datasets[1]!.datasetId, requestCursor: null,
         pageSize: legacyCatalog.datasets[1]!.pageSize
@@ -381,6 +367,11 @@ describe("transaction-owned organization reconciliation dataset adapter", () => 
     }
     await expect(adapter.closeSnapshot(snapshot, "completed")).rejects.toThrow("not consumed completely");
     expect(fake.sql.at(-1)).toBe("ROLLBACK");
+  });
+
+  it("waits for spool cleanup before raw commit and rolls back when spool cleanup fails", async () => {
+    await exerciseSpoolCloseOrdering("success");
+    await exerciseSpoolCloseOrdering("failure");
   });
 
   it("rejects descriptor-unsafe or non-ASCII catalogs before calling the connection factory", () => {
@@ -415,6 +406,72 @@ describe("transaction-owned organization reconciliation dataset adapter", () => 
     expect(getterInvoked).toBe(false);
   });
 });
+
+async function exerciseSpoolCloseOrdering(mode: "success" | "failure"): Promise<void> {
+  const closeStarted = deferred();
+  const releaseClose = deferred();
+  vi.resetModules();
+  vi.doMock("node:fs/promises", async () => {
+    const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    return {
+      ...actual,
+      open: async (...args: Parameters<typeof actual.open>) => {
+        const handle = await actual.open(...args);
+        const close = handle.close.bind(handle);
+        Object.defineProperty(handle, "close", {
+          configurable: true,
+          value: async () => {
+            closeStarted.resolve();
+            await releaseClose.promise;
+            await close();
+            if (mode === "failure") throw new Error("injected spool close failure");
+          }
+        });
+        return handle;
+      }
+    };
+  });
+  try {
+    const module = await import(
+      "../src/iam-organization-reconciliation/mysql-source-adapters/transaction-dataset-adapter.js"
+    );
+    const fake = fakeConnection(legacyRows());
+    const legacyCatalog = catalog([
+      "legacy-membership", "legacy-organization-directory", "legacy-role-assignment", "legacy-subject-universe"
+    ]);
+    const adapter = module.createOrganizationReconciliationMysqlTransactionDatasetAdapter({
+      componentId: "legacy-main", expectedSourceId: "legacy-db", connectionFactory: fake.factory,
+      evidenceNonce: NONCE, catalogSha256: DIGEST_A, datasetCatalog: legacyCatalog
+    });
+    const snapshot = await adapter.openSnapshot();
+    for (const spec of legacyCatalog.datasets) {
+      const pages = await exhaustDataset(adapter, snapshot, spec);
+      adapter.verifySnapshotDatasetReplay({ snapshot, datasetId: spec.datasetId, pages });
+    }
+    const closePromise = adapter.closeSnapshot(snapshot, "completed");
+    await closeStarted.promise;
+    expect(fake.sql).not.toContain("COMMIT");
+    expect(fake.sql).not.toContain("ROLLBACK");
+    releaseClose.resolve();
+    if (mode === "success") {
+      await expect(closePromise).resolves.toBeUndefined();
+      expect(fake.sql.at(-1)).toBe("COMMIT");
+    } else {
+      await expect(closePromise).rejects.toThrow("Closing the materialized transaction snapshot failed");
+      expect(fake.sql.at(-1)).toBe("ROLLBACK");
+    }
+  } finally {
+    releaseClose.resolve();
+    vi.doUnmock("node:fs/promises");
+    vi.resetModules();
+  }
+}
+
+function deferred(): { readonly promise: Promise<void>; resolve(): void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((accepted) => { resolve = accepted; });
+  return Object.freeze({ promise, resolve });
+}
 
 async function exhaustDataset(
   adapter: ReturnType<typeof createOrganizationReconciliationMysqlTransactionDatasetAdapter>,

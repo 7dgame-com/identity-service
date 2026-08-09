@@ -1,4 +1,5 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { isProxy } from "node:util/types";
 import {
   createOrganizationReconciliationProvenanceBindingFromInput,
   verifyOrganizationReconciliationProvenance,
@@ -32,13 +33,25 @@ import {
 import {
   ORGANIZATION_RECONCILIATION_COMPILED_PIPELINE_REGISTRATION_READY,
   ORGANIZATION_RECONCILIATION_RAW_SOURCE_CAPABILITY_READY,
-  ORGANIZATION_RECONCILIATION_TRANSACTION_ADAPTER_FACTORY_CAPABILITY_READY
+  ORGANIZATION_RECONCILIATION_TRANSACTION_ADAPTER_FACTORY_CAPABILITY_READY,
+  ORGANIZATION_RECONCILIATION_TRANSACTION_DATASET_SPOOL_READY
 } from "./iam-organization-reconciliation-runtime-readiness.js";
 
 export type OrganizationReconciliationSeverity = "P0" | "P1" | "P2" | "info";
 export type OrganizationDecision = "allow" | "deny";
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | { readonly [key: string]: JsonValue } | readonly JsonValue[];
+
+export const ORGANIZATION_RECONCILIATION_STRING_ARRAY_EVIDENCE_HASH_BUILDER_CONTRACT =
+  "iam-organization-reconciliation-string-array-evidence-hash-builder/v1" as const;
+
+/** Structural HMAC computation only; this opaque handle conveys no source trust. */
+export interface OrganizationReconciliationStringArrayEvidenceHashBuilder {
+  readonly contract: typeof ORGANIZATION_RECONCILIATION_STRING_ARRAY_EVIDENCE_HASH_BUILDER_CONTRACT;
+  append(this: OrganizationReconciliationStringArrayEvidenceHashBuilder, value: string): void;
+  seal(this: OrganizationReconciliationStringArrayEvidenceHashBuilder): string;
+  abort(this: OrganizationReconciliationStringArrayEvidenceHashBuilder): void;
+}
 
 export type OrganizationReconciliationSurface =
   | "organization-directory"
@@ -66,6 +79,7 @@ export const ORGANIZATION_RECONCILIATION_REAL_SOURCE_ADAPTERS_READY =
   ORGANIZATION_RECONCILIATION_PROJECTION_CATALOGS_READY &&
   ORGANIZATION_RECONCILIATION_DATASET_LINEAGE_PRODUCTION_READY &&
   ORGANIZATION_RECONCILIATION_TRANSACTION_ADAPTER_FACTORY_CAPABILITY_READY &&
+  ORGANIZATION_RECONCILIATION_TRANSACTION_DATASET_SPOOL_READY &&
   ORGANIZATION_RECONCILIATION_OPERATION_EVIDENCE_PROJECTOR_READY &&
   ORGANIZATION_RECONCILIATION_COMPILED_PIPELINE_REGISTRATION_READY;
 
@@ -1752,10 +1766,158 @@ export function createOrganizationReconciliationEvidenceHash(
   evidenceNonce: string,
   value: JsonValue
 ): string {
-  return createHmac("sha256", evidenceNonce)
-    .update("iam-organization-reconciliation:v3\u001f")
-    .update(stableSerialize(value))
-    .digest("hex");
+  const capturedStrings = capturePlainStringArrayForEvidenceHash(value);
+  if (capturedStrings !== null) {
+    const builder = createOrganizationReconciliationStringArrayEvidenceHashBuilder(evidenceNonce);
+    try {
+      for (const entry of capturedStrings) builder.append(entry);
+      return builder.seal();
+    } catch (error) {
+      try { builder.abort(); } catch { /* builder already poisoned */ }
+      throw error;
+    }
+  }
+  const key = evidenceHashKey(evidenceNonce);
+  try {
+    return createHmac("sha256", key)
+      .update(ORGANIZATION_RECONCILIATION_EVIDENCE_HASH_DOMAIN)
+      .update(stableSerialize(value))
+      .digest("hex");
+  } finally {
+    key.fill(0);
+  }
+}
+
+interface StringArrayEvidenceHashBuilderState {
+  phase: "appending" | "sealed" | "poisoned";
+  readonly key: Buffer;
+  hmac: ReturnType<typeof createHmac> | null;
+  first: boolean;
+  methods: {
+    readonly append: OrganizationReconciliationStringArrayEvidenceHashBuilder["append"];
+    readonly seal: OrganizationReconciliationStringArrayEvidenceHashBuilder["seal"];
+    readonly abort: OrganizationReconciliationStringArrayEvidenceHashBuilder["abort"];
+  } | null;
+}
+
+const ORGANIZATION_RECONCILIATION_EVIDENCE_HASH_DOMAIN =
+  "iam-organization-reconciliation:v3\u001f" as const;
+const stringArrayEvidenceHashBuilderBrands = new WeakMap<object, StringArrayEvidenceHashBuilderState>();
+
+export function createOrganizationReconciliationStringArrayEvidenceHashBuilder(
+  evidenceNonce: string | Buffer
+): OrganizationReconciliationStringArrayEvidenceHashBuilder {
+  const key = evidenceHashKey(evidenceNonce);
+  let hmac: ReturnType<typeof createHmac>;
+  try {
+    hmac = createHmac("sha256", key)
+      .update(ORGANIZATION_RECONCILIATION_EVIDENCE_HASH_DOMAIN)
+      .update("[");
+  } catch (error) {
+    key.fill(0);
+    throw error;
+  }
+  const state: StringArrayEvidenceHashBuilderState = {
+    phase: "appending",
+    key,
+    hmac,
+    first: true,
+    methods: null
+  };
+  const append: OrganizationReconciliationStringArrayEvidenceHashBuilder["append"] =
+    function (this: OrganizationReconciliationStringArrayEvidenceHashBuilder, value) {
+      const accepted = requireStringArrayEvidenceHashBuilder(this, append, "append");
+      try {
+        if (typeof value !== "string") throw new Error("invalid string-array evidence value");
+        const hmac = accepted.hmac!;
+        if (!accepted.first) hmac.update(",");
+        hmac.update(JSON.stringify(value)!);
+        accepted.first = false;
+      } catch {
+        poisonStringArrayEvidenceHashBuilder(accepted);
+        throw new Error("Appending string-array evidence hash content failed.");
+      }
+    };
+  const seal: OrganizationReconciliationStringArrayEvidenceHashBuilder["seal"] =
+    function (this: OrganizationReconciliationStringArrayEvidenceHashBuilder) {
+      const accepted = requireStringArrayEvidenceHashBuilder(this, seal, "seal");
+      try {
+        const digest = accepted.hmac!.update("]").digest("hex");
+        accepted.hmac = null;
+        accepted.phase = "sealed";
+        return digest;
+      } catch {
+        poisonStringArrayEvidenceHashBuilder(accepted);
+        throw new Error("Sealing string-array evidence hash content failed.");
+      } finally {
+        accepted.key.fill(0);
+      }
+    };
+  const abort: OrganizationReconciliationStringArrayEvidenceHashBuilder["abort"] =
+    function (this: OrganizationReconciliationStringArrayEvidenceHashBuilder) {
+      poisonStringArrayEvidenceHashBuilder(
+        requireStringArrayEvidenceHashBuilder(this, abort, "abort")
+      );
+    };
+  const builder = Object.freeze({
+    contract: ORGANIZATION_RECONCILIATION_STRING_ARRAY_EVIDENCE_HASH_BUILDER_CONTRACT,
+    append,
+    seal,
+    abort
+  });
+  state.methods = Object.freeze({ append, seal, abort });
+  stringArrayEvidenceHashBuilderBrands.set(builder, state);
+  return builder;
+}
+
+function requireStringArrayEvidenceHashBuilder(
+  candidate: unknown,
+  method: Function,
+  operation: keyof NonNullable<StringArrayEvidenceHashBuilderState["methods"]>
+): StringArrayEvidenceHashBuilderState {
+  const state = candidate && typeof candidate === "object" ? stringArrayEvidenceHashBuilderBrands.get(candidate) : undefined;
+  if (!state || state.phase !== "appending" || state.methods?.[operation] !== method || !Object.isFrozen(candidate)) {
+    throw new Error("The string-array evidence hash builder lifecycle is invalid.");
+  }
+  return state;
+}
+
+function poisonStringArrayEvidenceHashBuilder(state: StringArrayEvidenceHashBuilderState): void {
+  state.phase = "poisoned";
+  state.hmac = null;
+  // Best-effort overwrite only; JavaScript/OpenSSL do not promise strong erasure.
+  state.key.fill(0);
+}
+
+function evidenceHashKey(evidenceNonce: string | Buffer): Buffer {
+  // Preserve the historical hash helper semantics; nonce validity is gated by
+  // validation callers, not by this byte-compatible structural emitter.
+  if (typeof evidenceNonce === "string") return Buffer.from(evidenceNonce, "utf8");
+  if (Buffer.isBuffer(evidenceNonce)) return Buffer.from(evidenceNonce);
+  throw new Error("An evidence nonce string or Buffer is required.");
+}
+
+function capturePlainStringArrayForEvidenceHash(candidate: JsonValue): readonly string[] | null {
+  if (!Array.isArray(candidate) || isProxy(candidate) || Object.getPrototypeOf(candidate) !== Array.prototype ||
+    Object.getOwnPropertySymbols(candidate).length > 0) return null;
+  const descriptors = Object.getOwnPropertyDescriptors(candidate);
+  const lengthDescriptor = descriptors["length"] as PropertyDescriptor | undefined;
+  if (!lengthDescriptor || !("value" in lengthDescriptor) || !Number.isSafeInteger(lengthDescriptor.value) ||
+    lengthDescriptor.value < 0) return null;
+  const length = lengthDescriptor.value as number;
+  const expected = new Set(["length", ...Array.from({ length }, (_, index) => String(index))]);
+  if (Object.keys(descriptors).length !== expected.size || Object.keys(descriptors).some((key) => !expected.has(key))) {
+    return null;
+  }
+  const captured: string[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = descriptors[String(index)];
+    if (!descriptor || !descriptor.enumerable || !("value" in descriptor) || typeof descriptor.value !== "string") {
+      return null;
+    }
+    captured.push(descriptor.value);
+  }
+  return Object.freeze(captured);
 }
 
 /**

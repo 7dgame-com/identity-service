@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isProxy } from "node:util/types";
 import {
   coordinateOrganizationReconciliationSnapshots,
   type CoordinateOrganizationReconciliationSnapshotsOptions,
@@ -176,12 +177,23 @@ interface RunBrand {
   readonly consumed: WeakSet<object>;
 }
 
+interface CapturedDatasetPage {
+  readonly canonical: OrganizationReconciliationDatasetPage<OrganizationReconciliationEvidenceJsonValue>;
+  /** Exact adapter-returned array identity; never copied into public lineage evidence. */
+  readonly replayRecords: readonly OrganizationReconciliationEvidenceJsonValue[];
+}
+
 const runBrands = new WeakMap<object, RunBrand>();
 const artifactBrands = new WeakMap<object, { readonly run: OrganizationReconciliationDatasetLineageRun }>();
 const LINEAGE_HASH_DOMAIN = Buffer.from("iam-organization-reconciliation:dataset-lineage:v1\u001f", "utf8");
 const CATALOG_HASH_DOMAIN = Buffer.from("iam-organization-reconciliation:untrusted-dataset-catalog:v1\u001f", "utf8");
 const MAX_TOTAL_DATASET_PAGES = 10_000;
 const MAX_TOTAL_DATASET_RECORDS = 10_000_000;
+const DATASET_PAGE_KEYS = Object.freeze([
+  "sourceId", "sourceVersion", "snapshotId", "snapshotRecordCount", "subjectUniverseCount",
+  "subjectUniverseHash", "datasetId", "datasetRecordCount", "requestCursor", "nextCursor",
+  "recordOffset", "records"
+] as const);
 
 export function organizationReconciliationDatasetLineageReadiness(): OrganizationReconciliationDatasetLineageReadiness {
   return Object.freeze({
@@ -444,7 +456,8 @@ async function collectDataset(
       throw new DatasetLineageFailure("Reading an authoritative dataset page failed.");
     }
     assertReadStable(component);
-    const page = canonicalPage(candidate);
+    const capturedPage = captureDatasetPage(candidate, dataset.pageSize);
+    const page = capturedPage.canonical;
     validatePage(page, snapshot, dataset, requestCursor, records.length, expectedDatasetCount);
     expectedDatasetCount ??= page.datasetRecordCount;
     if (records.length + page.records.length > dataset.maxRecords) {
@@ -470,7 +483,7 @@ async function collectDataset(
       requestCursor: page.requestCursor,
       nextCursor: page.nextCursor,
       recordOffset: page.recordOffset,
-      records: page.records
+      records: capturedPage.replayRecords
     }));
     records.push(...page.records);
     if (page.nextCursor === null) break;
@@ -511,14 +524,70 @@ async function collectDataset(
   return Object.freeze({ ...artifactBody, lineageSha256: sha256(LINEAGE_HASH_DOMAIN, artifactBody) });
 }
 
-function canonicalPage(candidate: unknown): OrganizationReconciliationDatasetPage<OrganizationReconciliationEvidenceJsonValue> {
-  const canonical = canonicalizeOrganizationReconciliationEvidenceValue(candidate);
-  exactObject(canonical, [
-    "sourceId", "sourceVersion", "snapshotId", "snapshotRecordCount", "subjectUniverseCount",
-    "subjectUniverseHash", "datasetId", "datasetRecordCount", "requestCursor", "nextCursor",
-    "recordOffset", "records"
-  ], "dataset page");
-  return canonical as unknown as OrganizationReconciliationDatasetPage<OrganizationReconciliationEvidenceJsonValue>;
+function captureDatasetPage(candidate: unknown, pageSize: number): CapturedDatasetPage {
+  if (candidate === null || typeof candidate !== "object" || isProxy(candidate)) {
+    throw new DatasetLineageFailure("The dataset page is invalid.");
+  }
+  const captured = exactObject(candidate, DATASET_PAGE_KEYS, "dataset page");
+  const replay = captureDatasetPageRecords(captured.records, pageSize);
+
+  // Canonicalization sees only the descriptor-captured array copy. The exact
+  // adapter array remains private and is used solely for replay verification.
+  captured.records = replay.canonicalInput;
+  const canonical = canonicalizeOrganizationReconciliationEvidenceValue(captured);
+  exactObject(canonical, DATASET_PAGE_KEYS, "dataset page");
+  return Object.freeze({
+    canonical: canonical as unknown as OrganizationReconciliationDatasetPage<
+      OrganizationReconciliationEvidenceJsonValue
+    >,
+    replayRecords: replay.identity
+  });
+}
+
+function captureDatasetPageRecords(candidate: unknown, pageSize: number): {
+  readonly identity: readonly OrganizationReconciliationEvidenceJsonValue[];
+  readonly canonicalInput: readonly unknown[];
+} {
+  if (
+    !Array.isArray(candidate) ||
+    isProxy(candidate) ||
+    Object.getPrototypeOf(candidate) !== Array.prototype ||
+    Object.getOwnPropertySymbols(candidate).length > 0
+  ) {
+    throw new DatasetLineageFailure("The dataset page records are invalid.");
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(candidate);
+  const lengthDescriptor = descriptors["length"] as PropertyDescriptor | undefined;
+  if (
+    !lengthDescriptor ||
+    !("value" in lengthDescriptor) ||
+    lengthDescriptor.enumerable ||
+    !Number.isSafeInteger(lengthDescriptor.value) ||
+    lengthDescriptor.value < 0 ||
+    lengthDescriptor.value > pageSize
+  ) {
+    throw new DatasetLineageFailure("The dataset page records are sparse or invalid.");
+  }
+  const length = lengthDescriptor.value as number;
+  const expectedKeys = new Set(["length", ...Array.from({ length }, (_, index) => String(index))]);
+  if (
+    Object.keys(descriptors).length !== expectedKeys.size ||
+    Object.keys(descriptors).some((key) => !expectedKeys.has(key))
+  ) {
+    throw new DatasetLineageFailure("The dataset page records have sparse, hidden, or unknown fields.");
+  }
+  const canonicalInput: unknown[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = descriptors[String(index)];
+    if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) {
+      throw new DatasetLineageFailure("The dataset page records contain an accessor or sparse entry.");
+    }
+    canonicalInput.push(descriptor.value);
+  }
+  return Object.freeze({
+    identity: candidate as readonly OrganizationReconciliationEvidenceJsonValue[],
+    canonicalInput: Object.freeze(canonicalInput)
+  });
 }
 
 function validatePage(

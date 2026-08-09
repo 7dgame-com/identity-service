@@ -436,19 +436,32 @@ payload/signature 组装接口；外部 provenance verifier 本身不读取或�
 
 当前 transaction-owned bridge 已实现固定 11 个 raw dataset：Legacy 4 个、Identity 6 个、plugin 1 个；
 Identity 集合已包含 `identity-subject-universe` raw dataset 的读取实现与固定结构项。每个 component 在各自
-独立的 repeatable-read transaction 内，按固定 dataset ID 集合与 caller-structured untrusted catalog 先完整
-扫描，累计 component/dataset/page/record totals，以有界内存缓存原始页，
-再从缓存按 cursor chain 回放；私有 verifier 使用仅由该 transaction 持有的 run secret 逐 dataset 重算
-commitment。对每个 component，只有分配给它的固定 dataset 集合全部回放并验证，该 component 的 close
-gate 才可能接受 completed；失败或不完整消费必须 rollback。三个事务仍然独立，不能据此声称跨数据库
-原子提交。私有 secret 不进入 snapshot、manifest、lineage artifact 或 CLI 输入，销毁仅是 JavaScript
-进程内的 best-effort overwrite，不构成强内存擦除保证。
+独立的 repeatable-read transaction 内，按固定 dataset ID 集合与 caller-structured untrusted catalog 扫描。
+adapter 不再缓存完整 raw page 集合：每页通过 canonical transport 写入同一受限本地 spool，并增量计算
+page/dataset/component inventory；seal 后每次只从 spool 读取一个有界页回放。成功初始化后 spool 文件已
+unlink，仅保留进程内 fd；但 create→unlink 仍有不可消除的命名 artifact 崩溃窗口，受控失败只做
+best-effort cleanup，且当前没有证明 at-rest encryption、强擦除或跨进程磁盘 quota。
 
-上述 bridge 仍没有 runtime wiring。64 MiB component cache、page/record 上限与 serialized-byte 预算只是
-当前默认关闭实现的显式资源门禁；它不是 production streaming projector，也不是 JavaScript heap 上界或
-内存安全证明。generic dataset-lineage 的 WeakMap brand 只证明 artifact 来自同一进程内同一次结构化
-collection run，并阻止 clone/cross-run/replay；它不认证物理 source、transaction adapter factory、owner
-catalog 或外部 attestation。
+Legacy/Identity subject reference 只在 transaction-adapter hardened factory 闭包内由同一 raw subject page
+逐页派生，不开放 mapper 或 spool 给调用方；sidecar 绑定该页的 dataset/count/offset/order，并以有界
+k-way merge 复用现有 evidence-HMAC 字节协议。这个绑定仍只证明 factory 内结构化派生关系，不认证物理
+数据库、owner catalog 或 source 真实性，也尚未 production-register。dataset-lineage 私下保留 spool
+返回的 exact records 数组身份给 replay verifier，公开 artifact 继续只含 canonical 深拷贝，因此
+clone、跨页/跨组件 A/B 与 accessor/proxy 替换会 fail closed。
+
+对每个 component，只有固定 dataset 集合全部回放并通过 spool verifier，close gate 才可能接受
+completed；spool cleanup 成功后才允许 raw transaction COMMIT，任何 spool 失败仍必须尝试 raw
+ROLLBACK。三个事务仍然独立，不能据此声称跨数据库原子提交。私有 secret 不进入 snapshot、manifest、
+lineage artifact 或 CLI 输入，销毁仅是 JavaScript 进程内的 best-effort overwrite，不构成强内存擦除保证。
+
+上述 bridge 已具备默认关闭的 bounded transaction spool 接线，但仍没有 production runtime registration。
+64 MiB/component、192 MiB process-global、最多 3 个 active spool，加上 page/record 上限与进程内
+reservation，构成本地资源门禁；它们不是 production
+streaming projector、JavaScript heap 上界、磁盘机密性或内存安全证明。尤其 dataset-lineage collector
+仍会为最终 artifact 累积完整 canonical `records`，所以既有
+`bounded-streaming-projector-not-implemented` blocker 必须保留，不能把本切片称为完成 Task 7.2。
+generic dataset-lineage 的 WeakMap brand 只证明 artifact 来自同一进程内同一次结构化 collection run；
+它不认证物理 source、owner catalog 或外部 attestation。
 
 该 MySQL session 不接受运行时 SQL，只接受源码内 immutable statement ID/catalog，固定 keyset
 cursor 参数契约、Legacy RBAC `auth_item.type=1` 以及 Identity shadow 的
@@ -458,9 +471,10 @@ cursor 参数契约、Legacy RBAC `auth_item.type=1` 以及 Identity shadow 的
 context 与 capability catalog 五项 owner decision 均未批准；Legacy/Identity 两侧独立 semantic projector、
 projector artifact provenance 和 compiled pipeline registration 也均未注册。
 
-因此 raw-source capability、transaction-adapter factory capability、transaction adapter、dataset lineage、
-surface projector、operation-evidence projector、compiled pipeline 和 semantic registry readiness 当前统一为
-`false`。`assembleCoordinatedOrganizationReconciliationInput` 不是可用入口：它在 dedicated branded
+因此 bounded transaction spool 与 transaction-adapter factory capability 的 implementation fact 为
+`true`，但两者的 production readiness 仍分别为 `false`；raw-source capability、transaction adapter、
+dataset lineage、surface projector、operation-evidence projector、compiled pipeline 和 semantic registry
+readiness 也全部保持 `false`。`assembleCoordinatedOrganizationReconciliationInput` 不是可用入口：它在 dedicated branded
 operation-evidence projector readiness 为 false 时无条件硬拒，不能进入 validator/CLI；不存在调用参数、
 环境变量或普通 adapter 可以打开这条路径。仓库也没有已批准的公钥 policy、compiled trust profile、签名
 服务、逐页原始响应保管或双节点运行证据。因此本地测试 PASS 只证明这些默认关闭 primitive 的契约，

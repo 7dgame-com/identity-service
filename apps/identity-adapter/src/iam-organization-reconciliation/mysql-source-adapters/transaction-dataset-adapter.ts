@@ -16,14 +16,14 @@ import {
   type OrganizationReconciliationDatasetSpec
 } from "../../iam-organization-reconciliation-dataset-lineage.js";
 import {
-  createOrganizationReconciliationComponentDatasetInventory,
   createOrganizationReconciliationContentSnapshotId,
   createOrganizationReconciliationContentSourceVersion,
   type OrganizationReconciliationInventoryJsonValue
 } from "../../iam-organization-reconciliation-dataset-inventory.js";
 import {
-  createOrganizationReconciliationEvidenceHash
-} from "../../iam-organization-reconciliation-validator.js";
+  openOrganizationReconciliationTransactionDatasetSpool,
+  type OrganizationReconciliationTransactionDatasetSpool
+} from "../../iam-organization-reconciliation-transaction-dataset-spool.js";
 import { subjectRefForLegacyUserId } from "../../iam-organization-reconciliation-refs.js";
 import {
   ORGANIZATION_RECONCILIATION_MYSQL_STATEMENT_CATALOG_SHA256,
@@ -86,6 +86,7 @@ export interface OrganizationReconciliationMysqlTransactionDatasetAdapterReadine
     "identity-shadow-versus-candidate-read-model-not-owner-approved",
     "plugin-registry-and-static-overlay-contract-not-owner-approved",
     "mysql-collation-and-unique-order-contract-not-owner-approved",
+    "bounded-transaction-spool-not-production-ready",
     "operation-evidence-projector-not-production-registered",
     "bounded-streaming-projector-not-implemented",
     "compiled-reconciliation-pipeline-not-registered",
@@ -104,6 +105,7 @@ OrganizationReconciliationMysqlTransactionDatasetAdapterReadiness {
       "identity-shadow-versus-candidate-read-model-not-owner-approved",
       "plugin-registry-and-static-overlay-contract-not-owner-approved",
       "mysql-collation-and-unique-order-contract-not-owner-approved",
+      "bounded-transaction-spool-not-production-ready",
       "operation-evidence-projector-not-production-registered",
       "bounded-streaming-projector-not-implemented",
       "compiled-reconciliation-pipeline-not-registered",
@@ -124,29 +126,12 @@ export interface CreateOrganizationReconciliationMysqlTransactionDatasetAdapterO
 type RawSnapshot = LegacyMainMysqlRawSnapshot | IdentityMysqlRawSnapshot | PluginRegistryMysqlRawSnapshot;
 type RawPage = OrganizationReconciliationMysqlRawPage<OrganizationReconciliationMysqlRawSurface, unknown>;
 
-interface CachedPage {
-  readonly requestCursor: string | null;
-  readonly nextCursor: string | null;
-  readonly recordOffset: number;
-  readonly records: readonly OrganizationReconciliationInventoryJsonValue[];
-}
-
-interface CachedDataset {
-  readonly spec: OrganizationReconciliationDatasetSpec;
-  readonly pages: readonly CachedPage[];
-  readonly recordCount: number;
-  readonly byteCount: number;
-  expectedCursor: string | null;
-  replayPageIndex: number;
-  exhausted: boolean;
-  verified: boolean;
-}
-
 interface ActiveSnapshot {
   readonly publicSnapshot: Readonly<OrganizationReconciliationSourceSnapshot>;
   readonly rawSnapshot: RawSnapshot;
-  readonly datasets: ReadonlyMap<string, CachedDataset>;
-  readonly commitmentKey: Buffer;
+  readonly spool: OrganizationReconciliationTransactionDatasetSpool;
+  readonly datasetCount: number;
+  verifiedDatasetCount: number;
   poisoned: boolean;
   closing: boolean;
   closePromise: Promise<void> | null;
@@ -183,7 +168,6 @@ const COMPONENT_DATASETS: Readonly<Record<OrganizationReconciliationMysqlRawComp
     ]),
     plugin: Object.freeze(["plugin-registry"])
   });
-const MAX_COMPONENT_CACHED_BYTES = 64 * 1024 * 1024;
 const MAX_COMPONENT_PAGES = 10_000;
 const MAX_COMPONENT_RECORDS = 10_000_000;
 const STRUCTURAL_CATALOG_HASH_DOMAIN = Buffer.from(
@@ -206,35 +190,31 @@ export function createOrganizationReconciliationMysqlTransactionDatasetAdapter(
       opening = true;
       let rawSnapshot: RawSnapshot | null = null;
       let commitmentKey: Buffer | null = null;
+      let spool: OrganizationReconciliationTransactionDatasetSpool | null = null;
       try {
         rawSnapshot = await openRawSnapshot(options);
         commitmentKey = randomBytes(32);
-        const datasets = new Map<string, CachedDataset>();
-        let componentByteCount = 0;
-        for (const spec of options.datasets) {
-          const cached = await scanDataset(
-            rawSnapshot,
-            spec,
-            MAX_COMPONENT_CACHED_BYTES - componentByteCount
-          );
-          componentByteCount += cached.byteCount;
-          if (componentByteCount > MAX_COMPONENT_CACHED_BYTES) {
-            throw new Error("The materialized component exceeds its cache byte bound.");
-          }
-          datasets.set(spec.datasetId, cached);
-        }
-        const inventory = createOrganizationReconciliationComponentDatasetInventory({
+        spool = await openOrganizationReconciliationTransactionDatasetSpool({
           componentId: options.componentId,
           sourceId: options.expectedSourceId,
           catalogSha256: options.catalogSha256,
-          datasets: [...datasets.entries()].map(([datasetId, dataset]) => ({ datasetId, pages: dataset.pages })),
-          commitmentKey
+          datasetCatalog: options.datasetCatalog,
+          commitmentKey,
+          subjectUniverse: options.componentId === "plugin" ? null : {
+            datasetId: options.componentId === "legacy-main" ?
+              "legacy-subject-universe" : "identity-subject-universe",
+            evidenceNonce: options.evidenceNonce
+          }
         });
-        const subjectUniverse = createSubjectUniverse(
-          options.componentId,
-          datasets,
-          options.evidenceNonce
-        );
+        // The spool owns a private copy after open; this factory retains no run key.
+        commitmentKey.fill(0);
+        commitmentKey = null;
+        for (const spec of options.datasets) {
+          await spoolRawDataset(rawSnapshot, spec, spool, options.componentId);
+        }
+        const inventory = await spool.seal();
+        const subjectUniverse = options.componentId === "plugin" ?
+          Object.freeze({ count: 0, hash: "" }) : spool.subjectUniverse();
         const publicSnapshot = Object.freeze({
           sourceId: options.expectedSourceId,
           sourceVersion: createOrganizationReconciliationContentSourceVersion(options.expectedSourceId, inventory),
@@ -247,12 +227,22 @@ export function createOrganizationReconciliationMysqlTransactionDatasetAdapter(
           datasetInventory: inventory
         });
         active = {
-          publicSnapshot, rawSnapshot, datasets, commitmentKey, poisoned: false, closing: false, closePromise: null
+          publicSnapshot,
+          rawSnapshot,
+          spool,
+          datasetCount: options.datasets.length,
+          verifiedDatasetCount: 0,
+          poisoned: false,
+          closing: false,
+          closePromise: null
         };
+        rawSnapshot = null;
+        spool = null;
         return publicSnapshot;
       } catch {
         // Best-effort overwrite only; JavaScript runtimes do not guarantee strong memory erasure.
         commitmentKey?.fill(0);
+        await spool?.close("failed").catch(() => undefined);
         await rawSnapshot?.close("failed").catch(() => undefined);
         throw new Error("Materializing the transaction-owned dataset inventory failed.");
       } finally {
@@ -268,33 +258,31 @@ export function createOrganizationReconciliationMysqlTransactionDatasetAdapter(
       if (request.snapshot !== state.publicSnapshot) {
         throw new Error("The materialized dataset request uses an unexpected snapshot handle.");
       }
-      const dataset = state.datasets.get(request.datasetId);
-      if (!dataset || request.pageSize !== dataset.spec.pageSize || dataset.exhausted ||
-        request.requestCursor !== dataset.expectedCursor) {
-        throw new Error("The materialized dataset cursor chain is invalid.");
+      try {
+        const page = await state.spool.readPage({
+          datasetId: request.datasetId,
+          requestCursor: request.requestCursor,
+          pageSize: request.pageSize
+        });
+        const snapshot = state.publicSnapshot;
+        return Object.freeze({
+          sourceId: snapshot.sourceId,
+          sourceVersion: snapshot.sourceVersion,
+          snapshotId: snapshot.snapshotId,
+          snapshotRecordCount: snapshot.recordCount,
+          subjectUniverseCount: snapshot.subjectUniverseCount,
+          subjectUniverseHash: snapshot.subjectUniverseHash,
+          datasetId: page.datasetId,
+          datasetRecordCount: page.datasetRecordCount,
+          requestCursor: page.requestCursor,
+          nextCursor: page.nextCursor,
+          recordOffset: page.recordOffset,
+          records: page.records
+        } satisfies OrganizationReconciliationDatasetPage<OrganizationReconciliationInventoryJsonValue>);
+      } catch {
+        state.poisoned = true;
+        throw new Error("Reading the bounded transaction dataset page failed.");
       }
-      const page = dataset.pages[dataset.replayPageIndex];
-      if (!page || page.requestCursor !== request.requestCursor) {
-        throw new Error("The materialized dataset page is unavailable.");
-      }
-      dataset.replayPageIndex += 1;
-      dataset.expectedCursor = page.nextCursor;
-      dataset.exhausted = page.nextCursor === null;
-      const snapshot = state.publicSnapshot;
-      return Object.freeze({
-        sourceId: snapshot.sourceId,
-        sourceVersion: snapshot.sourceVersion,
-        snapshotId: snapshot.snapshotId,
-        snapshotRecordCount: snapshot.recordCount,
-        subjectUniverseCount: snapshot.subjectUniverseCount,
-        subjectUniverseHash: snapshot.subjectUniverseHash,
-        datasetId: request.datasetId,
-        datasetRecordCount: dataset.recordCount,
-        requestCursor: page.requestCursor,
-        nextCursor: page.nextCursor,
-        recordOffset: page.recordOffset,
-        records: page.records
-      } satisfies OrganizationReconciliationDatasetPage<OrganizationReconciliationInventoryJsonValue>);
     },
     verifySnapshotDatasetReplay(
       candidateRequest: OrganizationReconciliationDatasetReplayVerificationRequest<
@@ -308,27 +296,13 @@ export function createOrganizationReconciliationMysqlTransactionDatasetAdapter(
         const request = exact(candidateRequest, ["snapshot", "datasetId", "pages"]);
         if (request.snapshot !== state.publicSnapshot) throw new Error("unexpected snapshot");
         const datasetId = requireDatasetId(request.datasetId);
-        const dataset = state.datasets.get(datasetId);
-        if (!dataset || dataset.verified || !dataset.exhausted || dataset.replayPageIndex !== dataset.pages.length) {
-          throw new Error("not consumable");
-        }
-        const observed = createOrganizationReconciliationComponentDatasetInventory({
-          componentId: options.componentId,
-          sourceId: options.expectedSourceId,
-          catalogSha256: options.catalogSha256,
-          datasets: [{
+        state.spool.verifyDatasetReplay({
           datasetId,
           pages: request.pages as OrganizationReconciliationDatasetReplayVerificationRequest<
             OrganizationReconciliationInventoryJsonValue
           >["pages"]
-          }],
-          commitmentKey: state.commitmentKey
-        }).datasets[0]!;
-        const expected = state.publicSnapshot.datasetInventory!.datasets.find((entry) => entry.datasetId === datasetId);
-        if (!expected || observed.lineageSha256 !== expected.lineageSha256) {
-          throw new Error("commitment mismatch");
-        }
-        dataset.verified = true;
+        });
+        state.verifiedDatasetCount += 1;
       } catch {
         poisonActiveSnapshot(state);
         throw new Error("The materialized replay does not match its transaction-owned commitment.");
@@ -343,24 +317,34 @@ export function createOrganizationReconciliationMysqlTransactionDatasetAdapter(
       state.closing = true;
       state.closePromise = (async () => {
         const validOutcome = outcome === "completed" || outcome === "failed";
-        // This full-set gate is what prevents a partial dataset replay from committing.
-        const fullyReplayed = [...state.datasets.values()].every((dataset) =>
-          dataset.exhausted && dataset.replayPageIndex === dataset.pages.length && dataset.verified
-        ) && !state.poisoned;
-        const acceptedOutcome = validOutcome && outcome === "completed" && fullyReplayed ? "completed" : "failed";
-        // Best-effort overwrite before the first close await; strong erasure is not guaranteed by JavaScript.
-        state.commitmentKey.fill(0);
+        const fullyReplayed = state.verifiedDatasetCount === state.datasetCount && !state.poisoned;
+        const requestedCommit = validOutcome && outcome === "completed" && fullyReplayed;
+        let spoolCommitted = false;
+        let spoolCloseFailed = false;
         try {
-          await state.rawSnapshot.close(acceptedOutcome);
+          const spoolOutcome = await state.spool.close(requestedCommit ? "completed" : "failed");
+          spoolCommitted = spoolOutcome === "completed";
         } catch {
-          throw new Error("Closing the materialized transaction snapshot failed.");
+          spoolCloseFailed = true;
+        }
+        // Raw COMMIT is attempted only after the spool has closed successfully
+        // and proved complete. Every spool failure still reaches raw ROLLBACK.
+        const rawOutcome = requestedCommit && spoolCommitted && !spoolCloseFailed ? "completed" : "failed";
+        let rawCloseFailed = false;
+        try {
+          await state.rawSnapshot.close(rawOutcome);
+        } catch {
+          rawCloseFailed = true;
         } finally {
           active = null;
+        }
+        if (spoolCloseFailed || rawCloseFailed) {
+          throw new Error("Closing the materialized transaction snapshot failed.");
         }
         if (!validOutcome) {
           throw new Error("The materialized transaction snapshot close outcome is invalid.");
         }
-        if (outcome === "completed" && !fullyReplayed) {
+        if (outcome === "completed" && (!fullyReplayed || !spoolCommitted)) {
           throw new Error("The materialized transaction snapshot was not consumed completely.");
         }
       })();
@@ -548,58 +532,63 @@ async function openRawSnapshot(options: ValidatedOptions): Promise<RawSnapshot> 
   }
 }
 
-async function scanDataset(
+async function spoolRawDataset(
   rawSnapshot: RawSnapshot,
   spec: OrganizationReconciliationDatasetSpec,
-  remainingSerializedByteBudget: number
-): Promise<CachedDataset> {
-  const pages: CachedPage[] = [];
+  spool: OrganizationReconciliationTransactionDatasetSpool,
+  componentId: OrganizationReconciliationMysqlRawComponentId
+): Promise<void> {
   let requestCursor: string | null = null;
   let recordCount = 0;
-  let byteCount = 0;
-  const observedCursors = new Set<string>();
+  let pageCount = 0;
   while (true) {
-    if (pages.length >= spec.maxPages) throw new Error("A raw dataset exceeded its page bound.");
+    if (pageCount >= spec.maxPages) throw new Error("A raw dataset exceeded its page bound.");
     const rawPage = await readRawPage(rawSnapshot, spec.datasetId, requestCursor, spec.pageSize);
     if (rawPage.requestCursor !== requestCursor || rawPage.recordOffset !== recordCount ||
       rawPage.records.length > spec.pageSize || rawPage.surface !== spec.datasetId) {
       throw new Error("A raw dataset page is not contiguous.");
     }
     const records = rawPage.records as unknown as readonly OrganizationReconciliationInventoryJsonValue[];
-    const serialized = JSON.stringify(records);
-    byteCount += Buffer.byteLength(serialized, "utf8");
-    // Serialized bytes are bounded here; this is not a JavaScript heap bound.
-    if (byteCount > remainingSerializedByteBudget) {
-      throw new Error("A raw dataset exceeded its remaining component serialized-byte budget.");
-    }
-    recordCount += records.length;
-    if (recordCount > spec.maxRecords) throw new Error("A raw dataset exceeded its record bound.");
-    pages.push(Object.freeze({
+    await spool.appendPage({
+      datasetId: spec.datasetId,
       requestCursor: rawPage.requestCursor,
       nextCursor: rawPage.nextCursor,
       recordOffset: rawPage.recordOffset,
       records
-    }));
+    });
+    if (isSubjectUniverseDataset(componentId, spec.datasetId)) {
+      await spool.appendSubjectUniversePage({
+        datasetId: spec.datasetId,
+        recordOffset: rawPage.recordOffset,
+        subjectRefs: projectSubjectRefsFromRawPage(componentId, rawPage.records)
+      });
+    }
+    pageCount += 1;
+    recordCount += records.length;
     if (rawPage.nextCursor === null) break;
-    if (records.length < spec.pageSize) {
-      throw new Error("A raw dataset page is short before its terminal cursor.");
-    }
-    if (observedCursors.has(rawPage.nextCursor)) {
-      throw new Error("A raw dataset cursor chain repeated or made no progress.");
-    }
-    observedCursors.add(rawPage.nextCursor);
     requestCursor = rawPage.nextCursor;
   }
-  return {
-    spec,
-    pages: Object.freeze(pages),
-    recordCount,
-    byteCount,
-    expectedCursor: null,
-    replayPageIndex: 0,
-    exhausted: false,
-    verified: false
-  };
+}
+
+function isSubjectUniverseDataset(
+  componentId: OrganizationReconciliationMysqlRawComponentId,
+  datasetId: string
+): boolean {
+  return (componentId === "legacy-main" && datasetId === "legacy-subject-universe") ||
+    (componentId === "identity" && datasetId === "identity-subject-universe");
+}
+
+function projectSubjectRefsFromRawPage(
+  componentId: OrganizationReconciliationMysqlRawComponentId,
+  candidateRecords: unknown
+): readonly string[] {
+  if (componentId === "plugin") throw new Error("The plugin component has no subject-universe projection.");
+  const records = safeArray(candidateRecords, "subject-universe raw page", 0, 5_000);
+  return Object.freeze(records.map((candidate) => {
+    const row = exact(candidate, componentId === "legacy-main" ?
+      ["legacyUserId", "status"] : ["legacyUserId", "status", "source"]);
+    return subjectRefForLegacyUserId(row.legacyUserId as string);
+  }));
 }
 
 function readRawPage(
@@ -633,32 +622,6 @@ function readRawPage(
   return Promise.reject(new Error("The fixed raw dataset is unavailable."));
 }
 
-function createSubjectUniverse(
-  componentId: OrganizationReconciliationMysqlRawComponentId,
-  datasets: ReadonlyMap<string, CachedDataset>,
-  evidenceNonce: string
-): { readonly count: number; readonly hash: string } {
-  if (componentId === "plugin") return { count: 0, hash: "" };
-  const datasetId = componentId === "legacy-main" ? "legacy-subject-universe" : "identity-subject-universe";
-  const dataset = datasets.get(datasetId);
-  if (!dataset) throw new Error("The complete subject universe dataset is missing.");
-  const subjectRefs = dataset.pages.flatMap((page) => page.records.map((record) => {
-    if (!record || typeof record !== "object" || Array.isArray(record)) {
-      throw new Error("A subject universe row is invalid.");
-    }
-    return subjectRefForLegacyUserId((record as { legacyUserId?: string }).legacyUserId!);
-  }));
-  const unique = new Set(subjectRefs);
-  if (unique.size !== subjectRefs.length || subjectRefs.length < 1) {
-    throw new Error("The complete subject universe is empty or duplicate.");
-  }
-  const sorted = [...subjectRefs].sort();
-  return {
-    count: sorted.length,
-    hash: createOrganizationReconciliationEvidenceHash(evidenceNonce, sorted)
-  };
-}
-
 function validateReadRequest(candidate: unknown): OrganizationReconciliationDatasetPageRequest {
   const request = exact(candidate, ["snapshot", "datasetId", "requestCursor", "pageSize"]);
   if (request.requestCursor !== null && (typeof request.requestCursor !== "string" || request.requestCursor.length < 1)) {
@@ -674,8 +637,6 @@ function validateReadRequest(candidate: unknown): OrganizationReconciliationData
 
 function poisonActiveSnapshot(state: ActiveSnapshot): void {
   state.poisoned = true;
-  // Best-effort overwrite only; JavaScript runtimes do not guarantee strong memory erasure.
-  state.commitmentKey.fill(0);
 }
 
 function safeArray(candidate: unknown, label: string, minimum: number, maximum: number): readonly unknown[] {
@@ -691,9 +652,7 @@ function safeArray(candidate: unknown, label: string, minimum: number, maximum: 
     throw new Error(`The ${label} is sparse or unbounded.`);
   }
   const length = lengthDescriptor.value;
-  const expectedNames = new Set(["length", ...Array.from({ length }, (_, index) => String(index))]);
-  if (Object.keys(descriptors).length !== expectedNames.size ||
-    Object.keys(descriptors).some((name) => !expectedNames.has(name))) {
+  if (Object.keys(descriptors).length !== length + 1) {
     throw new Error(`The ${label} has sparse, hidden, or extra fields.`);
   }
   const values: unknown[] = [];
