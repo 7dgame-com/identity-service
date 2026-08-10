@@ -13,6 +13,7 @@ import {
   type OpenOrganizationReconciliationMysqlRawSnapshotOptions
 } from "../src/iam-organization-reconciliation/mysql-source-adapters/raw-source-snapshots.js";
 import {
+  ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM,
   ORGANIZATION_RECONCILIATION_MYSQL_STATEMENTS,
   ORGANIZATION_RECONCILIATION_MYSQL_STATEMENT_CATALOG_SHA256,
   type MysqlRepeatableReadSnapshotConnection,
@@ -77,10 +78,10 @@ describe("organization reconciliation source-specific MySQL raw adapters", () =>
       updated_at: 1_700_000_100
     };
     const fake = fakeConnection({
-      "legacy-organization-directory-page/v1": [[directoryRow]],
-      "legacy-subject-universe-page/v1": [[{ id: 9, status: 10 }]],
-      "legacy-membership-page/v1": [[{ user_id: 9, organization_id: 3 }]],
-      "legacy-role-assignment-page/v1": [[{ user_id: "9", item_name: "manager" }]],
+      "legacy-organization-directory-page/v3": [[directoryRow]],
+      "legacy-subject-universe-page/v3": [[{ id: 9, status: 10 }]],
+      "legacy-membership-page/v3": [[{ user_id: 9, organization_id: 3 }]],
+      "legacy-role-assignment-page/v3": [[{ user_id: "9", item_name: "manager" }]],
       "legacy-rbac-edge-page/v1": [[{ parent: "manager", child: "organization.update" }]]
     });
     const snapshot = await openLegacyMainMysqlRawSnapshot(optionsFor(fake, "legacy-main-db"));
@@ -110,10 +111,10 @@ describe("organization reconciliation source-specific MySQL raw adapters", () =>
     expect([directory, subjects, memberships, roles, edges].every((page) => page.nextCursor === null)).toBe(true);
 
     expect(dataQueries(fake)).toEqual([
-      [sql("legacy-organization-directory-page/v1"), [0, 10]],
-      [sql("legacy-subject-universe-page/v1"), [0, 10]],
-      [sql("legacy-membership-page/v1"), [0, 0, 0, 10]],
-      [sql("legacy-role-assignment-page/v1"), [0, 0, "", 10]],
+      [sql("legacy-organization-directory-page/v3"), [0, 10]],
+      [sql("legacy-subject-universe-page/v3"), [0, 10]],
+      [sql("legacy-membership-page/v3"), [0, 0, 0, 10]],
+      [sql("legacy-role-assignment-page/v3"), [0, 0, "", 10]],
       [sql("legacy-rbac-edge-page/v1"), ["", "", "", 10]]
     ]);
     await snapshot.close("completed");
@@ -122,35 +123,41 @@ describe("organization reconciliation source-specific MySQL raw adapters", () =>
 
   it("reads candidate, mapping, shadow, candidate-membership, and role-shadow Identity datasets", async () => {
     const fake = fakeConnection({
-      "identity-organization-candidate-page/v1": [[{
+      "identity-organization-candidate-page/v3": [[{
         legacy_organization_id: 4,
         identity_organization_id: "legacy:4",
         name: "south-campus",
         title: "South Campus",
+        source: "legacy",
         candidate_status: "candidate"
       }]],
-      "identity-organization-id-map-page/v1": [[{
+      "identity-organization-id-map-page/v3": [[{
         legacy_organization_id: 4,
         identity_organization_id: "legacy:4",
+        source: "legacy",
         mapping_status: "active"
       }]],
-      "identity-membership-shadow-page/v1": [[{
+      "identity-membership-shadow-page/v3": [[{
         legacy_user_id: 12,
         organization_id: 4,
         organization_role: null,
+        source: "legacy-shadow",
         status: "shadow"
       }]],
-      "identity-membership-candidate-page/v1": [[{
+      "identity-membership-candidate-page/v3": [[{
         legacy_user_id: 12,
         legacy_organization_id: 4,
         identity_user_id: "legacy:12",
         identity_organization_id: "legacy:4",
         organization_role: "member",
-        candidate_status: "candidate"
+        source: "legacy",
+        candidate_status: "candidate",
+        operation_key: "operation-12"
       }]],
-      "identity-role-shadow-page/v1": [[{
+      "identity-role-shadow-page/v3": [[{
         legacy_user_id: 12,
         role_name: "manager",
+        source: "legacy-shadow",
         status: "shadow"
       }]]
     });
@@ -167,17 +174,20 @@ describe("organization reconciliation source-specific MySQL raw adapters", () =>
       identityOrganizationId: "legacy:4",
       name: "south-campus",
       title: "South Campus",
+      source: "legacy",
       candidateStatus: "candidate"
     });
     expect(mappings.records[0]).toEqual({
       legacyOrganizationId: "4",
       identityOrganizationId: "legacy:4",
+      source: "legacy",
       mappingStatus: "active"
     });
     expect(shadowMemberships.records[0]).toEqual({
       legacyUserId: "12",
       legacyOrganizationId: "4",
       organizationRole: null,
+      source: "legacy-shadow",
       status: "shadow"
     });
     expect(candidateMemberships.records[0]).toEqual({
@@ -186,22 +196,133 @@ describe("organization reconciliation source-specific MySQL raw adapters", () =>
       identityUserId: "legacy:12",
       identityOrganizationId: "legacy:4",
       organizationRole: "member",
-      candidateStatus: "candidate"
+      source: "legacy",
+      candidateStatus: "candidate",
+      operationKey: "operation-12"
     });
-    expect(shadowRoles.records[0]).toEqual({ legacyUserId: "12", roleName: "manager", status: "shadow" });
+    expect(shadowRoles.records[0]).toEqual({
+      legacyUserId: "12", roleName: "manager", source: "legacy-shadow", status: "shadow"
+    });
     expect(dataQueries(fake).map(([statement]) => statement)).toEqual([
-      sql("identity-organization-candidate-page/v1"),
-      sql("identity-organization-id-map-page/v1"),
-      sql("identity-membership-shadow-page/v1"),
-      sql("identity-membership-candidate-page/v1"),
-      sql("identity-role-shadow-page/v1")
+      sql("identity-organization-candidate-page/v3"),
+      sql("identity-organization-id-map-page/v3"),
+      sql("identity-membership-shadow-page/v3"),
+      sql("identity-membership-candidate-page/v3"),
+      sql("identity-role-shadow-page/v3")
     ]);
     await snapshot.close("completed");
   });
 
+  it("reads all Develop-pinned IAM and explicit completeness datasets without DDL", async () => {
+    const checksum = ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM;
+    const fake = fakeConnection({
+      "identity-membership-candidate-snapshot-page/v1": [[{
+        identity_user_id: "legacy:12", legacy_user_id: 12, operation_key: "operation-12",
+        organization_count: 1, source: "legacy", candidate_status: "candidate"
+      }]],
+      "identity-iam-policy-version-page/v1": [[{
+        checksum, source: "legacy-import-candidate", status: "candidate",
+        role_count: "1", permission_count: 1n, relation_count: 1
+      }]],
+      "identity-iam-role-page/v1": [[{
+        policy_checksum: checksum, role_name: "root", description: null,
+        source: "legacy-import-candidate", status: "candidate"
+      }]],
+      "identity-iam-permission-page/v1": [[{
+        policy_checksum: checksum, permission_name: "organization.update", description: "Update organization",
+        source: "legacy-import-candidate", status: "candidate"
+      }]],
+      "identity-iam-item-relation-page/v1": [[{
+        policy_checksum: checksum, parent_name: "root", parent_type: "role",
+        child_name: "organization.update", child_type: "permission",
+        source: "legacy-import-candidate", status: "candidate"
+      }]],
+      "identity-iam-subject-assignment-page/v1": [[{
+        identity_user_id: "legacy:12", legacy_user_id: 12, item_name: "root", item_type: "role",
+        policy_checksum: checksum, source: "legacy-import-candidate", status: "candidate"
+      }]],
+      "identity-iam-subject-assignment-snapshot-page/v1": [[{
+        identity_user_id: "legacy:12", legacy_user_id: 12, policy_checksum: checksum,
+        snapshot_key: checksum, assignment_count: "1",
+        source: "legacy-import-candidate", status: "candidate"
+      }]]
+    });
+    const snapshot = await openIdentityMysqlRawSnapshot(optionsFor(fake, "identity-candidate-db"));
+
+    const membershipSnapshot = await snapshot.readMembershipCandidateSnapshotPage({ requestCursor: null, pageSize: 20 });
+    const policy = await snapshot.readIamPolicyVersionPage({ requestCursor: null, pageSize: 20 });
+    const roles = await snapshot.readIamRolePage({ requestCursor: null, pageSize: 20 });
+    const permissions = await snapshot.readIamPermissionPage({ requestCursor: null, pageSize: 20 });
+    const relations = await snapshot.readIamItemRelationPage({ requestCursor: null, pageSize: 20 });
+    const assignments = await snapshot.readIamSubjectAssignmentPage({ requestCursor: null, pageSize: 20 });
+    const assignmentSnapshots = await snapshot.readIamSubjectAssignmentSnapshotPage({ requestCursor: null, pageSize: 20 });
+
+    expect(membershipSnapshot.records).toEqual([{
+      identityUserId: "legacy:12", legacyUserId: "12", operationKey: "operation-12",
+      organizationCount: 1, source: "legacy", candidateStatus: "candidate"
+    }]);
+    expect(policy.records).toEqual([{
+      policyChecksum: checksum, source: "legacy-import-candidate", status: "candidate",
+      roleCount: 1, permissionCount: 1, relationCount: 1
+    }]);
+    expect(roles.records[0]).toMatchObject({ policyChecksum: checksum, itemName: "root" });
+    expect(permissions.records[0]).toMatchObject({ itemName: "organization.update" });
+    expect(relations.records[0]).toMatchObject({ parentName: "root", childName: "organization.update" });
+    expect(assignments.records[0]).toMatchObject({ identityUserId: "legacy:12", itemName: "root" });
+    expect(assignmentSnapshots.records[0]).toMatchObject({
+      identityUserId: "legacy:12", snapshotKey: checksum, assignmentCount: 1
+    });
+    expect(dataQueries(fake).map(([, parameters]) => parameters)).toEqual([
+      [0, 0, "", 20],
+      [checksum, "", 20],
+      [checksum, "", 20],
+      [checksum, "", 20],
+      [checksum, "", "", "", 20],
+      [checksum, 0, 0, "", 0, "", "", 20],
+      [checksum, checksum, checksum, 0, 0, "", 20]
+    ]);
+    await snapshot.close("completed");
+  });
+
+  it("reads rule-free Legacy RBAC items and direct role-or-permission assignments", async () => {
+    const fake = fakeConnection({
+      "legacy-rbac-item-page/v1": [[{
+        name: "organization.update", type: 2, description: null, rule_name: null
+      }]],
+      "legacy-rbac-assignment-page/v1": [[{
+        user_id: 12, item_name: "organization.update", type: 2
+      }]]
+    });
+    const snapshot = await openLegacyMainMysqlRawSnapshot(optionsFor(fake, "legacy-main-db"));
+    const items = await snapshot.readRbacItemPage({ requestCursor: null, pageSize: 20 });
+    const assignments = await snapshot.readRbacAssignmentPage({ requestCursor: null, pageSize: 20 });
+    expect(items.records).toEqual([{
+      itemName: "organization.update", itemType: "permission", description: null, ruleName: null
+    }]);
+    expect(assignments.records).toEqual([{
+      legacyUserId: "12", itemName: "organization.update", itemType: "permission"
+    }]);
+    expect(dataQueries(fake)).toEqual([
+      [sql("legacy-rbac-item-page/v1"), ["", 20]],
+      [sql("legacy-rbac-assignment-page/v1"), [0, 0, "", 20]]
+    ]);
+    await snapshot.close("completed");
+
+    const namedRule = fakeConnection({
+      "legacy-rbac-item-page/v1": [[{
+        name: "organization.update", type: 2, description: null, rule_name: "UnsafeRule"
+      }]]
+    });
+    const namedRuleSnapshot = await openLegacyMainMysqlRawSnapshot(optionsFor(namedRule, "legacy-main-db"));
+    await expect(namedRuleSnapshot.readRbacItemPage({ requestCursor: null, pageSize: 20 }))
+      .rejects.toThrow("Reading the Legacy main MySQL reconciliation snapshot page failed");
+    await namedRuleSnapshot.close("failed");
+    expect(namedRule.queries.at(-1)?.[0]).toBe("ROLLBACK");
+  });
+
   it("reads the plugin registry through its only fixed statement and exact owner-facing fields", async () => {
     const fake = fakeConnection({
-      "plugin-registry-page/v1": [[{
+      "plugin-registry-page/v3": [[{
         id: "system-admin",
         enabled: 1,
         access_scope: "admin-only",
@@ -220,20 +341,20 @@ describe("organization reconciliation source-specific MySQL raw adapters", () =>
       accessScope: "admin-only",
       organizationName: "north-campus"
     }]);
-    expect(dataQueries(fake)).toEqual([[sql("plugin-registry-page/v1"), ["", 100]]]);
+    expect(dataQueries(fake)).toEqual([[sql("plugin-registry-page/v3"), ["", 100]]]);
     await snapshot.close("completed");
   });
 
   it("binds an opaque keyset cursor to one Identity candidate-membership chain and permits a terminal empty page", async () => {
     const fake = fakeConnection({
-      "identity-membership-candidate-page/v1": [
+      "identity-membership-candidate-page/v3": [
         [{
           legacy_user_id: 2,
           legacy_organization_id: 7,
           identity_user_id: "legacy:2",
           identity_organization_id: "legacy:7",
           organization_role: "member",
-          candidate_status: "candidate"
+          source: "legacy", candidate_status: "candidate", operation_key: "operation-2"
         }],
         [{
           legacy_user_id: 2,
@@ -241,7 +362,7 @@ describe("organization reconciliation source-specific MySQL raw adapters", () =>
           identity_user_id: "legacy:2",
           identity_organization_id: "legacy:8",
           organization_role: "member",
-          candidate_status: "candidate"
+          source: "legacy", candidate_status: "candidate", operation_key: "operation-2"
         }],
         []
       ]
@@ -258,9 +379,9 @@ describe("organization reconciliation source-specific MySQL raw adapters", () =>
     expect(second.recordOffset).toBe(1);
     expect(terminal).toMatchObject({ recordOffset: 2, records: [], nextCursor: null });
     expect(dataQueries(fake).map(([, parameters]) => parameters)).toEqual([
-      [0, 0, 0, 0, 0, "", 0, 0, "", "", 1],
-      ["2", "2", "7", "2", "7", "legacy:2", "2", "7", "legacy:2", "legacy:7", 1],
-      ["2", "2", "7", "2", "7", "legacy:2", "2", "7", "legacy:2", "legacy:8", 1]
+      [0, 0, "", "", "", 1],
+      ["2", "7", "legacy:2", "legacy:7", "operation-2", 1],
+      ["2", "7", "legacy:2", "legacy:8", "operation-2", 1]
     ]);
     await snapshot.close("completed");
   });
@@ -381,7 +502,7 @@ describe("organization reconciliation source-specific MySQL raw adapters", () =>
     expect(bindingFake.queries).toEqual([]);
 
     const queryFake = fakeConnection({}, {
-      failSql: sql("legacy-subject-universe-page/v1"),
+      failSql: sql("legacy-subject-universe-page/v3"),
       secret: "private-driver-secret"
     });
     const snapshot = await openLegacyMainMysqlRawSnapshot(optionsFor(queryFake, "legacy-main-db"));
@@ -453,7 +574,7 @@ describe("organization reconciliation source-specific MySQL raw adapters", () =>
     };
 
     for (const row of [getterRow, symbolRow, prototypeRow, unknownFieldRow]) {
-      const fake = fakeConnection({ "legacy-organization-directory-page/v1": [[row]] });
+      const fake = fakeConnection({ "legacy-organization-directory-page/v3": [[row]] });
       const snapshot = await openLegacyMainMysqlRawSnapshot(optionsFor(fake, "legacy-main-db"));
       const failure = await snapshot.readOrganizationDirectoryPage({ requestCursor: null, pageSize: 10 })
         .catch((error: unknown) => error);
@@ -463,7 +584,7 @@ describe("organization reconciliation source-specific MySQL raw adapters", () =>
     expect(getter).not.toHaveBeenCalled();
 
     const unorderedFake = fakeConnection({
-      "legacy-subject-universe-page/v1": [[{ id: 2, status: 10 }, { id: 1, status: 10 }]]
+      "legacy-subject-universe-page/v3": [[{ id: 2, status: 10 }, { id: 1, status: 10 }]]
     });
     const unordered = await openLegacyMainMysqlRawSnapshot(optionsFor(unorderedFake, "legacy-main-db"));
     const orderFailure = await unordered.readSubjectUniversePage({ requestCursor: null, pageSize: 10 })
@@ -476,11 +597,12 @@ describe("organization reconciliation source-specific MySQL raw adapters", () =>
 
   it("rejects lifecycle/status selector drift instead of treating unapproved Identity rows as reconciled", async () => {
     const fake = fakeConnection({
-      "identity-organization-candidate-page/v1": [[{
+      "identity-organization-candidate-page/v3": [[{
         legacy_organization_id: 4,
         identity_organization_id: "legacy:4",
         name: "south-campus",
         title: "South Campus",
+        source: "legacy",
         candidate_status: "active"
       }]]
     });
@@ -496,7 +618,7 @@ describe("organization reconciliation source-specific MySQL raw adapters", () =>
 
   it("accepts valid composite-key ordering across numeric digit and string length transitions", async () => {
     const legacyFake = fakeConnection({
-      "legacy-membership-page/v1": [[
+      "legacy-membership-page/v3": [[
         { user_id: 99_999, organization_id: 1 },
         { user_id: 100_000, organization_id: 1 }
       ]]
@@ -507,14 +629,14 @@ describe("organization reconciliation source-specific MySQL raw adapters", () =>
     await legacy.close("completed");
 
     const identityFake = fakeConnection({
-      "identity-membership-candidate-page/v1": [[
+      "identity-membership-candidate-page/v3": [[
         {
           legacy_user_id: 1,
           legacy_organization_id: 1,
           identity_user_id: "aa",
           identity_organization_id: "legacy:1",
           organization_role: "member",
-          candidate_status: "candidate"
+          source: "legacy", candidate_status: "candidate", operation_key: "operation-1"
         },
         {
           legacy_user_id: 1,
@@ -522,7 +644,7 @@ describe("organization reconciliation source-specific MySQL raw adapters", () =>
           identity_user_id: "z",
           identity_organization_id: "legacy:1",
           organization_role: "member",
-          candidate_status: "candidate"
+          source: "legacy", candidate_status: "candidate", operation_key: "operation-1"
         }
       ]]
     });
@@ -533,7 +655,7 @@ describe("organization reconciliation source-specific MySQL raw adapters", () =>
   });
 
   it("makes close idempotent, waits for accepted reads, and rejects reads after close starts", async () => {
-    const fake = fakeConnection({ "plugin-registry-page/v1": [[]] });
+    const fake = fakeConnection({ "plugin-registry-page/v3": [[]] });
     const snapshot = await openPluginRegistryMysqlRawSnapshot(optionsFor(fake, "plugin-registry-db"));
 
     const read = snapshot.readPluginRegistryPage({ requestCursor: null, pageSize: 10 });

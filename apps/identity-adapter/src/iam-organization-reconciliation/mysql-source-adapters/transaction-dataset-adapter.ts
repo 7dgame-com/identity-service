@@ -155,12 +155,21 @@ const COMPONENT_DATASETS: Readonly<Record<OrganizationReconciliationMysqlRawComp
     "legacy-main": Object.freeze([
       "legacy-membership",
       "legacy-organization-directory",
+      "legacy-rbac-assignment",
       "legacy-rbac-edge",
+      "legacy-rbac-item",
       "legacy-role-assignment",
       "legacy-subject-universe"
     ]),
     identity: Object.freeze([
+      "identity-iam-item-relation",
+      "identity-iam-permission",
+      "identity-iam-policy-version",
+      "identity-iam-role",
+      "identity-iam-subject-assignment",
+      "identity-iam-subject-assignment-snapshot",
       "identity-membership-candidate",
+      "identity-membership-candidate-snapshot",
       "identity-membership-shadow",
       "identity-organization-candidate",
       "identity-organization-id-map",
@@ -604,14 +613,23 @@ function readRawPage(
     switch (datasetId) {
       case "legacy-membership": return legacy.readMembershipPage(request) as Promise<RawPage>;
       case "legacy-organization-directory": return legacy.readOrganizationDirectoryPage(request) as Promise<RawPage>;
+      case "legacy-rbac-assignment": return legacy.readRbacAssignmentPage(request) as Promise<RawPage>;
       case "legacy-rbac-edge": return legacy.readRbacEdgePage(request) as Promise<RawPage>;
+      case "legacy-rbac-item": return legacy.readRbacItemPage(request) as Promise<RawPage>;
       case "legacy-role-assignment": return legacy.readRoleAssignmentPage(request) as Promise<RawPage>;
       case "legacy-subject-universe": return legacy.readSubjectUniversePage(request) as Promise<RawPage>;
     }
   } else if (snapshot.metadata.componentId === "identity") {
     const identity = snapshot as IdentityMysqlRawSnapshot;
     switch (datasetId) {
+      case "identity-iam-item-relation": return identity.readIamItemRelationPage(request) as Promise<RawPage>;
+      case "identity-iam-permission": return identity.readIamPermissionPage(request) as Promise<RawPage>;
+      case "identity-iam-policy-version": return identity.readIamPolicyVersionPage(request) as Promise<RawPage>;
+      case "identity-iam-role": return identity.readIamRolePage(request) as Promise<RawPage>;
+      case "identity-iam-subject-assignment": return identity.readIamSubjectAssignmentPage(request) as Promise<RawPage>;
+      case "identity-iam-subject-assignment-snapshot": return identity.readIamSubjectAssignmentSnapshotPage(request) as Promise<RawPage>;
       case "identity-membership-candidate": return identity.readMembershipCandidatePage(request) as Promise<RawPage>;
+      case "identity-membership-candidate-snapshot": return identity.readMembershipCandidateSnapshotPage(request) as Promise<RawPage>;
       case "identity-membership-shadow": return identity.readMembershipShadowPage(request) as Promise<RawPage>;
       case "identity-organization-candidate": return identity.readOrganizationCandidatePage(request) as Promise<RawPage>;
       case "identity-organization-id-map": return identity.readOrganizationIdMapPage(request) as Promise<RawPage>;

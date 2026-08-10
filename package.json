@@ -20,6 +20,8 @@
     "iam:organization-write:materialization-gate:dist": "node dist/scripts/iam-organization-candidate-materialization-gate.js",
     "iam:organization-reconciliation:validate": "tsx scripts/iam-organization-reconciliation-validate.ts",
     "iam:organization-reconciliation:validate:dist": "node dist/scripts/iam-organization-reconciliation-validate.js",
+    "iam:organization-reconciliation:develop-preflight": "tsx scripts/iam-organization-reconciliation-develop-preflight.ts",
+    "iam:organization-reconciliation:develop-preflight:dist": "node dist/scripts/iam-organization-reconciliation-develop-preflight.js",
     "invitation:import": "tsx scripts/invitation-import.ts"
   },
   "dependencies": {
