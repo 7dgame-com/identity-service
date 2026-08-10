@@ -287,6 +287,47 @@ IDENTITY_IAM_ORG_WRITE_ROLLOUT_ALLOWLIST: ""
 IDENTITY_IAM_ORG_WRITE_ROLLOUT_PERCENTAGE: "0"
 ```
 
+### Develop 全主体 candidate batch（仅本地实现，尚不可运行）
+
+为 7.2 的全主体对账准备 Identity candidate 基线，当前源码另提供一个严格限定在
+`xrteeth-develop` 的批量 primitive。它读取同一 Legacy `REPEATABLE READ`、`READ ONLY` 快照中的完整
+user/全局 role/organization membership，先做纯只读 preview，再只为 active ordinary subjects 补齐
+缺失的 Identity candidate。具有 `root` 等受保护角色的主体只计数和报告，永不进入写循环；Legacy
+始终只读，AuthZ owner 仍为 Legacy。该 primitive 不授权 dual-write、Identity-native、publish、tmrpp 或
+Production，也不关闭 6.9/7.2。
+
+默认和窗口恢复值必须固定为：
+
+```yaml
+IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_MATERIALIZATION_ENABLED: "false"
+IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_MATERIALIZATION_ENVIRONMENT: "disabled"
+IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_MATERIALIZATION_PLAN_HMAC_KEY: ""
+IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_EXPECTED_LEGACY_SUBJECT_COUNT: "0"
+IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_EXPECTED_PROTECTED_SUBJECT_COUNT: "0"
+```
+
+受控 preview/apply 要求 Identity DB 精确为 `xrugc_identity_dev`、Legacy DB 精确为 `bujiaban`，并要求
+现有单主体 materialization 已恢复为 disabled/target `0`。preview 只返回聚合计数和 HMAC plan token，
+不返回 Legacy user ID、用户名、角色或组织；plan token 绑定完整 Legacy source snapshot、状态、受保护分类
+和组织 fingerprint。Preview 阶段必须保持 batch `ENABLED=false`；审核 token/计数并取得独立写批准后，
+才可临时设为 `true` 进入 Apply。Apply 在跨节点 MySQL batch advisory lock 内重新读取并核对相同 source snapshot，
+随后逐主体复用现有 subject lock、ledger、candidate transaction 和 fresh Legacy postcheck。中途失败可用
+同一 plan/idempotency key 续跑，已对齐主体只跳过、不重写；普通主体出现 inactive、unresolved operation、
+count drift、fingerprint drift 或任何 P0/P2 时，写循环开始前整体 fail closed。
+
+内部实现入口为：
+
+```text
+GET  /internal/iam/organization-write/candidate-batch-materialization/preview
+POST /internal/iam/organization-write/candidate-batch-materialization/apply
+```
+
+两者均要求 `X-Identity-Internal-Token` 和精确 40 位 `X-Identity-Expected-Revision`；POST 另要求
+`Idempotency-Key` 和刚审核的 64 位 plan token。当前尚未提供经审核的 batch operator gate，因此不得用
+临时 curl、Portainer console 或手工拼接请求执行。下一切片必须先补充只从环境变量读取 secret 的
+preview/apply/postcheck CLI，并验证不确定结果、恢复门禁和完整 ledger 证据；在该 CLI 发布、CI 通过并
+取得独立 Develop 写窗批准前，本能力只属于 default-off 的本地实现。
+
 ### Candidate schema / DDL 批准边界
 
 preview、readiness、alignment、ledger 和 materialization apply 均不再 lazy ensure schema。

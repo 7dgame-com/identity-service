@@ -61,6 +61,18 @@ export async function runOrganizationWriteWindowGate(
     posture?.candidateMaterializationTargetConfigured,
     false
   );
+  compare(
+    failures,
+    "health.organizationWrite.candidateBatchMaterializationEnabled",
+    posture?.candidateBatchMaterializationEnabled,
+    false
+  );
+  compare(
+    failures,
+    "health.organizationWrite.candidateBatchMaterializationEnvironment",
+    posture?.candidateBatchMaterializationEnvironment,
+    "disabled"
+  );
   compare(failures, "health.organizationWrite.rolloutMode", posture?.rolloutMode, "allowlist");
   compare(failures, "health.organizationWrite.rolloutAllowlistCount", posture?.rolloutAllowlistCount, options.expectedAllowlistCount);
   compare(failures, "health.organizationWrite.rolloutPercentage", posture?.rolloutPercentage, 0);

@@ -750,6 +750,8 @@ function assertHealth(
   requireEqual(failures, `${label} dual-write execution`, posture?.dualWriteExecutionEnabled, false);
   requireEqual(failures, `${label} materialization enabled`, posture?.candidateMaterializationEnabled, options.apply);
   requireEqual(failures, `${label} materialization target configured`, posture?.candidateMaterializationTargetConfigured, true);
+  requireEqual(failures, `${label} batch materialization enabled`, posture?.candidateBatchMaterializationEnabled, false);
+  requireEqual(failures, `${label} batch materialization environment`, posture?.candidateBatchMaterializationEnvironment, "disabled");
   requireEqual(failures, `${label} rollout mode`, posture?.rolloutMode, "off");
   requireEqual(failures, `${label} rollout allowlist count`, posture?.rolloutAllowlistCount, 0);
   requireEqual(failures, `${label} rollout percentage`, posture?.rolloutPercentage, 0);
@@ -773,6 +775,8 @@ function assertRestoredHealth(
   requireEqual(failures, "restored health dual-write execution", posture?.dualWriteExecutionEnabled, false);
   requireEqual(failures, "restored health materialization enabled", posture?.candidateMaterializationEnabled, false);
   requireEqual(failures, "restored health materialization target configured", posture?.candidateMaterializationTargetConfigured, false);
+  requireEqual(failures, "restored health batch materialization enabled", posture?.candidateBatchMaterializationEnabled, false);
+  requireEqual(failures, "restored health batch materialization environment", posture?.candidateBatchMaterializationEnvironment, "disabled");
   requireEqual(failures, "restored health rollout mode", posture?.rolloutMode, "off");
   requireEqual(failures, "restored health rollout allowlist count", posture?.rolloutAllowlistCount, 0);
   requireEqual(failures, "restored health rollout percentage", posture?.rolloutPercentage, 0);
@@ -814,6 +818,11 @@ function assertReadiness(failures: string[], readiness: Record<string, any> | un
   requireEqual(failures, "readiness materialization source", materialization?.sourceOfTruth, "legacy");
   requireEqual(failures, "readiness legacy mutation", materialization?.mutatesLegacy, false);
   requireEqual(failures, "readiness materialization write scope", materialization?.writeScope, "identity-candidate-only");
+  const batch = readiness?.candidateBatchMaterialization;
+  requireEqual(failures, "readiness batch materialization enabled", batch?.enabled, false);
+  requireEqual(failures, "readiness batch materialization environment", batch?.environment, "disabled");
+  requireEqual(failures, "readiness batch materialization apply", batch?.canApply, false);
+  requireEqual(failures, "readiness batch protected subject writes", batch?.protectedSubjectsWritten, false);
 }
 
 function assertRestoredReadiness(failures: string[], readiness: Record<string, any> | undefined): void {
@@ -850,6 +859,11 @@ function assertRestoredReadiness(failures: string[], readiness: Record<string, a
   requireEqual(failures, "restored readiness materialization source", materialization?.sourceOfTruth, "legacy");
   requireEqual(failures, "restored readiness legacy mutation", materialization?.mutatesLegacy, false);
   requireEqual(failures, "restored readiness materialization write scope", materialization?.writeScope, "identity-candidate-only");
+  const batch = readiness?.candidateBatchMaterialization;
+  requireEqual(failures, "restored readiness batch materialization enabled", batch?.enabled, false);
+  requireEqual(failures, "restored readiness batch materialization environment", batch?.environment, "disabled");
+  requireEqual(failures, "restored readiness batch materialization apply", batch?.canApply, false);
+  requireEqual(failures, "restored readiness batch protected subject writes", batch?.protectedSubjectsWritten, false);
 }
 
 function assertPreview(

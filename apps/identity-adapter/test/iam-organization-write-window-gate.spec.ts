@@ -79,6 +79,19 @@ describe("IAM organization-write read-only window gate", () => {
     ]));
   });
 
+  it("fails closed while candidate batch materialization remains configured", async () => {
+    const result = await runOrganizationWriteWindowGate(options(), fixtureFetch({
+      candidateBatchMaterializationEnabled: true,
+      candidateBatchMaterializationEnvironment: "xrteeth-develop"
+    }));
+
+    expect(result.passed).toBe(false);
+    expect(result.failures).toEqual(expect.arrayContaining([
+      "health.organizationWrite.candidateBatchMaterializationEnabled expected false, got true",
+      "health.organizationWrite.candidateBatchMaterializationEnvironment expected disabled, got xrteeth-develop"
+    ]));
+  });
+
   it("accepts tokens only from the environment and validates explicit target input", () => {
     expect(() => parseOrganizationWriteWindowGateArgs(["--legacy-user-id=24", "--token=secret"], {})).toThrow(
       "Do not pass tokens on the command line"
@@ -111,6 +124,8 @@ function fixtureFetch(overrides: {
   dualWriteExecutionEnabled?: boolean;
   candidateMaterializationEnabled?: boolean;
   candidateMaterializationTargetConfigured?: boolean;
+  candidateBatchMaterializationEnabled?: boolean;
+  candidateBatchMaterializationEnvironment?: "disabled" | "xrteeth-develop";
   decision?: Record<string, unknown>;
   summaryOperations?: Record<string, unknown>[];
   alignment?: Record<string, unknown>;
@@ -123,6 +138,8 @@ function fixtureFetch(overrides: {
     dualWriteExecutionEnabled,
     candidateMaterializationEnabled: overrides.candidateMaterializationEnabled ?? false,
     candidateMaterializationTargetConfigured: overrides.candidateMaterializationTargetConfigured ?? false,
+    candidateBatchMaterializationEnabled: overrides.candidateBatchMaterializationEnabled ?? false,
+    candidateBatchMaterializationEnvironment: overrides.candidateBatchMaterializationEnvironment ?? "disabled",
     rolloutMode: "allowlist",
     rolloutAllowlistCount: 1,
     rolloutPercentage: 0,

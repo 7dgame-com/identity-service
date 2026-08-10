@@ -28,6 +28,11 @@ describe("IAM organization membership write compatibility layer", () => {
     delete process.env.IDENTITY_IAM_ORG_WRITE_ROLLOUT_PERCENTAGE;
     delete process.env.IDENTITY_IAM_ORG_WRITE_CANDIDATE_MATERIALIZATION_ENABLED;
     delete process.env.IDENTITY_IAM_ORG_WRITE_CANDIDATE_MATERIALIZATION_TARGET_LEGACY_USER_ID;
+    delete process.env.IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_MATERIALIZATION_ENABLED;
+    delete process.env.IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_MATERIALIZATION_ENVIRONMENT;
+    delete process.env.IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_MATERIALIZATION_PLAN_HMAC_KEY;
+    delete process.env.IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_EXPECTED_LEGACY_SUBJECT_COUNT;
+    delete process.env.IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_EXPECTED_PROTECTED_SUBJECT_COUNT;
   });
 
   afterEach(() => {
@@ -65,7 +70,12 @@ describe("IAM organization membership write compatibility layer", () => {
       organizationWriteRolloutAllowlist: "",
       organizationWriteRolloutPercentage: 0,
       organizationWriteCandidateMaterializationEnabled: false,
-      organizationWriteCandidateMaterializationTargetLegacyUserId: 0
+      organizationWriteCandidateMaterializationTargetLegacyUserId: 0,
+      organizationWriteCandidateBatchMaterializationEnabled: false,
+      organizationWriteCandidateBatchMaterializationEnvironment: "disabled",
+      organizationWriteCandidateBatchMaterializationPlanHmacKey: undefined,
+      organizationWriteCandidateBatchExpectedLegacySubjectCount: 0,
+      organizationWriteCandidateBatchExpectedProtectedSubjectCount: 0
     });
   });
 
@@ -74,7 +84,9 @@ describe("IAM organization membership write compatibility layer", () => {
     process.env.IDENTITY_BUILD_REVISION = "a".repeat(40);
     const organizationWrite = {
       previewCandidateMaterialization: vi.fn(async () => ({ mutation: false, expectedSnapshotFingerprint: "a".repeat(64) })),
-      materializeCandidate: vi.fn(async () => ({ materialized: true }))
+      materializeCandidate: vi.fn(async () => ({ materialized: true })),
+      previewCandidateBatchMaterialization: vi.fn(async () => ({ mutation: false, planToken: "b".repeat(64) })),
+      materializeCandidateBatch: vi.fn(async () => ({ completed: true }))
     };
     const controller = new IamOrganizationWriteController(organizationWrite as never);
 
@@ -106,6 +118,28 @@ describe("IAM organization membership write compatibility layer", () => {
       "24",
       { expectedSnapshotFingerprint: "a".repeat(64) }
     )).rejects.toMatchObject({ response: { code: "IDEMPOTENCY_KEY_CONFLICT" } });
+
+    await expect(controller.previewCandidateBatchMaterialization(
+      "organization-internal-test",
+      "a".repeat(40)
+    )).resolves.toMatchObject({
+      capability: "iam-organization-candidate-batch-materialization-preview",
+      data: { mutation: false, planToken: "b".repeat(64) }
+    });
+    await expect(controller.materializeCandidateBatch(
+      "organization-internal-test",
+      "a".repeat(40),
+      "batch-key",
+      undefined,
+      { planToken: "b".repeat(64) }
+    )).resolves.toMatchObject({
+      capability: "iam-organization-candidate-batch-materialization",
+      data: { completed: true }
+    });
+    expect(organizationWrite.materializeCandidateBatch).toHaveBeenCalledWith({
+      planToken: "b".repeat(64),
+      idempotencyKey: "batch-key"
+    });
   });
 
   it.each([

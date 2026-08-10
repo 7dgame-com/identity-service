@@ -376,6 +376,36 @@ describe.skipIf(!enabled)("IAM organization write MySQL integration", () => {
     await expect(second.withCandidateMaterializationSubjectLock(legacyUserId, async () => "released-after-error"))
       .resolves.toEqual({ acquired: true, value: "released-after-error" });
   }, 30_000);
+
+  it("holds the cross-node candidate batch lock on one MySQL session and releases it exactly after the callback", async () => {
+    safeMysqlTestTarget();
+    const first = new IamOrganizationWriteRepository();
+    const second = new IamOrganizationWriteRepository();
+    repositories.push(first, second);
+    let entered!: () => void;
+    let release!: () => void;
+    const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+    const releasePromise = new Promise<void>((resolve) => { release = resolve; });
+
+    const held = first.withCandidateMaterializationBatchLock(async () => {
+      entered();
+      await releasePromise;
+      return "held";
+    });
+    await enteredPromise;
+    await expect(second.withCandidateMaterializationBatchLock(async () => "unexpected"))
+      .resolves.toEqual({ acquired: false });
+    release();
+    await expect(held).resolves.toEqual({ acquired: true, value: "held" });
+    await expect(second.withCandidateMaterializationBatchLock(async () => "released"))
+      .resolves.toEqual({ acquired: true, value: "released" });
+
+    await expect(first.withCandidateMaterializationBatchLock(async () => {
+      throw new Error("batch callback failed");
+    })).rejects.toThrow("batch callback failed");
+    await expect(second.withCandidateMaterializationBatchLock(async () => "released-after-error"))
+      .resolves.toEqual({ acquired: true, value: "released-after-error" });
+  }, 30_000);
 });
 
 interface MysqlTestTarget { host: string; port: number; database: string; user: string; password: string; }
