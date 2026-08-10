@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import {
   BadRequestException,
   ConflictException,
@@ -24,7 +24,12 @@ import {
   organizationWriteRequestFingerprint
 } from "./iam-organization-write.repository.js";
 import { JwtIssuerService, VerifiedAccessToken } from "./jwt-issuer.service.js";
-import { LegacyIdentityReader, LegacyOrganization, LegacyUserReadModel } from "./legacy-identity.reader.js";
+import {
+  LegacyIdentityReader,
+  LegacyOrganization,
+  LegacyUserReadModel,
+  type LegacyOrganizationCandidateSourceUser
+} from "./legacy-identity.reader.js";
 import { PluginUserWriteRequest, PluginUserWriteService } from "./plugin-user-write.service.js";
 
 export interface IamOrganizationWriteProxyResponse {
@@ -32,6 +37,34 @@ export interface IamOrganizationWriteProxyResponse {
   body: unknown;
   mode: "legacy-proxy" | "dual-write";
   evidence: IamOrganizationWriteEvidence;
+}
+
+export const ORGANIZATION_CANDIDATE_BATCH_MATERIALIZATION_CONTRACT =
+  "iam-organization-candidate-batch-materialization/xrteeth-develop/v1" as const;
+
+interface OrganizationCandidateBatchSubjectPlan {
+  readonly source: LegacyOrganizationCandidateSourceUser;
+  readonly legacyUser: LegacyUserReadModel;
+  readonly snapshotFingerprint: string;
+  readonly protected: boolean;
+  readonly alignment: OrganizationAlignment;
+  readonly unresolvedOperationCount: number;
+  readonly disposition: "aligned" | "materialize" | "protected" | "blocked";
+}
+
+interface OrganizationCandidateBatchPlan {
+  readonly planToken: string;
+  readonly subjects: readonly OrganizationCandidateBatchSubjectPlan[];
+  readonly legacySubjectCount: number;
+  readonly ordinarySubjectCount: number;
+  readonly protectedSubjectCount: number;
+  readonly ordinaryAlignedCount: number;
+  readonly ordinaryMissingCount: number;
+  readonly ordinaryBlockedCount: number;
+  readonly inactiveOrdinaryCount: number;
+  readonly protectedAlignedCount: number;
+  readonly protectedMissingCount: number;
+  readonly blockers: readonly string[];
 }
 
 @Injectable()
@@ -92,6 +125,25 @@ export class IamOrganizationWriteService {
       ...(!iam.organizationWriteCandidateMaterializationEnabled ? ["candidate-materialization-disabled"] : []),
       ...this.candidateMaterializationPostureBlockedReasons()
     ]);
+    const candidateBatchConfigurationBlockers = this.candidateBatchConfigurationBlockedReasons();
+    const candidateBatchPreviewBlockers = uniqueStrings([
+      ...candidateBatchConfigurationBlockers,
+      ...(!this.repository.isConfigured() ? ["identity-organization-candidate-repository"] : []),
+      ...(materializationSchema.blocker ? [materializationSchema.blocker] : [])
+    ]);
+    const candidateBatchApplyBlockers = uniqueStrings([
+      ...candidateBatchPreviewBlockers,
+      ...(!iam.organizationWriteCandidateBatchMaterializationEnabled
+        ? ["candidate-batch-materialization-disabled"]
+        : []),
+      ...this.candidateMaterializationPostureBlockedReasons(),
+      ...(iam.organizationWriteCandidateMaterializationEnabled
+        ? ["single-subject-candidate-materialization-must-be-disabled"]
+        : []),
+      ...(iam.organizationWriteCandidateMaterializationTargetLegacyUserId !== 0
+        ? ["single-subject-candidate-target-must-be-zero"]
+        : [])
+    ]);
     return {
       enabled: iam.organizationWriteMode !== "disabled",
       mode: iam.organizationWriteMode,
@@ -124,6 +176,27 @@ export class IamOrganizationWriteService {
         requiresIdempotencyKey: true,
         sourceOfTruth: "legacy",
         mutatesLegacy: false,
+        writeScope: "identity-candidate-only"
+      },
+      candidateBatchMaterialization: {
+        contract: ORGANIZATION_CANDIDATE_BATCH_MATERIALIZATION_CONTRACT,
+        enabled: iam.organizationWriteCandidateBatchMaterializationEnabled,
+        environment: iam.organizationWriteCandidateBatchMaterializationEnvironment,
+        planHmacKeyConfigured: candidateBatchPlanHmacKeyConfigured(iam),
+        expectedLegacySubjectCount: iam.organizationWriteCandidateBatchExpectedLegacySubjectCount,
+        expectedProtectedSubjectCount: iam.organizationWriteCandidateBatchExpectedProtectedSubjectCount,
+        canPreview: candidateBatchPreviewBlockers.length === 0,
+        canApply: candidateBatchApplyBlockers.length === 0,
+        blockers: candidateBatchApplyBlockers,
+        previewEndpoint: "/internal/iam/organization-write/candidate-batch-materialization/preview",
+        endpoint: "/internal/iam/organization-write/candidate-batch-materialization/apply",
+        requiresInternalToken: true,
+        requiresExpectedBuildRevision: true,
+        requiresPlanHmac: true,
+        requiresIdempotencyKey: true,
+        sourceOfTruth: "legacy",
+        mutatesLegacy: false,
+        protectedSubjectsWritten: false,
         writeScope: "identity-candidate-only"
       },
       identityNativeSupported: false,
@@ -329,6 +402,236 @@ export class IamOrganizationWriteService {
       });
     }
     return lock.value;
+  }
+
+  async previewCandidateBatchMaterialization() {
+    this.requireRepository();
+    await this.assertCandidateMaterializationSchemaReady();
+    this.assertCandidateBatchConfiguration();
+    const plan = await this.createCandidateBatchPlan();
+    return candidateBatchPublicPlan(plan, {
+      applyEnabled: this.config.iam.organizationWriteCandidateBatchMaterializationEnabled,
+      postureBlockers: this.candidateMaterializationPostureBlockedReasons()
+    });
+  }
+
+  async materializeCandidateBatch(input: { planToken?: string; idempotencyKey?: string }) {
+    const { iam } = this.config;
+    if (!iam.organizationWriteCandidateBatchMaterializationEnabled) {
+      throw new NotFoundException({
+        code: "IAM_ORGANIZATION_CANDIDATE_BATCH_MATERIALIZATION_DISABLED",
+        message: "Organization candidate batch materialization is disabled."
+      });
+    }
+    this.assertCandidateBatchConfiguration();
+    this.assertCandidateMaterializationPosture();
+    if (iam.organizationWriteCandidateMaterializationEnabled ||
+      iam.organizationWriteCandidateMaterializationTargetLegacyUserId !== 0) {
+      throw new ConflictException({
+        code: "IAM_ORGANIZATION_CANDIDATE_BATCH_SINGLE_SUBJECT_GATE_ACTIVE",
+        message: "The single-subject candidate materialization gate must be fully restored before batch apply."
+      });
+    }
+    this.requireRepository();
+    const planToken = candidateBatchPlanTokenInput(input.planToken);
+    const idempotencyKey = candidateMaterializationIdempotencyKey(input.idempotencyKey);
+    const batchLock = await this.repository.withCandidateMaterializationBatchLock(async () => {
+      await this.assertCandidateMaterializationSchemaReady();
+      const plan = await this.createCandidateBatchPlan();
+      if (!constantTimeHexEqual(plan.planToken, planToken)) {
+        throw new ConflictException({
+          code: "IAM_ORGANIZATION_CANDIDATE_BATCH_PLAN_CHANGED",
+          message: "The reviewed Legacy batch plan no longer matches the current source snapshot."
+        });
+      }
+      if (plan.blockers.length > 0 || plan.ordinaryBlockedCount > 0) {
+        throw new ConflictException({
+          code: "IAM_ORGANIZATION_CANDIDATE_BATCH_PLAN_BLOCKED",
+          message: "The current candidate batch plan contains a fail-closed blocker.",
+          blockedReasons: [...plan.blockers]
+        });
+      }
+
+      let appliedCount = 0;
+      let replayedCount = 0;
+      let skippedAlignedCount = 0;
+      for (const subject of plan.subjects) {
+        if (subject.disposition === "protected") continue;
+        if (subject.disposition === "aligned") {
+          skippedAlignedCount += 1;
+          continue;
+        }
+        if (subject.disposition !== "materialize") {
+          throw new ConflictException({
+            code: "IAM_ORGANIZATION_CANDIDATE_BATCH_PLAN_BLOCKED",
+            message: "The current candidate batch plan contains a non-materializable ordinary subject."
+          });
+        }
+        const subjectIdempotencyKey = candidateBatchSubjectIdempotencyKey({
+          planToken,
+          idempotencyKey,
+          legacyUserId: subject.source.id,
+          key: this.requireCandidateBatchPlanHmacKey()
+        });
+        const locked = await this.repository.withCandidateMaterializationSubjectLock(subject.source.id, async () =>
+          this.materializeCandidateWhileLocked({
+            legacyUserId: subject.source.id,
+            expectedSnapshotFingerprint: subject.snapshotFingerprint,
+            idempotencyKey: subjectIdempotencyKey
+          })
+        );
+        if (!locked.acquired) {
+          throw new ConflictException({
+            code: "IAM_ORGANIZATION_CANDIDATE_MATERIALIZATION_SUBJECT_BUSY",
+            message: "Another organization materialization operation is active for a batch subject."
+          });
+        }
+        if (locked.value.idempotentReplay === true) replayedCount += 1;
+        else appliedCount += 1;
+      }
+      const finalPlan = await this.createCandidateBatchPlan();
+      if (!constantTimeHexEqual(finalPlan.planToken, planToken) ||
+        finalPlan.blockers.length > 0 ||
+        finalPlan.ordinaryMissingCount > 0 ||
+        finalPlan.ordinaryBlockedCount > 0) {
+        throw new ConflictException({
+          code: "IAM_ORGANIZATION_CANDIDATE_BATCH_POSTCHECK_FAILED",
+          message: "The full Legacy source or Identity candidate set changed before the batch postcheck completed.",
+          blockedReasons: [...finalPlan.blockers]
+        });
+      }
+      this.logger.log(JSON.stringify({
+        event: "identity.iam.organization_candidate.batch_materialized",
+        planTokenDigest: shortDigest(planToken),
+        legacySubjectCount: plan.legacySubjectCount,
+        protectedSkippedCount: plan.protectedSubjectCount,
+        appliedCount,
+        replayedCount,
+        skippedAlignedCount
+      }));
+      return {
+        contract: ORGANIZATION_CANDIDATE_BATCH_MATERIALIZATION_CONTRACT,
+        mutation: appliedCount > 0,
+        completed: true,
+        planTokenDigest: shortDigest(planToken),
+        legacySubjectCount: plan.legacySubjectCount,
+        ordinarySubjectCount: plan.ordinarySubjectCount,
+        protectedSkippedCount: plan.protectedSubjectCount,
+        appliedCount,
+        replayedCount,
+        skippedAlignedCount,
+        sourceOfTruth: "legacy" as const,
+        legacyWritePerformed: false,
+        protectedSubjectWritePerformed: false,
+        writeScope: "identity-candidate-only" as const
+      };
+    });
+    if (!batchLock.acquired) {
+      throw new ConflictException({
+        code: "IAM_ORGANIZATION_CANDIDATE_BATCH_BUSY",
+        message: "Another organization candidate batch operation is active."
+      });
+    }
+    return batchLock.value;
+  }
+
+  private async createCandidateBatchPlan(): Promise<OrganizationCandidateBatchPlan> {
+    const snapshot = await this.legacy.readOrganizationCandidateSourceSnapshot();
+    const users = [...snapshot.users];
+    if (users.length === 0 || users.length > 5000) {
+      throw new ServiceUnavailableException({
+        code: "IAM_ORGANIZATION_CANDIDATE_BATCH_SOURCE_INVALID",
+        message: "The Legacy candidate batch source universe is empty or exceeds the reviewed bound."
+      });
+    }
+    let previousId = 0;
+    const subjects: OrganizationCandidateBatchSubjectPlan[] = [];
+    for (const source of users) {
+      if (!Number.isSafeInteger(source.id) || source.id <= previousId) {
+        throw new ServiceUnavailableException({
+          code: "IAM_ORGANIZATION_CANDIDATE_BATCH_SOURCE_ORDER_INVALID",
+          message: "The Legacy candidate batch source universe is not strictly ordered."
+        });
+      }
+      previousId = source.id;
+      const legacyUser = candidateBatchLegacyUser(source);
+      const snapshotFingerprint = organizationCandidateSnapshotFingerprint(
+        source.id,
+        normalizeOrganizations(legacyUser.organizations)
+      );
+      const [candidate, unresolvedOperationCount] = await Promise.all([
+        this.repository.candidateForLegacyUser(source.id),
+        this.repository.countUnresolvedForLegacyUser(source.id)
+      ]);
+      const alignment = organizationAlignment(source.id, legacyUser, candidate);
+      const protectedSubject = isProtectedOrganizationSubject(legacyUser);
+      const disposition = protectedSubject
+        ? "protected"
+        : source.status !== 10
+          ? "blocked"
+          : alignment.aligned && alignment.P0 === 0 && alignment.P1 === 0 && alignment.P2 === 0 &&
+              unresolvedOperationCount === 0
+            ? "aligned"
+            : alignment.reason === "identity-candidate-snapshot-missing" &&
+                alignment.P0 === 0 && alignment.P2 === 0 && unresolvedOperationCount === 0
+              ? "materialize"
+              : "blocked";
+      subjects.push(Object.freeze({
+        source,
+        legacyUser,
+        snapshotFingerprint,
+        protected: protectedSubject,
+        alignment,
+        unresolvedOperationCount,
+        disposition
+      }));
+    }
+
+    const protectedSubjects = subjects.filter((subject) => subject.protected);
+    const ordinarySubjects = subjects.filter((subject) => !subject.protected);
+    const key = this.requireCandidateBatchPlanHmacKey();
+    let planToken: string;
+    try {
+      planToken = createHmac("sha256", key)
+        .update("iam-organization-candidate-batch-plan:xrteeth-develop:v1\u001f", "utf8")
+        .update(JSON.stringify(subjects.map((subject) => ({
+          legacyUserId: subject.source.id,
+          status: subject.source.status,
+          protected: subject.protected,
+          snapshotFingerprint: subject.snapshotFingerprint
+        }))), "utf8")
+        .digest("hex");
+    } finally {
+      key.fill(0);
+    }
+    const blockers = uniqueStrings([
+      ...(subjects.length !== this.config.iam.organizationWriteCandidateBatchExpectedLegacySubjectCount
+        ? ["legacy-subject-count-mismatch"]
+        : []),
+      ...(protectedSubjects.length !== this.config.iam.organizationWriteCandidateBatchExpectedProtectedSubjectCount
+        ? ["protected-subject-count-mismatch"]
+        : []),
+      ...(subjects.some((subject) => subject.unresolvedOperationCount > 0)
+        ? ["unresolved-candidate-materialization-operation"]
+        : []),
+      ...(ordinarySubjects.some((subject) => subject.disposition === "blocked")
+        ? ["ordinary-subject-not-materializable"]
+        : [])
+    ]);
+    return Object.freeze({
+      planToken,
+      subjects: Object.freeze(subjects),
+      legacySubjectCount: subjects.length,
+      ordinarySubjectCount: ordinarySubjects.length,
+      protectedSubjectCount: protectedSubjects.length,
+      ordinaryAlignedCount: ordinarySubjects.filter((subject) => subject.disposition === "aligned").length,
+      ordinaryMissingCount: ordinarySubjects.filter((subject) => subject.disposition === "materialize").length,
+      ordinaryBlockedCount: ordinarySubjects.filter((subject) => subject.disposition === "blocked").length,
+      inactiveOrdinaryCount: ordinarySubjects.filter((subject) => subject.source.status !== 10).length,
+      protectedAlignedCount: protectedSubjects.filter((subject) => subject.alignment.aligned).length,
+      protectedMissingCount: protectedSubjects.filter((subject) => !subject.alignment.aligned).length,
+      blockers: Object.freeze(blockers)
+    });
   }
 
   private async materializeCandidateWhileLocked(input: {
@@ -789,6 +1092,48 @@ export class IamOrganizationWriteService {
     }
   }
 
+  private candidateBatchConfigurationBlockedReasons(): string[] {
+    const { iam, identityDb, legacyDb } = this.config;
+    return [
+      ...(iam.organizationWriteCandidateBatchMaterializationEnvironment !== "xrteeth-develop"
+        ? ["candidate-batch-environment-not-xrteeth-develop"]
+        : []),
+      ...(identityDb.name !== "xrugc_identity_dev" ? ["candidate-batch-identity-database-mismatch"] : []),
+      ...(legacyDb.name !== "bujiaban" ? ["candidate-batch-legacy-database-mismatch"] : []),
+      ...(!candidateBatchPlanHmacKeyConfigured(iam) ? ["candidate-batch-plan-hmac-key-not-configured"] : []),
+      ...(iam.organizationWriteCandidateBatchExpectedLegacySubjectCount <= 0
+        ? ["candidate-batch-expected-legacy-subject-count-not-configured"]
+        : []),
+      ...(iam.organizationWriteCandidateBatchExpectedProtectedSubjectCount <= 0 ||
+        iam.organizationWriteCandidateBatchExpectedProtectedSubjectCount >=
+          iam.organizationWriteCandidateBatchExpectedLegacySubjectCount
+        ? ["candidate-batch-expected-protected-subject-count-not-configured"]
+        : [])
+    ];
+  }
+
+  private assertCandidateBatchConfiguration(): void {
+    const blockedReasons = this.candidateBatchConfigurationBlockedReasons();
+    if (blockedReasons.length > 0) {
+      throw new ServiceUnavailableException({
+        code: "IAM_ORGANIZATION_CANDIDATE_BATCH_CONFIGURATION_NOT_READY",
+        message: "The xrteeth Develop candidate batch configuration is not complete.",
+        blockedReasons
+      });
+    }
+  }
+
+  private requireCandidateBatchPlanHmacKey(): Buffer {
+    const key = this.config.iam.organizationWriteCandidateBatchMaterializationPlanHmacKey?.trim().toLowerCase() ?? "";
+    if (!/^[a-f0-9]{64}$/.test(key)) {
+      throw new ServiceUnavailableException({
+        code: "IAM_ORGANIZATION_CANDIDATE_BATCH_PLAN_KEY_NOT_CONFIGURED",
+        message: "The candidate batch plan HMAC key is not configured."
+      });
+    }
+    return Buffer.from(key, "hex");
+  }
+
   private candidateMaterializationPostureBlockedReasons(): string[] {
     const { iam } = this.config;
     return [
@@ -993,6 +1338,98 @@ function candidateMaterializationBlockedPreview(legacyUserId: number, blocker: s
 
 function uniqueStrings(values: string[]): string[] {
   return [...new Set(values)];
+}
+
+function candidateBatchPlanHmacKeyConfigured(
+  iam: ReturnType<typeof loadConfig>["iam"]
+): boolean {
+  return /^[a-f0-9]{64}$/.test(
+    iam.organizationWriteCandidateBatchMaterializationPlanHmacKey?.trim().toLowerCase() ?? ""
+  );
+}
+
+function candidateBatchLegacyUser(source: LegacyOrganizationCandidateSourceUser): LegacyUserReadModel {
+  return {
+    id: source.id,
+    username: source.username,
+    email: null,
+    status: source.status,
+    nickname: null,
+    emailVerifiedAt: null,
+    createdAt: null,
+    updatedAt: null,
+    userInfo: {},
+    roles: [...source.roles],
+    organizations: source.organizations.map((organization) => ({ ...organization })),
+    source: "legacy"
+  };
+}
+
+function candidateBatchPublicPlan(
+  plan: OrganizationCandidateBatchPlan,
+  input: { applyEnabled: boolean; postureBlockers: string[] }
+) {
+  const blockedReasons = uniqueStrings([
+    ...plan.blockers,
+    ...input.postureBlockers
+  ]);
+  return {
+    contract: ORGANIZATION_CANDIDATE_BATCH_MATERIALIZATION_CONTRACT,
+    mutation: false,
+    executable: blockedReasons.length === 0,
+    applyEnabled: input.applyEnabled,
+    planToken: plan.planToken,
+    legacySubjectCount: plan.legacySubjectCount,
+    ordinarySubjectCount: plan.ordinarySubjectCount,
+    protectedSubjectCount: plan.protectedSubjectCount,
+    ordinaryAlignedCount: plan.ordinaryAlignedCount,
+    ordinaryMissingCount: plan.ordinaryMissingCount,
+    ordinaryBlockedCount: plan.ordinaryBlockedCount,
+    inactiveOrdinaryCount: plan.inactiveOrdinaryCount,
+    protectedAlignedCount: plan.protectedAlignedCount,
+    protectedMissingCount: plan.protectedMissingCount,
+    sourceOfTruth: "legacy" as const,
+    legacyWritePerformed: false,
+    identityCandidateWritePerformed: false,
+    protectedSubjectWritePerformed: false,
+    blockedReasons
+  };
+}
+
+function candidateBatchPlanTokenInput(value: string | undefined): string {
+  const normalized = value?.trim().toLowerCase() ?? "";
+  if (!/^[a-f0-9]{64}$/.test(normalized)) {
+    throw new BadRequestException({
+      code: "IAM_ORGANIZATION_CANDIDATE_BATCH_PLAN_TOKEN_REQUIRED",
+      message: "A reviewed 64-character candidate batch plan token is required."
+    });
+  }
+  return normalized;
+}
+
+function constantTimeHexEqual(left: string, right: string): boolean {
+  if (!/^[a-f0-9]{64}$/.test(left) || !/^[a-f0-9]{64}$/.test(right)) return false;
+  return timingSafeEqual(Buffer.from(left, "hex"), Buffer.from(right, "hex"));
+}
+
+function candidateBatchSubjectIdempotencyKey(input: {
+  planToken: string;
+  idempotencyKey: string;
+  legacyUserId: number;
+  key: Buffer;
+}): string {
+  try {
+    return createHmac("sha256", input.key)
+      .update("iam-organization-candidate-batch-subject-idempotency:v1\u001f", "utf8")
+      .update(input.planToken, "utf8")
+      .update("\u001f", "utf8")
+      .update(input.idempotencyKey, "utf8")
+      .update("\u001f", "utf8")
+      .update(String(input.legacyUserId), "utf8")
+      .digest("hex");
+  } finally {
+    input.key.fill(0);
+  }
 }
 
 function parseMembershipReplace(body: unknown): SelectedMembershipReplace | { selected: false } {

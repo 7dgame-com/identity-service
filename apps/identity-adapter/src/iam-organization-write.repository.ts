@@ -542,6 +542,36 @@ export class IamOrganizationWriteRepository implements OnModuleDestroy {
     }
   }
 
+  async withCandidateMaterializationBatchLock<T>(
+    callback: () => Promise<T>
+  ): Promise<{ acquired: false } | { acquired: true; value: T }> {
+    const pool = this.requirePool();
+    const connection = await pool.getConnection();
+    const lockName = "iam-org-candidate-batch:v1";
+    let acquired = false;
+    let reusable = true;
+    try {
+      const [rows] = await connection.execute<RowDataPacket[]>("SELECT GET_LOCK(?, 0) AS acquired", [lockName]);
+      acquired = Number(rows[0]?.acquired) === 1;
+      if (!acquired) return { acquired: false };
+      return { acquired: true, value: await callback() };
+    } finally {
+      if (acquired) {
+        try {
+          const [rows] = await connection.execute<RowDataPacket[]>("SELECT RELEASE_LOCK(?) AS released", [lockName]);
+          if (Number(rows[0]?.released) !== 1) {
+            reusable = false;
+            connection.destroy();
+          }
+        } catch {
+          reusable = false;
+          connection.destroy();
+        }
+      }
+      if (reusable) connection.release();
+    }
+  }
+
   private async ensureSchema(): Promise<void> {
     this.schemaReady ??= this.createSchema();
     await this.schemaReady;

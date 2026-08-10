@@ -18,6 +18,8 @@
     "iam:organization-write:window-gate:dist": "node dist/scripts/iam-organization-write-window-gate.js",
     "iam:organization-write:materialization-gate": "tsx scripts/iam-organization-candidate-materialization-gate.ts",
     "iam:organization-write:materialization-gate:dist": "node dist/scripts/iam-organization-candidate-materialization-gate.js",
+    "iam:organization-write:batch-materialization-gate": "tsx scripts/iam-organization-candidate-batch-materialization-gate.ts",
+    "iam:organization-write:batch-materialization-gate:dist": "node dist/scripts/iam-organization-candidate-batch-materialization-gate.js",
     "iam:organization-reconciliation:validate": "tsx scripts/iam-organization-reconciliation-validate.ts",
     "iam:organization-reconciliation:validate:dist": "node dist/scripts/iam-organization-reconciliation-validate.js",
     "iam:organization-reconciliation:develop-preflight": "tsx scripts/iam-organization-reconciliation-develop-preflight.ts",

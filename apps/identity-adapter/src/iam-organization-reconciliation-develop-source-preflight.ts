@@ -20,15 +20,48 @@ import type {
 } from "./iam-organization-reconciliation/mysql-repeatable-read-snapshot.js";
 
 export const ORGANIZATION_RECONCILIATION_DEVELOP_SOURCE_PREFLIGHT_CONTRACT =
-  "iam-organization-reconciliation-xrteeth-develop-source-preflight/v1" as const;
+  "iam-organization-reconciliation-xrteeth-develop-source-preflight/v3" as const;
 
 const SET_REPEATABLE_READ = "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ";
 const START_READ_ONLY = "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY";
 const ROLLBACK = "ROLLBACK";
+const SHOW_CURRENT_GRANTS = "SHOW GRANTS FOR CURRENT_USER()";
 const MAX_SCHEMA_ROWS = 512;
+const MAX_SUBJECT_ROWS = 1_000_000;
+const MAX_RBAC_ITEM_ROWS = 4_096;
+const MAX_RBAC_EDGE_ROWS = 16_384;
+
+const LEGACY_SUBJECT_IDS_QUERY = "SELECT id AS subject_id FROM `user` ORDER BY id ASC";
+const IDENTITY_SUBJECT_IDS_QUERY =
+  "SELECT legacy_user_id AS subject_id FROM identity_users WHERE legacy_user_id IS NOT NULL AND source = 'legacy-shadow' AND status IN ('active', 'inactive') ORDER BY legacy_user_id ASC";
+const IDENTITY_MEMBERSHIP_SNAPSHOT_SUBJECT_IDS_QUERY =
+  "SELECT legacy_user_id AS subject_id FROM identity_organization_membership_snapshots WHERE source = 'legacy' AND candidate_status = 'candidate' ORDER BY legacy_user_id ASC";
+const LEGACY_RBAC_ITEMS_QUERY =
+  "SELECT name, type, rule_name FROM auth_item WHERE type IN (1, 2) ORDER BY CAST(name AS BINARY) ASC";
+const LEGACY_RBAC_EDGES_QUERY =
+  "SELECT parent, child FROM auth_item_child ORDER BY CAST(parent AS BINARY) ASC, CAST(child AS BINARY) ASC";
+const DEVELOP_RECONCILIATION_CAPABILITY_ITEMS = Object.freeze([
+  "organization.bind-user",
+  "organization.create",
+  "organization.list",
+  "organization.update",
+  "user-management.change-role",
+  "user-management.create-user",
+  "user-management.delete-user",
+  "user-management.list-users",
+  "user-management.manage-invitations",
+  "user-management.update-user",
+  "user-management.view-user"
+]);
 
 const SOURCE_IDENTITY_QUERY =
-  "SELECT DATABASE() AS database_name, @@hostname AS server_hostname, @@port AS server_port, @@version AS server_version";
+  "SELECT DATABASE() AS database_name, CURRENT_USER() AS current_user, @@hostname AS server_hostname, @@port AS server_port, @@version AS server_version";
+
+const EXPECTED_DATABASES = Object.freeze({
+  "legacy-main": "bujiaban",
+  identity: "xrugc_identity_dev",
+  plugin: "bujiaban_plugin"
+} satisfies Record<OrganizationReconciliationMysqlRawComponentId, string>);
 
 const SCHEMA_QUERIES = Object.freeze({
   "legacy-main":
@@ -99,6 +132,7 @@ export interface OrganizationReconciliationDevelopSourcePreflightDependencies {
   readonly legacyConnectionFactory: MysqlRepeatableReadSnapshotConnectionFactory;
   readonly identityConnectionFactory: MysqlRepeatableReadSnapshotConnectionFactory;
   readonly pluginConnectionFactory: MysqlRepeatableReadSnapshotConnectionFactory;
+  readonly expectedDatabaseUsers: Readonly<Record<OrganizationReconciliationMysqlRawComponentId, string>>;
   readonly buildRevision: string;
   readonly now: () => Date;
 }
@@ -115,6 +149,9 @@ export interface OrganizationReconciliationDevelopSourcePreflightReport {
   readonly components: readonly {
     readonly componentId: OrganizationReconciliationMysqlRawComponentId;
     readonly sourceIdentitySha256: string;
+    readonly databaseBindingPassed: boolean;
+    readonly readOnlyGrantPassed: boolean;
+    readonly grantScopeSha256: string;
     readonly physicalSchemaSha256: string;
     readonly schemaShapePassed: boolean;
     readonly requiredColumnCount: number;
@@ -123,6 +160,23 @@ export interface OrganizationReconciliationDevelopSourcePreflightReport {
     readonly nonEmptyDatasetProbeCount: number;
     readonly aggregateCounts: Readonly<Record<string, number>>;
   }[];
+  readonly subjectUniverseComparison: {
+    readonly legacySubjectCount: number;
+    readonly identitySelectedSubjectCount: number;
+    readonly missingInIdentityCount: number;
+    readonly extraInIdentityCount: number;
+  };
+  readonly legacyRbacScope: {
+    readonly targetCount: number;
+    readonly presentTargetCount: number;
+    readonly namedRuleIntersectionCount: number;
+  };
+  readonly membershipSnapshotComparison: {
+    readonly legacySubjectCount: number;
+    readonly snapshotSubjectCount: number;
+    readonly missingLegacySnapshotCount: number;
+    readonly extraSnapshotCount: number;
+  };
   readonly checks: readonly { readonly checkId: string; readonly passed: boolean }[];
   readonly failures: readonly string[];
   readonly passed: boolean;
@@ -136,22 +190,48 @@ export async function runOrganizationReconciliationDevelopSourcePreflight(
 ): Promise<OrganizationReconciliationDevelopSourcePreflightReport> {
   const checkedAt = dependencies.now().toISOString();
   const componentInputs = [
-    { componentId: "legacy-main", factory: dependencies.legacyConnectionFactory },
-    { componentId: "identity", factory: dependencies.identityConnectionFactory },
-    { componentId: "plugin", factory: dependencies.pluginConnectionFactory }
+    {
+      componentId: "legacy-main",
+      factory: dependencies.legacyConnectionFactory,
+      expectedDatabaseUser: dependencies.expectedDatabaseUsers["legacy-main"]
+    },
+    {
+      componentId: "identity",
+      factory: dependencies.identityConnectionFactory,
+      expectedDatabaseUser: dependencies.expectedDatabaseUsers.identity
+    },
+    {
+      componentId: "plugin",
+      factory: dependencies.pluginConnectionFactory,
+      expectedDatabaseUser: dependencies.expectedDatabaseUsers.plugin
+    }
   ] as const;
   const failures: string[] = [];
   const components = [] as Array<OrganizationReconciliationDevelopSourcePreflightReport["components"][number]>;
+  const inspections = new Map<OrganizationReconciliationMysqlRawComponentId, PhysicalSourceInspection>();
   const probeCounts = new Map<OrganizationReconciliationMysqlRawComponentId, Readonly<Record<string, number>>>();
 
   for (const input of componentInputs) {
     try {
-      const metadata = await inspectPhysicalSource(input.componentId, input.factory);
-      const probes = await probeRawDatasets(input.componentId, input.factory);
+      const metadata = await inspectPhysicalSource(
+        input.componentId,
+        input.factory,
+        input.expectedDatabaseUser
+      );
+      inspections.set(input.componentId, metadata);
+      const probes = metadata.databaseBindingPassed && metadata.readOnlyGrantPassed && metadata.schemaShapePassed
+        ? await probeRawDatasets(
+          input.componentId,
+          verifiedSourceConnectionFactory(input.componentId, input.factory, input.expectedDatabaseUser)
+        )
+        : Object.freeze({} as Readonly<Record<string, number>>);
       probeCounts.set(input.componentId, probes);
       components.push(Object.freeze({
         componentId: input.componentId,
         sourceIdentitySha256: metadata.sourceIdentitySha256,
+        databaseBindingPassed: metadata.databaseBindingPassed,
+        readOnlyGrantPassed: metadata.readOnlyGrantPassed,
+        grantScopeSha256: metadata.grantScopeSha256,
         physicalSchemaSha256: metadata.physicalSchemaSha256,
         schemaShapePassed: metadata.schemaShapePassed,
         requiredColumnCount: metadata.requiredColumnCount,
@@ -160,6 +240,8 @@ export async function runOrganizationReconciliationDevelopSourcePreflight(
         nonEmptyDatasetProbeCount: Object.values(probes).filter((count) => count === 1).length,
         aggregateCounts: metadata.aggregateCounts
       }));
+      if (!metadata.databaseBindingPassed) failures.push(`${input.componentId}:database-binding`);
+      if (!metadata.readOnlyGrantPassed) failures.push(`${input.componentId}:read-only-grant`);
       if (!metadata.schemaShapePassed) failures.push(`${input.componentId}:schema-shape`);
     } catch {
       failures.push(`${input.componentId}:read-only-preflight`);
@@ -171,17 +253,44 @@ export async function runOrganizationReconciliationDevelopSourcePreflight(
   const identity = byComponent.get("identity")?.aggregateCounts ?? {};
   const plugin = byComponent.get("plugin")?.aggregateCounts ?? {};
   const identityProbes = probeCounts.get("identity") ?? {};
+  const legacyInspection = inspections.get("legacy-main");
+  const identityInspection = inspections.get("identity");
+  const subjectUniverseComparison = compareSubjectUniverses(
+    legacyInspection?.subjectIds ?? [],
+    identityInspection?.subjectIds ?? []
+  );
+  const legacyRbacScope = legacyInspection?.legacyRbacScope ?? Object.freeze({
+    targetCount: DEVELOP_RECONCILIATION_CAPABILITY_ITEMS.length,
+    presentTargetCount: 0,
+    namedRuleIntersectionCount: 0
+  });
+  const membershipSnapshotComparison = compareMembershipSnapshotSubjects(
+    legacyInspection?.subjectIds ?? [],
+    identityInspection?.membershipSnapshotSubjectIds ?? []
+  );
   const checks = Object.freeze([
     check("all-components-probed", components.length === 3),
+    check("all-component-database-bindings-exact",
+      components.length === 3 && components.every((component) => component.databaseBindingPassed)),
+    check("all-component-grants-read-only-and-table-bounded",
+      components.length === 3 && components.every((component) => component.readOnlyGrantPassed)),
     check("all-21-datasets-probed", components.reduce((sum, component) => sum + component.datasetProbeCount, 0) === 21),
-    check("legacy-rule-free", legacy.legacy_named_rule_count === 0),
-    check("identity-subjects-complete", identity.identity_subject_count === legacy.legacy_subject_count),
+    check("legacy-reconciliation-capability-catalog-present",
+      legacyRbacScope.presentTargetCount === legacyRbacScope.targetCount),
+    check("legacy-reconciliation-scope-rule-free",
+      legacyRbacScope.presentTargetCount === legacyRbacScope.targetCount &&
+      legacyRbacScope.namedRuleIntersectionCount === 0),
+    check("identity-legacy-subjects-complete",
+      legacyInspection !== undefined && identityInspection !== undefined &&
+      subjectUniverseComparison.missingInIdentityCount === 0),
     check("identity-subjects-unique", identity.identity_subject_collision_count === 0),
     check("identity-organizations-complete",
       identity.identity_organization_candidate_count === legacy.legacy_organization_count &&
       identity.identity_organization_id_map_count === legacy.legacy_organization_count),
-    check("identity-membership-snapshots-complete",
-      identity.identity_membership_snapshot_count === identity.identity_subject_count),
+    check("identity-legacy-membership-snapshots-complete",
+      legacyInspection !== undefined && identityInspection !== undefined &&
+      membershipSnapshotComparison.missingLegacySnapshotCount === 0 &&
+      membershipSnapshotComparison.extraSnapshotCount === 0),
     check("identity-membership-counts-complete",
       identity.identity_membership_candidate_count === identity.identity_membership_snapshot_organization_sum),
     check("identity-policy-version-pinned", identity.identity_iam_policy_version_count === 1),
@@ -208,6 +317,9 @@ export async function runOrganizationReconciliationDevelopSourcePreflight(
     statementCatalogSha256: ORGANIZATION_RECONCILIATION_DEVELOP_SOURCE_CATALOG.statementCatalogSha256,
     iamPolicyChecksum: ORGANIZATION_RECONCILIATION_DEVELOP_SOURCE_CATALOG.iamPolicyChecksum,
     components: Object.freeze(components),
+    subjectUniverseComparison,
+    legacyRbacScope,
+    membershipSnapshotComparison,
     checks,
     failures: Object.freeze([...new Set(failures)].sort()),
     passed: failures.length === 0,
@@ -215,27 +327,55 @@ export async function runOrganizationReconciliationDevelopSourcePreflight(
   });
 }
 
-async function inspectPhysicalSource(
-  componentId: OrganizationReconciliationMysqlRawComponentId,
-  factory: MysqlRepeatableReadSnapshotConnectionFactory
-): Promise<{
+interface PhysicalSourceInspection {
   readonly sourceIdentitySha256: string;
+  readonly databaseBindingPassed: boolean;
+  readonly readOnlyGrantPassed: boolean;
+  readonly grantScopeSha256: string;
   readonly physicalSchemaSha256: string;
   readonly schemaShapePassed: boolean;
   readonly requiredColumnCount: number;
   readonly observedColumnCount: number;
   readonly aggregateCounts: Readonly<Record<string, number>>;
-}> {
+  readonly subjectIds: readonly string[];
+  readonly membershipSnapshotSubjectIds: readonly string[];
+  readonly legacyRbacScope: OrganizationReconciliationDevelopSourcePreflightReport["legacyRbacScope"] | null;
+}
+
+async function inspectPhysicalSource(
+  componentId: OrganizationReconciliationMysqlRawComponentId,
+  factory: MysqlRepeatableReadSnapshotConnectionFactory,
+  expectedDatabaseUser: string
+): Promise<PhysicalSourceInspection> {
   const connection = await factory();
   let failed = false;
+  let transactionStarted = false;
   try {
+    const grantRows = rows(await connection.query(SHOW_CURRENT_GRANTS));
+    const grantInspection = inspectReadOnlyGrants(componentId, grantRows);
     await connection.query(SET_REPEATABLE_READ);
     await connection.query(START_READ_ONLY);
+    transactionStarted = true;
     const identityRows = rows(await connection.query(SOURCE_IDENTITY_QUERY));
+    const databaseBindingPassed = captureDatabaseBinding(componentId, identityRows, expectedDatabaseUser);
     const schemaRows = rows(await connection.query(SCHEMA_QUERIES[componentId]));
     const checksum = ORGANIZATION_RECONCILIATION_DEVELOP_SOURCE_CATALOG.iamPolicyChecksum;
     const aggregateParameters = componentId === "identity" ? Array(8).fill(checksum) : [];
     const aggregateRows = rows(await connection.query(AGGREGATE_QUERIES[componentId], aggregateParameters));
+    const subjectIds = componentId === "legacy-main"
+      ? captureSubjectIds(rows(await connection.query(LEGACY_SUBJECT_IDS_QUERY)))
+      : componentId === "identity"
+        ? captureSubjectIds(rows(await connection.query(IDENTITY_SUBJECT_IDS_QUERY)))
+        : Object.freeze([] as string[]);
+    const membershipSnapshotSubjectIds = componentId === "identity"
+      ? captureSubjectIds(rows(await connection.query(IDENTITY_MEMBERSHIP_SNAPSHOT_SUBJECT_IDS_QUERY)))
+      : Object.freeze([] as string[]);
+    const legacyRbacScope = componentId === "legacy-main"
+      ? captureLegacyRbacScope(
+        rows(await connection.query(LEGACY_RBAC_ITEMS_QUERY)),
+        rows(await connection.query(LEGACY_RBAC_EDGES_QUERY))
+      )
+      : null;
     const schema = captureSchemaRows(schemaRows);
     const required = REQUIRED_COLUMNS[componentId];
     const requiredColumnCount = Object.values(required).reduce((sum, columns) => sum + columns.length, 0);
@@ -244,22 +384,250 @@ async function inspectPhysicalSource(
     );
     return Object.freeze({
       sourceIdentitySha256: digest(identityRows),
+      databaseBindingPassed,
+      readOnlyGrantPassed: grantInspection.passed,
+      grantScopeSha256: grantInspection.sha256,
       physicalSchemaSha256: digest(schema),
       schemaShapePassed,
       requiredColumnCount,
       observedColumnCount: schema.length,
-      aggregateCounts: captureAggregateRows(aggregateRows)
+      aggregateCounts: captureAggregateRows(aggregateRows),
+      subjectIds,
+      membershipSnapshotSubjectIds,
+      legacyRbacScope
     });
   } catch (error) {
     failed = true;
     throw error;
   } finally {
-    await connection.query(ROLLBACK).catch(() => undefined);
-    await connection.release();
-    if (failed) {
-      // The public caller receives only the component-level failure label.
+    let cleanupFailed = false;
+    if (transactionStarted) {
+      try {
+        await connection.query(ROLLBACK);
+      } catch {
+        cleanupFailed = true;
+      }
+    }
+    try {
+      await connection.release();
+    } catch {
+      cleanupFailed = true;
+    }
+    if (cleanupFailed && !failed) throw new Error("The Develop source preflight cleanup failed.");
+  }
+}
+
+function captureDatabaseBinding(
+  componentId: OrganizationReconciliationMysqlRawComponentId,
+  candidate: readonly unknown[],
+  expectedDatabaseUser: string
+): boolean {
+  if (!/^[A-Za-z0-9_.-]{1,64}$/.test(expectedDatabaseUser)) {
+    throw new Error("The expected database user is invalid.");
+  }
+  if (candidate.length !== 1) throw new Error("The physical source identity is invalid.");
+  const row = record(candidate[0]);
+  const databaseName = metadata(row.database_name);
+  const currentUser = metadata(row.current_user);
+  metadata(row.server_hostname);
+  integer(row.server_port);
+  metadata(row.server_version);
+  const separator = currentUser.lastIndexOf("@");
+  const currentDatabaseUser = separator > 0 ? currentUser.slice(0, separator) : "";
+  const currentDatabaseHost = separator > 0 ? currentUser.slice(separator + 1) : "";
+  return databaseName === EXPECTED_DATABASES[componentId] &&
+    currentDatabaseUser === expectedDatabaseUser &&
+    currentDatabaseHost.length > 0;
+}
+
+function inspectReadOnlyGrants(
+  componentId: OrganizationReconciliationMysqlRawComponentId,
+  candidate: readonly unknown[]
+): { readonly passed: boolean; readonly sha256: string } {
+  if (candidate.length < 1 || candidate.length > 32) {
+    throw new Error("The current-user grant set is outside the reviewed bound.");
+  }
+  const expectedDatabase = EXPECTED_DATABASES[componentId];
+  const requiredTables = Object.keys(REQUIRED_COLUMNS[componentId]);
+  const coveredTables = new Set<string>();
+  let passed = true;
+  const statements: string[] = [];
+  for (const value of candidate) {
+    const row = record(value);
+    const values = Object.values(row);
+    if (values.length !== 1 || typeof values[0] !== "string") {
+      throw new Error("A current-user grant row is invalid.");
+    }
+    const statement = values[0].replace(/\s+/g, " ").trim();
+    if (statement.length < 1 || statement.length > 4_096 || statement.normalize("NFC") !== statement) {
+      throw new Error("A current-user grant statement is invalid.");
+    }
+    statements.push(statement);
+    if (/\bWITH\s+GRANT\s+OPTION\b/i.test(statement)) {
+      passed = false;
+      continue;
+    }
+    const match = /^GRANT\s+(.+?)\s+ON\s+(\S+)\s+TO\s+.+$/i.exec(statement);
+    if (!match) {
+      passed = false;
+      continue;
+    }
+    const privileges = (match[1] as string).split(",").map((privilege) => privilege.trim().toUpperCase());
+    const scope = match[2] as string;
+    if (privileges.length === 1 && privileges[0] === "USAGE" && scope === "*.*") continue;
+    if (privileges.length < 1 || privileges.some((privilege) => privilege !== "SELECT" && privilege !== "SHOW VIEW") ||
+      !privileges.includes("SELECT")) {
+      passed = false;
+      continue;
+    }
+    const databaseScope = `\`${expectedDatabase}\`.*`;
+    if (scope === databaseScope || scope === `${expectedDatabase}.*`) {
+      for (const table of requiredTables) coveredTables.add(table);
+      continue;
+    }
+    const matchedTable = requiredTables.find((table) =>
+      scope === `\`${expectedDatabase}\`.\`${table}\`` || scope === `${expectedDatabase}.${table}`
+    );
+    if (matchedTable) coveredTables.add(matchedTable);
+    else passed = false;
+  }
+  if (requiredTables.some((table) => !coveredTables.has(table))) passed = false;
+  statements.sort((left, right) => Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8")));
+  return Object.freeze({ passed, sha256: digest(statements) });
+}
+
+function verifiedSourceConnectionFactory(
+  componentId: OrganizationReconciliationMysqlRawComponentId,
+  factory: MysqlRepeatableReadSnapshotConnectionFactory,
+  expectedDatabaseUser: string
+): MysqlRepeatableReadSnapshotConnectionFactory {
+  return async () => {
+    const connection = await factory();
+    let accepted = false;
+    try {
+      const grantInspection = inspectReadOnlyGrants(
+        componentId,
+        rows(await connection.query(SHOW_CURRENT_GRANTS))
+      );
+      const databaseBindingPassed = captureDatabaseBinding(
+        componentId,
+        rows(await connection.query(SOURCE_IDENTITY_QUERY)),
+        expectedDatabaseUser
+      );
+      if (!grantInspection.passed || !databaseBindingPassed) {
+        throw new Error("The dataset probe source identity is not accepted.");
+      }
+      accepted = true;
+      return connection;
+    } finally {
+      if (!accepted) await connection.release();
+    }
+  };
+}
+
+function captureSubjectIds(candidate: readonly unknown[]): readonly string[] {
+  if (candidate.length > MAX_SUBJECT_ROWS) throw new Error("The subject universe exceeded its bound.");
+  const output: string[] = [];
+  let previous = 0;
+  for (const value of candidate) {
+    const row = record(value);
+    const subjectId = integer(row.subject_id);
+    if (subjectId < 1 || subjectId <= previous) throw new Error("The subject universe order is invalid.");
+    output.push(String(subjectId));
+    previous = subjectId;
+  }
+  return Object.freeze(output);
+}
+
+function compareSubjectUniverses(
+  legacySubjectIds: readonly string[],
+  identitySubjectIds: readonly string[]
+): OrganizationReconciliationDevelopSourcePreflightReport["subjectUniverseComparison"] {
+  const legacy = new Set(legacySubjectIds);
+  const identity = new Set(identitySubjectIds);
+  let missingInIdentityCount = 0;
+  let extraInIdentityCount = 0;
+  for (const subjectId of legacy) if (!identity.has(subjectId)) missingInIdentityCount += 1;
+  for (const subjectId of identity) if (!legacy.has(subjectId)) extraInIdentityCount += 1;
+  return Object.freeze({
+    legacySubjectCount: legacy.size,
+    identitySelectedSubjectCount: identity.size,
+    missingInIdentityCount,
+    extraInIdentityCount
+  });
+}
+
+function compareMembershipSnapshotSubjects(
+  legacySubjectIds: readonly string[],
+  snapshotSubjectIds: readonly string[]
+): OrganizationReconciliationDevelopSourcePreflightReport["membershipSnapshotComparison"] {
+  const legacy = new Set(legacySubjectIds);
+  const snapshots = new Set(snapshotSubjectIds);
+  let missingLegacySnapshotCount = 0;
+  let extraSnapshotCount = 0;
+  for (const subjectId of legacy) if (!snapshots.has(subjectId)) missingLegacySnapshotCount += 1;
+  for (const subjectId of snapshots) if (!legacy.has(subjectId)) extraSnapshotCount += 1;
+  return Object.freeze({
+    legacySubjectCount: legacy.size,
+    snapshotSubjectCount: snapshots.size,
+    missingLegacySnapshotCount,
+    extraSnapshotCount
+  });
+}
+
+function captureLegacyRbacScope(
+  itemRows: readonly unknown[],
+  edgeRows: readonly unknown[]
+): OrganizationReconciliationDevelopSourcePreflightReport["legacyRbacScope"] {
+  if (itemRows.length > MAX_RBAC_ITEM_ROWS || edgeRows.length > MAX_RBAC_EDGE_ROWS) {
+    throw new Error("The RBAC graph exceeded its bound.");
+  }
+  const items = new Map<string, { readonly ruleName: string | null }>();
+  for (const value of itemRows) {
+    const row = record(value);
+    const name = metadata(row.name);
+    const type = integer(row.type);
+    if ((type !== 1 && type !== 2) || items.has(name)) throw new Error("An RBAC item is invalid.");
+    const ruleName = row.rule_name === null ? null : metadata(row.rule_name);
+    items.set(name, Object.freeze({ ruleName }));
+  }
+  const parents = new Map<string, string[]>();
+  const edgeKeys = new Set<string>();
+  for (const value of edgeRows) {
+    const row = record(value);
+    const parent = metadata(row.parent);
+    const child = metadata(row.child);
+    if (!items.has(parent) || !items.has(child)) throw new Error("An RBAC edge references an unknown item.");
+    const key = `${parent}\u001f${child}`;
+    if (edgeKeys.has(key)) throw new Error("An RBAC edge is duplicated.");
+    edgeKeys.add(key);
+    const list = parents.get(child) ?? [];
+    list.push(parent);
+    parents.set(child, list);
+  }
+  let presentTargetCount = 0;
+  const namedRuleItems = new Set<string>();
+  for (const target of DEVELOP_RECONCILIATION_CAPABILITY_ITEMS) {
+    if (!items.has(target)) continue;
+    presentTargetCount += 1;
+    const visited = new Set([target]);
+    const queue = [target];
+    for (let index = 0; index < queue.length; index += 1) {
+      const current = queue[index] as string;
+      if (typeof items.get(current)?.ruleName === "string") namedRuleItems.add(current);
+      for (const parent of parents.get(current) ?? []) {
+        if (!visited.has(parent)) {
+          visited.add(parent);
+          queue.push(parent);
+        }
+      }
     }
   }
+  return Object.freeze({
+    targetCount: DEVELOP_RECONCILIATION_CAPABILITY_ITEMS.length,
+    presentTargetCount,
+    namedRuleIntersectionCount: namedRuleItems.size
+  });
 }
 
 async function probeRawDatasets(

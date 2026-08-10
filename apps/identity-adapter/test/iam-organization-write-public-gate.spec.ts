@@ -9,7 +9,9 @@ describe("IAM organization-write public posture gate", () => {
   it("requires candidate materialization and its target to be off by default", () => {
     expect(parseOrganizationWritePublicGateArgs([])).toMatchObject({
       expectedCandidateMaterializationEnabled: false,
-      expectedCandidateMaterializationTargetConfigured: false
+      expectedCandidateMaterializationTargetConfigured: false,
+      expectedCandidateBatchMaterializationEnabled: false,
+      expectedCandidateBatchMaterializationEnvironment: "disabled"
     });
   });
 
@@ -49,6 +51,19 @@ describe("IAM organization-write public posture gate", () => {
     expect(result).toMatchObject({ passed: true, failures: [] });
   });
 
+  it("fails closed when candidate batch materialization is configured outside its reviewed window", async () => {
+    const result = await runOrganizationWritePublicGate(options(), fixtureFetch({
+      candidateBatchMaterializationEnabled: true,
+      candidateBatchMaterializationEnvironment: "xrteeth-develop"
+    }));
+
+    expect(result.passed).toBe(false);
+    expect(result.failures).toEqual(expect.arrayContaining([
+      expect.stringContaining("candidateBatchMaterializationEnabled expected false, got true"),
+      expect.stringContaining("candidateBatchMaterializationEnvironment expected disabled, got xrteeth-develop")
+    ]));
+  });
+
   it("rejects an older health schema that omits the materialization posture", async () => {
     const result = await runOrganizationWritePublicGate(options(), fixtureFetch({
       omitMaterializationPosture: true
@@ -57,7 +72,9 @@ describe("IAM organization-write public posture gate", () => {
     expect(result.passed).toBe(false);
     expect(result.failures).toEqual(expect.arrayContaining([
       expect.stringContaining("candidateMaterializationEnabled expected false, got undefined"),
-      expect.stringContaining("candidateMaterializationTargetConfigured expected false, got undefined")
+      expect.stringContaining("candidateMaterializationTargetConfigured expected false, got undefined"),
+      expect.stringContaining("candidateBatchMaterializationEnabled expected false, got undefined"),
+      expect.stringContaining("candidateBatchMaterializationEnvironment expected disabled, got undefined")
     ]));
   });
 });
@@ -70,6 +87,8 @@ function options(): OrganizationWritePublicGateOptions {
     expectedDualWriteExecution: false,
     expectedCandidateMaterializationEnabled: false,
     expectedCandidateMaterializationTargetConfigured: false,
+    expectedCandidateBatchMaterializationEnabled: false,
+    expectedCandidateBatchMaterializationEnvironment: "disabled",
     expectedRolloutMode: "off",
     expectedRolloutPercentage: 0,
     expectedAllowlistCount: 0
@@ -79,6 +98,8 @@ function options(): OrganizationWritePublicGateOptions {
 function fixtureFetch(overrides: {
   candidateMaterializationEnabled?: boolean;
   candidateMaterializationTargetConfigured?: boolean;
+  candidateBatchMaterializationEnabled?: boolean;
+  candidateBatchMaterializationEnvironment?: "disabled" | "xrteeth-develop";
   omitMaterializationPosture?: boolean;
 } = {}) {
   const organizationWrite: Record<string, unknown> = {
@@ -87,6 +108,8 @@ function fixtureFetch(overrides: {
     dualWriteExecutionEnabled: false,
     candidateMaterializationEnabled: overrides.candidateMaterializationEnabled ?? false,
     candidateMaterializationTargetConfigured: overrides.candidateMaterializationTargetConfigured ?? false,
+    candidateBatchMaterializationEnabled: overrides.candidateBatchMaterializationEnabled ?? false,
+    candidateBatchMaterializationEnvironment: overrides.candidateBatchMaterializationEnvironment ?? "disabled",
     rolloutMode: "off",
     rolloutAllowlistCount: 0,
     rolloutPercentage: 0,
@@ -96,6 +119,8 @@ function fixtureFetch(overrides: {
   if (overrides.omitMaterializationPosture) {
     delete organizationWrite.candidateMaterializationEnabled;
     delete organizationWrite.candidateMaterializationTargetConfigured;
+    delete organizationWrite.candidateBatchMaterializationEnabled;
+    delete organizationWrite.candidateBatchMaterializationEnvironment;
   }
 
   return vi.fn(async () => json({

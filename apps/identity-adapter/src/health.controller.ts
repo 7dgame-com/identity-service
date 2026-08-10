@@ -56,6 +56,10 @@ export class HealthController {
               this.config.iam.organizationWriteCandidateMaterializationEnabled,
             candidateMaterializationTargetConfigured:
               this.config.iam.organizationWriteCandidateMaterializationTargetLegacyUserId > 0,
+            candidateBatchMaterializationEnabled:
+              this.config.iam.organizationWriteCandidateBatchMaterializationEnabled,
+            candidateBatchMaterializationEnvironment:
+              this.config.iam.organizationWriteCandidateBatchMaterializationEnvironment,
             rolloutMode: this.config.iam.organizationWriteRolloutMode,
             rolloutAllowlistCount: this.config.iam.organizationWriteRolloutAllowlist
               .split(",")

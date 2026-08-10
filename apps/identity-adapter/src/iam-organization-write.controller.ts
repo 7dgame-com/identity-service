@@ -123,6 +123,42 @@ export class IamOrganizationWriteController {
     };
   }
 
+  @Get("candidate-batch-materialization/preview")
+  async previewCandidateBatchMaterialization(
+    @Headers("x-identity-internal-token") token: string | undefined,
+    @Headers("x-identity-expected-revision") expectedRevisionHeader: string | string[] | undefined
+  ) {
+    this.assertInternalToken(token);
+    this.assertExpectedBuildRevision(expectedRevisionHeader);
+    return {
+      status: "ok",
+      service: "identity-adapter",
+      capability: "iam-organization-candidate-batch-materialization-preview",
+      data: await this.organizationWrite.previewCandidateBatchMaterialization()
+    };
+  }
+
+  @Post("candidate-batch-materialization/apply")
+  async materializeCandidateBatch(
+    @Headers("x-identity-internal-token") token: string | undefined,
+    @Headers("x-identity-expected-revision") expectedRevisionHeader: string | string[] | undefined,
+    @Headers("idempotency-key") idempotencyKey: string | string[] | undefined,
+    @Headers("x-idempotency-key") idempotencyKeyAlias: string | string[] | undefined,
+    @Body() body: unknown
+  ) {
+    this.assertInternalToken(token);
+    this.assertExpectedBuildRevision(expectedRevisionHeader);
+    return {
+      status: "ok",
+      service: "identity-adapter",
+      capability: "iam-organization-candidate-batch-materialization",
+      data: await this.organizationWrite.materializeCandidateBatch({
+        planToken: batchMaterializationPlanToken(body),
+        idempotencyKey: materializationIdempotencyKey(idempotencyKey, idempotencyKeyAlias)
+      })
+    };
+  }
+
   private assertInternalToken(token: string | undefined): void {
     const configuredToken = this.config.iam.internalToken;
     if (!configuredToken) {
@@ -178,6 +214,12 @@ function parseLegacyUserId(value: string): number {
 function materializationFingerprint(body: unknown): string | undefined {
   if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
   const value = (body as Record<string, unknown>).expectedSnapshotFingerprint;
+  return typeof value === "string" ? value : undefined;
+}
+
+function batchMaterializationPlanToken(body: unknown): string | undefined {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
+  const value = (body as Record<string, unknown>).planToken;
   return typeof value === "string" ? value : undefined;
 }
 

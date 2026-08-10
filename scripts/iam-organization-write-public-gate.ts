@@ -7,6 +7,8 @@ export interface OrganizationWritePublicGateOptions {
   expectedDualWriteExecution: boolean;
   expectedCandidateMaterializationEnabled: boolean;
   expectedCandidateMaterializationTargetConfigured: boolean;
+  expectedCandidateBatchMaterializationEnabled: boolean;
+  expectedCandidateBatchMaterializationEnvironment: "disabled" | "xrteeth-develop";
   expectedRolloutMode: "off" | "allowlist" | "percentage" | "full";
   expectedRolloutPercentage: number;
   expectedAllowlistCount?: number;
@@ -19,6 +21,8 @@ interface OrganizationWritePosture {
   dualWriteExecutionEnabled: boolean;
   candidateMaterializationEnabled: boolean;
   candidateMaterializationTargetConfigured: boolean;
+  candidateBatchMaterializationEnabled: boolean;
+  candidateBatchMaterializationEnvironment: string;
   rolloutMode: string;
   rolloutAllowlistCount: number;
   rolloutPercentage: number;
@@ -68,6 +72,18 @@ async function inspect(fetcher: typeof fetch, url: string, options: Organization
       posture.candidateMaterializationTargetConfigured,
       options.expectedCandidateMaterializationTargetConfigured
     );
+    compare(
+      failures,
+      "candidateBatchMaterializationEnabled",
+      posture.candidateBatchMaterializationEnabled,
+      options.expectedCandidateBatchMaterializationEnabled
+    );
+    compare(
+      failures,
+      "candidateBatchMaterializationEnvironment",
+      posture.candidateBatchMaterializationEnvironment,
+      options.expectedCandidateBatchMaterializationEnvironment
+    );
     compare(failures, "rolloutMode", posture.rolloutMode, options.expectedRolloutMode);
     compare(failures, "rolloutPercentage", posture.rolloutPercentage, options.expectedRolloutPercentage);
     if (options.expectedAllowlistCount !== undefined) {
@@ -92,6 +108,8 @@ export function parseOrganizationWritePublicGateArgs(argv: string[]): Organizati
     expectedDualWriteExecution: false,
     expectedCandidateMaterializationEnabled: false,
     expectedCandidateMaterializationTargetConfigured: false,
+    expectedCandidateBatchMaterializationEnabled: false,
+    expectedCandidateBatchMaterializationEnvironment: "disabled",
     expectedRolloutMode: "off",
     expectedRolloutPercentage: 0,
     expectedAllowlistCount: 0
@@ -108,6 +126,17 @@ export function parseOrganizationWritePublicGateArgs(argv: string[]): Organizati
       options.expectedCandidateMaterializationTargetConfigured = booleanValue(
         arg,
         "--expected-candidate-materialization-target-configured="
+      );
+    } else if (arg.startsWith("--expected-candidate-batch-materialization-enabled=")) {
+      options.expectedCandidateBatchMaterializationEnabled = booleanValue(
+        arg,
+        "--expected-candidate-batch-materialization-enabled="
+      );
+    } else if (arg.startsWith("--expected-candidate-batch-materialization-environment=")) {
+      options.expectedCandidateBatchMaterializationEnvironment = enumValue(
+        arg,
+        "--expected-candidate-batch-materialization-environment=",
+        ["disabled", "xrteeth-develop"]
       );
     } else if (arg.startsWith("--expected-rollout-mode=")) options.expectedRolloutMode = enumValue(arg, "--expected-rollout-mode=", ["off", "allowlist", "percentage", "full"]);
     else if (arg.startsWith("--expected-rollout-percentage=")) options.expectedRolloutPercentage = integerValue(arg, "--expected-rollout-percentage=", 0, 100);

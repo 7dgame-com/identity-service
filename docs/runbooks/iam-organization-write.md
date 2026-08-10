@@ -287,6 +287,121 @@ IDENTITY_IAM_ORG_WRITE_ROLLOUT_ALLOWLIST: ""
 IDENTITY_IAM_ORG_WRITE_ROLLOUT_PERCENTAGE: "0"
 ```
 
+### Develop 全主体 candidate batch（仅本地实现，尚不可运行）
+
+为 7.2 的全主体对账准备 Identity candidate 基线，当前源码另提供一个严格限定在
+`xrteeth-develop` 的批量 primitive。它读取同一 Legacy `REPEATABLE READ`、`READ ONLY` 快照中的完整
+user/全局 role/organization membership，先做纯只读 preview，再只为 active ordinary subjects 补齐
+缺失的 Identity candidate。具有 `root` 等受保护角色的主体只计数和报告，永不进入写循环；Legacy
+始终只读，AuthZ owner 仍为 Legacy。该 primitive 不授权 dual-write、Identity-native、publish、tmrpp 或
+Production，也不关闭 6.9/7.2。
+
+默认和窗口恢复值必须固定为：
+
+```yaml
+IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_MATERIALIZATION_ENABLED: "false"
+IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_MATERIALIZATION_ENVIRONMENT: "disabled"
+IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_MATERIALIZATION_PLAN_HMAC_KEY: ""
+IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_EXPECTED_LEGACY_SUBJECT_COUNT: "0"
+IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_EXPECTED_PROTECTED_SUBJECT_COUNT: "0"
+```
+
+受控 preview/apply 要求 Identity DB 精确为 `xrugc_identity_dev`、Legacy DB 精确为 `bujiaban`，并要求
+现有单主体 materialization 已恢复为 disabled/target `0`。preview 只返回聚合计数和 HMAC plan token，
+不返回 Legacy user ID、用户名、角色或组织；plan token 绑定完整 Legacy source snapshot、状态、受保护分类
+和组织 fingerprint。Preview 阶段必须保持 batch `ENABLED=false`；审核 token/计数并取得独立写批准后，
+才可临时设为 `true` 进入 Apply。Apply 在跨节点 MySQL batch advisory lock 内重新读取并核对相同 source snapshot，
+随后逐主体复用现有 subject lock、ledger、candidate transaction 和 fresh Legacy postcheck。中途失败可用
+同一 plan/idempotency key 续跑，已对齐主体只跳过、不重写；普通主体出现 inactive、unresolved operation、
+count drift、fingerprint drift 或任何 P0/P2 时，写循环开始前整体 fail closed。
+
+内部实现入口为：
+
+```text
+GET  /internal/iam/organization-write/candidate-batch-materialization/preview
+POST /internal/iam/organization-write/candidate-batch-materialization/apply
+```
+
+两者均要求 `X-Identity-Internal-Token` 和精确 40 位 `X-Identity-Expected-Revision`；POST 另要求
+`Idempotency-Key` 和刚审核的 64 位 plan token。不得用临时 curl、Portainer console 或手工拼接请求；
+只能在这组代码已发布到 xrteeth Develop、CI 通过且另行批准写窗后使用编译后的 operator gate。
+
+Preview 阶段 batch `ENABLED=false`，但 environment/key/精确 expected counts 已配置：
+
+```sh
+IDENTITY_IAM_INTERNAL_API_TOKEN='<runtime-secret>' \
+npm run iam:organization-write:batch-materialization-gate:dist -- \
+  --adapter-url=http://127.0.0.1:8086 \
+  --expected-revision=<full-40-character-develop-git-sha> \
+  --expected-legacy-subject-count=<reviewed-full-count> \
+  --expected-protected-subject-count=<reviewed-protected-count>
+```
+
+只有 `passed=true`、`ordinaryBlocked=0`、`inactiveOrdinary=0`、preview count 与审核值完全一致，才可把
+输出中的完整 plan token 转入窗口专用 secret。取得独立写批准并临时将 batch `ENABLED=true` 后，Apply
+只从环境变量读取 plan token、idempotency key 和 internal token，先重跑全量 preflight，至多 POST 一次，
+随后再次要求全量 ordinary missing=0：
+
+```sh
+IDENTITY_IAM_INTERNAL_API_TOKEN='<runtime-secret>' \
+IDENTITY_IAM_ORG_CANDIDATE_BATCH_PLAN_TOKEN='<reviewed-64-hex-plan>' \
+IDENTITY_IAM_ORG_CANDIDATE_BATCH_IDEMPOTENCY_KEY='<approved-window-key>' \
+npm run iam:organization-write:batch-materialization-gate:dist -- \
+  --apply \
+  --adapter-url=http://127.0.0.1:8086 \
+  --expected-revision=<full-40-character-develop-git-sha> \
+  --expected-legacy-subject-count=<reviewed-full-count> \
+  --expected-protected-subject-count=<reviewed-protected-count>
+```
+
+每个阶段还要从 xrteeth Develop 公网入口独立核对正在运行的同一 revision；Preview 期预期 batch
+disabled/develop，Apply 期只把 enabled 改为 true，窗口恢复后回到 public gate 的默认 false/disabled：
+
+```sh
+npm run iam:organization-write:public-gate:dist -- \
+  --urls=https://identity.d.xrteeth.com/health \
+  --expected-revision=<full-40-character-develop-git-sha> \
+  --expected-candidate-batch-materialization-enabled=false \
+  --expected-candidate-batch-materialization-environment=xrteeth-develop
+
+npm run iam:organization-write:public-gate:dist -- \
+  --urls=https://identity.d.xrteeth.com/health \
+  --expected-revision=<full-40-character-develop-git-sha> \
+  --expected-candidate-batch-materialization-enabled=true \
+  --expected-candidate-batch-materialization-environment=xrteeth-develop
+```
+
+若输出 `outcomeUnknown=true` 或 `postcheckIncomplete=true`，立即把 batch `ENABLED=false`，不得重发 POST。
+在 environment/key/count 尚保留的短暂核验状态，用原 plan/key 执行纯 GET outcome verifier；它只接受
+full preview 中 ordinary missing=0，不会发送 POST：
+
+```sh
+IDENTITY_IAM_INTERNAL_API_TOKEN='<runtime-secret>' \
+IDENTITY_IAM_ORG_CANDIDATE_BATCH_PLAN_TOKEN='<same-reviewed-plan>' \
+IDENTITY_IAM_ORG_CANDIDATE_BATCH_IDEMPOTENCY_KEY='<same-window-key>' \
+npm run iam:organization-write:batch-materialization-gate:dist -- \
+  --verify-outcome \
+  --adapter-url=http://127.0.0.1:8086 \
+  --expected-revision=<full-40-character-develop-git-sha> \
+  --expected-legacy-subject-count=<reviewed-full-count> \
+  --expected-protected-subject-count=<reviewed-protected-count>
+```
+
+成功、失败或不确定结果处理完毕后，都必须清空五个 batch 配置并验证恢复；恢复门禁不读取 plan/key，
+也不访问 Legacy：
+
+```sh
+IDENTITY_IAM_INTERNAL_API_TOKEN='<runtime-secret>' \
+npm run iam:organization-write:batch-materialization-gate:dist -- \
+  --expect-restored \
+  --adapter-url=http://127.0.0.1:8086 \
+  --expected-revision=<full-40-character-develop-git-sha>
+```
+
+operator 输出只在 Preview 成功时显示完整 plan token；Apply/outcome/restored 只显示 digest 和聚合计数，
+不得保存 token、idempotency 原文或主体资料。在本切片推送、Develop CI、部署与独立写窗批准完成前，
+这些命令仍只属于 default-off 的本地实现，禁止实际执行。
+
 ### Candidate schema / DDL 批准边界
 
 preview、readiness、alignment、ledger 和 materialization apply 均不再 lazy ensure schema。
@@ -474,8 +589,34 @@ cursor 参数契约、Legacy rule-free RBAC 与 Develop exact IAM checksum/sourc
 decoder、顺序或查询失败都会 poison 当前 session，只能 rollback。仓库另提供
 `iam:organization-reconciliation:develop-preflight:dist`：它只接受 `--environment=xrteeth-develop`，要求
 Identity database 为 `xrugc_identity_dev`，在三源固定 read-only snapshot 中读取 schema metadata、aggregate
-counts 与每个 dataset 的单行 strict-decoder probe，并只输出计数、检查 ID 与 SHA-256 摘要。该命令不做 DDL、
-不写数据、不翻 readiness，也不允许 main、publish、Production 或 tmrpp 目标。
+counts 与每个 dataset 的单行 strict-decoder probe，并只输出计数、检查 ID 与 SHA-256 摘要。v3 preflight
+还在每个已连接 session 上执行 `SHOW GRANTS FOR CURRENT_USER()`：只接受精确 Develop schema 或固定表的
+`SELECT`（可附带 `SHOW VIEW`）及全局 `USAGE`，拒绝全局 SELECT、角色间接授权、写/DDL 权限、未知 scope
+和 `WITH GRANT OPTION`；公开报告只保留 grant-set digest 与通过布尔值，不回显账号或 grant 文本。它同时
+要求 `DATABASE()` 精确为 `bujiaban`、`xrugc_identity_dev`、`bujiaban_plugin`，并要求 MySQL
+`CURRENT_USER()` 解析出的账号精确等于对应专用配置用户名，防止凭据被接到同形异库或被数据库映射为另一授权身份。
+preflight
+会在进程内比较完整 Legacy subject ID 集合与选中的 Identity legacy-shadow 集合，但公开报告只输出
+Legacy/Identity 总数、缺失数与额外数，不输出主体 ID；通过条件是每个 Legacy 主体均已在 Identity 中出现，
+Identity-only 主体只作为额外集合单列，不能静默并入 Legacy 决策宇宙。Legacy RBAC 的 named-rule 门禁只检查
+源码固定的 11 个 Develop reconciliation capability 及其授权祖先闭包；全库其它 Verse/Meta/resource 规则不再
+误伤这个 source preflight，但 capability owner 决策、完整 evaluator 与 production registry 仍未批准。
+membership snapshot 完整性同样以 Legacy 主体集合为边界：每个 Legacy 主体必须恰有一条 candidate snapshot
+（包含显式 `organization_count=0`），Identity-only 主体不得被用来扩大或补足迁移集合。
+
+三源均必须使用 reconciliation 专用只读身份：Legacy 使用
+`IDENTITY_IAM_ORG_RECONCILIATION_LEGACY_DB_USER/PASSWORD`，Identity 使用
+`IDENTITY_IAM_ORG_RECONCILIATION_IDENTITY_DB_USER/PASSWORD`，plugin 使用显式
+`PLUGIN_DB_HOST/PORT/NAME/USER/PASSWORD`，其中 `PLUGIN_DB_NAME` 固定为 `bujiaban_plugin`。三个用户名必须
+互不相同，并且不得等于 Legacy/Identity 服务运行账号；不得以 system-admin 运行账号作为替代。
+用户名不同只完成配置门禁；只有实际 Develop v3 preflight 的
+`databaseBindingPassed=true`（数据库名与 session 授权账号均精确）、`readOnlyGrantPassed=true` 和 grant digest
+才构成当前 session 的只读证据。
+实际 plugin access scope
+枚举为 `auth-only`、`manager-only`、`admin-only`、`root-only`；这与 subject role/projector 的
+`root/admin/manager/user` 是两层不同契约，禁止直接混用。
+
+该命令不做 DDL、不写数据、不翻 readiness，也不允许 main、publish、Production 或 tmrpp 目标。
 当前 semantic registry 的 compiled production table 故意为空，且不接受 argv、环境变量、JSON 或 evidence
 注入。Identity shadow/candidate owner selectors、organization role scopes、plugin overlay、campus public
 context 与 capability catalog 五项 owner decision 均未批准；Legacy/Identity 两侧独立 semantic projector、

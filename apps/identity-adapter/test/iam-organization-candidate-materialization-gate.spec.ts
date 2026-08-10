@@ -897,6 +897,8 @@ function fixtureFetch(input: FixtureFetchInput) {
     dualWriteExecutionEnabled: false,
     candidateMaterializationEnabled: input.apply,
     candidateMaterializationTargetConfigured: true,
+    candidateBatchMaterializationEnabled: false,
+    candidateBatchMaterializationEnvironment: "disabled",
     rolloutMode: "off",
     rolloutAllowlistCount: 0,
     rolloutPercentage: 0,
@@ -929,6 +931,12 @@ function fixtureFetch(input: FixtureFetchInput) {
     repositoryConfigured: true,
     dualWriteExecutionEnabled: false,
     candidateMaterialization: materialization,
+    candidateBatchMaterialization: {
+      enabled: false,
+      environment: "disabled",
+      canApply: false,
+      protectedSubjectsWritten: false
+    },
     identityNativeSupported: false,
     rollout: { mode: "off", allowlistCount: 0, percentage: 0, selectionConfigured: false },
     blockedReasons: []

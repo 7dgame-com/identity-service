@@ -2330,6 +2330,8 @@ describe("identity-adapter readonly API", () => {
       dualWriteExecutionEnabled: false,
       candidateMaterializationEnabled: false,
       candidateMaterializationTargetConfigured: false,
+      candidateBatchMaterializationEnabled: false,
+      candidateBatchMaterializationEnvironment: "disabled",
       rolloutMode: "off",
       rolloutAllowlistCount: 0,
       rolloutPercentage: 0,

@@ -143,6 +143,17 @@ export const configSchema = z.object({
     organizationWriteCandidateMaterializationTargetLegacyUserId: numberFromEnv
       .transform((value) => value ?? 0)
       .pipe(z.number().int().min(0)),
+    organizationWriteCandidateBatchMaterializationEnabled: boolFromEnv.default(false),
+    organizationWriteCandidateBatchMaterializationEnvironment: z
+      .enum(["disabled", "xrteeth-develop"])
+      .default("disabled"),
+    organizationWriteCandidateBatchMaterializationPlanHmacKey: optionalStringFromEnv,
+    organizationWriteCandidateBatchExpectedLegacySubjectCount: numberFromEnv
+      .transform((value) => value ?? 0)
+      .pipe(z.number().int().min(0).max(5000)),
+    organizationWriteCandidateBatchExpectedProtectedSubjectCount: numberFromEnv
+      .transform((value) => value ?? 0)
+      .pipe(z.number().int().min(0).max(5000)),
     pluginUserWriteMode: z.enum(["disabled", "legacy-proxy", "dual-write", "identity-native"]).default("disabled"),
     pluginUserWriteShadowMode: z.enum(["off", "plan", "ledger-only"]).default("off"),
     pluginUserWriteDualWriteExecutionEnabled: boolFromEnv.default(false),
@@ -375,6 +386,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
         env.IDENTITY_IAM_ORG_WRITE_CANDIDATE_MATERIALIZATION_ENABLED,
       organizationWriteCandidateMaterializationTargetLegacyUserId:
         env.IDENTITY_IAM_ORG_WRITE_CANDIDATE_MATERIALIZATION_TARGET_LEGACY_USER_ID,
+      organizationWriteCandidateBatchMaterializationEnabled:
+        env.IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_MATERIALIZATION_ENABLED,
+      organizationWriteCandidateBatchMaterializationEnvironment:
+        env.IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_MATERIALIZATION_ENVIRONMENT,
+      organizationWriteCandidateBatchMaterializationPlanHmacKey:
+        env.IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_MATERIALIZATION_PLAN_HMAC_KEY,
+      organizationWriteCandidateBatchExpectedLegacySubjectCount:
+        env.IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_EXPECTED_LEGACY_SUBJECT_COUNT,
+      organizationWriteCandidateBatchExpectedProtectedSubjectCount:
+        env.IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_EXPECTED_PROTECTED_SUBJECT_COUNT,
       pluginUserWriteMode: env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE,
       pluginUserWriteShadowMode: env.IDENTITY_IAM_PLUGIN_USER_WRITE_SHADOW_MODE,
       pluginUserWriteDualWriteExecutionEnabled: env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED,
