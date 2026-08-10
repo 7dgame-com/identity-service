@@ -18,7 +18,8 @@ This command is restricted to xrteeth Develop. It opens only fixed read-only
 MySQL snapshots, executes compiled schema/count probes and one-row strict
 decoder probes, and prints a sanitized JSON report. It performs no DDL or
 write, never enables reconciliation/runtime readiness, and never targets
-main, publish, Production, or tmrpp.
+main, publish, Production, or tmrpp. The plugin source requires a dedicated
+PLUGIN_DB_* read-only credential; Legacy DB credentials are never reused.
 `;
 
 export interface OrganizationReconciliationDevelopPreflightCliIo {
@@ -45,14 +46,11 @@ export async function runOrganizationReconciliationDevelopPreflightCli(
 
   try {
     const config = loadConfig(env);
-    validateDevelopDatabaseConfiguration(config, env);
+    const pluginDb = validateDevelopDatabaseConfiguration(config, env);
     const report = await runOrganizationReconciliationDevelopSourcePreflight({
       legacyConnectionFactory: connectionFactory(config.legacyDb),
       identityConnectionFactory: connectionFactory(config.identityDb),
-      pluginConnectionFactory: connectionFactory({
-        ...config.legacyDb,
-        name: ORGANIZATION_RECONCILIATION_DEVELOP_PLUGIN_DATABASE
-      }),
+      pluginConnectionFactory: connectionFactory(pluginDb),
       buildRevision: env.IDENTITY_BUILD_REVISION ?? "unknown",
       now: () => new Date()
     });
@@ -64,7 +62,13 @@ export async function runOrganizationReconciliationDevelopPreflightCli(
   }
 }
 
-function validateDevelopDatabaseConfiguration(config: IdentityConfig, env: NodeJS.ProcessEnv): void {
+export function validateDevelopDatabaseConfiguration(config: IdentityConfig, env: NodeJS.ProcessEnv): {
+  readonly host: string;
+  readonly port: number;
+  readonly name: string;
+  readonly user: string;
+  readonly password: string;
+} {
   if (!config.legacyDb.host || !config.legacyDb.user || !config.legacyDb.password ||
     !config.identityDb.host || !config.identityDb.user || !config.identityDb.password) {
     throw new Error("The Develop database configuration is incomplete.");
@@ -72,10 +76,23 @@ function validateDevelopDatabaseConfiguration(config: IdentityConfig, env: NodeJ
   if (config.identityDb.name !== "xrugc_identity_dev") {
     throw new Error("The Identity database is not the compiled xrteeth Develop database.");
   }
-  const pluginDatabase = env.PLUGIN_DB_NAME ?? ORGANIZATION_RECONCILIATION_DEVELOP_PLUGIN_DATABASE;
+  const pluginDatabase = env.PLUGIN_DB_NAME;
   if (pluginDatabase !== ORGANIZATION_RECONCILIATION_DEVELOP_PLUGIN_DATABASE) {
     throw new Error("The plugin database is not the compiled Develop source.");
   }
+  const pluginPort = Number(env.PLUGIN_DB_PORT ?? "3306");
+  if (!env.PLUGIN_DB_HOST || !env.PLUGIN_DB_USER || !env.PLUGIN_DB_PASSWORD ||
+    !Number.isInteger(pluginPort) || pluginPort < 1 || pluginPort > 65_535 ||
+    env.PLUGIN_DB_USER === config.legacyDb.user) {
+    throw new Error("The dedicated Develop plugin read-only database configuration is incomplete.");
+  }
+  return Object.freeze({
+    host: env.PLUGIN_DB_HOST,
+    port: pluginPort,
+    name: pluginDatabase,
+    user: env.PLUGIN_DB_USER,
+    password: env.PLUGIN_DB_PASSWORD
+  });
 }
 
 function connectionFactory(config: {

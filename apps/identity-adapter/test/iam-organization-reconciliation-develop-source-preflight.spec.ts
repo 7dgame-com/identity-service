@@ -14,8 +14,10 @@ import {
   type MysqlRepeatableReadSnapshotConnectionFactory
 } from "../src/iam-organization-reconciliation/mysql-repeatable-read-snapshot.js";
 import {
-  runOrganizationReconciliationDevelopPreflightCli
+  runOrganizationReconciliationDevelopPreflightCli,
+  validateDevelopDatabaseConfiguration
 } from "../../../scripts/iam-organization-reconciliation-develop-preflight.js";
+import type { IdentityConfig } from "../src/config.js";
 
 describe("xrteeth Develop organization reconciliation source preflight", () => {
   it("compiles the exact bounded 21-dataset catalog while remaining not ready", () => {
@@ -55,6 +57,7 @@ describe("xrteeth Develop organization reconciliation source preflight", () => {
     });
 
     expect(report).toMatchObject({
+      contract: "iam-organization-reconciliation-xrteeth-develop-source-preflight/v2",
       environment: "xrteeth-develop",
       mode: "read-only",
       checkedAt: "2026-08-10T08:00:00.000Z",
@@ -62,6 +65,23 @@ describe("xrteeth Develop organization reconciliation source preflight", () => {
       passed: true,
       productionReady: false,
       failures: []
+    });
+    expect(report.subjectUniverseComparison).toEqual({
+      legacySubjectCount: 2,
+      identitySelectedSubjectCount: 2,
+      missingInIdentityCount: 0,
+      extraInIdentityCount: 0
+    });
+    expect(report.legacyRbacScope).toEqual({
+      targetCount: 11,
+      presentTargetCount: 11,
+      namedRuleIntersectionCount: 0
+    });
+    expect(report.membershipSnapshotComparison).toEqual({
+      legacySubjectCount: 2,
+      snapshotSubjectCount: 2,
+      missingLegacySnapshotCount: 0,
+      extraSnapshotCount: 0
     });
     expect(report.components.map((component) => component.datasetProbeCount)).toEqual([7, 13, 1]);
     expect(report.components.every((component) => component.schemaShapePassed)).toBe(true);
@@ -72,19 +92,80 @@ describe("xrteeth Develop organization reconciliation source preflight", () => {
   });
 
   it("fails closed on incomplete candidate coverage without leaking rows", async () => {
-    const identityAggregates = aggregateRows("identity").map((row) =>
-      row.metric === "identity_membership_snapshot_count" ? { ...row, metric_value: "1" } : row
-    );
     const report = await runOrganizationReconciliationDevelopSourcePreflight({
       legacyConnectionFactory: fakeFactory("legacy-main", aggregateRows("legacy-main")).factory,
-      identityConnectionFactory: fakeFactory("identity", identityAggregates).factory,
+      identityConnectionFactory: fakeFactory("identity", aggregateRows("identity"), {
+        membershipSnapshotSubjectIds: [1]
+      }).factory,
       pluginConnectionFactory: fakeFactory("plugin", aggregateRows("plugin")).factory,
       buildRevision: "b".repeat(40),
       now: () => new Date("2026-08-10T08:00:00.000Z")
     });
     expect(report.passed).toBe(false);
-    expect(report.failures).toContain("identity-membership-snapshots-complete");
+    expect(report.failures).toContain("identity-legacy-membership-snapshots-complete");
+    expect(report.membershipSnapshotComparison.missingLegacySnapshotCount).toBe(1);
     expect(report.productionReady).toBe(false);
+  });
+
+  it("proves every Legacy subject is represented while reporting Identity-only subjects separately", async () => {
+    const report = await runOrganizationReconciliationDevelopSourcePreflight({
+      legacyConnectionFactory: fakeFactory("legacy-main", aggregateRows("legacy-main"), {
+        subjectIds: [1, 2]
+      }).factory,
+      identityConnectionFactory: fakeFactory("identity", aggregateRows("identity"), {
+        subjectIds: [1, 2, 3]
+      }).factory,
+      pluginConnectionFactory: fakeFactory("plugin", aggregateRows("plugin")).factory,
+      buildRevision: "c".repeat(40),
+      now: () => new Date("2026-08-10T08:00:00.000Z")
+    });
+    expect(report.failures).not.toContain("identity-legacy-subjects-complete");
+    expect(report.subjectUniverseComparison).toEqual({
+      legacySubjectCount: 2,
+      identitySelectedSubjectCount: 3,
+      missingInIdentityCount: 0,
+      extraInIdentityCount: 1
+    });
+
+    const missing = await runOrganizationReconciliationDevelopSourcePreflight({
+      legacyConnectionFactory: fakeFactory("legacy-main", aggregateRows("legacy-main"), {
+        subjectIds: [1, 2]
+      }).factory,
+      identityConnectionFactory: fakeFactory("identity", aggregateRows("identity"), {
+        subjectIds: [1, 3]
+      }).factory,
+      pluginConnectionFactory: fakeFactory("plugin", aggregateRows("plugin")).factory,
+      buildRevision: "d".repeat(40),
+      now: () => new Date("2026-08-10T08:00:00.000Z")
+    });
+    expect(missing.failures).toContain("identity-legacy-subjects-complete");
+    expect(missing.subjectUniverseComparison.missingInIdentityCount).toBe(1);
+  });
+
+  it("limits named-rule rejection to the compiled reconciliation capability closure", async () => {
+    const unrelated = await runOrganizationReconciliationDevelopSourcePreflight({
+      legacyConnectionFactory: fakeFactory("legacy-main", aggregateRows("legacy-main"), {
+        additionalRbacItems: [{ name: "unrelated", type: 2, rule_name: "legacy-rule" }]
+      }).factory,
+      identityConnectionFactory: fakeFactory("identity", aggregateRows("identity")).factory,
+      pluginConnectionFactory: fakeFactory("plugin", aggregateRows("plugin")).factory,
+      buildRevision: "e".repeat(40),
+      now: () => new Date("2026-08-10T08:00:00.000Z")
+    });
+    expect(unrelated.failures).not.toContain("legacy-reconciliation-scope-rule-free");
+
+    const intersecting = await runOrganizationReconciliationDevelopSourcePreflight({
+      legacyConnectionFactory: fakeFactory("legacy-main", aggregateRows("legacy-main"), {
+        additionalRbacItems: [{ name: "legacy-rule-parent", type: 1, rule_name: "legacy-rule" }],
+        rbacEdges: [{ parent: "legacy-rule-parent", child: "organization.list" }]
+      }).factory,
+      identityConnectionFactory: fakeFactory("identity", aggregateRows("identity")).factory,
+      pluginConnectionFactory: fakeFactory("plugin", aggregateRows("plugin")).factory,
+      buildRevision: "f".repeat(40),
+      now: () => new Date("2026-08-10T08:00:00.000Z")
+    });
+    expect(intersecting.failures).toContain("legacy-reconciliation-scope-rule-free");
+    expect(intersecting.legacyRbacScope.namedRuleIntersectionCount).toBe(1);
   });
 
   it("requires the exact Develop-only CLI target before any connection attempt", async () => {
@@ -106,11 +187,46 @@ describe("xrteeth Develop organization reconciliation source preflight", () => {
     expect(stdout.join("")).toContain("performs no DDL or");
     expect(stderr).toEqual([]);
   });
+
+  it("requires a dedicated plugin read-only database identity instead of reusing Legacy credentials", () => {
+    const config = {
+      legacyDb: { host: "legacy-db", port: 3306, name: "bujiaban", user: "legacy-reader", password: "legacy" },
+      identityDb: { host: "identity-db", port: 3306, name: "xrugc_identity_dev", user: "identity-reader", password: "identity" }
+    } as unknown as IdentityConfig;
+    expect(() => validateDevelopDatabaseConfiguration(config, {
+      PLUGIN_DB_HOST: "plugin-db",
+      PLUGIN_DB_NAME: "bujiaban_plugin",
+      PLUGIN_DB_USER: "legacy-reader",
+      PLUGIN_DB_PASSWORD: "plugin"
+    })).toThrow(/dedicated/);
+    expect(validateDevelopDatabaseConfiguration(config, {
+      PLUGIN_DB_HOST: "plugin-db",
+      PLUGIN_DB_PORT: "3306",
+      PLUGIN_DB_NAME: "bujiaban_plugin",
+      PLUGIN_DB_USER: "plugin-readonly",
+      PLUGIN_DB_PASSWORD: "plugin"
+    })).toEqual({
+      host: "plugin-db",
+      port: 3306,
+      name: "bujiaban_plugin",
+      user: "plugin-readonly",
+      password: "plugin"
+    });
+  });
 });
 
 type Component = "legacy-main" | "identity" | "plugin";
 
-function fakeFactory(component: Component, aggregates: readonly Record<string, unknown>[]) {
+function fakeFactory(
+  component: Component,
+  aggregates: readonly Record<string, unknown>[],
+  options: {
+    readonly subjectIds?: readonly number[];
+    readonly membershipSnapshotSubjectIds?: readonly number[];
+    readonly additionalRbacItems?: readonly Record<string, unknown>[];
+    readonly rbacEdges?: readonly Record<string, unknown>[];
+  } = {}
+) {
   const sql: string[] = [];
   const factory: MysqlRepeatableReadSnapshotConnectionFactory = async () => ({
     async query(statement, parameters = []) {
@@ -126,6 +242,19 @@ function fakeFactory(component: Component, aggregates: readonly Record<string, u
       }
       if (statement.includes("INFORMATION_SCHEMA.COLUMNS")) return [schemaRows(component), []];
       if (statement.includes(" AS metric")) return [aggregates, []];
+      if (statement === "SELECT id AS subject_id FROM `user` ORDER BY id ASC" ||
+        statement.startsWith("SELECT legacy_user_id AS subject_id FROM identity_users")) {
+        return [(options.subjectIds ?? [1, 2]).map((subjectId) => ({ subject_id: subjectId })), []];
+      }
+      if (statement.startsWith("SELECT legacy_user_id AS subject_id FROM identity_organization_membership_snapshots")) {
+        return [(options.membershipSnapshotSubjectIds ?? [1, 2]).map((subjectId) => ({ subject_id: subjectId })), []];
+      }
+      if (statement.startsWith("SELECT name, type, rule_name FROM auth_item")) {
+        return [[...capabilityItems(), ...(options.additionalRbacItems ?? [])], []];
+      }
+      if (statement.startsWith("SELECT parent, child FROM auth_item_child")) {
+        return [[...(options.rbacEdges ?? [])], []];
+      }
       if (statement === ORGANIZATION_RECONCILIATION_MYSQL_STATEMENTS["identity-iam-policy-version-page/v1"]) {
         expect(parameters[0]).toBe(ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM);
         return [[{
@@ -142,6 +271,22 @@ function fakeFactory(component: Component, aggregates: readonly Record<string, u
     release() {}
   });
   return { factory, sql };
+}
+
+function capabilityItems(): Record<string, unknown>[] {
+  return [
+    "organization.bind-user",
+    "organization.create",
+    "organization.list",
+    "organization.update",
+    "user-management.change-role",
+    "user-management.create-user",
+    "user-management.delete-user",
+    "user-management.list-users",
+    "user-management.manage-invitations",
+    "user-management.update-user",
+    "user-management.view-user"
+  ].map((name) => ({ name, type: 2, rule_name: null }));
 }
 
 function schemaRows(component: Component): Record<string, unknown>[] {
