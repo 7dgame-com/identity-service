@@ -593,7 +593,7 @@ counts 与每个 dataset 的单行 strict-decoder probe，并只输出计数、�
 还在每个已连接 session 上执行 `SHOW GRANTS FOR CURRENT_USER()`：只接受精确 Develop schema 或固定表的
 `SELECT`（可附带 `SHOW VIEW`）及全局 `USAGE`，拒绝全局 SELECT、角色间接授权、写/DDL 权限、未知 scope
 和 `WITH GRANT OPTION`；公开报告只保留 grant-set digest 与通过布尔值，不回显账号或 grant 文本。它同时
-要求 `DATABASE()` 精确为 `bujiaban`、`xrugc_identity_dev`、`bujiaban_plugin`，并要求 MySQL
+要求 `DATABASE()` 精确为 `bujiaban_development`、`xrugc_identity_dev`、`bujiaban_plugin`，并要求 MySQL
 `CURRENT_USER()` 解析出的账号精确等于对应专用配置用户名，防止凭据被接到同形异库或被数据库映射为另一授权身份。
 preflight
 会在进程内比较完整 Legacy subject ID 集合与选中的 Identity legacy-shadow 集合，但公开报告只输出
@@ -642,6 +642,14 @@ PLUGIN_DB_PASSWORD
 `iam-organization-reconciliation-xrteeth-develop-preflight-launch-diagnostic/v1` 输出一个固定 failure ID；
 该诊断不回显任何环境变量值。只有 launch 成功后的 v3 sanitized report 才能作为 schema、grant、dataset
 与完整性证据，launch failure 不能被记作 dataset mismatch。
+
+仓库另提供默认关闭的双节点结构一致性门禁：它只接受两份均已通过的 v3 sanitized report，要求两个调用方
+标签不同、时间窗口有界，并逐项核对 build revision、source/statement catalog、IAM policy checksum、三组件
+database identity/grant/schema digest、21 个 dataset probe、aggregate counts、subject universe、membership snapshot
+与 Legacy RBAC scope。任一 A/B 拼接或集合缺失都会 fail closed；输出只保留 canonical SHA-256 和固定摘要。
+该门禁的 node ID 与 expected build revision 仍是调用方提供的结构字段，hash 不是签名；当前没有 collector
+公钥、compiled trust profile 或外部 attestation，所以它只能证明“双份脱敏报告结构一致”，不能证明节点身份、
+物理来源真实性、完整八表面对账或 Task 7.2 已完成。
 
 该命令不做 DDL、不写数据、不翻 readiness，也不允许 main、publish、Production 或 tmrpp 目标。
 当前 semantic registry 的 compiled production table 故意为空，且不接受 argv、环境变量、JSON 或 evidence
