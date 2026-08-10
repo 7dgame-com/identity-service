@@ -5,6 +5,7 @@ import {
   ORGANIZATION_RECONCILIATION_SNAPSHOT_MODE
 } from "../../iam-organization-reconciliation-collector.js";
 import {
+  ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM,
   ORGANIZATION_RECONCILIATION_MYSQL_STATEMENT_CATALOG_SHA256,
   openMysqlRepeatableReadSnapshot,
   type MysqlRepeatableReadSnapshotConnectionFactory,
@@ -70,12 +71,21 @@ export type OrganizationReconciliationMysqlRawSurface =
   | "legacy-membership"
   | "legacy-role-assignment"
   | "legacy-rbac-edge"
+  | "legacy-rbac-item"
+  | "legacy-rbac-assignment"
   | "identity-subject-universe"
   | "identity-organization-candidate"
   | "identity-organization-id-map"
   | "identity-membership-shadow"
   | "identity-membership-candidate"
+  | "identity-membership-candidate-snapshot"
   | "identity-role-shadow"
+  | "identity-iam-policy-version"
+  | "identity-iam-role"
+  | "identity-iam-permission"
+  | "identity-iam-item-relation"
+  | "identity-iam-subject-assignment"
+  | "identity-iam-subject-assignment-snapshot"
   | "plugin-registry";
 
 export interface OpenOrganizationReconciliationMysqlRawSnapshotOptions {
@@ -138,23 +148,38 @@ export interface LegacyRbacEdgeMysqlRawRecord {
   readonly childName: string;
 }
 
+export interface LegacyRbacItemMysqlRawRecord {
+  readonly itemName: string;
+  readonly itemType: "role" | "permission";
+  readonly description: string | null;
+  readonly ruleName: null;
+}
+
+export interface LegacyRbacAssignmentMysqlRawRecord {
+  readonly legacyUserId: string;
+  readonly itemName: string;
+  readonly itemType: "role" | "permission";
+}
+
 export interface IdentityOrganizationCandidateMysqlRawRecord {
   readonly legacyOrganizationId: string;
   readonly identityOrganizationId: string;
   readonly name: string;
   readonly title: string;
+  readonly source: "legacy";
   readonly candidateStatus: "candidate";
 }
 
 export interface IdentitySubjectUniverseMysqlRawRecord {
   readonly legacyUserId: string;
-  readonly status: string;
-  readonly source: string;
+  readonly status: "active" | "inactive";
+  readonly source: "legacy-shadow";
 }
 
 export interface IdentityOrganizationIdMapMysqlRawRecord {
   readonly legacyOrganizationId: string;
   readonly identityOrganizationId: string;
+  readonly source: "legacy";
   readonly mappingStatus: "active";
 }
 
@@ -162,6 +187,7 @@ export interface IdentityOrganizationMembershipShadowMysqlRawRecord {
   readonly legacyUserId: string;
   readonly legacyOrganizationId: string;
   readonly organizationRole: string | null;
+  readonly source: "legacy-shadow";
   readonly status: "shadow";
 }
 
@@ -171,13 +197,72 @@ export interface IdentityOrganizationMembershipCandidateMysqlRawRecord {
   readonly identityUserId: string;
   readonly identityOrganizationId: string;
   readonly organizationRole: "member";
+  readonly source: "legacy";
   readonly candidateStatus: "candidate";
+  readonly operationKey: string;
 }
 
 export interface IdentityRoleAssignmentShadowMysqlRawRecord {
   readonly legacyUserId: string;
   readonly roleName: string;
+  readonly source: "legacy-shadow";
   readonly status: "shadow";
+}
+
+export interface IdentityOrganizationMembershipCandidateSnapshotMysqlRawRecord {
+  readonly identityUserId: string;
+  readonly legacyUserId: string;
+  readonly operationKey: string;
+  readonly organizationCount: number;
+  readonly source: "legacy";
+  readonly candidateStatus: "candidate";
+}
+
+export interface IdentityIamPolicyVersionMysqlRawRecord {
+  readonly policyChecksum: typeof ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM;
+  readonly source: "legacy-import-candidate";
+  readonly status: "candidate";
+  readonly roleCount: number;
+  readonly permissionCount: number;
+  readonly relationCount: number;
+}
+
+export interface IdentityIamNamedItemMysqlRawRecord {
+  readonly policyChecksum: typeof ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM;
+  readonly itemName: string;
+  readonly description: string | null;
+  readonly source: "legacy-import-candidate";
+  readonly status: "candidate";
+}
+
+export interface IdentityIamItemRelationMysqlRawRecord {
+  readonly policyChecksum: typeof ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM;
+  readonly parentName: string;
+  readonly parentType: "role" | "permission";
+  readonly childName: string;
+  readonly childType: "role" | "permission";
+  readonly source: "legacy-import-candidate";
+  readonly status: "candidate";
+}
+
+export interface IdentityIamSubjectAssignmentMysqlRawRecord {
+  readonly identityUserId: string;
+  readonly legacyUserId: string;
+  readonly itemName: string;
+  readonly itemType: "role" | "permission";
+  readonly policyChecksum: typeof ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM;
+  readonly source: "legacy-import-candidate";
+  readonly status: "candidate";
+}
+
+export interface IdentityIamSubjectAssignmentSnapshotMysqlRawRecord {
+  readonly identityUserId: string;
+  readonly legacyUserId: string;
+  readonly policyChecksum: typeof ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM;
+  readonly snapshotKey: typeof ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM;
+  readonly assignmentCount: number;
+  readonly source: "legacy-import-candidate";
+  readonly status: "candidate";
 }
 
 export type OrganizationReconciliationPluginAccessScope =
@@ -230,6 +315,18 @@ export interface LegacyMainMysqlRawSnapshot
     "legacy-rbac-edge",
     LegacyRbacEdgeMysqlRawRecord
   >>;
+  readRbacItemPage(
+    request: OrganizationReconciliationMysqlRawPageRequest
+  ): Promise<OrganizationReconciliationMysqlRawPage<
+    "legacy-rbac-item",
+    LegacyRbacItemMysqlRawRecord
+  >>;
+  readRbacAssignmentPage(
+    request: OrganizationReconciliationMysqlRawPageRequest
+  ): Promise<OrganizationReconciliationMysqlRawPage<
+    "legacy-rbac-assignment",
+    LegacyRbacAssignmentMysqlRawRecord
+  >>;
 }
 
 export interface IdentityMysqlRawSnapshot
@@ -264,11 +361,53 @@ export interface IdentityMysqlRawSnapshot
     "identity-membership-candidate",
     IdentityOrganizationMembershipCandidateMysqlRawRecord
   >>;
+  readMembershipCandidateSnapshotPage(
+    request: OrganizationReconciliationMysqlRawPageRequest
+  ): Promise<OrganizationReconciliationMysqlRawPage<
+    "identity-membership-candidate-snapshot",
+    IdentityOrganizationMembershipCandidateSnapshotMysqlRawRecord
+  >>;
   readRoleShadowPage(
     request: OrganizationReconciliationMysqlRawPageRequest
   ): Promise<OrganizationReconciliationMysqlRawPage<
     "identity-role-shadow",
     IdentityRoleAssignmentShadowMysqlRawRecord
+  >>;
+  readIamPolicyVersionPage(
+    request: OrganizationReconciliationMysqlRawPageRequest
+  ): Promise<OrganizationReconciliationMysqlRawPage<
+    "identity-iam-policy-version",
+    IdentityIamPolicyVersionMysqlRawRecord
+  >>;
+  readIamRolePage(
+    request: OrganizationReconciliationMysqlRawPageRequest
+  ): Promise<OrganizationReconciliationMysqlRawPage<
+    "identity-iam-role",
+    IdentityIamNamedItemMysqlRawRecord
+  >>;
+  readIamPermissionPage(
+    request: OrganizationReconciliationMysqlRawPageRequest
+  ): Promise<OrganizationReconciliationMysqlRawPage<
+    "identity-iam-permission",
+    IdentityIamNamedItemMysqlRawRecord
+  >>;
+  readIamItemRelationPage(
+    request: OrganizationReconciliationMysqlRawPageRequest
+  ): Promise<OrganizationReconciliationMysqlRawPage<
+    "identity-iam-item-relation",
+    IdentityIamItemRelationMysqlRawRecord
+  >>;
+  readIamSubjectAssignmentPage(
+    request: OrganizationReconciliationMysqlRawPageRequest
+  ): Promise<OrganizationReconciliationMysqlRawPage<
+    "identity-iam-subject-assignment",
+    IdentityIamSubjectAssignmentMysqlRawRecord
+  >>;
+  readIamSubjectAssignmentSnapshotPage(
+    request: OrganizationReconciliationMysqlRawPageRequest
+  ): Promise<OrganizationReconciliationMysqlRawPage<
+    "identity-iam-subject-assignment-snapshot",
+    IdentityIamSubjectAssignmentSnapshotMysqlRawRecord
   >>;
 }
 
@@ -288,12 +427,20 @@ type AnyRawRecord =
   | LegacyOrganizationMembershipMysqlRawRecord
   | LegacyRoleAssignmentMysqlRawRecord
   | LegacyRbacEdgeMysqlRawRecord
+  | LegacyRbacItemMysqlRawRecord
+  | LegacyRbacAssignmentMysqlRawRecord
   | IdentitySubjectUniverseMysqlRawRecord
   | IdentityOrganizationCandidateMysqlRawRecord
   | IdentityOrganizationIdMapMysqlRawRecord
   | IdentityOrganizationMembershipShadowMysqlRawRecord
   | IdentityOrganizationMembershipCandidateMysqlRawRecord
   | IdentityRoleAssignmentShadowMysqlRawRecord
+  | IdentityOrganizationMembershipCandidateSnapshotMysqlRawRecord
+  | IdentityIamPolicyVersionMysqlRawRecord
+  | IdentityIamNamedItemMysqlRawRecord
+  | IdentityIamItemRelationMysqlRawRecord
+  | IdentityIamSubjectAssignmentMysqlRawRecord
+  | IdentityIamSubjectAssignmentSnapshotMysqlRawRecord
   | PluginRegistryMysqlRawRecord;
 
 interface SurfaceDefinition<
@@ -330,7 +477,7 @@ interface ValidatedOpenDependencies {
 
 const LEGACY_DIRECTORY = defineSurface({
   surface: "legacy-organization-directory",
-  statementId: "legacy-organization-directory-page/v1",
+  statementId: "legacy-organization-directory-page/v3",
   initialCursorValues: [0],
   decode: decodeLegacyOrganizationDirectory,
   cursorValues: (record) => [record.legacyOrganizationId],
@@ -340,7 +487,7 @@ const LEGACY_DIRECTORY = defineSurface({
 
 const LEGACY_SUBJECTS = defineSurface({
   surface: "legacy-subject-universe",
-  statementId: "legacy-subject-universe-page/v1",
+  statementId: "legacy-subject-universe-page/v3",
   initialCursorValues: [0],
   decode: decodeLegacySubjectUniverse,
   cursorValues: (record) => [record.legacyUserId],
@@ -350,7 +497,7 @@ const LEGACY_SUBJECTS = defineSurface({
 
 const LEGACY_MEMBERSHIPS = defineSurface({
   surface: "legacy-membership",
-  statementId: "legacy-membership-page/v1",
+  statementId: "legacy-membership-page/v3",
   initialCursorValues: [0, 0],
   decode: decodeLegacyMembership,
   cursorValues: (record) => [record.legacyUserId, record.legacyOrganizationId],
@@ -363,12 +510,15 @@ const LEGACY_MEMBERSHIPS = defineSurface({
 
 const LEGACY_ROLES = defineSurface({
   surface: "legacy-role-assignment",
-  statementId: "legacy-role-assignment-page/v1",
+  statementId: "legacy-role-assignment-page/v3",
   initialCursorValues: [0, ""],
   decode: decodeLegacyRoleAssignment,
   cursorValues: (record) => [record.legacyUserId, record.roleName],
   queryParameters: twoPartStringParameters,
-  orderKey: (record) => tupleOrderKey(numericOrderKey(record.legacyUserId), record.roleName)
+  orderKey: (record) => tupleOrderKey(
+    numericOrderKey(record.legacyUserId),
+    utf8ByteOrderKey(record.roleName)
+  )
 });
 
 const LEGACY_RBAC_EDGES = defineSurface({
@@ -384,9 +534,32 @@ const LEGACY_RBAC_EDGES = defineSurface({
   )
 });
 
+const LEGACY_RBAC_ITEMS = defineSurface({
+  surface: "legacy-rbac-item",
+  statementId: "legacy-rbac-item-page/v1",
+  initialCursorValues: [""],
+  decode: decodeLegacyRbacItem,
+  cursorValues: (record) => [record.itemName],
+  queryParameters: singleKeyParameters,
+  orderKey: (record) => utf8ByteOrderKey(record.itemName)
+});
+
+const LEGACY_RBAC_ASSIGNMENTS = defineSurface({
+  surface: "legacy-rbac-assignment",
+  statementId: "legacy-rbac-assignment-page/v1",
+  initialCursorValues: [0, ""],
+  decode: decodeLegacyRbacAssignment,
+  cursorValues: (record) => [record.legacyUserId, record.itemName],
+  queryParameters: twoPartStringParameters,
+  orderKey: (record) => tupleOrderKey(
+    numericOrderKey(record.legacyUserId),
+    utf8ByteOrderKey(record.itemName)
+  )
+});
+
 const IDENTITY_SUBJECTS = defineSurface({
   surface: "identity-subject-universe",
-  statementId: "identity-subject-universe-page/v1",
+  statementId: "identity-subject-universe-page/v3",
   initialCursorValues: [0],
   decode: decodeIdentitySubjectUniverse,
   cursorValues: (record) => [record.legacyUserId],
@@ -396,7 +569,7 @@ const IDENTITY_SUBJECTS = defineSurface({
 
 const IDENTITY_ORGANIZATIONS = defineSurface({
   surface: "identity-organization-candidate",
-  statementId: "identity-organization-candidate-page/v1",
+  statementId: "identity-organization-candidate-page/v3",
   initialCursorValues: [0],
   decode: decodeIdentityOrganizationCandidate,
   cursorValues: (record) => [record.legacyOrganizationId],
@@ -406,7 +579,7 @@ const IDENTITY_ORGANIZATIONS = defineSurface({
 
 const IDENTITY_ORGANIZATION_MAP = defineSurface({
   surface: "identity-organization-id-map",
-  statementId: "identity-organization-id-map-page/v1",
+  statementId: "identity-organization-id-map-page/v3",
   initialCursorValues: [0],
   decode: decodeIdentityOrganizationIdMap,
   cursorValues: (record) => [record.legacyOrganizationId],
@@ -416,7 +589,7 @@ const IDENTITY_ORGANIZATION_MAP = defineSurface({
 
 const IDENTITY_MEMBERSHIP_SHADOW = defineSurface({
   surface: "identity-membership-shadow",
-  statementId: "identity-membership-shadow-page/v1",
+  statementId: "identity-membership-shadow-page/v3",
   initialCursorValues: [0, 0],
   decode: decodeIdentityMembershipShadow,
   cursorValues: (record) => [record.legacyUserId, record.legacyOrganizationId],
@@ -429,42 +602,130 @@ const IDENTITY_MEMBERSHIP_SHADOW = defineSurface({
 
 const IDENTITY_MEMBERSHIP_CANDIDATE = defineSurface({
   surface: "identity-membership-candidate",
-  statementId: "identity-membership-candidate-page/v1",
-  initialCursorValues: [0, 0, "", ""],
+  statementId: "identity-membership-candidate-page/v3",
+  initialCursorValues: [0, 0, "", "", ""],
   decode: decodeIdentityMembershipCandidate,
   cursorValues: (record) => [
     record.legacyUserId,
     record.legacyOrganizationId,
     record.identityUserId,
-    record.identityOrganizationId
+    record.identityOrganizationId,
+    record.operationKey
   ],
-  queryParameters: fourPartCandidateMembershipParameters,
+  queryParameters: fivePartCandidateMembershipParameters,
   orderKey: (record) => tupleOrderKey(
     numericOrderKey(record.legacyUserId),
     numericOrderKey(record.legacyOrganizationId),
-    record.identityUserId,
-    record.identityOrganizationId
+    utf8ByteOrderKey(record.identityUserId),
+    utf8ByteOrderKey(record.identityOrganizationId),
+    utf8ByteOrderKey(record.operationKey)
+  )
+});
+
+const IDENTITY_MEMBERSHIP_CANDIDATE_SNAPSHOT = defineSurface({
+  surface: "identity-membership-candidate-snapshot",
+  statementId: "identity-membership-candidate-snapshot-page/v1",
+  initialCursorValues: [0, ""],
+  decode: decodeIdentityMembershipCandidateSnapshot,
+  cursorValues: (record) => [record.legacyUserId, record.operationKey],
+  queryParameters: twoPartStringParameters,
+  orderKey: (record) => tupleOrderKey(
+    numericOrderKey(record.legacyUserId),
+    utf8ByteOrderKey(record.operationKey)
   )
 });
 
 const IDENTITY_ROLE_SHADOW = defineSurface({
   surface: "identity-role-shadow",
-  statementId: "identity-role-shadow-page/v1",
+  statementId: "identity-role-shadow-page/v3",
   initialCursorValues: [0, ""],
   decode: decodeIdentityRoleShadow,
   cursorValues: (record) => [record.legacyUserId, record.roleName],
   queryParameters: twoPartStringParameters,
-  orderKey: (record) => tupleOrderKey(numericOrderKey(record.legacyUserId), record.roleName)
+  orderKey: (record) => tupleOrderKey(
+    numericOrderKey(record.legacyUserId),
+    utf8ByteOrderKey(record.roleName)
+  )
+});
+
+const IDENTITY_IAM_POLICY_VERSION = defineSurface({
+  surface: "identity-iam-policy-version",
+  statementId: "identity-iam-policy-version-page/v1",
+  initialCursorValues: [""],
+  decode: decodeIdentityIamPolicyVersion,
+  cursorValues: (record) => [record.policyChecksum],
+  queryParameters: pinnedPolicySingleKeyParameters,
+  orderKey: (record) => utf8ByteOrderKey(record.policyChecksum)
+});
+
+const IDENTITY_IAM_ROLES = defineSurface({
+  surface: "identity-iam-role",
+  statementId: "identity-iam-role-page/v1",
+  initialCursorValues: [""],
+  decode: decodeIdentityIamRole,
+  cursorValues: (record) => [record.itemName],
+  queryParameters: pinnedPolicySingleKeyParameters,
+  orderKey: (record) => utf8ByteOrderKey(record.itemName)
+});
+
+const IDENTITY_IAM_PERMISSIONS = defineSurface({
+  surface: "identity-iam-permission",
+  statementId: "identity-iam-permission-page/v1",
+  initialCursorValues: [""],
+  decode: decodeIdentityIamPermission,
+  cursorValues: (record) => [record.itemName],
+  queryParameters: pinnedPolicySingleKeyParameters,
+  orderKey: (record) => utf8ByteOrderKey(record.itemName)
+});
+
+const IDENTITY_IAM_RELATIONS = defineSurface({
+  surface: "identity-iam-item-relation",
+  statementId: "identity-iam-item-relation-page/v1",
+  initialCursorValues: ["", ""],
+  decode: decodeIdentityIamItemRelation,
+  cursorValues: (record) => [record.parentName, record.childName],
+  queryParameters: pinnedPolicyTwoPartStringParameters,
+  orderKey: (record) => tupleOrderKey(
+    utf8ByteOrderKey(record.parentName),
+    utf8ByteOrderKey(record.childName)
+  )
+});
+
+const IDENTITY_IAM_SUBJECT_ASSIGNMENTS = defineSurface({
+  surface: "identity-iam-subject-assignment",
+  statementId: "identity-iam-subject-assignment-page/v1",
+  initialCursorValues: [0, "", ""],
+  decode: decodeIdentityIamSubjectAssignment,
+  cursorValues: (record) => [record.legacyUserId, record.identityUserId, record.itemName],
+  queryParameters: pinnedPolicySubjectAssignmentParameters,
+  orderKey: (record) => tupleOrderKey(
+    numericOrderKey(record.legacyUserId),
+    utf8ByteOrderKey(record.identityUserId),
+    utf8ByteOrderKey(record.itemName)
+  )
+});
+
+const IDENTITY_IAM_SUBJECT_ASSIGNMENT_SNAPSHOTS = defineSurface({
+  surface: "identity-iam-subject-assignment-snapshot",
+  statementId: "identity-iam-subject-assignment-snapshot-page/v1",
+  initialCursorValues: [0, ""],
+  decode: decodeIdentityIamSubjectAssignmentSnapshot,
+  cursorValues: (record) => [record.legacyUserId, record.identityUserId],
+  queryParameters: pinnedPolicySubjectAssignmentSnapshotParameters,
+  orderKey: (record) => tupleOrderKey(
+    numericOrderKey(record.legacyUserId),
+    utf8ByteOrderKey(record.identityUserId)
+  )
 });
 
 const PLUGIN_REGISTRY = defineSurface({
   surface: "plugin-registry",
-  statementId: "plugin-registry-page/v1",
+  statementId: "plugin-registry-page/v3",
   initialCursorValues: [""],
   decode: decodePluginRegistry,
   cursorValues: (record) => [record.pluginId],
   queryParameters: singleKeyParameters,
-  orderKey: (record) => record.pluginId
+  orderKey: (record) => utf8ByteOrderKey(record.pluginId)
 });
 
 export async function openLegacyMainMysqlRawSnapshot(
@@ -483,6 +744,10 @@ export async function openLegacyMainMysqlRawSnapshot(
       core.read(LEGACY_ROLES, request),
     readRbacEdgePage: (request: OrganizationReconciliationMysqlRawPageRequest) =>
       core.read(LEGACY_RBAC_EDGES, request),
+    readRbacItemPage: (request: OrganizationReconciliationMysqlRawPageRequest) =>
+      core.read(LEGACY_RBAC_ITEMS, request),
+    readRbacAssignmentPage: (request: OrganizationReconciliationMysqlRawPageRequest) =>
+      core.read(LEGACY_RBAC_ASSIGNMENTS, request),
     close: (outcome: MysqlRepeatableReadSnapshotOutcome) => core.close(outcome)
   });
 }
@@ -503,8 +768,22 @@ export async function openIdentityMysqlRawSnapshot(
       core.read(IDENTITY_MEMBERSHIP_SHADOW, request),
     readMembershipCandidatePage: (request: OrganizationReconciliationMysqlRawPageRequest) =>
       core.read(IDENTITY_MEMBERSHIP_CANDIDATE, request),
+    readMembershipCandidateSnapshotPage: (request: OrganizationReconciliationMysqlRawPageRequest) =>
+      core.read(IDENTITY_MEMBERSHIP_CANDIDATE_SNAPSHOT, request),
     readRoleShadowPage: (request: OrganizationReconciliationMysqlRawPageRequest) =>
       core.read(IDENTITY_ROLE_SHADOW, request),
+    readIamPolicyVersionPage: (request: OrganizationReconciliationMysqlRawPageRequest) =>
+      core.read(IDENTITY_IAM_POLICY_VERSION, request),
+    readIamRolePage: (request: OrganizationReconciliationMysqlRawPageRequest) =>
+      core.read(IDENTITY_IAM_ROLES, request),
+    readIamPermissionPage: (request: OrganizationReconciliationMysqlRawPageRequest) =>
+      core.read(IDENTITY_IAM_PERMISSIONS, request),
+    readIamItemRelationPage: (request: OrganizationReconciliationMysqlRawPageRequest) =>
+      core.read(IDENTITY_IAM_RELATIONS, request),
+    readIamSubjectAssignmentPage: (request: OrganizationReconciliationMysqlRawPageRequest) =>
+      core.read(IDENTITY_IAM_SUBJECT_ASSIGNMENTS, request),
+    readIamSubjectAssignmentSnapshotPage: (request: OrganizationReconciliationMysqlRawPageRequest) =>
+      core.read(IDENTITY_IAM_SUBJECT_ASSIGNMENT_SNAPSHOTS, request),
     close: (outcome: MysqlRepeatableReadSnapshotOutcome) => core.close(outcome)
   });
 }
@@ -757,17 +1036,60 @@ function twoPartStringParameters(
   return [cursor[0]!, cursor[0]!, cursor[1]!, pageSize];
 }
 
-function fourPartCandidateMembershipParameters(
+function fivePartCandidateMembershipParameters(
   cursor: readonly MysqlSnapshotParameter[],
   pageSize: number
 ): readonly MysqlSnapshotParameter[] {
-  requireCursorTuple(cursor, 4);
-  const [legacyUserId, legacyOrganizationId, identityUserId, identityOrganizationId] = cursor;
+  requireCursorTuple(cursor, 5);
+  const [legacyUserId, legacyOrganizationId, identityUserId, identityOrganizationId, operationKey] = cursor;
   return [
-    legacyUserId!, legacyUserId!, legacyOrganizationId!,
-    legacyUserId!, legacyOrganizationId!, identityUserId!,
-    legacyUserId!, legacyOrganizationId!, identityUserId!, identityOrganizationId!,
+    legacyUserId!, legacyOrganizationId!, identityUserId!, identityOrganizationId!, operationKey!,
     pageSize
+  ];
+}
+
+function pinnedPolicySingleKeyParameters(
+  cursor: readonly MysqlSnapshotParameter[],
+  pageSize: number
+): readonly MysqlSnapshotParameter[] {
+  requireCursorTuple(cursor, 1);
+  return [ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM, cursor[0]!, pageSize];
+}
+
+function pinnedPolicyTwoPartStringParameters(
+  cursor: readonly MysqlSnapshotParameter[],
+  pageSize: number
+): readonly MysqlSnapshotParameter[] {
+  requireCursorTuple(cursor, 2);
+  return [
+    ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM,
+    cursor[0]!, cursor[0]!, cursor[1]!, pageSize
+  ];
+}
+
+function pinnedPolicySubjectAssignmentParameters(
+  cursor: readonly MysqlSnapshotParameter[],
+  pageSize: number
+): readonly MysqlSnapshotParameter[] {
+  requireCursorTuple(cursor, 3);
+  const [legacyUserId, identityUserId, itemName] = cursor;
+  return [
+    ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM,
+    legacyUserId!, legacyUserId!, identityUserId!, legacyUserId!, identityUserId!, itemName!, pageSize
+  ];
+}
+
+function pinnedPolicySubjectAssignmentSnapshotParameters(
+  cursor: readonly MysqlSnapshotParameter[],
+  pageSize: number
+): readonly MysqlSnapshotParameter[] {
+  requireCursorTuple(cursor, 2);
+  const [legacyUserId, identityUserId] = cursor;
+  return [
+    ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM,
+    ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM,
+    ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM,
+    legacyUserId!, legacyUserId!, identityUserId!, pageSize
   ];
 }
 
@@ -821,47 +1143,70 @@ function decodeLegacyRbacEdge(candidate: unknown): Readonly<LegacyRbacEdgeMysqlR
   });
 }
 
+function decodeLegacyRbacItem(candidate: unknown): Readonly<LegacyRbacItemMysqlRawRecord> {
+  const row = exactRecord(candidate, ["name", "type", "description", "rule_name"]);
+  if (row.rule_name !== null) throw new Error("named Yii RBAC rules are unsupported");
+  return Object.freeze({
+    itemName: canonicalText(row.name, 255),
+    itemType: rbacItemType(row.type),
+    description: nullableCanonicalText(row.description, 65_535),
+    ruleName: null
+  });
+}
+
+function decodeLegacyRbacAssignment(candidate: unknown): Readonly<LegacyRbacAssignmentMysqlRawRecord> {
+  const row = exactRecord(candidate, ["user_id", "item_name", "type"]);
+  return Object.freeze({
+    legacyUserId: positiveId(row.user_id),
+    itemName: canonicalText(row.item_name, 255),
+    itemType: rbacItemType(row.type)
+  });
+}
+
 function decodeIdentitySubjectUniverse(candidate: unknown): Readonly<IdentitySubjectUniverseMysqlRawRecord> {
   const row = exactRecord(candidate, ["legacy_user_id", "status", "source"]);
   return Object.freeze({
     legacyUserId: positiveId(row.legacy_user_id),
-    status: canonicalText(row.status, 32),
-    source: canonicalText(row.source, 64)
+    status: identitySubjectStatus(row.status),
+    source: exactLiteral(row.source, "legacy-shadow")
   });
 }
 
 function decodeIdentityOrganizationCandidate(candidate: unknown): Readonly<IdentityOrganizationCandidateMysqlRawRecord> {
   const row = exactRecord(candidate, [
-    "legacy_organization_id", "identity_organization_id", "name", "title", "candidate_status"
+    "legacy_organization_id", "identity_organization_id", "name", "title", "source", "candidate_status"
   ]);
   return Object.freeze({
     legacyOrganizationId: positiveId(row.legacy_organization_id),
     identityOrganizationId: canonicalText(row.identity_organization_id, 128),
     name: organizationName(row.name),
     title: canonicalText(row.title, 255),
+    source: exactLiteral(row.source, "legacy"),
     candidateStatus: exactLiteral(row.candidate_status, "candidate")
   });
 }
 
 function decodeIdentityOrganizationIdMap(candidate: unknown): Readonly<IdentityOrganizationIdMapMysqlRawRecord> {
   const row = exactRecord(candidate, [
-    "legacy_organization_id", "identity_organization_id", "mapping_status"
+    "legacy_organization_id", "identity_organization_id", "source", "mapping_status"
   ]);
   return Object.freeze({
     legacyOrganizationId: positiveId(row.legacy_organization_id),
     identityOrganizationId: canonicalText(row.identity_organization_id, 128),
+    source: exactLiteral(row.source, "legacy"),
     mappingStatus: exactLiteral(row.mapping_status, "active")
   });
 }
 
 function decodeIdentityMembershipShadow(candidate: unknown): Readonly<IdentityOrganizationMembershipShadowMysqlRawRecord> {
   const row = exactRecord(candidate, [
-    "legacy_user_id", "organization_id", "organization_role", "status"
+    "legacy_user_id", "organization_id", "organization_role", "source", "status"
   ]);
   return Object.freeze({
     legacyUserId: positiveId(row.legacy_user_id),
     legacyOrganizationId: positiveId(row.organization_id),
     organizationRole: nullableCanonicalText(row.organization_role, 128),
+    source: exactLiteral(row.source, "legacy-shadow"),
     status: exactLiteral(row.status, "shadow")
   });
 }
@@ -869,7 +1214,7 @@ function decodeIdentityMembershipShadow(candidate: unknown): Readonly<IdentityOr
 function decodeIdentityMembershipCandidate(candidate: unknown): Readonly<IdentityOrganizationMembershipCandidateMysqlRawRecord> {
   const row = exactRecord(candidate, [
     "legacy_user_id", "legacy_organization_id", "identity_user_id", "identity_organization_id",
-    "organization_role", "candidate_status"
+    "organization_role", "source", "candidate_status", "operation_key"
   ]);
   return Object.freeze({
     legacyUserId: positiveId(row.legacy_user_id),
@@ -877,16 +1222,135 @@ function decodeIdentityMembershipCandidate(candidate: unknown): Readonly<Identit
     identityUserId: canonicalText(row.identity_user_id, 128),
     identityOrganizationId: canonicalText(row.identity_organization_id, 128),
     organizationRole: exactLiteral(row.organization_role, "member"),
-    candidateStatus: exactLiteral(row.candidate_status, "candidate")
+    source: exactLiteral(row.source, "legacy"),
+    candidateStatus: exactLiteral(row.candidate_status, "candidate"),
+    operationKey: canonicalText(row.operation_key, 160)
   });
 }
 
 function decodeIdentityRoleShadow(candidate: unknown): Readonly<IdentityRoleAssignmentShadowMysqlRawRecord> {
-  const row = exactRecord(candidate, ["legacy_user_id", "role_name", "status"]);
+  const row = exactRecord(candidate, ["legacy_user_id", "role_name", "source", "status"]);
   return Object.freeze({
     legacyUserId: positiveId(row.legacy_user_id),
     roleName: canonicalText(row.role_name, 128),
+    source: exactLiteral(row.source, "legacy-shadow"),
     status: exactLiteral(row.status, "shadow")
+  });
+}
+
+function decodeIdentityMembershipCandidateSnapshot(
+  candidate: unknown
+): Readonly<IdentityOrganizationMembershipCandidateSnapshotMysqlRawRecord> {
+  const row = exactRecord(candidate, [
+    "identity_user_id", "legacy_user_id", "operation_key", "organization_count", "source", "candidate_status"
+  ]);
+  return Object.freeze({
+    identityUserId: canonicalText(row.identity_user_id, 128),
+    legacyUserId: positiveId(row.legacy_user_id),
+    operationKey: canonicalText(row.operation_key, 160),
+    organizationCount: nonNegativeSafeInteger(row.organization_count),
+    source: exactLiteral(row.source, "legacy"),
+    candidateStatus: exactLiteral(row.candidate_status, "candidate")
+  });
+}
+
+function decodeIdentityIamPolicyVersion(candidate: unknown): Readonly<IdentityIamPolicyVersionMysqlRawRecord> {
+  const row = exactRecord(candidate, [
+    "checksum", "source", "status", "role_count", "permission_count", "relation_count"
+  ]);
+  return Object.freeze({
+    policyChecksum: exactLiteral(row.checksum, ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM),
+    source: exactLiteral(row.source, "legacy-import-candidate"),
+    status: exactLiteral(row.status, "candidate"),
+    roleCount: nonNegativeSafeInteger(row.role_count),
+    permissionCount: nonNegativeSafeInteger(row.permission_count),
+    relationCount: nonNegativeSafeInteger(row.relation_count)
+  });
+}
+
+function decodeIdentityIamRole(candidate: unknown): Readonly<IdentityIamNamedItemMysqlRawRecord> {
+  return decodeIdentityIamNamedItem(candidate, "role_name");
+}
+
+function decodeIdentityIamPermission(candidate: unknown): Readonly<IdentityIamNamedItemMysqlRawRecord> {
+  return decodeIdentityIamNamedItem(candidate, "permission_name");
+}
+
+function decodeIdentityIamNamedItem(
+  candidate: unknown,
+  nameColumn: "role_name" | "permission_name"
+): Readonly<IdentityIamNamedItemMysqlRawRecord> {
+  const row = exactRecord(candidate, ["policy_checksum", nameColumn, "description", "source", "status"]);
+  return Object.freeze({
+    policyChecksum: exactLiteral(
+      row.policy_checksum,
+      ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM
+    ),
+    itemName: canonicalText(row[nameColumn], 255),
+    description: nullableCanonicalText(row.description, 65_535),
+    source: exactLiteral(row.source, "legacy-import-candidate"),
+    status: exactLiteral(row.status, "candidate")
+  });
+}
+
+function decodeIdentityIamItemRelation(candidate: unknown): Readonly<IdentityIamItemRelationMysqlRawRecord> {
+  const row = exactRecord(candidate, [
+    "policy_checksum", "parent_name", "parent_type", "child_name", "child_type", "source", "status"
+  ]);
+  return Object.freeze({
+    policyChecksum: exactLiteral(
+      row.policy_checksum,
+      ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM
+    ),
+    parentName: canonicalText(row.parent_name, 255),
+    parentType: iamItemType(row.parent_type),
+    childName: canonicalText(row.child_name, 255),
+    childType: iamItemType(row.child_type),
+    source: exactLiteral(row.source, "legacy-import-candidate"),
+    status: exactLiteral(row.status, "candidate")
+  });
+}
+
+function decodeIdentityIamSubjectAssignment(
+  candidate: unknown
+): Readonly<IdentityIamSubjectAssignmentMysqlRawRecord> {
+  const row = exactRecord(candidate, [
+    "identity_user_id", "legacy_user_id", "item_name", "item_type", "policy_checksum", "source", "status"
+  ]);
+  return Object.freeze({
+    identityUserId: canonicalText(row.identity_user_id, 64),
+    legacyUserId: positiveId(row.legacy_user_id),
+    itemName: canonicalText(row.item_name, 255),
+    itemType: iamItemType(row.item_type),
+    policyChecksum: exactLiteral(
+      row.policy_checksum,
+      ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM
+    ),
+    source: exactLiteral(row.source, "legacy-import-candidate"),
+    status: exactLiteral(row.status, "candidate")
+  });
+}
+
+function decodeIdentityIamSubjectAssignmentSnapshot(
+  candidate: unknown
+): Readonly<IdentityIamSubjectAssignmentSnapshotMysqlRawRecord> {
+  const row = exactRecord(candidate, [
+    "identity_user_id", "legacy_user_id", "policy_checksum", "snapshot_key", "assignment_count", "source", "status"
+  ]);
+  return Object.freeze({
+    identityUserId: canonicalText(row.identity_user_id, 64),
+    legacyUserId: positiveId(row.legacy_user_id),
+    policyChecksum: exactLiteral(
+      row.policy_checksum,
+      ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM
+    ),
+    snapshotKey: exactLiteral(
+      row.snapshot_key,
+      ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM
+    ),
+    assignmentCount: nonNegativeSafeInteger(row.assignment_count),
+    source: exactLiteral(row.source, "legacy-import-candidate"),
+    status: exactLiteral(row.status, "candidate")
   });
 }
 
@@ -945,10 +1409,15 @@ function positiveId(value: unknown): string {
 }
 
 function nonNegativeSafeInteger(value: unknown): number {
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
-    throw new Error("invalid non-negative integer");
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return value;
+  if (typeof value === "bigint" && value >= 0n && value <= BigInt(Number.MAX_SAFE_INTEGER)) {
+    return Number(value);
   }
-  return value;
+  if (typeof value === "string" && /^(?:0|[1-9]\d*)$/.test(value)) {
+    const parsed = Number(value);
+    if (Number.isSafeInteger(parsed)) return parsed;
+  }
+  throw new Error("invalid non-negative integer");
 }
 
 function canonicalText(value: unknown, maxLength: number): string {
@@ -981,6 +1450,22 @@ function canonicalCursor(value: unknown): string {
 function exactLiteral<TLiteral extends string>(value: unknown, literal: TLiteral): TLiteral {
   if (value !== literal) throw new Error("unexpected row lifecycle state");
   return literal;
+}
+
+function rbacItemType(value: unknown): "role" | "permission" {
+  if (value === 1 || value === 1n || value === "1") return "role";
+  if (value === 2 || value === 2n || value === "2") return "permission";
+  throw new Error("invalid Yii RBAC item type");
+}
+
+function iamItemType(value: unknown): "role" | "permission" {
+  if (value === "role" || value === "permission") return value;
+  throw new Error("invalid Identity IAM item type");
+}
+
+function identitySubjectStatus(value: unknown): "active" | "inactive" {
+  if (value === "active" || value === "inactive") return value;
+  throw new Error("invalid Identity subject status");
 }
 
 function mysqlBoolean(value: unknown): boolean {

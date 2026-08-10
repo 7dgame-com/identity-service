@@ -434,11 +434,14 @@ cursor、精确 count/offset/order/unique key，并在成功、读取失败、�
 snapshot session、dataset-lineage collector，以及可交给 HSM/KMS 的 canonical attestation
 payload/signature 组装接口；外部 provenance verifier 本身不读取或持有 private key。
 
-当前 transaction-owned bridge 已实现固定 12 个 raw dataset：Legacy 5 个、Identity 6 个、plugin 1 个；
-Legacy 集合新增 `legacy-rbac-edge`，只读取源码已证明的 `auth_item_child(parent, child)` 关系事实，使用
-MySQL explicit binary keyset 与 Node UTF-8 byte order；这不批准 RBAC item/assignment selector，也不证明
-运行时 schema、collation 或物理 source。Identity 集合已包含 `identity-subject-universe` raw dataset 的
-读取实现与固定结构项。每个 component 在各自
+当前 Develop source-shape bridge 已实现 proposal 中固定的 21 个 raw dataset：Legacy 7 个、Identity 13 个、
+plugin 1 个。Legacy 在既有目录、主体、成员关系、role assignment 与 `legacy-rbac-edge` 基础上加入完整
+rule-free RBAC item/edge/direct role-or-permission assignment；任一 `rule_name IS NOT NULL` 都会 fail closed。
+Identity 加入 candidate membership explicit snapshot、精确 pinned Develop IAM policy version、role、permission、
+relation、subject assignment，以及由同一 read-only transaction 对完整 Identity subject universe 做 LEFT JOIN
+聚合得到的 explicit zero-assignment snapshot；没有为预检创建新表或执行 DDL。当前 Develop IAM checksum 只是
+源码固定的测试候选，不是 Production trust root。所有 text keyset 使用 MySQL explicit binary order 与 Node
+UTF-8 byte order；这仍不证明运行时 schema、collation、物理 source 或 owner semantic registry。每个 component 在各自
 独立的 repeatable-read transaction 内，按固定 dataset ID 集合与 caller-structured untrusted catalog 扫描。
 adapter 不再缓存完整 raw page 集合：每页通过 canonical transport 写入同一受限本地 spool，并增量计算
 page/dataset/component inventory；seal 后每次只从 spool 读取一个有界页回放。成功初始化后 spool 文件已
@@ -467,8 +470,12 @@ generic dataset-lineage 的 WeakMap brand 只证明 artifact 来自同一进程�
 它不认证物理 source、owner catalog 或外部 attestation。
 
 该 MySQL session 不接受运行时 SQL，只接受源码内 immutable statement ID/catalog，固定 keyset
-cursor 参数契约、Legacy RBAC `auth_item.type=1` 以及 Identity shadow 的
-`source=legacy-shadow/status=shadow`；policy/参数/查询失败都会 poison 当前 session，只能 rollback。
+cursor 参数契约、Legacy rule-free RBAC 与 Develop exact IAM checksum/source/status selectors；policy、参数、
+decoder、顺序或查询失败都会 poison 当前 session，只能 rollback。仓库另提供
+`iam:organization-reconciliation:develop-preflight:dist`：它只接受 `--environment=xrteeth-develop`，要求
+Identity database 为 `xrugc_identity_dev`，在三源固定 read-only snapshot 中读取 schema metadata、aggregate
+counts 与每个 dataset 的单行 strict-decoder probe，并只输出计数、检查 ID 与 SHA-256 摘要。该命令不做 DDL、
+不写数据、不翻 readiness，也不允许 main、publish、Production 或 tmrpp 目标。
 当前 semantic registry 的 compiled production table 故意为空，且不接受 argv、环境变量、JSON 或 evidence
 注入。Identity shadow/candidate owner selectors、organization role scopes、plugin overlay、campus public
 context 与 capability catalog 五项 owner decision 均未批准；Legacy/Identity 两侧独立 semantic projector、

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM,
   ORGANIZATION_RECONCILIATION_MYSQL_STATEMENTS,
   ORGANIZATION_RECONCILIATION_MYSQL_STATEMENT_CATALOG_SHA256,
   openMysqlRepeatableReadSnapshot,
@@ -8,9 +9,9 @@ import {
 
 const SET_REPEATABLE_READ = "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ";
 const START_READ_ONLY_SNAPSHOT = "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY";
-const DIRECTORY_STATEMENT_ID = "legacy-organization-directory-page/v1" as const;
+const DIRECTORY_STATEMENT_ID = "legacy-organization-directory-page/v3" as const;
 const DIRECTORY_SQL = ORGANIZATION_RECONCILIATION_MYSQL_STATEMENTS[DIRECTORY_STATEMENT_ID];
-const SUBJECT_STATEMENT_ID = "legacy-subject-universe-page/v1" as const;
+const SUBJECT_STATEMENT_ID = "legacy-subject-universe-page/v3" as const;
 const SUBJECT_SQL = ORGANIZATION_RECONCILIATION_MYSQL_STATEMENTS[SUBJECT_STATEMENT_ID];
 const RBAC_EDGE_STATEMENT_ID = "legacy-rbac-edge-page/v1" as const;
 const RBAC_EDGE_SQL =
@@ -139,11 +140,11 @@ describe("organization reconciliation MySQL repeatable-read snapshot", () => {
   });
 
   it("enumerates only Legacy RBAC role items and pins shadow ownership", () => {
-    expect(ORGANIZATION_RECONCILIATION_MYSQL_STATEMENTS["legacy-role-assignment-page/v1"])
+    expect(ORGANIZATION_RECONCILIATION_MYSQL_STATEMENTS["legacy-role-assignment-page/v3"])
       .toContain("INNER JOIN auth_item AS ai ON ai.name = aa.item_name AND ai.type = 1");
-    expect(ORGANIZATION_RECONCILIATION_MYSQL_STATEMENTS["identity-membership-shadow-page/v1"])
+    expect(ORGANIZATION_RECONCILIATION_MYSQL_STATEMENTS["identity-membership-shadow-page/v3"])
       .toContain("source = 'legacy-shadow' AND status = 'shadow'");
-    expect(ORGANIZATION_RECONCILIATION_MYSQL_STATEMENTS["identity-role-shadow-page/v1"])
+    expect(ORGANIZATION_RECONCILIATION_MYSQL_STATEMENTS["identity-role-shadow-page/v3"])
       .toContain("source = 'legacy-shadow' AND status = 'shadow'");
   });
 
@@ -163,16 +164,39 @@ describe("organization reconciliation MySQL repeatable-read snapshot", () => {
     ]);
   });
 
+  it("pins every Develop IAM statement to one exact policy checksum and read-only binary keysets", async () => {
+    const checksum = ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM;
+    const fake = fakeConnection();
+    const session = await openMysqlRepeatableReadSnapshot(async () => fake.connection);
+    await session.query("identity-iam-policy-version-page/v1", [checksum, "", 100]);
+    await session.query("identity-iam-role-page/v1", [checksum, "", 100]);
+    await session.query("identity-iam-permission-page/v1", [checksum, "", 100]);
+    await session.query("identity-iam-item-relation-page/v1", [checksum, "", "", "", 100]);
+    await session.query("identity-iam-subject-assignment-page/v1", [
+      checksum, 0, 0, "", 0, "", "", 100
+    ]);
+    await session.query("identity-iam-subject-assignment-snapshot-page/v1", [
+      checksum, checksum, checksum, 0, 0, "", 100
+    ]);
+    await session.close("completed");
+    expect(fake.queries.slice(2, -1).every(([statement]) => statement.startsWith("SELECT"))).toBe(true);
+    expect(fake.queries.slice(2, -1).every(([statement]) => statement.includes("legacy-import-candidate"))).toBe(true);
+    expect(fake.queries.at(-1)?.[0]).toBe("COMMIT");
+  });
+
   it.each([
     [DIRECTORY_STATEMENT_ID, [0]],
     [DIRECTORY_STATEMENT_ID, [0, 0]],
     [DIRECTORY_STATEMENT_ID, [0, 5_001]],
-    ["legacy-membership-page/v1", [1, 2, 0, 100]],
+    ["legacy-membership-page/v3", [1, 2, 0, 100]],
     [RBAC_EDGE_STATEMENT_ID, ["parent", "different-parent", "child", 100]],
     [RBAC_EDGE_STATEMENT_ID, ["parent", "parent", null, 100]],
     [RBAC_EDGE_STATEMENT_ID, ["p".repeat(65), "p".repeat(65), "child", 100]],
     [RBAC_EDGE_STATEMENT_ID, ["parent", "parent", "child"]],
-    ["identity-membership-candidate-page/v1", [1, 1, 2, 1, 3, "user-a", 1, 2, "user-a", "org-a", 100]],
+    ["identity-membership-candidate-page/v3", [1, 1, 2, 1, 3, "user-a", 1, 2, "user-a", "org-a", 100]],
+    ["identity-iam-policy-version-page/v1", ["0".repeat(64), "", 100]],
+    ["identity-iam-item-relation-page/v1", [ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM, "left", "right", "child", 100]],
+    ["identity-iam-subject-assignment-snapshot-page/v1", [ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM, ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM, "0".repeat(64), 0, 0, "", 100]],
     [DIRECTORY_STATEMENT_ID, [null, 100]],
     [DIRECTORY_STATEMENT_ID, [{ toSqlString: () => "SLEEP(10)" }, 100]],
     [DIRECTORY_STATEMENT_ID, [Number.NaN, 100]]

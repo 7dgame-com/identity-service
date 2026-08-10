@@ -11,36 +11,58 @@ const CLOSE_FAILURE = "Closing the read-only MySQL snapshot failed.";
 const CLOSED_FAILURE = "The read-only MySQL snapshot session is closed.";
 const SQL_POLICY_FAILURE = "The MySQL snapshot query is not an approved read-only statement.";
 
+/** Develop-only reviewed IAM candidate pin. It is not a production trust root. */
+export const ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM =
+  "a5d8ad00b1a5775e8c4bf40745f3ba2b623b4a7aa1704075fc2519d5ba1da532" as const;
+
 /**
  * Immutable statement catalog. Runtime callers select one reviewed ID and can
  * never provide SQL text, identifiers, functions, comments, or locking clauses.
  * Adding a statement is a source-reviewed protocol change.
  */
 export const ORGANIZATION_RECONCILIATION_MYSQL_STATEMENTS = Object.freeze({
-  "legacy-organization-directory-page/v1":
-    "SELECT id, name, title, created_at, updated_at FROM `organization` WHERE id > ? ORDER BY id ASC LIMIT ?",
-  "legacy-subject-universe-page/v1":
+  "legacy-organization-directory-page/v3":
+    "SELECT id, name, title, created_at, updated_at FROM organization WHERE id > ? ORDER BY id ASC LIMIT ?",
+  "legacy-subject-universe-page/v3":
     "SELECT id, status FROM `user` WHERE id > ? ORDER BY id ASC LIMIT ?",
-  "legacy-membership-page/v1":
+  "legacy-membership-page/v3":
     "SELECT user_id, organization_id FROM user_organization WHERE (user_id > ?) OR (user_id = ? AND organization_id > ?) ORDER BY user_id ASC, organization_id ASC LIMIT ?",
-  "legacy-role-assignment-page/v1":
-    "SELECT aa.user_id, aa.item_name FROM auth_assignment AS aa INNER JOIN auth_item AS ai ON ai.name = aa.item_name AND ai.type = 1 WHERE (aa.user_id > ?) OR (aa.user_id = ? AND aa.item_name > ?) ORDER BY aa.user_id ASC, aa.item_name ASC LIMIT ?",
+  "legacy-role-assignment-page/v3":
+    "SELECT u.id AS user_id, aa.item_name FROM auth_assignment AS aa INNER JOIN `user` AS u ON aa.user_id = CAST(u.id AS CHAR) INNER JOIN auth_item AS ai ON ai.name = aa.item_name AND ai.type = 1 WHERE (u.id > ?) OR (u.id = ? AND CAST(aa.item_name AS BINARY) > CAST(? AS BINARY)) ORDER BY u.id ASC, CAST(aa.item_name AS BINARY) ASC LIMIT ?",
   "legacy-rbac-edge-page/v1":
     "SELECT parent, child FROM auth_item_child WHERE (CAST(parent AS BINARY) > CAST(? AS BINARY)) OR (CAST(parent AS BINARY) = CAST(? AS BINARY) AND CAST(child AS BINARY) > CAST(? AS BINARY)) ORDER BY CAST(parent AS BINARY) ASC, CAST(child AS BINARY) ASC LIMIT ?",
-  "identity-subject-universe-page/v1":
-    "SELECT legacy_user_id, status, source FROM identity_users WHERE legacy_user_id IS NOT NULL AND legacy_user_id > ? ORDER BY legacy_user_id ASC LIMIT ?",
-  "identity-organization-candidate-page/v1":
-    "SELECT legacy_organization_id, identity_organization_id, name, title, candidate_status FROM identity_organizations_candidate WHERE legacy_organization_id > ? ORDER BY legacy_organization_id ASC LIMIT ?",
-  "identity-organization-id-map-page/v1":
-    "SELECT legacy_organization_id, identity_organization_id, mapping_status FROM identity_organization_id_map WHERE legacy_organization_id > ? ORDER BY legacy_organization_id ASC LIMIT ?",
-  "identity-membership-shadow-page/v1":
-    "SELECT legacy_user_id, organization_id, organization_role, status FROM identity_organization_memberships_shadow WHERE source = 'legacy-shadow' AND status = 'shadow' AND ((legacy_user_id > ?) OR (legacy_user_id = ? AND organization_id > ?)) ORDER BY legacy_user_id ASC, organization_id ASC LIMIT ?",
-  "identity-membership-candidate-page/v1":
-    "SELECT legacy_user_id, legacy_organization_id, identity_user_id, identity_organization_id, organization_role, candidate_status FROM identity_organization_memberships_candidate WHERE (legacy_user_id > ?) OR (legacy_user_id = ? AND legacy_organization_id > ?) OR (legacy_user_id = ? AND legacy_organization_id = ? AND identity_user_id > ?) OR (legacy_user_id = ? AND legacy_organization_id = ? AND identity_user_id = ? AND identity_organization_id > ?) ORDER BY legacy_user_id ASC, legacy_organization_id ASC, identity_user_id ASC, identity_organization_id ASC LIMIT ?",
-  "identity-role-shadow-page/v1":
-    "SELECT legacy_user_id, role_name, status FROM identity_role_assignments_shadow WHERE source = 'legacy-shadow' AND status = 'shadow' AND ((legacy_user_id > ?) OR (legacy_user_id = ? AND role_name > ?)) ORDER BY legacy_user_id ASC, role_name ASC LIMIT ?",
-  "plugin-registry-page/v1":
-    "SELECT id, enabled, access_scope, organization_name FROM plugins WHERE id > ? ORDER BY id ASC LIMIT ?"
+  "legacy-rbac-item-page/v1":
+    "SELECT name, type, description, rule_name FROM auth_item WHERE type IN (1, 2) AND CAST(name AS BINARY) > CAST(? AS BINARY) ORDER BY CAST(name AS BINARY) ASC LIMIT ?",
+  "legacy-rbac-assignment-page/v1":
+    "SELECT u.id AS user_id, aa.item_name, ai.type FROM auth_assignment AS aa INNER JOIN `user` AS u ON aa.user_id = CAST(u.id AS CHAR) INNER JOIN auth_item AS ai ON ai.name = aa.item_name AND ai.type IN (1, 2) WHERE (u.id > ?) OR (u.id = ? AND CAST(aa.item_name AS BINARY) > CAST(? AS BINARY)) ORDER BY u.id ASC, CAST(aa.item_name AS BINARY) ASC LIMIT ?",
+  "identity-subject-universe-page/v3":
+    "SELECT legacy_user_id, status, source FROM identity_users WHERE legacy_user_id IS NOT NULL AND source = 'legacy-shadow' AND status IN ('active', 'inactive') AND legacy_user_id > ? ORDER BY legacy_user_id ASC LIMIT ?",
+  "identity-organization-candidate-page/v3":
+    "SELECT legacy_organization_id, identity_organization_id, name, title, source, candidate_status FROM identity_organizations_candidate WHERE source = 'legacy' AND candidate_status = 'candidate' AND legacy_organization_id > ? ORDER BY legacy_organization_id ASC LIMIT ?",
+  "identity-organization-id-map-page/v3":
+    "SELECT legacy_organization_id, identity_organization_id, source, mapping_status FROM identity_organization_id_map WHERE source = 'legacy' AND mapping_status = 'active' AND legacy_organization_id > ? ORDER BY legacy_organization_id ASC LIMIT ?",
+  "identity-membership-shadow-page/v3":
+    "SELECT legacy_user_id, organization_id, organization_role, source, status FROM identity_organization_memberships_shadow WHERE source = 'legacy-shadow' AND status = 'shadow' AND ((legacy_user_id > ?) OR (legacy_user_id = ? AND organization_id > ?)) ORDER BY legacy_user_id ASC, organization_id ASC LIMIT ?",
+  "identity-membership-candidate-page/v3":
+    "SELECT legacy_user_id, legacy_organization_id, identity_user_id, identity_organization_id, organization_role, source, candidate_status, operation_key FROM identity_organization_memberships_candidate WHERE source = 'legacy' AND candidate_status = 'candidate' AND (legacy_user_id, legacy_organization_id, CAST(identity_user_id AS BINARY), CAST(identity_organization_id AS BINARY), CAST(operation_key AS BINARY)) > (?, ?, CAST(? AS BINARY), CAST(? AS BINARY), CAST(? AS BINARY)) ORDER BY legacy_user_id ASC, legacy_organization_id ASC, CAST(identity_user_id AS BINARY) ASC, CAST(identity_organization_id AS BINARY) ASC, CAST(operation_key AS BINARY) ASC LIMIT ?",
+  "identity-membership-candidate-snapshot-page/v1":
+    "SELECT identity_user_id, legacy_user_id, operation_key, organization_count, source, candidate_status FROM identity_organization_membership_snapshots WHERE source = 'legacy' AND candidate_status = 'candidate' AND ((legacy_user_id > ?) OR (legacy_user_id = ? AND CAST(operation_key AS BINARY) > CAST(? AS BINARY))) ORDER BY legacy_user_id ASC, CAST(operation_key AS BINARY) ASC LIMIT ?",
+  "identity-role-shadow-page/v3":
+    "SELECT legacy_user_id, role_name, source, status FROM identity_role_assignments_shadow WHERE source = 'legacy-shadow' AND status = 'shadow' AND ((legacy_user_id > ?) OR (legacy_user_id = ? AND CAST(role_name AS BINARY) > CAST(? AS BINARY))) ORDER BY legacy_user_id ASC, CAST(role_name AS BINARY) ASC LIMIT ?",
+  "identity-iam-policy-version-page/v1":
+    "SELECT checksum, source, status, role_count, permission_count, relation_count FROM identity_iam_policy_versions WHERE checksum = ? AND source = 'legacy-import-candidate' AND status = 'candidate' AND CAST(checksum AS BINARY) > CAST(? AS BINARY) ORDER BY CAST(checksum AS BINARY) ASC LIMIT ?",
+  "identity-iam-role-page/v1":
+    "SELECT policy_checksum, role_name, description, source, status FROM identity_iam_roles WHERE policy_checksum = ? AND source = 'legacy-import-candidate' AND status = 'candidate' AND CAST(role_name AS BINARY) > CAST(? AS BINARY) ORDER BY CAST(role_name AS BINARY) ASC LIMIT ?",
+  "identity-iam-permission-page/v1":
+    "SELECT policy_checksum, permission_name, description, source, status FROM identity_iam_permissions WHERE policy_checksum = ? AND source = 'legacy-import-candidate' AND status = 'candidate' AND CAST(permission_name AS BINARY) > CAST(? AS BINARY) ORDER BY CAST(permission_name AS BINARY) ASC LIMIT ?",
+  "identity-iam-item-relation-page/v1":
+    "SELECT policy_checksum, parent_name, parent_type, child_name, child_type, source, status FROM identity_iam_item_relations WHERE policy_checksum = ? AND source = 'legacy-import-candidate' AND status = 'candidate' AND ((CAST(parent_name AS BINARY) > CAST(? AS BINARY)) OR (CAST(parent_name AS BINARY) = CAST(? AS BINARY) AND CAST(child_name AS BINARY) > CAST(? AS BINARY))) ORDER BY CAST(parent_name AS BINARY) ASC, CAST(child_name AS BINARY) ASC LIMIT ?",
+  "identity-iam-subject-assignment-page/v1":
+    "SELECT identity_user_id, legacy_user_id, item_name, item_type, policy_checksum, source, status FROM identity_iam_subject_assignments WHERE policy_checksum = ? AND source = 'legacy-import-candidate' AND status = 'candidate' AND legacy_user_id IS NOT NULL AND ((legacy_user_id > ?) OR (legacy_user_id = ? AND CAST(identity_user_id AS BINARY) > CAST(? AS BINARY)) OR (legacy_user_id = ? AND CAST(identity_user_id AS BINARY) = CAST(? AS BINARY) AND CAST(item_name AS BINARY) > CAST(? AS BINARY))) ORDER BY legacy_user_id ASC, CAST(identity_user_id AS BINARY) ASC, CAST(item_name AS BINARY) ASC LIMIT ?",
+  "identity-iam-subject-assignment-snapshot-page/v1":
+    "SELECT iu.id AS identity_user_id, iu.legacy_user_id, ? AS policy_checksum, ? AS snapshot_key, COUNT(isa.id) AS assignment_count, 'legacy-import-candidate' AS source, 'candidate' AS status FROM identity_users AS iu LEFT JOIN identity_iam_subject_assignments AS isa ON isa.identity_user_id = iu.id AND isa.legacy_user_id = iu.legacy_user_id AND isa.policy_checksum = ? AND isa.source = 'legacy-import-candidate' AND isa.status = 'candidate' WHERE iu.source = 'legacy-shadow' AND iu.status IN ('active', 'inactive') AND iu.legacy_user_id IS NOT NULL AND ((iu.legacy_user_id > ?) OR (iu.legacy_user_id = ? AND CAST(iu.id AS BINARY) > CAST(? AS BINARY))) GROUP BY iu.id, iu.legacy_user_id ORDER BY iu.legacy_user_id ASC, CAST(iu.id AS BINARY) ASC LIMIT ?",
+  "plugin-registry-page/v3":
+    "SELECT id, enabled, access_scope, organization_name FROM plugins WHERE CAST(id AS BINARY) > CAST(? AS BINARY) ORDER BY CAST(id AS BINARY) ASC LIMIT ?"
 } as const);
 
 export type OrganizationReconciliationMysqlStatementId =
@@ -198,20 +220,20 @@ function resolveReviewedStatement(
   }
   const cursorParameters = parameters.slice(0, -1);
   switch (statementId) {
-    case "legacy-organization-directory-page/v1":
-    case "legacy-subject-universe-page/v1":
-    case "identity-subject-universe-page/v1":
-    case "identity-organization-candidate-page/v1":
-    case "identity-organization-id-map-page/v1":
+    case "legacy-organization-directory-page/v3":
+    case "legacy-subject-universe-page/v3":
+    case "identity-subject-universe-page/v3":
+    case "identity-organization-candidate-page/v3":
+    case "identity-organization-id-map-page/v3":
       requireNonNegativeId(cursorParameters[0]);
       break;
-    case "legacy-membership-page/v1":
-    case "identity-membership-shadow-page/v1":
+    case "legacy-membership-page/v3":
+    case "identity-membership-shadow-page/v3":
       requireRepeatedNonNegativeId(cursorParameters[0], cursorParameters[1]);
       requireNonNegativeId(cursorParameters[2]);
       break;
-    case "legacy-role-assignment-page/v1":
-    case "identity-role-shadow-page/v1":
+    case "legacy-role-assignment-page/v3":
+    case "identity-role-shadow-page/v3":
       requireRepeatedNonNegativeId(cursorParameters[0], cursorParameters[1]);
       requireCanonicalCursor(cursorParameters[2]);
       break;
@@ -222,31 +244,70 @@ function resolveReviewedStatement(
       );
       requireCanonicalCursor(cursorParameters[2], 64);
       break;
-    case "identity-membership-candidate-page/v1":
-      requireRepeatedValues([
-        cursorParameters[0],
-        cursorParameters[1],
-        cursorParameters[3],
-        cursorParameters[6]
-      ], requireNonNegativeId);
-      requireRepeatedValues([
-        cursorParameters[2],
-        cursorParameters[4],
-        cursorParameters[7]
-      ], requireNonNegativeId);
-      requireRepeatedValues([
-        cursorParameters[5],
-        cursorParameters[8]
-      ], requireCanonicalCursor);
-      requireCanonicalCursor(cursorParameters[9]);
+    case "legacy-rbac-item-page/v1":
+      requireCanonicalCursor(cursorParameters[0], 255);
       break;
-    case "plugin-registry-page/v1":
+    case "legacy-rbac-assignment-page/v1":
+      requireRepeatedNonNegativeId(cursorParameters[0], cursorParameters[1]);
+      requireCanonicalCursor(cursorParameters[2], 255);
+      break;
+    case "identity-membership-candidate-page/v3":
+      requireNonNegativeId(cursorParameters[0]);
+      requireNonNegativeId(cursorParameters[1]);
+      requireCanonicalCursor(cursorParameters[2], 128);
+      requireCanonicalCursor(cursorParameters[3], 128);
+      requireCanonicalCursor(cursorParameters[4], 160);
+      break;
+    case "identity-membership-candidate-snapshot-page/v1":
+      requireRepeatedNonNegativeId(cursorParameters[0], cursorParameters[1]);
+      requireCanonicalCursor(cursorParameters[2], 160);
+      break;
+    case "identity-iam-policy-version-page/v1":
+    case "identity-iam-role-page/v1":
+    case "identity-iam-permission-page/v1":
+      requireDevelopPolicyChecksum(cursorParameters[0]);
+      requireCanonicalCursor(cursorParameters[1], 255);
+      break;
+    case "identity-iam-item-relation-page/v1":
+      requireDevelopPolicyChecksum(cursorParameters[0]);
+      requireRepeatedValues(
+        [cursorParameters[1], cursorParameters[2]],
+        (value) => requireCanonicalCursor(value, 255)
+      );
+      requireCanonicalCursor(cursorParameters[3], 255);
+      break;
+    case "identity-iam-subject-assignment-page/v1":
+      requireDevelopPolicyChecksum(cursorParameters[0]);
+      requireRepeatedValues(
+        [cursorParameters[1], cursorParameters[2], cursorParameters[4]],
+        requireNonNegativeId
+      );
+      requireRepeatedValues(
+        [cursorParameters[3], cursorParameters[5]],
+        (value) => requireCanonicalCursor(value, 64)
+      );
+      requireCanonicalCursor(cursorParameters[6], 255);
+      break;
+    case "identity-iam-subject-assignment-snapshot-page/v1":
+      requireDevelopPolicyChecksum(cursorParameters[0]);
+      requireDevelopPolicyChecksum(cursorParameters[1]);
+      requireDevelopPolicyChecksum(cursorParameters[2]);
+      requireRepeatedNonNegativeId(cursorParameters[3], cursorParameters[4]);
+      requireCanonicalCursor(cursorParameters[5], 64);
+      break;
+    case "plugin-registry-page/v3":
       requireCanonicalCursor(cursorParameters[0]);
       break;
     default:
       throw new Error(SQL_POLICY_FAILURE);
   }
   return sql;
+}
+
+function requireDevelopPolicyChecksum(value: MysqlSnapshotParameter | undefined): void {
+  if (value !== ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM) {
+    throw new Error(SQL_POLICY_FAILURE);
+  }
 }
 
 function requireRepeatedNonNegativeId(left: MysqlSnapshotParameter | undefined, right: MysqlSnapshotParameter | undefined): void {

@@ -15,6 +15,7 @@ import {
   organizationReconciliationMysqlTransactionDatasetAdapterReadiness
 } from "../src/iam-organization-reconciliation/mysql-source-adapters/transaction-dataset-adapter.js";
 import {
+  ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM,
   ORGANIZATION_RECONCILIATION_MYSQL_STATEMENTS,
   type MysqlRepeatableReadSnapshotConnection,
   type OrganizationReconciliationMysqlStatementId
@@ -27,7 +28,9 @@ const NONCE = "0123456789abcdef0123456789abcdef";
 const LEGACY_DATASET_IDS = [
   "legacy-membership",
   "legacy-organization-directory",
+  "legacy-rbac-assignment",
   "legacy-rbac-edge",
+  "legacy-rbac-item",
   "legacy-role-assignment",
   "legacy-subject-universe"
 ] as const;
@@ -143,8 +146,11 @@ describe("transaction-owned organization reconciliation dataset adapter", () => 
     const plugin = fakeConnection(pluginRows());
     const legacyCatalog = catalog(LEGACY_DATASET_IDS);
     const identityCatalog = catalog([
-      "identity-membership-candidate", "identity-membership-shadow", "identity-organization-candidate",
-      "identity-organization-id-map", "identity-role-shadow", "identity-subject-universe"
+      "identity-iam-item-relation", "identity-iam-permission", "identity-iam-policy-version",
+      "identity-iam-role", "identity-iam-subject-assignment", "identity-iam-subject-assignment-snapshot",
+      "identity-membership-candidate", "identity-membership-candidate-snapshot", "identity-membership-shadow",
+      "identity-organization-candidate", "identity-organization-id-map", "identity-role-shadow",
+      "identity-subject-universe"
     ]);
     const pluginCatalog = catalog(["plugin-registry"]);
     const adapters = [
@@ -172,13 +178,16 @@ describe("transaction-owned organization reconciliation dataset adapter", () => 
       clock: { now: () => new Date(Date.UTC(2026, 7, 9, 8, 0, 0, tick++)) }
     });
 
-    expect(run.artifacts).toHaveLength(12);
+    expect(run.artifacts).toHaveLength(21);
     expect(run.artifacts.map((artifact) => artifact.datasetId)).toEqual([
       ...LEGACY_DATASET_IDS,
-      "identity-membership-candidate", "identity-membership-shadow", "identity-organization-candidate",
-      "identity-organization-id-map", "identity-role-shadow", "identity-subject-universe", "plugin-registry"
+      "identity-iam-item-relation", "identity-iam-permission", "identity-iam-policy-version",
+      "identity-iam-role", "identity-iam-subject-assignment", "identity-iam-subject-assignment-snapshot",
+      "identity-membership-candidate", "identity-membership-candidate-snapshot", "identity-membership-shadow",
+      "identity-organization-candidate", "identity-organization-id-map", "identity-role-shadow",
+      "identity-subject-universe", "plugin-registry"
     ]);
-    expect(run.coordinatorManifest.components.map((component) => component.recordCount)).toEqual([5, 6, 1]);
+    expect(run.coordinatorManifest.components.map((component) => component.recordCount)).toEqual([7, 13, 1]);
     expect(run.artifacts.find((artifact) => artifact.datasetId === "legacy-rbac-edge")?.records)
       .toEqual([{ parentName: "root", childName: "organization.update" }]);
     for (const fake of [legacy, identity, plugin]) {
@@ -201,7 +210,7 @@ describe("transaction-owned organization reconciliation dataset adapter", () => 
     const firstSnapshot = await firstAdapter.openSnapshot();
     expect(firstSnapshot.sourceVersion).toMatch(/^[a-f0-9]{64}$/);
     expect(firstSnapshot.snapshotId).toMatch(/^[a-f0-9]{64}$/);
-    expect(firstSnapshot.datasetInventory).toMatchObject({ recordCount: 5, catalogSha256: DIGEST_A });
+    expect(firstSnapshot.datasetInventory).toMatchObject({ recordCount: 7, catalogSha256: DIGEST_A });
     const partialClose = firstAdapter.closeSnapshot(firstSnapshot, "completed");
     await expect(partialClose)
       .rejects.toThrow("not consumed completely");
@@ -279,7 +288,7 @@ describe("transaction-owned organization reconciliation dataset adapter", () => 
   it("clears the factory key on scan failure and still surfaces raw-close failures", async () => {
     const legacyCatalog = catalog(LEGACY_DATASET_IDS);
     const invalidRows = legacyRows();
-    invalidRows["legacy-membership-page/v1"] = [[{ user_id: 0, organization_id: 1 }]];
+    invalidRows["legacy-membership-page/v3"] = [[{ user_id: 0, organization_id: 1 }]];
     const scanFake = fakeConnection(invalidRows);
     const scanAdapter = createOrganizationReconciliationMysqlTransactionDatasetAdapter({
       componentId: "legacy-main", expectedSourceId: "legacy-db", connectionFactory: scanFake.factory,
@@ -519,40 +528,82 @@ function catalog(datasetIds: readonly string[]): OrganizationReconciliationDatas
 
 function legacyRows(): Partial<Record<OrganizationReconciliationMysqlStatementId, readonly unknown[][]>> {
   return {
-    "legacy-membership-page/v1": [[{ user_id: 1, organization_id: 1 }]],
-    "legacy-organization-directory-page/v1": [[{
+    "legacy-membership-page/v3": [[{ user_id: 1, organization_id: 1 }]],
+    "legacy-organization-directory-page/v3": [[{
       id: 1, name: "root", title: "Root", created_at: 1, updated_at: 1
     }]],
     "legacy-rbac-edge-page/v1": [[{ parent: "root", child: "organization.update" }]],
-    "legacy-role-assignment-page/v1": [[{ user_id: 1, item_name: "root" }]],
-    "legacy-subject-universe-page/v1": [[{ id: 1, status: 10 }]]
+    "legacy-rbac-item-page/v1": [[{
+      name: "root", type: 1, description: "root role", rule_name: null
+    }]],
+    "legacy-rbac-assignment-page/v1": [[{ user_id: 1, item_name: "root", type: 1 }]],
+    "legacy-role-assignment-page/v3": [[{ user_id: 1, item_name: "root" }]],
+    "legacy-subject-universe-page/v3": [[{ id: 1, status: 10 }]]
   };
 }
 
 function identityRows(): Partial<Record<OrganizationReconciliationMysqlStatementId, readonly unknown[][]>> {
   return {
-    "identity-membership-candidate-page/v1": [[{
+    "identity-iam-item-relation-page/v1": [[{
+      policy_checksum: ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM,
+      parent_name: "root", parent_type: "role", child_name: "organization.update",
+      child_type: "permission", source: "legacy-import-candidate", status: "candidate"
+    }]],
+    "identity-iam-permission-page/v1": [[{
+      policy_checksum: ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM,
+      permission_name: "organization.update", description: null,
+      source: "legacy-import-candidate", status: "candidate"
+    }]],
+    "identity-iam-policy-version-page/v1": [[{
+      checksum: ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM,
+      source: "legacy-import-candidate", status: "candidate",
+      role_count: 1, permission_count: 1, relation_count: 1
+    }]],
+    "identity-iam-role-page/v1": [[{
+      policy_checksum: ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM,
+      role_name: "root", description: null, source: "legacy-import-candidate", status: "candidate"
+    }]],
+    "identity-iam-subject-assignment-page/v1": [[{
+      identity_user_id: "legacy:1", legacy_user_id: 1, item_name: "root", item_type: "role",
+      policy_checksum: ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM,
+      source: "legacy-import-candidate", status: "candidate"
+    }]],
+    "identity-iam-subject-assignment-snapshot-page/v1": [[{
+      identity_user_id: "legacy:1", legacy_user_id: 1,
+      policy_checksum: ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM,
+      snapshot_key: ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM,
+      assignment_count: 1, source: "legacy-import-candidate", status: "candidate"
+    }]],
+    "identity-membership-candidate-page/v3": [[{
       legacy_user_id: 1, legacy_organization_id: 1, identity_user_id: "legacy:1",
-      identity_organization_id: "legacy:1", organization_role: "member", candidate_status: "candidate"
+      identity_organization_id: "legacy:1", organization_role: "member", source: "legacy",
+      candidate_status: "candidate", operation_key: "operation-1"
     }]],
-    "identity-membership-shadow-page/v1": [[{
-      legacy_user_id: 1, organization_id: 1, organization_role: "member", status: "shadow"
+    "identity-membership-candidate-snapshot-page/v1": [[{
+      identity_user_id: "legacy:1", legacy_user_id: 1, operation_key: "operation-1",
+      organization_count: 1, source: "legacy", candidate_status: "candidate"
     }]],
-    "identity-organization-candidate-page/v1": [[{
+    "identity-membership-shadow-page/v3": [[{
+      legacy_user_id: 1, organization_id: 1, organization_role: "member",
+      source: "legacy-shadow", status: "shadow"
+    }]],
+    "identity-organization-candidate-page/v3": [[{
       legacy_organization_id: 1, identity_organization_id: "legacy:1", name: "root", title: "Root",
-      candidate_status: "candidate"
+      source: "legacy", candidate_status: "candidate"
     }]],
-    "identity-organization-id-map-page/v1": [[{
-      legacy_organization_id: 1, identity_organization_id: "legacy:1", mapping_status: "active"
+    "identity-organization-id-map-page/v3": [[{
+      legacy_organization_id: 1, identity_organization_id: "legacy:1", source: "legacy", mapping_status: "active"
     }]],
-    "identity-role-shadow-page/v1": [[{ legacy_user_id: 1, role_name: "root", status: "shadow" }]],
-    "identity-subject-universe-page/v1": [[{ legacy_user_id: 1, status: "active", source: "legacy-shadow" }]]
+    "identity-role-shadow-page/v3": [[{
+      legacy_user_id: 1, role_name: "root", source: "legacy-shadow", status: "shadow"
+    }]],
+    "identity-subject-universe-page/v3": [[{ legacy_user_id: 1, status: "active", source: "legacy-shadow" }]]
   };
 }
 
 function pluginRows(): Partial<Record<OrganizationReconciliationMysqlStatementId, readonly unknown[][]>> {
   return {
-    "plugin-registry-page/v1": [[{
+    "plugin-registry-page/v3": [[{
       id: "system-admin", enabled: 1, access_scope: "root-only", organization_name: null
     }]]
   };
