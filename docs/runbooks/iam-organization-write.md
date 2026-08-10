@@ -589,7 +589,13 @@ cursor 参数契约、Legacy rule-free RBAC 与 Develop exact IAM checksum/sourc
 decoder、顺序或查询失败都会 poison 当前 session，只能 rollback。仓库另提供
 `iam:organization-reconciliation:develop-preflight:dist`：它只接受 `--environment=xrteeth-develop`，要求
 Identity database 为 `xrugc_identity_dev`，在三源固定 read-only snapshot 中读取 schema metadata、aggregate
-counts 与每个 dataset 的单行 strict-decoder probe，并只输出计数、检查 ID 与 SHA-256 摘要。v2 preflight
+counts 与每个 dataset 的单行 strict-decoder probe，并只输出计数、检查 ID 与 SHA-256 摘要。v3 preflight
+还在每个已连接 session 上执行 `SHOW GRANTS FOR CURRENT_USER()`：只接受精确 Develop schema 或固定表的
+`SELECT`（可附带 `SHOW VIEW`）及全局 `USAGE`，拒绝全局 SELECT、角色间接授权、写/DDL 权限、未知 scope
+和 `WITH GRANT OPTION`；公开报告只保留 grant-set digest 与通过布尔值，不回显账号或 grant 文本。它同时
+要求 `DATABASE()` 精确为 `bujiaban`、`xrugc_identity_dev`、`bujiaban_plugin`，并要求 MySQL
+`CURRENT_USER()` 解析出的账号精确等于对应专用配置用户名，防止凭据被接到同形异库或被数据库映射为另一授权身份。
+preflight
 会在进程内比较完整 Legacy subject ID 集合与选中的 Identity legacy-shadow 集合，但公开报告只输出
 Legacy/Identity 总数、缺失数与额外数，不输出主体 ID；通过条件是每个 Legacy 主体均已在 Identity 中出现，
 Identity-only 主体只作为额外集合单列，不能静默并入 Legacy 决策宇宙。Legacy RBAC 的 named-rule 门禁只检查
@@ -598,10 +604,15 @@ Identity-only 主体只作为额外集合单列，不能静默并入 Legacy 决�
 membership snapshot 完整性同样以 Legacy 主体集合为边界：每个 Legacy 主体必须恰有一条 candidate snapshot
 （包含显式 `organization_count=0`），Identity-only 主体不得被用来扩大或补足迁移集合。
 
-plugin source 必须使用显式 `PLUGIN_DB_HOST/PORT/NAME/USER/PASSWORD`；`PLUGIN_DB_NAME` 固定为
-`bujiaban_plugin`，并拒绝与 Legacy 相同的数据库用户名。不得以 system-admin 的运行账号或 Legacy 账号作为
-替代。该配置只表示 dedicated credential 的 fail-closed 输入，仍须由 Develop DBA/运维证据证明该账号只有
-目标 schema 的 `SELECT`/`USAGE`，本地代码不会把用户名不同误称为物理只读授权。实际 plugin access scope
+三源均必须使用 reconciliation 专用只读身份：Legacy 使用
+`IDENTITY_IAM_ORG_RECONCILIATION_LEGACY_DB_USER/PASSWORD`，Identity 使用
+`IDENTITY_IAM_ORG_RECONCILIATION_IDENTITY_DB_USER/PASSWORD`，plugin 使用显式
+`PLUGIN_DB_HOST/PORT/NAME/USER/PASSWORD`，其中 `PLUGIN_DB_NAME` 固定为 `bujiaban_plugin`。三个用户名必须
+互不相同，并且不得等于 Legacy/Identity 服务运行账号；不得以 system-admin 运行账号作为替代。
+用户名不同只完成配置门禁；只有实际 Develop v3 preflight 的
+`databaseBindingPassed=true`（数据库名与 session 授权账号均精确）、`readOnlyGrantPassed=true` 和 grant digest
+才构成当前 session 的只读证据。
+实际 plugin access scope
 枚举为 `auth-only`、`manager-only`、`admin-only`、`root-only`；这与 subject role/projector 的
 `root/admin/manager/user` 是两层不同契约，禁止直接混用。
 

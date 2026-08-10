@@ -15,11 +15,13 @@ export const organizationReconciliationDevelopPreflightHelp = `Usage:
   npm run iam:organization-reconciliation:develop-preflight -- --environment=xrteeth-develop
 
 This command is restricted to xrteeth Develop. It opens only fixed read-only
-MySQL snapshots, executes compiled schema/count probes and one-row strict
-decoder probes, and prints a sanitized JSON report. It performs no DDL or
+MySQL snapshots, verifies exact database bindings and current-user read-only
+grants, executes compiled schema/count probes and one-row strict decoder
+probes, and prints a sanitized JSON report. It performs no DDL or
 write, never enables reconciliation/runtime readiness, and never targets
-main, publish, Production, or tmrpp. The plugin source requires a dedicated
-PLUGIN_DB_* read-only credential; Legacy DB credentials are never reused.
+main, publish, Production, or tmrpp. Legacy, Identity, and plugin sources each
+require a distinct dedicated read-only credential; service credentials are
+never reused.
 `;
 
 export interface OrganizationReconciliationDevelopPreflightCliIo {
@@ -46,11 +48,16 @@ export async function runOrganizationReconciliationDevelopPreflightCli(
 
   try {
     const config = loadConfig(env);
-    const pluginDb = validateDevelopDatabaseConfiguration(config, env);
+    const databases = validateDevelopDatabaseConfiguration(config, env);
     const report = await runOrganizationReconciliationDevelopSourcePreflight({
-      legacyConnectionFactory: connectionFactory(config.legacyDb),
-      identityConnectionFactory: connectionFactory(config.identityDb),
-      pluginConnectionFactory: connectionFactory(pluginDb),
+      legacyConnectionFactory: connectionFactory(databases.legacy),
+      identityConnectionFactory: connectionFactory(databases.identity),
+      pluginConnectionFactory: connectionFactory(databases.plugin),
+      expectedDatabaseUsers: Object.freeze({
+        "legacy-main": databases.legacy.user,
+        identity: databases.identity.user,
+        plugin: databases.plugin.user
+      }),
       buildRevision: env.IDENTITY_BUILD_REVISION ?? "unknown",
       now: () => new Date()
     });
@@ -63,35 +70,56 @@ export async function runOrganizationReconciliationDevelopPreflightCli(
 }
 
 export function validateDevelopDatabaseConfiguration(config: IdentityConfig, env: NodeJS.ProcessEnv): {
-  readonly host: string;
-  readonly port: number;
-  readonly name: string;
-  readonly user: string;
-  readonly password: string;
+  readonly legacy: { readonly host: string; readonly port: number; readonly name: string; readonly user: string; readonly password: string };
+  readonly identity: { readonly host: string; readonly port: number; readonly name: string; readonly user: string; readonly password: string };
+  readonly plugin: { readonly host: string; readonly port: number; readonly name: string; readonly user: string; readonly password: string };
 } {
-  if (!config.legacyDb.host || !config.legacyDb.user || !config.legacyDb.password ||
-    !config.identityDb.host || !config.identityDb.user || !config.identityDb.password) {
+  if (!config.legacyDb.host || !config.identityDb.host) {
     throw new Error("The Develop database configuration is incomplete.");
   }
-  if (config.identityDb.name !== "xrugc_identity_dev") {
-    throw new Error("The Identity database is not the compiled xrteeth Develop database.");
+  if (config.legacyDb.name !== "bujiaban" || config.identityDb.name !== "xrugc_identity_dev") {
+    throw new Error("The service databases are not the compiled xrteeth Develop sources.");
   }
   const pluginDatabase = env.PLUGIN_DB_NAME;
   if (pluginDatabase !== ORGANIZATION_RECONCILIATION_DEVELOP_PLUGIN_DATABASE) {
     throw new Error("The plugin database is not the compiled Develop source.");
   }
   const pluginPort = Number(env.PLUGIN_DB_PORT ?? "3306");
+  const legacyUser = env.IDENTITY_IAM_ORG_RECONCILIATION_LEGACY_DB_USER;
+  const legacyPassword = env.IDENTITY_IAM_ORG_RECONCILIATION_LEGACY_DB_PASSWORD;
+  const identityUser = env.IDENTITY_IAM_ORG_RECONCILIATION_IDENTITY_DB_USER;
+  const identityPassword = env.IDENTITY_IAM_ORG_RECONCILIATION_IDENTITY_DB_PASSWORD;
   if (!env.PLUGIN_DB_HOST || !env.PLUGIN_DB_USER || !env.PLUGIN_DB_PASSWORD ||
+    !legacyUser || !legacyPassword || !identityUser || !identityPassword ||
+    ![legacyUser, identityUser, env.PLUGIN_DB_USER].every((user) => /^[A-Za-z0-9_.-]{1,64}$/.test(user)) ||
     !Number.isInteger(pluginPort) || pluginPort < 1 || pluginPort > 65_535 ||
-    env.PLUGIN_DB_USER === config.legacyDb.user) {
-    throw new Error("The dedicated Develop plugin read-only database configuration is incomplete.");
+    new Set([legacyUser, identityUser, env.PLUGIN_DB_USER]).size !== 3 ||
+    [legacyUser, identityUser, env.PLUGIN_DB_USER].some((user) =>
+      user === config.legacyDb.user || user === config.identityDb.user)) {
+    throw new Error("The dedicated Develop reconciliation read-only database configuration is incomplete.");
   }
   return Object.freeze({
-    host: env.PLUGIN_DB_HOST,
-    port: pluginPort,
-    name: pluginDatabase,
-    user: env.PLUGIN_DB_USER,
-    password: env.PLUGIN_DB_PASSWORD
+    legacy: Object.freeze({
+      host: config.legacyDb.host,
+      port: config.legacyDb.port,
+      name: config.legacyDb.name,
+      user: legacyUser,
+      password: legacyPassword
+    }),
+    identity: Object.freeze({
+      host: config.identityDb.host,
+      port: config.identityDb.port,
+      name: config.identityDb.name,
+      user: identityUser,
+      password: identityPassword
+    }),
+    plugin: Object.freeze({
+      host: env.PLUGIN_DB_HOST,
+      port: pluginPort,
+      name: pluginDatabase,
+      user: env.PLUGIN_DB_USER,
+      password: env.PLUGIN_DB_PASSWORD
+    })
   });
 }
 

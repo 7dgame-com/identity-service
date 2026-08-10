@@ -19,6 +19,12 @@ import {
 } from "../../../scripts/iam-organization-reconciliation-develop-preflight.js";
 import type { IdentityConfig } from "../src/config.js";
 
+const TEST_DATABASE_USERS = Object.freeze({
+  "legacy-main": "legacy-main-reader",
+  identity: "identity-reader",
+  plugin: "plugin-reader"
+});
+
 describe("xrteeth Develop organization reconciliation source preflight", () => {
   it("compiles the exact bounded 21-dataset catalog while remaining not ready", () => {
     expect(ORGANIZATION_RECONCILIATION_DEVELOP_SOURCE_CATALOG_READY).toBe(false);
@@ -52,12 +58,13 @@ describe("xrteeth Develop organization reconciliation source preflight", () => {
       legacyConnectionFactory: legacy.factory,
       identityConnectionFactory: identity.factory,
       pluginConnectionFactory: plugin.factory,
+      expectedDatabaseUsers: TEST_DATABASE_USERS,
       buildRevision: "a".repeat(40),
       now: () => new Date("2026-08-10T08:00:00.000Z")
     });
 
     expect(report).toMatchObject({
-      contract: "iam-organization-reconciliation-xrteeth-develop-source-preflight/v2",
+      contract: "iam-organization-reconciliation-xrteeth-develop-source-preflight/v3",
       environment: "xrteeth-develop",
       mode: "read-only",
       checkedAt: "2026-08-10T08:00:00.000Z",
@@ -85,10 +92,13 @@ describe("xrteeth Develop organization reconciliation source preflight", () => {
     });
     expect(report.components.map((component) => component.datasetProbeCount)).toEqual([7, 13, 1]);
     expect(report.components.every((component) => component.schemaShapePassed)).toBe(true);
+    expect(report.components.every((component) => component.databaseBindingPassed)).toBe(true);
+    expect(report.components.every((component) => component.readOnlyGrantPassed)).toBe(true);
+    expect(report.components.every((component) => /^[a-f0-9]{64}$/.test(component.grantScopeSha256))).toBe(true);
     expect(JSON.stringify(report)).not.toContain("identity_user_id");
     expect(JSON.stringify(report)).not.toContain("legacy_user_id");
     expect([...legacy.sql, ...identity.sql, ...plugin.sql].every((sql) =>
-      /^(SELECT|SET TRANSACTION|START TRANSACTION|COMMIT|ROLLBACK)/.test(sql))).toBe(true);
+      /^(SELECT|SHOW GRANTS|SET TRANSACTION|START TRANSACTION|COMMIT|ROLLBACK)/.test(sql))).toBe(true);
   });
 
   it("fails closed on incomplete candidate coverage without leaking rows", async () => {
@@ -98,6 +108,7 @@ describe("xrteeth Develop organization reconciliation source preflight", () => {
         membershipSnapshotSubjectIds: [1]
       }).factory,
       pluginConnectionFactory: fakeFactory("plugin", aggregateRows("plugin")).factory,
+      expectedDatabaseUsers: TEST_DATABASE_USERS,
       buildRevision: "b".repeat(40),
       now: () => new Date("2026-08-10T08:00:00.000Z")
     });
@@ -116,6 +127,7 @@ describe("xrteeth Develop organization reconciliation source preflight", () => {
         subjectIds: [1, 2, 3]
       }).factory,
       pluginConnectionFactory: fakeFactory("plugin", aggregateRows("plugin")).factory,
+      expectedDatabaseUsers: TEST_DATABASE_USERS,
       buildRevision: "c".repeat(40),
       now: () => new Date("2026-08-10T08:00:00.000Z")
     });
@@ -135,6 +147,7 @@ describe("xrteeth Develop organization reconciliation source preflight", () => {
         subjectIds: [1, 3]
       }).factory,
       pluginConnectionFactory: fakeFactory("plugin", aggregateRows("plugin")).factory,
+      expectedDatabaseUsers: TEST_DATABASE_USERS,
       buildRevision: "d".repeat(40),
       now: () => new Date("2026-08-10T08:00:00.000Z")
     });
@@ -149,6 +162,7 @@ describe("xrteeth Develop organization reconciliation source preflight", () => {
       }).factory,
       identityConnectionFactory: fakeFactory("identity", aggregateRows("identity")).factory,
       pluginConnectionFactory: fakeFactory("plugin", aggregateRows("plugin")).factory,
+      expectedDatabaseUsers: TEST_DATABASE_USERS,
       buildRevision: "e".repeat(40),
       now: () => new Date("2026-08-10T08:00:00.000Z")
     });
@@ -161,11 +175,75 @@ describe("xrteeth Develop organization reconciliation source preflight", () => {
       }).factory,
       identityConnectionFactory: fakeFactory("identity", aggregateRows("identity")).factory,
       pluginConnectionFactory: fakeFactory("plugin", aggregateRows("plugin")).factory,
+      expectedDatabaseUsers: TEST_DATABASE_USERS,
       buildRevision: "f".repeat(40),
       now: () => new Date("2026-08-10T08:00:00.000Z")
     });
     expect(intersecting.failures).toContain("legacy-reconciliation-scope-rule-free");
     expect(intersecting.legacyRbacScope.namedRuleIntersectionCount).toBe(1);
+  });
+
+  it("rejects writable, global, role-indirect or incomplete source grants", async () => {
+    for (const grantStatements of [
+      ["GRANT SELECT, UPDATE ON `bujiaban_plugin`.* TO `plugin-reader`@`%`"],
+      ["GRANT SELECT ON *.* TO `plugin-reader`@`%`"],
+      ["GRANT `plugin-reader-role`@`%` TO `plugin-reader`@`%`"],
+      ["GRANT SELECT ON `bujiaban_plugin`.`other_table` TO `plugin-reader`@`%`"],
+      ["GRANT SELECT ON `bujiaban_plugin`.* TO `plugin-reader`@`%` WITH GRANT OPTION"]
+    ]) {
+      const report = await runOrganizationReconciliationDevelopSourcePreflight({
+        legacyConnectionFactory: fakeFactory("legacy-main", aggregateRows("legacy-main")).factory,
+        identityConnectionFactory: fakeFactory("identity", aggregateRows("identity")).factory,
+        pluginConnectionFactory: fakeFactory("plugin", aggregateRows("plugin"), { grantStatements }).factory,
+        expectedDatabaseUsers: TEST_DATABASE_USERS,
+        buildRevision: "9".repeat(40),
+        now: () => new Date("2026-08-10T08:00:00.000Z")
+      });
+      expect(report.passed).toBe(false);
+      expect(report.failures).toContain("plugin:read-only-grant");
+      expect(report.failures).toContain("all-component-grants-read-only-and-table-bounded");
+      expect(report.components.find((component) => component.componentId === "plugin"))
+        .toMatchObject({ readOnlyGrantPassed: false });
+      expect(JSON.stringify(report)).not.toContain("plugin-reader");
+    }
+  });
+
+  it("fails the component when rollback or connection close cannot be proven", async () => {
+    for (const option of [{ rollbackFails: true }, { releaseFails: true }]) {
+      const report = await runOrganizationReconciliationDevelopSourcePreflight({
+        legacyConnectionFactory: fakeFactory("legacy-main", aggregateRows("legacy-main")).factory,
+        identityConnectionFactory: fakeFactory("identity", aggregateRows("identity"), option).factory,
+        pluginConnectionFactory: fakeFactory("plugin", aggregateRows("plugin")).factory,
+        expectedDatabaseUsers: TEST_DATABASE_USERS,
+        buildRevision: "8".repeat(40),
+        now: () => new Date("2026-08-10T08:00:00.000Z")
+      });
+      expect(report.passed).toBe(false);
+      expect(report.failures).toContain("identity:read-only-preflight");
+      expect(report.components.map((component) => component.componentId)).toEqual(["legacy-main", "plugin"]);
+    }
+  });
+
+  it("rejects a same-shape source connected to the wrong database or resolved account", async () => {
+    for (const sourceIdentity of [
+      { databaseName: "bujiaban_plugin_clone" },
+      { currentUser: "plugin-service@%" }
+    ]) {
+      const report = await runOrganizationReconciliationDevelopSourcePreflight({
+        legacyConnectionFactory: fakeFactory("legacy-main", aggregateRows("legacy-main")).factory,
+        identityConnectionFactory: fakeFactory("identity", aggregateRows("identity")).factory,
+        pluginConnectionFactory: fakeFactory("plugin", aggregateRows("plugin"), sourceIdentity).factory,
+        expectedDatabaseUsers: TEST_DATABASE_USERS,
+        buildRevision: "7".repeat(40),
+        now: () => new Date("2026-08-10T08:00:00.000Z")
+      });
+      expect(report.passed).toBe(false);
+      expect(report.failures).toContain("plugin:database-binding");
+      expect(report.failures).toContain("all-component-database-bindings-exact");
+      expect(report.components.find((component) => component.componentId === "plugin"))
+        .toMatchObject({ databaseBindingPassed: false });
+      expect(JSON.stringify(report)).not.toContain(sourceIdentity.databaseName ?? sourceIdentity.currentUser);
+    }
   });
 
   it("requires the exact Develop-only CLI target before any connection attempt", async () => {
@@ -188,30 +266,61 @@ describe("xrteeth Develop organization reconciliation source preflight", () => {
     expect(stderr).toEqual([]);
   });
 
-  it("requires a dedicated plugin read-only database identity instead of reusing Legacy credentials", () => {
+  it("requires three distinct reconciliation-only database identities instead of service credentials", () => {
     const config = {
       legacyDb: { host: "legacy-db", port: 3306, name: "bujiaban", user: "legacy-reader", password: "legacy" },
       identityDb: { host: "identity-db", port: 3306, name: "xrugc_identity_dev", user: "identity-reader", password: "identity" }
     } as unknown as IdentityConfig;
-    expect(() => validateDevelopDatabaseConfiguration(config, {
+    const dedicated = {
+      IDENTITY_IAM_ORG_RECONCILIATION_LEGACY_DB_USER: "reconciliation-legacy",
+      IDENTITY_IAM_ORG_RECONCILIATION_LEGACY_DB_PASSWORD: "legacy-secret",
+      IDENTITY_IAM_ORG_RECONCILIATION_IDENTITY_DB_USER: "reconciliation-identity",
+      IDENTITY_IAM_ORG_RECONCILIATION_IDENTITY_DB_PASSWORD: "identity-secret",
       PLUGIN_DB_HOST: "plugin-db",
-      PLUGIN_DB_NAME: "bujiaban_plugin",
-      PLUGIN_DB_USER: "legacy-reader",
-      PLUGIN_DB_PASSWORD: "plugin"
-    })).toThrow(/dedicated/);
-    expect(validateDevelopDatabaseConfiguration(config, {
-      PLUGIN_DB_HOST: "plugin-db",
-      PLUGIN_DB_PORT: "3306",
       PLUGIN_DB_NAME: "bujiaban_plugin",
       PLUGIN_DB_USER: "plugin-readonly",
       PLUGIN_DB_PASSWORD: "plugin"
-    })).toEqual({
-      host: "plugin-db",
-      port: 3306,
-      name: "bujiaban_plugin",
-      user: "plugin-readonly",
-      password: "plugin"
+    };
+    expect(() => validateDevelopDatabaseConfiguration(config, {
+      ...dedicated,
+      PLUGIN_DB_USER: "identity-reader",
+    })).toThrow(/dedicated/);
+    expect(() => validateDevelopDatabaseConfiguration(config, {
+      ...dedicated,
+      IDENTITY_IAM_ORG_RECONCILIATION_LEGACY_DB_USER: "reconciliation-identity"
+    })).toThrow(/dedicated/);
+    expect(() => validateDevelopDatabaseConfiguration(config, {
+      ...dedicated,
+      IDENTITY_IAM_ORG_RECONCILIATION_IDENTITY_DB_PASSWORD: ""
+    })).toThrow(/dedicated/);
+    expect(validateDevelopDatabaseConfiguration(config, dedicated)).toEqual({
+      legacy: {
+        host: "legacy-db",
+        port: 3306,
+        name: "bujiaban",
+        user: "reconciliation-legacy",
+        password: "legacy-secret"
+      },
+      identity: {
+        host: "identity-db",
+        port: 3306,
+        name: "xrugc_identity_dev",
+        user: "reconciliation-identity",
+        password: "identity-secret"
+      },
+      plugin: {
+        host: "plugin-db",
+        port: 3306,
+        name: "bujiaban_plugin",
+        user: "plugin-readonly",
+        password: "plugin"
+      }
     });
+    expect(() => validateDevelopDatabaseConfiguration(config, {
+      ...dedicated,
+      PLUGIN_DB_PORT: "3306",
+      PLUGIN_DB_USER: "legacy-reader"
+    })).toThrow(/dedicated/);
   });
 });
 
@@ -225,16 +334,28 @@ function fakeFactory(
     readonly membershipSnapshotSubjectIds?: readonly number[];
     readonly additionalRbacItems?: readonly Record<string, unknown>[];
     readonly rbacEdges?: readonly Record<string, unknown>[];
+    readonly grantStatements?: readonly string[];
+    readonly databaseName?: string;
+    readonly currentUser?: string;
+    readonly rollbackFails?: boolean;
+    readonly releaseFails?: boolean;
   } = {}
 ) {
   const sql: string[] = [];
   const factory: MysqlRepeatableReadSnapshotConnectionFactory = async () => ({
     async query(statement, parameters = []) {
       sql.push(statement);
+      if (statement === "SHOW GRANTS FOR CURRENT_USER()") {
+        return [(options.grantStatements ?? defaultGrantStatements(component)).map((grant) => ({
+          [`Grants for ${component}-reader@%`]: grant
+        })), []];
+      }
+      if (statement === "ROLLBACK" && options.rollbackFails) throw new Error("injected rollback failure");
       if (statement.startsWith("SELECT DATABASE()")) {
         return [[{
-          database_name: component === "identity" ? "xrugc_identity_dev" :
-            component === "plugin" ? "bujiaban_plugin" : "bujiaban",
+          database_name: options.databaseName ?? (component === "identity" ? "xrugc_identity_dev" :
+            component === "plugin" ? "bujiaban_plugin" : "bujiaban"),
+          current_user: options.currentUser ?? `${component}-reader@%`,
           server_hostname: "develop-db",
           server_port: 3306,
           server_version: "8.0-test"
@@ -268,9 +389,20 @@ function fakeFactory(
       }
       return [[], []];
     },
-    release() {}
+    release() {
+      if (options.releaseFails) throw new Error("injected release failure");
+    }
   });
   return { factory, sql };
+}
+
+function defaultGrantStatements(component: Component): string[] {
+  const database = component === "identity" ? "xrugc_identity_dev" :
+    component === "plugin" ? "bujiaban_plugin" : "bujiaban";
+  return [
+    `GRANT USAGE ON *.* TO \`${component}-reader\`@\`%\``,
+    `GRANT SELECT, SHOW VIEW ON \`${database}\`.* TO \`${component}-reader\`@\`%\``
+  ];
 }
 
 function capabilityItems(): Record<string, unknown>[] {
