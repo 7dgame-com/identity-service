@@ -176,6 +176,19 @@ describe("xrteeth Develop organization candidate batch materialization", () => {
     expect(fixture.repository.replaceCandidate).toHaveBeenCalledTimes(1);
   });
 
+  it("blocks the whole batch when any subject has an unresolved materialization operation", async () => {
+    const fixture = batchFixture({ unresolvedSubjectId: 1 });
+    const preview = await fixture.service.previewCandidateBatchMaterialization();
+
+    expect(preview).toMatchObject({ executable: false, ordinaryBlockedCount: 1 });
+    expect(preview.blockedReasons).toContain("unresolved-candidate-materialization-operation");
+    await expect(fixture.service.materializeCandidateBatch({
+      planToken: preview.planToken,
+      idempotencyKey: "reviewed-develop-batch-unresolved"
+    })).rejects.toMatchObject({ response: { code: "IAM_ORGANIZATION_CANDIDATE_BATCH_PLAN_BLOCKED" } });
+    expect(fixture.repository.replaceCandidate).not.toHaveBeenCalled();
+  });
+
   it("keeps the new batch gate disabled and unconfigured by default", async () => {
     process.env = { ...originalEnv };
     const fixture = batchFixture({ batchEnabled: false });
@@ -221,6 +234,7 @@ function batchFixture(input: {
   expectedLegacySubjectCount?: number;
   driftLegacySourceDuringFinalPostcheck?: boolean;
   batchEnabled?: boolean;
+  unresolvedSubjectId?: number;
 } = {}) {
   let busySubjectId = input.busySubjectId ?? null;
   const sources = [
@@ -258,7 +272,9 @@ function batchFixture(input: {
         : { acquired: true as const, value: await callback() }
     ),
     candidateForLegacyUser: vi.fn(async (legacyUserId: number) => candidates.get(legacyUserId) ?? null),
-    countUnresolvedForLegacyUser: vi.fn(async () => 0),
+    countUnresolvedForLegacyUser: vi.fn(async (legacyUserId: number) =>
+      legacyUserId === input.unresolvedSubjectId ? 1 : 0
+    ),
     find: vi.fn(async (operationKey: string) => operations.get(operationKey) ?? null),
     beginCandidateMaterialization: vi.fn(async (operation: Record<string, any>) => {
       if (operations.has(operation.operationKey)) return { duplicate: true };

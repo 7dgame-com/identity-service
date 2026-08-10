@@ -569,7 +569,8 @@ export class IamOrganizationWriteService {
         ? "protected"
         : source.status !== 10
           ? "blocked"
-          : alignment.aligned && alignment.P0 === 0 && alignment.P1 === 0 && alignment.P2 === 0
+          : alignment.aligned && alignment.P0 === 0 && alignment.P1 === 0 && alignment.P2 === 0 &&
+              unresolvedOperationCount === 0
             ? "aligned"
             : alignment.reason === "identity-candidate-snapshot-missing" &&
                 alignment.P0 === 0 && alignment.P2 === 0 && unresolvedOperationCount === 0
@@ -609,6 +610,9 @@ export class IamOrganizationWriteService {
         : []),
       ...(protectedSubjects.length !== this.config.iam.organizationWriteCandidateBatchExpectedProtectedSubjectCount
         ? ["protected-subject-count-mismatch"]
+        : []),
+      ...(subjects.some((subject) => subject.unresolvedOperationCount > 0)
+        ? ["unresolved-candidate-materialization-operation"]
         : []),
       ...(ordinarySubjects.some((subject) => subject.disposition === "blocked")
         ? ["ordinary-subject-not-materializable"]

@@ -323,10 +323,84 @@ POST /internal/iam/organization-write/candidate-batch-materialization/apply
 ```
 
 两者均要求 `X-Identity-Internal-Token` 和精确 40 位 `X-Identity-Expected-Revision`；POST 另要求
-`Idempotency-Key` 和刚审核的 64 位 plan token。当前尚未提供经审核的 batch operator gate，因此不得用
-临时 curl、Portainer console 或手工拼接请求执行。下一切片必须先补充只从环境变量读取 secret 的
-preview/apply/postcheck CLI，并验证不确定结果、恢复门禁和完整 ledger 证据；在该 CLI 发布、CI 通过并
-取得独立 Develop 写窗批准前，本能力只属于 default-off 的本地实现。
+`Idempotency-Key` 和刚审核的 64 位 plan token。不得用临时 curl、Portainer console 或手工拼接请求；
+只能在这组代码已发布到 xrteeth Develop、CI 通过且另行批准写窗后使用编译后的 operator gate。
+
+Preview 阶段 batch `ENABLED=false`，但 environment/key/精确 expected counts 已配置：
+
+```sh
+IDENTITY_IAM_INTERNAL_API_TOKEN='<runtime-secret>' \
+npm run iam:organization-write:batch-materialization-gate:dist -- \
+  --adapter-url=http://127.0.0.1:8086 \
+  --expected-revision=<full-40-character-develop-git-sha> \
+  --expected-legacy-subject-count=<reviewed-full-count> \
+  --expected-protected-subject-count=<reviewed-protected-count>
+```
+
+只有 `passed=true`、`ordinaryBlocked=0`、`inactiveOrdinary=0`、preview count 与审核值完全一致，才可把
+输出中的完整 plan token 转入窗口专用 secret。取得独立写批准并临时将 batch `ENABLED=true` 后，Apply
+只从环境变量读取 plan token、idempotency key 和 internal token，先重跑全量 preflight，至多 POST 一次，
+随后再次要求全量 ordinary missing=0：
+
+```sh
+IDENTITY_IAM_INTERNAL_API_TOKEN='<runtime-secret>' \
+IDENTITY_IAM_ORG_CANDIDATE_BATCH_PLAN_TOKEN='<reviewed-64-hex-plan>' \
+IDENTITY_IAM_ORG_CANDIDATE_BATCH_IDEMPOTENCY_KEY='<approved-window-key>' \
+npm run iam:organization-write:batch-materialization-gate:dist -- \
+  --apply \
+  --adapter-url=http://127.0.0.1:8086 \
+  --expected-revision=<full-40-character-develop-git-sha> \
+  --expected-legacy-subject-count=<reviewed-full-count> \
+  --expected-protected-subject-count=<reviewed-protected-count>
+```
+
+每个阶段还要从 xrteeth Develop 公网入口独立核对正在运行的同一 revision；Preview 期预期 batch
+disabled/develop，Apply 期只把 enabled 改为 true，窗口恢复后回到 public gate 的默认 false/disabled：
+
+```sh
+npm run iam:organization-write:public-gate:dist -- \
+  --urls=https://identity.d.xrteeth.com/health \
+  --expected-revision=<full-40-character-develop-git-sha> \
+  --expected-candidate-batch-materialization-enabled=false \
+  --expected-candidate-batch-materialization-environment=xrteeth-develop
+
+npm run iam:organization-write:public-gate:dist -- \
+  --urls=https://identity.d.xrteeth.com/health \
+  --expected-revision=<full-40-character-develop-git-sha> \
+  --expected-candidate-batch-materialization-enabled=true \
+  --expected-candidate-batch-materialization-environment=xrteeth-develop
+```
+
+若输出 `outcomeUnknown=true` 或 `postcheckIncomplete=true`，立即把 batch `ENABLED=false`，不得重发 POST。
+在 environment/key/count 尚保留的短暂核验状态，用原 plan/key 执行纯 GET outcome verifier；它只接受
+full preview 中 ordinary missing=0，不会发送 POST：
+
+```sh
+IDENTITY_IAM_INTERNAL_API_TOKEN='<runtime-secret>' \
+IDENTITY_IAM_ORG_CANDIDATE_BATCH_PLAN_TOKEN='<same-reviewed-plan>' \
+IDENTITY_IAM_ORG_CANDIDATE_BATCH_IDEMPOTENCY_KEY='<same-window-key>' \
+npm run iam:organization-write:batch-materialization-gate:dist -- \
+  --verify-outcome \
+  --adapter-url=http://127.0.0.1:8086 \
+  --expected-revision=<full-40-character-develop-git-sha> \
+  --expected-legacy-subject-count=<reviewed-full-count> \
+  --expected-protected-subject-count=<reviewed-protected-count>
+```
+
+成功、失败或不确定结果处理完毕后，都必须清空五个 batch 配置并验证恢复；恢复门禁不读取 plan/key，
+也不访问 Legacy：
+
+```sh
+IDENTITY_IAM_INTERNAL_API_TOKEN='<runtime-secret>' \
+npm run iam:organization-write:batch-materialization-gate:dist -- \
+  --expect-restored \
+  --adapter-url=http://127.0.0.1:8086 \
+  --expected-revision=<full-40-character-develop-git-sha>
+```
+
+operator 输出只在 Preview 成功时显示完整 plan token；Apply/outcome/restored 只显示 digest 和聚合计数，
+不得保存 token、idempotency 原文或主体资料。在本切片推送、Develop CI、部署与独立写窗批准完成前，
+这些命令仍只属于 default-off 的本地实现，禁止实际执行。
 
 ### Candidate schema / DDL 批准边界
 
