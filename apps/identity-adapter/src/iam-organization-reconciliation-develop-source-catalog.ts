@@ -17,6 +17,8 @@ export const ORGANIZATION_RECONCILIATION_DEVELOP_SOURCE_CATALOG_CONTRACT =
 export const ORGANIZATION_RECONCILIATION_DEVELOP_SOURCE_CATALOG_IMPLEMENTED = true as const;
 /** Physical fingerprints and the owner semantic registry are not pinned yet. */
 export const ORGANIZATION_RECONCILIATION_DEVELOP_SOURCE_CATALOG_READY = false as const;
+export const ORGANIZATION_RECONCILIATION_DEVELOP_LEGACY_DATABASE = "bujiaban_development" as const;
+export const ORGANIZATION_RECONCILIATION_DEVELOP_IDENTITY_DATABASE = "xrugc_identity_dev" as const;
 export const ORGANIZATION_RECONCILIATION_DEVELOP_PLUGIN_DATABASE = "bujiaban_plugin" as const;
 
 const PAGE_SIZE = 1_000;

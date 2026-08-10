@@ -2,6 +2,9 @@ import { createHash } from "node:crypto";
 import {
   ORGANIZATION_RECONCILIATION_DEVELOP_SOURCE_CATALOG,
   ORGANIZATION_RECONCILIATION_DEVELOP_SOURCE_CATALOG_SHA256,
+  ORGANIZATION_RECONCILIATION_DEVELOP_IDENTITY_DATABASE,
+  ORGANIZATION_RECONCILIATION_DEVELOP_LEGACY_DATABASE,
+  ORGANIZATION_RECONCILIATION_DEVELOP_PLUGIN_DATABASE,
   resolveOrganizationReconciliationDevelopSourceComponent
 } from "./iam-organization-reconciliation-develop-source-catalog.js";
 import {
@@ -58,9 +61,9 @@ const SOURCE_IDENTITY_QUERY =
   "SELECT DATABASE() AS database_name, CURRENT_USER() AS current_user, @@hostname AS server_hostname, @@port AS server_port, @@version AS server_version";
 
 const EXPECTED_DATABASES = Object.freeze({
-  "legacy-main": "bujiaban",
-  identity: "xrugc_identity_dev",
-  plugin: "bujiaban_plugin"
+  "legacy-main": ORGANIZATION_RECONCILIATION_DEVELOP_LEGACY_DATABASE,
+  identity: ORGANIZATION_RECONCILIATION_DEVELOP_IDENTITY_DATABASE,
+  plugin: ORGANIZATION_RECONCILIATION_DEVELOP_PLUGIN_DATABASE
 } satisfies Record<OrganizationReconciliationMysqlRawComponentId, string>);
 
 const SCHEMA_QUERIES = Object.freeze({
