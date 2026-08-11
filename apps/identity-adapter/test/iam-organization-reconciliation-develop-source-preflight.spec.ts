@@ -106,6 +106,9 @@ describe("xrteeth Develop organization reconciliation source preflight", () => {
       sql.startsWith("SELECT DATABASE() AS database_name"))).toEqual(Array(6).fill(
       "SELECT DATABASE() AS database_name, CURRENT_USER() AS `current_user`, @@hostname AS server_hostname, @@port AS server_port, @@version AS server_version"
     ));
+    expect(identity.sql.some((sql) =>
+      sql.includes("identity_users") && sql.includes("status = 'active'"))).toBe(true);
+    expect(identity.sql.every((sql) => !sql.includes("status IN ('active', 'inactive')"))).toBe(true);
   });
 
   it("fails closed on incomplete candidate coverage without leaking rows", async () => {

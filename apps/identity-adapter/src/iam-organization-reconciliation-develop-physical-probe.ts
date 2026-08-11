@@ -458,7 +458,7 @@ export const ORGANIZATION_RECONCILIATION_DEVELOP_PHYSICAL_CATALOG_SHA256 = diges
   ORGANIZATION_RECONCILIATION_DEVELOP_PHYSICAL_CATALOG
 );
 export const ORGANIZATION_RECONCILIATION_DEVELOP_PHYSICAL_CATALOG_PINNED_SHA256 =
-  "3d4243a7a894203bd5371d5f9ebd41e45d54e2daba8a631f0e4793b58cce68b3" as const;
+  "0dbe9b09b3f645a909eba01d431e76f5bc1bbf5327b0f2ae3fa09d1a17856ef2" as const;
 
 export interface OrganizationReconciliationDevelopPhysicalProbeDependencies {
   readonly legacyConnectionFactory: MysqlRepeatableReadSnapshotConnectionFactory;

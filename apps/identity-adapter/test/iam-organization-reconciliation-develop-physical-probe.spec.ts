@@ -35,7 +35,7 @@ describe("xrteeth Develop compiled physical probe", () => {
   it("pins the exact compiled 7/13/1 statement-to-dataset and 6/12/1 physical closure without a thirteenth Identity table", async () => {
     expect(ORGANIZATION_RECONCILIATION_DEVELOP_PHYSICAL_PROBE_READY).toBe(false);
     expect(ORGANIZATION_RECONCILIATION_DEVELOP_PHYSICAL_CATALOG_SHA256)
-      .toBe("3d4243a7a894203bd5371d5f9ebd41e45d54e2daba8a631f0e4793b58cce68b3");
+      .toBe("0dbe9b09b3f645a909eba01d431e76f5bc1bbf5327b0f2ae3fa09d1a17856ef2");
     expect(ORGANIZATION_RECONCILIATION_DEVELOP_PHYSICAL_CATALOG_PINNED_SHA256)
       .toBe(ORGANIZATION_RECONCILIATION_DEVELOP_PHYSICAL_CATALOG_SHA256);
     expect(ORGANIZATION_RECONCILIATION_DEVELOP_PHYSICAL_CATALOG).toMatchObject({
