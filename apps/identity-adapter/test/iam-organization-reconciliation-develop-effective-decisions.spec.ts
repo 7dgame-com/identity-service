@@ -396,7 +396,11 @@ describe(
       name: "unknown owner-scoped roles",
       mutate: (records: RecordsByComponent) => {
         records.identity["identity-iam-role"]!.push(policyItem("rogue-role"));
+        records.identity["identity-iam-item-relation"]!.push(
+          identityRelation("rogue-role", "role", "organization.update", "permission")
+        );
         policyVersion(records).roleCount = records.identity["identity-iam-role"]!.length;
+        policyVersion(records).relationCount = records.identity["identity-iam-item-relation"]!.length;
       },
       error: "unknown owner-scoped role"
     }
@@ -406,6 +410,34 @@ describe(
       views.identity,
       ORGANIZATION_OWNER_DEVELOP_APPROVED_REGISTRY_CANDIDATE.registrySha256
     )).toThrow(error);
+  });
+
+  it("keeps Identity-only roles outside the approved organization decision scope", async () => {
+    const registrySha256 = ORGANIZATION_OWNER_DEVELOP_APPROVED_REGISTRY_CANDIDATE.registrySha256;
+    const baselineViews = createDevelopProjectionSnapshotViews(await collect(createFixtures()));
+    const baseline = projectDevelopIdentityEffectiveDecisions(baselineViews.identity, registrySha256);
+    const identityOnlyViews = createDevelopProjectionSnapshotViews(await collect(createFixtures((records) => {
+      records.identity["identity-iam-role"]!.push(policyItem("developer"));
+      records.identity["identity-iam-permission"]!.push(policyItem("scene-package.export"));
+      records.identity["identity-iam-item-relation"]!.push(
+        identityRelation("developer", "role", "scene-package.export", "permission"),
+        identityRelation("root", "role", "scene-package.export", "permission")
+      );
+      records.identity["identity-iam-subject-assignment"]!.push(
+        identityAssignment("3", "developer", "role")
+      );
+      records.identity["identity-iam-subject-assignment-snapshot"]!
+        .find((row) => row.legacyUserId === "3")!.assignmentCount = 1;
+      policyVersion(records).roleCount = records.identity["identity-iam-role"]!.length;
+      policyVersion(records).permissionCount = records.identity["identity-iam-permission"]!.length;
+      policyVersion(records).relationCount = records.identity["identity-iam-item-relation"]!.length;
+    })));
+    const withIdentityOnlyRole = projectDevelopIdentityEffectiveDecisions(
+      identityOnlyViews.identity,
+      registrySha256
+    );
+
+    expect(withIdentityOnlyRole.effectiveDecisions).toEqual(baseline.effectiveDecisions);
   });
 
   it("requires exact Identity membership counts and explicit zero rows before evaluating roles", async () => {

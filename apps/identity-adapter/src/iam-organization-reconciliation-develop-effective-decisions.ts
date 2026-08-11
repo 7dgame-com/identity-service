@@ -338,7 +338,8 @@ function buildLegacyRuleFreeGraph(
     parents.set(child, parentValues);
   }
   assertAcyclic(items.keys(), children, "Legacy Yii RBAC");
-  assertUnknownLegacyRolesAreOutsideApprovedScope(
+  assertUnknownRolesAreOutsideApprovedScope(
+    "Legacy",
     items,
     children,
     capabilities,
@@ -445,7 +446,7 @@ function buildIdentityRuleFreeGraph(
   if (roleRows.length !== expectedRoleCount || permissionRows.length !== expectedPermissionCount) {
     fail("The Identity IAM policy role or permission count does not match its pinned version.");
   }
-  requireCatalogItems(items, capabilities, approvedRoles, "Identity");
+  requireCatalogItems(items, capabilities, approvedRoles, "Identity", true);
 
   const children = new Map<string, Set<string>>();
   const relationRows = datasetRows(view, "identity-iam-item-relation");
@@ -476,6 +477,13 @@ function buildIdentityRuleFreeGraph(
     fail("The Identity IAM policy relation count does not match its pinned version.");
   }
   assertAcyclic(items.keys(), children, "Identity IAM");
+  assertUnknownRolesAreOutsideApprovedScope(
+    "Identity",
+    items,
+    children,
+    capabilities,
+    approvedRoles
+  );
 
   const snapshotsBySubject = new Map<string, Readonly<{ identityUserId: string; assignmentCount: number }>>();
   const identityUserIds = new Set<string>();
@@ -917,12 +925,12 @@ function requireCatalogItems(
   capabilities: readonly ApprovedCapabilityEntry[],
   approvedRoles: ReadonlySet<string>,
   side: "Legacy" | "Identity",
-  allowLegacyRolesOutsideApprovedScope = false
+  allowRolesOutsideApprovedScope = false
 ): void {
   for (const [itemName, itemType] of items) {
     if (
       itemType === "role" && !approvedRoles.has(itemName) &&
-      !allowLegacyRolesOutsideApprovedScope
+      !allowRolesOutsideApprovedScope
     ) {
       fail(`The ${side} rule-free graph contains an unknown owner-scoped role.`);
     }
@@ -942,7 +950,8 @@ function requireCatalogItems(
   }
 }
 
-function assertUnknownLegacyRolesAreOutsideApprovedScope(
+function assertUnknownRolesAreOutsideApprovedScope(
+  side: "Legacy" | "Identity",
   items: ReadonlyMap<string, ItemType>,
   children: ReadonlyMap<string, ReadonlySet<string>>,
   capabilities: readonly ApprovedCapabilityEntry[],
@@ -962,7 +971,7 @@ function assertUnknownLegacyRolesAreOutsideApprovedScope(
       if (visited.has(reachable)) continue;
       visited.add(reachable);
       if (reachable !== itemName && approvedScope.has(reachable)) {
-        fail("The Legacy rule-free graph contains an unknown owner-scoped role.");
+        fail(`The ${side} rule-free graph contains an unknown owner-scoped role.`);
       }
       for (const child of children.get(reachable) ?? []) pending.push(child);
     }
