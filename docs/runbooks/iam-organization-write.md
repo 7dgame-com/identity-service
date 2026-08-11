@@ -588,12 +588,12 @@ generic dataset-lineage 的 WeakMap brand 只证明 artifact 来自同一进程�
 cursor 参数契约、Legacy rule-free RBAC 与 Develop exact IAM checksum/source/status selectors；policy、参数、
 decoder、顺序或查询失败都会 poison 当前 session，只能 rollback。仓库另提供
 `iam:organization-reconciliation:develop-preflight:dist`：它只接受 `--environment=xrteeth-develop`，要求
-Identity database 为 `xrugc_identity_dev`，在三源固定 read-only snapshot 中读取 schema metadata、aggregate
+Legacy database 为 `bujiaban_development`、Identity database 为 `xrugc_identity_dev`，在三源固定 read-only snapshot 中读取 schema metadata、aggregate
 counts 与每个 dataset 的单行 strict-decoder probe，并只输出计数、检查 ID 与 SHA-256 摘要。v3 preflight
 还在每个已连接 session 上执行 `SHOW GRANTS FOR CURRENT_USER()`：只接受精确 Develop schema 或固定表的
 `SELECT`（可附带 `SHOW VIEW`）及全局 `USAGE`，拒绝全局 SELECT、角色间接授权、写/DDL 权限、未知 scope
 和 `WITH GRANT OPTION`；公开报告只保留 grant-set digest 与通过布尔值，不回显账号或 grant 文本。它同时
-要求 `DATABASE()` 精确为 `bujiaban`、`xrugc_identity_dev`、`bujiaban_plugin`，并要求 MySQL
+要求 `DATABASE()` 精确为 `bujiaban_development`、`xrugc_identity_dev`、`bujiaban_plugin`，并要求 MySQL
 `CURRENT_USER()` 解析出的账号精确等于对应专用配置用户名，防止凭据被接到同形异库或被数据库映射为另一授权身份。
 preflight
 会在进程内比较完整 Legacy subject ID 集合与选中的 Identity legacy-shadow 集合，但公开报告只输出
@@ -615,6 +615,55 @@ membership snapshot 完整性同样以 Legacy 主体集合为边界：每个 Leg
 实际 plugin access scope
 枚举为 `auth-only`、`manager-only`、`admin-only`、`root-only`；这与 subject role/projector 的
 `root/admin/manager/user` 是两层不同契约，禁止直接混用。
+
+在 Portainer 更新 `identity_service_develop` 前，数据库 owner 必须先在相应 MySQL 实例中创建三个
+不同的专用账号。每个账号只允许 `USAGE ON *.*` 与其精确来源 schema 的 `SELECT`（可选
+`SHOW VIEW`）；不得授予全局 `SELECT`、任何写入/DDL、`WITH GRANT OPTION` 或间接 role。账号名和密码只
+通过 Portainer secret/environment 注入，不写入 Git、报告、命令输出或 closeout。Legacy 精确来源必须是
+`bujiaban_development`，Identity 必须是 `xrugc_identity_dev`。`bujiaban_plugin` 只有在数据库 owner
+书面证明其为本次 Develop 允许读取的隔离来源或不可变 Develop snapshot 后才可配置；如果它同时承载
+Production 数据，必须停止并先提供独立 Develop snapshot，禁止以“只读”绕过环境边界。
+
+Portainer 只需向 identity adapter 增加以下键；值均由数据库 owner 提供，禁止从现有 service 账号复制：
+
+```text
+IDENTITY_IAM_ORG_RECONCILIATION_LEGACY_DB_USER
+IDENTITY_IAM_ORG_RECONCILIATION_LEGACY_DB_PASSWORD
+IDENTITY_IAM_ORG_RECONCILIATION_IDENTITY_DB_USER
+IDENTITY_IAM_ORG_RECONCILIATION_IDENTITY_DB_PASSWORD
+PLUGIN_DB_HOST
+PLUGIN_DB_PORT
+PLUGIN_DB_NAME
+PLUGIN_DB_USER
+PLUGIN_DB_PASSWORD
+```
+
+如果上述编译期配置门禁未满足，CLI 以
+`iam-organization-reconciliation-xrteeth-develop-preflight-launch-diagnostic/v1` 输出一个固定 failure ID；
+该诊断不回显任何环境变量值。只有 launch 成功后的 v3 sanitized report 才能作为 schema、grant、dataset
+与完整性证据，launch failure 不能被记作 dataset mismatch。
+
+仓库另提供默认关闭的双节点结构一致性门禁：它只接受两份均已通过的 v3 sanitized report，要求两个调用方
+标签不同、时间窗口有界，并逐项核对 build revision、source/statement catalog、IAM policy checksum、三组件
+database identity/grant/schema digest、21 个 dataset probe、aggregate counts、subject universe、membership snapshot
+与 Legacy RBAC scope。任一 A/B 拼接或集合缺失都会 fail closed；输出只保留 canonical SHA-256 和固定摘要。
+该门禁的 node ID 与 expected build revision 仍是调用方提供的结构字段，hash 不是签名；当前没有 collector
+公钥、compiled trust profile 或外部 attestation，所以它只能证明“双份脱敏报告结构一致”，不能证明节点身份、
+物理来源真实性、完整八表面对账或 Task 7.2 已完成。
+
+两台节点分别把单节点命令 stdout 原样保存为本地 JSON 后，结构门禁的离线调用为：
+
+```bash
+npm run iam:organization-reconciliation:develop-dual-node-preflight:dist -- \
+  --environment=xrteeth-develop \
+  --expected-build-revision=<40位小写Develop提交SHA> \
+  --node-a-id=<节点A审计标签> --node-a-report=<节点A本地JSON> \
+  --node-b-id=<节点B审计标签> --node-b-report=<节点B本地JSON>
+```
+
+输入必须是单节点 CLI 输出的 2-space canonical JSON（含结尾换行），每份不超过 1 MiB；URL、stdin、最终路径
+组件为 symlink、hard link、非普通文件、重复 JSON key、改写格式或读取期间发生变化都会拒绝。节点标签不是身份
+认证，不能用复制同一报告并更换标签的方式替代后续 Ed25519 双 collector provenance。
 
 该命令不做 DDL、不写数据、不翻 readiness，也不允许 main、publish、Production 或 tmrpp 目标。
 当前 semantic registry 的 compiled production table 故意为空，且不接受 argv、环境变量、JSON 或 evidence

@@ -2,6 +2,8 @@ import mysql from "mysql2/promise";
 import { pathToFileURL } from "node:url";
 import { loadConfig, type IdentityConfig } from "../apps/identity-adapter/src/config.js";
 import {
+  ORGANIZATION_RECONCILIATION_DEVELOP_IDENTITY_DATABASE,
+  ORGANIZATION_RECONCILIATION_DEVELOP_LEGACY_DATABASE,
   ORGANIZATION_RECONCILIATION_DEVELOP_PLUGIN_DATABASE
 } from "../apps/identity-adapter/src/iam-organization-reconciliation-develop-source-catalog.js";
 import {
@@ -27,6 +29,22 @@ never reused.
 export interface OrganizationReconciliationDevelopPreflightCliIo {
   readonly stdout: (text: string) => void;
   readonly stderr: (text: string) => void;
+}
+
+export const ORGANIZATION_RECONCILIATION_DEVELOP_PREFLIGHT_LAUNCH_DIAGNOSTIC_CONTRACT =
+  "iam-organization-reconciliation-xrteeth-develop-preflight-launch-diagnostic/v1" as const;
+
+type DevelopPreflightConfigurationFailure =
+  | "service-database-host-configuration-incomplete"
+  | "develop-database-name-binding-invalid"
+  | "plugin-database-name-binding-invalid"
+  | "dedicated-readonly-credentials-incomplete-or-invalid";
+
+class DevelopPreflightConfigurationError extends Error {
+  constructor(readonly failureId: DevelopPreflightConfigurationFailure) {
+    super(failureId);
+    this.name = "DevelopPreflightConfigurationError";
+  }
 }
 
 export async function runOrganizationReconciliationDevelopPreflightCli(
@@ -63,8 +81,18 @@ export async function runOrganizationReconciliationDevelopPreflightCli(
     });
     io.stdout(`${JSON.stringify(report, null, 2)}\n`);
     return report.passed ? 0 : 1;
-  } catch {
-    io.stderr("The xrteeth Develop read-only source preflight could not run.\n");
+  } catch (error) {
+    if (error instanceof DevelopPreflightConfigurationError) {
+      io.stderr(`${JSON.stringify({
+        contract: ORGANIZATION_RECONCILIATION_DEVELOP_PREFLIGHT_LAUNCH_DIAGNOSTIC_CONTRACT,
+        environment: "xrteeth-develop",
+        mode: "read-only",
+        passed: false,
+        failure: error.failureId
+      })}\n`);
+    } else {
+      io.stderr("The xrteeth Develop read-only source preflight could not run.\n");
+    }
     return 2;
   }
 }
@@ -75,14 +103,15 @@ export function validateDevelopDatabaseConfiguration(config: IdentityConfig, env
   readonly plugin: { readonly host: string; readonly port: number; readonly name: string; readonly user: string; readonly password: string };
 } {
   if (!config.legacyDb.host || !config.identityDb.host) {
-    throw new Error("The Develop database configuration is incomplete.");
+    throw new DevelopPreflightConfigurationError("service-database-host-configuration-incomplete");
   }
-  if (config.legacyDb.name !== "bujiaban" || config.identityDb.name !== "xrugc_identity_dev") {
-    throw new Error("The service databases are not the compiled xrteeth Develop sources.");
+  if (config.legacyDb.name !== ORGANIZATION_RECONCILIATION_DEVELOP_LEGACY_DATABASE ||
+    config.identityDb.name !== ORGANIZATION_RECONCILIATION_DEVELOP_IDENTITY_DATABASE) {
+    throw new DevelopPreflightConfigurationError("develop-database-name-binding-invalid");
   }
   const pluginDatabase = env.PLUGIN_DB_NAME;
   if (pluginDatabase !== ORGANIZATION_RECONCILIATION_DEVELOP_PLUGIN_DATABASE) {
-    throw new Error("The plugin database is not the compiled Develop source.");
+    throw new DevelopPreflightConfigurationError("plugin-database-name-binding-invalid");
   }
   const pluginPort = Number(env.PLUGIN_DB_PORT ?? "3306");
   const legacyUser = env.IDENTITY_IAM_ORG_RECONCILIATION_LEGACY_DB_USER;
@@ -96,7 +125,7 @@ export function validateDevelopDatabaseConfiguration(config: IdentityConfig, env
     new Set([legacyUser, identityUser, env.PLUGIN_DB_USER]).size !== 3 ||
     [legacyUser, identityUser, env.PLUGIN_DB_USER].some((user) =>
       user === config.legacyDb.user || user === config.identityDb.user)) {
-    throw new Error("The dedicated Develop reconciliation read-only database configuration is incomplete.");
+    throw new DevelopPreflightConfigurationError("dedicated-readonly-credentials-incomplete-or-invalid");
   }
   return Object.freeze({
     legacy: Object.freeze({

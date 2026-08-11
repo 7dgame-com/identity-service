@@ -24,6 +24,8 @@
     "iam:organization-reconciliation:validate:dist": "node dist/scripts/iam-organization-reconciliation-validate.js",
     "iam:organization-reconciliation:develop-preflight": "tsx scripts/iam-organization-reconciliation-develop-preflight.ts",
     "iam:organization-reconciliation:develop-preflight:dist": "node dist/scripts/iam-organization-reconciliation-develop-preflight.js",
+    "iam:organization-reconciliation:develop-dual-node-preflight": "tsx scripts/iam-organization-reconciliation-develop-dual-node-preflight.ts",
+    "iam:organization-reconciliation:develop-dual-node-preflight:dist": "node dist/scripts/iam-organization-reconciliation-develop-dual-node-preflight.js",
     "invitation:import": "tsx scripts/invitation-import.ts"
   },
   "dependencies": {

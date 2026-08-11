@@ -266,9 +266,37 @@ describe("xrteeth Develop organization reconciliation source preflight", () => {
     expect(stderr).toEqual([]);
   });
 
+  it("reports launch configuration failures with a sanitized fixed identifier", async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    expect(await runOrganizationReconciliationDevelopPreflightCli(
+      ["--environment=xrteeth-develop"],
+      {
+        LEGACY_DB_HOST: "legacy-db",
+        LEGACY_DB_NAME: "bujiaban_development",
+        IDENTITY_DB_HOST: "identity-db",
+        IDENTITY_DB_NAME: "xrugc_identity_dev"
+      },
+      {
+        stdout: (text) => stdout.push(text),
+        stderr: (text) => stderr.push(text)
+      }
+    )).toBe(2);
+    expect(stdout).toEqual([]);
+    expect(JSON.parse(stderr.join(""))).toEqual({
+      contract: "iam-organization-reconciliation-xrteeth-develop-preflight-launch-diagnostic/v1",
+      environment: "xrteeth-develop",
+      mode: "read-only",
+      passed: false,
+      failure: "plugin-database-name-binding-invalid"
+    });
+    expect(stderr.join("")).not.toContain("legacy-db");
+    expect(stderr.join("")).not.toContain("identity-db");
+  });
+
   it("requires three distinct reconciliation-only database identities instead of service credentials", () => {
     const config = {
-      legacyDb: { host: "legacy-db", port: 3306, name: "bujiaban", user: "legacy-reader", password: "legacy" },
+      legacyDb: { host: "legacy-db", port: 3306, name: "bujiaban_development", user: "legacy-reader", password: "legacy" },
       identityDb: { host: "identity-db", port: 3306, name: "xrugc_identity_dev", user: "identity-reader", password: "identity" }
     } as unknown as IdentityConfig;
     const dedicated = {
@@ -297,7 +325,7 @@ describe("xrteeth Develop organization reconciliation source preflight", () => {
       legacy: {
         host: "legacy-db",
         port: 3306,
-        name: "bujiaban",
+        name: "bujiaban_development",
         user: "reconciliation-legacy",
         password: "legacy-secret"
       },
@@ -321,6 +349,10 @@ describe("xrteeth Develop organization reconciliation source preflight", () => {
       PLUGIN_DB_PORT: "3306",
       PLUGIN_DB_USER: "legacy-reader"
     })).toThrow(/dedicated/);
+    expect(() => validateDevelopDatabaseConfiguration({
+      ...config,
+      legacyDb: { ...config.legacyDb, name: "bujiaban" }
+    } as IdentityConfig, dedicated)).toThrow(/develop-database-name-binding-invalid/);
   });
 });
 
@@ -354,7 +386,7 @@ function fakeFactory(
       if (statement.startsWith("SELECT DATABASE()")) {
         return [[{
           database_name: options.databaseName ?? (component === "identity" ? "xrugc_identity_dev" :
-            component === "plugin" ? "bujiaban_plugin" : "bujiaban"),
+            component === "plugin" ? "bujiaban_plugin" : "bujiaban_development"),
           current_user: options.currentUser ?? `${component}-reader@%`,
           server_hostname: "develop-db",
           server_port: 3306,
@@ -398,7 +430,7 @@ function fakeFactory(
 
 function defaultGrantStatements(component: Component): string[] {
   const database = component === "identity" ? "xrugc_identity_dev" :
-    component === "plugin" ? "bujiaban_plugin" : "bujiaban";
+    component === "plugin" ? "bujiaban_plugin" : "bujiaban_development";
   return [
     `GRANT USAGE ON *.* TO \`${component}-reader\`@\`%\``,
     `GRANT SELECT, SHOW VIEW ON \`${database}\`.* TO \`${component}-reader\`@\`%\``
