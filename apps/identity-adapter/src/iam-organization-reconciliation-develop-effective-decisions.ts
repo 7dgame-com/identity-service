@@ -341,7 +341,6 @@ function buildLegacyRuleFreeGraph(
   assertUnknownLegacyRolesAreOutsideApprovedScope(
     items,
     children,
-    parents,
     capabilities,
     approvedRoles
   );
@@ -946,7 +945,6 @@ function requireCatalogItems(
 function assertUnknownLegacyRolesAreOutsideApprovedScope(
   items: ReadonlyMap<string, ItemType>,
   children: ReadonlyMap<string, ReadonlySet<string>>,
-  parents: ReadonlyMap<string, ReadonlySet<string>>,
   capabilities: readonly ApprovedCapabilityEntry[],
   approvedRoles: ReadonlySet<string>
 ): void {
@@ -955,22 +953,18 @@ function assertUnknownLegacyRolesAreOutsideApprovedScope(
     for (const permission of capability.permissionItems) approvedScope.add(permission);
   }
 
-  const connectedToApprovedScope = new Set<string>();
-  const pending = [...approvedScope];
-  while (pending.length > 0) {
-    const item = pending.pop()!;
-    if (connectedToApprovedScope.has(item)) continue;
-    connectedToApprovedScope.add(item);
-    for (const child of children.get(item) ?? []) pending.push(child);
-    for (const parent of parents.get(item) ?? []) pending.push(parent);
-  }
-
   for (const [itemName, itemType] of items) {
-    if (
-      itemType === "role" && !approvedRoles.has(itemName) &&
-      connectedToApprovedScope.has(itemName)
-    ) {
-      fail("The Legacy rule-free graph contains an unknown owner-scoped role.");
+    if (itemType !== "role" || approvedRoles.has(itemName)) continue;
+    const visited = new Set<string>();
+    const pending = [itemName];
+    while (pending.length > 0) {
+      const reachable = pending.pop()!;
+      if (visited.has(reachable)) continue;
+      visited.add(reachable);
+      if (reachable !== itemName && approvedScope.has(reachable)) {
+        fail("The Legacy rule-free graph contains an unknown owner-scoped role.");
+      }
+      for (const child of children.get(reachable) ?? []) pending.push(child);
     }
   }
 }
