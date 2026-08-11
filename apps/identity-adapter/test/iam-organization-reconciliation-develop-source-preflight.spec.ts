@@ -99,6 +99,10 @@ describe("xrteeth Develop organization reconciliation source preflight", () => {
     expect(JSON.stringify(report)).not.toContain("legacy_user_id");
     expect([...legacy.sql, ...identity.sql, ...plugin.sql].every((sql) =>
       /^(SELECT|SHOW GRANTS|SET TRANSACTION|START TRANSACTION|COMMIT|ROLLBACK)/.test(sql))).toBe(true);
+    expect([...legacy.sql, ...identity.sql, ...plugin.sql].filter((sql) =>
+      sql.startsWith("SELECT DATABASE() AS database_name"))).toEqual(Array(6).fill(
+      "SELECT DATABASE() AS database_name, CURRENT_USER() AS `current_user`, @@hostname AS server_hostname, @@port AS server_port, @@version AS server_version"
+    ));
   });
 
   it("fails closed on incomplete candidate coverage without leaking rows", async () => {
