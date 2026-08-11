@@ -459,6 +459,29 @@ describe(
       ORGANIZATION_OWNER_DEVELOP_APPROVED_REGISTRY_CANDIDATE.registrySha256
     )).toThrow("membership count");
   });
+
+  it("accepts Legacy-protected root omissions without granting IAM capabilities", async () => {
+    const protectedRootViews = createDevelopProjectionSnapshotViews(await collect(createFixtures((records) => {
+      records.identity["identity-role-shadow"] = [
+        { legacyUserId: "1", roleName: "root", source: "legacy-shadow", status: "shadow" },
+        { legacyUserId: "2", roleName: "root", source: "legacy-shadow", status: "shadow" }
+      ];
+      records.identity["identity-iam-subject-assignment"] = records.identity[
+        "identity-iam-subject-assignment"
+      ]!.filter((row) => row.legacyUserId !== "1");
+      records.identity["identity-iam-subject-assignment-snapshot"]!
+        .find((row) => row.legacyUserId === "1")!.assignmentCount = 0;
+    })));
+
+    const projection = projectDevelopIdentityEffectiveDecisions(
+      protectedRootViews.identity,
+      ORGANIZATION_OWNER_DEVELOP_APPROVED_REGISTRY_CANDIDATE.registrySha256
+    );
+    expect(projection.effectiveDecisions
+      .filter((row) => row.subjectRef === "subject:legacy:1")
+      .every((row) => row.decision === "deny"))
+      .toBe(true);
+  });
 });
 
 function createFixtures(mutate?: (records: RecordsByComponent) => void): Fixture[] {

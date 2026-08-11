@@ -191,9 +191,10 @@ export function projectDevelopLegacyEffectiveDecisions(
 
 /**
  * Builds the Identity decision universe only from the exact pinned candidate
- * policy/version graph and its explicit subject-assignment snapshots. The
- * identity-role-shadow dataset is intentionally never read, so it cannot act
- * as a union, fill, or fallback authority.
+ * policy/version graph and its explicit subject-assignment snapshots.
+ * identity-role-shadow never grants an effective item; it is consulted only
+ * as non-grant evidence that an omitted membership snapshot belongs to a
+ * Legacy-protected root.
  */
 export function projectDevelopIdentityEffectiveDecisions(
   view: IdentityDevelopProjectionSnapshotView,
@@ -218,11 +219,13 @@ export function projectDevelopIdentityEffectiveDecisions(
       .filter(([, effectiveItems]) => effectiveItems.has("root"))
       .map(([legacyUserId]) => legacyUserId)
   );
+  const legacyProtectedRootIds = readIdentityLegacyProtectedRootIds(view, subjects);
   const memberships = readIdentityMemberships(
     view,
     subjects,
     organizations,
     protectedRootIds,
+    legacyProtectedRootIds,
     identityUserIdBySubject
   );
   const rows: EffectiveOrganizationDecisionRecord[] = [];
@@ -735,6 +738,7 @@ function readIdentityMemberships(
   subjects: ReadonlyMap<string, SubjectState>,
   organizations: ReadonlyMap<string, OrganizationState>,
   protectedRootIds: ReadonlySet<string>,
+  legacyProtectedRootIds: ReadonlySet<string>,
   identityUserIdBySubject: ReadonlyMap<string, string>
 ): IdentityMembershipState {
   const snapshots = new Map<string, Readonly<{
@@ -763,12 +767,13 @@ function readIdentityMemberships(
       organizationCount: nonNegativeInteger(row.organizationCount, "Identity membership snapshot count")
     }));
   }
-  const expectedSnapshotIds = new Set(
-    [...subjects.keys()].filter((legacyUserId) => !protectedRootIds.has(legacyUserId))
+  const omittedSnapshotIds = new Set(
+    [...subjects.keys()].filter((legacyUserId) => !snapshots.has(legacyUserId))
   );
   if (
-    snapshots.size !== expectedSnapshotIds.size ||
-    [...snapshots.keys()].some((legacyUserId) => !expectedSnapshotIds.has(legacyUserId))
+    [...protectedRootIds].some((legacyUserId) => !omittedSnapshotIds.has(legacyUserId)) ||
+    [...omittedSnapshotIds].some((legacyUserId) =>
+      !protectedRootIds.has(legacyUserId) && !legacyProtectedRootIds.has(legacyUserId))
   ) {
     fail("The Identity membership snapshot universe is incomplete; explicit zero rows are required.");
   }
@@ -820,6 +825,34 @@ function readIdentityMemberships(
       [...snapshots].map(([legacyUserId, snapshot]) => [legacyUserId, snapshot.identityUserId])
     )
   });
+}
+
+function readIdentityLegacyProtectedRootIds(
+  view: IdentityDevelopProjectionSnapshotView,
+  subjects: ReadonlyMap<string, SubjectState>
+): ReadonlySet<string> {
+  const protectedRootIds = new Set<string>();
+  const assignmentKeys = new Set<string>();
+  for (const candidate of datasetRows(view, "identity-role-shadow")) {
+    const row = exactRecord(candidate, [
+      "legacyUserId", "roleName", "source", "status"
+    ], "Identity protected-root shadow");
+    if (row.source !== "legacy-shadow" || row.status !== "shadow") {
+      fail("An Identity protected-root shadow is outside the exact approved selector.");
+    }
+    const legacyUserId = positiveId(row.legacyUserId, "Identity protected-root shadow subject");
+    const roleName = canonicalText(row.roleName, "Identity protected-root shadow role");
+    if (!subjects.has(legacyUserId)) {
+      fail("An Identity protected-root shadow references an unknown subject.");
+    }
+    const key = assignmentKey(legacyUserId, roleName);
+    if (assignmentKeys.has(key)) {
+      fail("The Identity protected-root shadow contains a duplicate assignment.");
+    }
+    assignmentKeys.add(key);
+    if (roleName === "root") protectedRootIds.add(legacyUserId);
+  }
+  return protectedRootIds;
 }
 
 function evaluateCapability(
