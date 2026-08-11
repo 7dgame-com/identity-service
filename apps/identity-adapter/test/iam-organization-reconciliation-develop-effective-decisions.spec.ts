@@ -306,6 +306,8 @@ describe(
       );
       records["legacy-main"]["legacy-rbac-edge"]!.push({
         parentName: "developer", childName: "scene-package.export"
+      }, {
+        parentName: "root", childName: "scene-package.export"
       });
       records["legacy-main"]["legacy-rbac-assignment"]!.push({
         legacyUserId: "3", itemName: "developer", itemType: "role"
