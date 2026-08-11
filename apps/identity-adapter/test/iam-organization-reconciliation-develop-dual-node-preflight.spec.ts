@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   createOrganizationReconciliationDevelopDualNodePreflightReport,
   ORGANIZATION_RECONCILIATION_DEVELOP_DUAL_NODE_PREFLIGHT_BLOCKERS,
@@ -7,6 +10,10 @@ import {
 import type {
   OrganizationReconciliationDevelopSourcePreflightReport
 } from "../src/iam-organization-reconciliation-develop-source-preflight.js";
+import {
+  readCanonicalDevelopPreflightReportFile,
+  runOrganizationReconciliationDevelopDualNodePreflightCli
+} from "../../../scripts/iam-organization-reconciliation-develop-dual-node-preflight.js";
 
 const BUILD = "a".repeat(40);
 const SHA = "b".repeat(64);
@@ -171,6 +178,121 @@ describe("xrteeth Develop dual-node source-preflight alignment", () => {
       { nodeId: "node-b", report: sourceReport("2026-08-10T08:00:01.000Z") }
     ], options())).toThrow("invalid or misaligned");
     expect(proxyTraps).toBe(0);
+  });
+
+  it("exposes a strict Develop-only CLI without reading files on invalid arguments", async () => {
+    let reads = 0;
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const io = {
+      readReportFile: async () => { reads += 1; return sourceReport("2026-08-10T08:00:00.000Z"); },
+      now: () => new Date("2026-08-10T08:10:00.000Z"),
+      stdout: (text: string) => stdout.push(text),
+      stderr: (text: string) => stderr.push(text)
+    };
+    expect(await runOrganizationReconciliationDevelopDualNodePreflightCli(["--help"], io)).toBe(0);
+    expect(stdout.join("")).toContain("structural alignment");
+    expect(stderr).toEqual([]);
+    stdout.length = 0;
+    expect(await runOrganizationReconciliationDevelopDualNodePreflightCli([
+      "--environment=production",
+      `--expected-build-revision=${BUILD}`,
+      "--node-a-id=node-a",
+      "--node-a-report=a.json",
+      "--node-b-id=node-b",
+      "--node-b-report=b.json"
+    ], io)).toBe(2);
+    expect(reads).toBe(0);
+    expect(stdout).toEqual([]);
+    expect(stderr.join("")).not.toContain("production");
+  });
+
+  it("runs the CLI on two sanitized reports and emits only the structural summary", async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const paths: string[] = [];
+    const reports = new Map<string, unknown>([
+      ["a.json", sourceReport("2026-08-10T08:00:00.000Z")],
+      ["b.json", sourceReport("2026-08-10T08:00:01.000Z")]
+    ]);
+    expect(await runOrganizationReconciliationDevelopDualNodePreflightCli([
+      "--node-b-report=b.json",
+      "--environment=xrteeth-develop",
+      "--node-a-id=node-a",
+      `--expected-build-revision=${BUILD}`,
+      "--node-b-id=node-b",
+      "--node-a-report=a.json"
+    ], {
+      readReportFile: async (path) => { paths.push(path); return reports.get(path); },
+      now: () => new Date("2026-08-10T08:10:00.000Z"),
+      stdout: (text) => stdout.push(text),
+      stderr: (text) => stderr.push(text)
+    })).toBe(0);
+    expect(paths.sort()).toEqual(["a.json", "b.json"]);
+    expect(stderr).toEqual([]);
+    expect(JSON.parse(stdout.join(""))).toMatchObject({
+      sourcePreflightAligned: true,
+      collectorSignaturesVerified: false,
+      productionReady: false
+    });
+    expect(stdout.join("")).not.toContain("aggregateCounts");
+  });
+
+  it("returns one fixed CLI error without echoing paths or mismatched report content", async () => {
+    const changed = mutableReport();
+    changed.components[0]!.physicalSchemaSha256 = "e".repeat(64);
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    expect(await runOrganizationReconciliationDevelopDualNodePreflightCli([
+      "--environment=xrteeth-develop",
+      `--expected-build-revision=${BUILD}`,
+      "--node-a-id=node-a",
+      "--node-a-report=secret-a.json",
+      "--node-b-id=node-b",
+      "--node-b-report=secret-b.json"
+    ], {
+      readReportFile: async (path) => path.includes("a")
+        ? sourceReport("2026-08-10T08:00:00.000Z")
+        : changed,
+      now: () => new Date("2026-08-10T08:10:00.000Z"),
+      stdout: (text) => stdout.push(text),
+      stderr: (text) => stderr.push(text)
+    })).toBe(2);
+    expect(stdout).toEqual([]);
+    expect(stderr.join("")).toBe("The dual-node Develop source-preflight evidence is invalid or misaligned.\n");
+    expect(stderr.join("")).not.toContain("secret-a");
+    expect(stderr.join("")).not.toContain("physicalSchema");
+  });
+
+  it("reads only exact canonical, ordinary, unlinked local report files", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "identity-dual-node-preflight-"));
+    try {
+      const reportPath = join(directory, "report.json");
+      const report = sourceReport("2026-08-10T08:00:00.000Z");
+      await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+      expect(await readCanonicalDevelopPreflightReportFile(reportPath)).toEqual(report);
+
+      const nonCanonicalPath = join(directory, "non-canonical.json");
+      await writeFile(nonCanonicalPath, `${JSON.stringify(report)}\n`, { encoding: "utf8", mode: 0o600 });
+      await expect(readCanonicalDevelopPreflightReportFile(nonCanonicalPath)).rejects.toThrow("invalid-local-report");
+
+      const duplicateKeyPath = join(directory, "duplicate-key.json");
+      const canonical = JSON.stringify(report, null, 2);
+      await writeFile(duplicateKeyPath, canonical.replace("{", `{\n  \"passed\": true,` ) + "\n", {
+        encoding: "utf8",
+        mode: 0o600
+      });
+      await expect(readCanonicalDevelopPreflightReportFile(duplicateKeyPath)).rejects.toThrow("invalid-local-report");
+
+      const linkPath = join(directory, "report-link.json");
+      await symlink(reportPath, linkPath);
+      await expect(readCanonicalDevelopPreflightReportFile(linkPath)).rejects.toThrow();
+      await expect(readCanonicalDevelopPreflightReportFile("https://example.invalid/report.json"))
+        .rejects.toThrow("invalid-local-report");
+      await expect(readCanonicalDevelopPreflightReportFile("-")).rejects.toThrow("invalid-local-report");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 });
 

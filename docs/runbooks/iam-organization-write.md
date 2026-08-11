@@ -651,6 +651,20 @@ database identity/grant/schema digest、21 个 dataset probe、aggregate counts�
 公钥、compiled trust profile 或外部 attestation，所以它只能证明“双份脱敏报告结构一致”，不能证明节点身份、
 物理来源真实性、完整八表面对账或 Task 7.2 已完成。
 
+两台节点分别把单节点命令 stdout 原样保存为本地 JSON 后，结构门禁的离线调用为：
+
+```bash
+npm run iam:organization-reconciliation:develop-dual-node-preflight:dist -- \
+  --environment=xrteeth-develop \
+  --expected-build-revision=<40位小写Develop提交SHA> \
+  --node-a-id=<节点A审计标签> --node-a-report=<节点A本地JSON> \
+  --node-b-id=<节点B审计标签> --node-b-report=<节点B本地JSON>
+```
+
+输入必须是单节点 CLI 输出的 2-space canonical JSON（含结尾换行），每份不超过 1 MiB；URL、stdin、最终路径
+组件为 symlink、hard link、非普通文件、重复 JSON key、改写格式或读取期间发生变化都会拒绝。节点标签不是身份
+认证，不能用复制同一报告并更换标签的方式替代后续 Ed25519 双 collector provenance。
+
 该命令不做 DDL、不写数据、不翻 readiness，也不允许 main、publish、Production 或 tmrpp 目标。
 当前 semantic registry 的 compiled production table 故意为空，且不接受 argv、环境变量、JSON 或 evidence
 注入。Identity shadow/candidate owner selectors、organization role scopes、plugin overlay、campus public
