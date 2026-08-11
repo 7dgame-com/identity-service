@@ -219,6 +219,23 @@ describe(
       .toThrow("approved Develop semantic registry candidate");
   });
 
+  it("retains an unrelated named Legacy permission outside the approved capability scope", async () => {
+    const views = createDevelopProjectionSnapshotViews(await collect(createFixtures((records) => {
+      records["legacy-main"]["legacy-rbac-item"]!.push({
+        itemName: "legacy-unrelated-named-permission",
+        itemType: "permission",
+        description: null,
+        ruleName: "legacy-unrelated-rule"
+      });
+    })));
+    const result = projectDevelopLegacyEffectiveDecisions(
+      views.legacy,
+      ORGANIZATION_OWNER_DEVELOP_APPROVED_REGISTRY_CANDIDATE.registrySha256
+    );
+
+    expect(result.effectiveDecisions).toHaveLength(3 * (1 + 2) * 20);
+  });
+
   it.each([
     {
       name: "named rules",

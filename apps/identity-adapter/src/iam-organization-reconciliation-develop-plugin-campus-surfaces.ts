@@ -239,9 +239,15 @@ function bindLegacyGlobalRoles(
   subjectsByRef: Map<string, MutableSubjectProjectionState>
 ): void {
   const itemTypes = new Map<string, "role" | "permission">();
+  const namedRuleItems = new Set<string>();
   const items = rows<LegacyRbacItemMysqlRawRecord>(view, "legacy-rbac-item");
   for (const item of items) {
-    if (item.ruleName !== null) throw new Error("A named Legacy Yii RBAC rule is unsupported.");
+    if (item.ruleName !== null) {
+      if (item.itemType === "role") {
+        throw new Error("A named Legacy Yii RBAC role is unsupported.");
+      }
+      namedRuleItems.add(item.itemName);
+    }
     if (itemTypes.has(item.itemName)) throw new Error("The Legacy RBAC item catalog is duplicate.");
     itemTypes.set(item.itemName, item.itemType);
   }
@@ -250,7 +256,10 @@ function bindLegacyGlobalRoles(
     items: items.map((item) => ({
       name: item.itemName,
       type: item.itemType,
-      ruleName: item.ruleName
+      // Named permissions outside the approved role-binding surface are
+      // retained as graph nodes but are never evaluated by this role-only
+      // projector. Any named role or direct named assignment still fails.
+      ruleName: null
     })),
     relations: rows<LegacyRbacEdgeMysqlRawRecord>(view, "legacy-rbac-edge")
       .map((relation) => ({ parent: relation.parentName, child: relation.childName }))
@@ -267,6 +276,9 @@ function bindLegacyGlobalRoles(
     assignmentKeys.add(key);
     if (itemTypes.get(assignment.itemName) !== assignment.itemType) {
       throw new Error("A Legacy RBAC assignment does not match the compiled item catalog.");
+    }
+    if (namedRuleItems.has(assignment.itemName)) {
+      throw new Error("A named Legacy Yii RBAC permission is directly assigned.");
     }
     bindApprovedGlobalRole(subject, assignment.itemName, assignment.itemType);
     const subjectAssignments = assignmentsBySubject.get(subjectRef) ?? [];

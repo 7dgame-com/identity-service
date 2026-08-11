@@ -152,7 +152,7 @@ export interface LegacyRbacItemMysqlRawRecord {
   readonly itemName: string;
   readonly itemType: "role" | "permission";
   readonly description: string | null;
-  readonly ruleName: null;
+  readonly ruleName: string | null;
 }
 
 export interface LegacyRbacAssignmentMysqlRawRecord {
@@ -1145,12 +1145,11 @@ function decodeLegacyRbacEdge(candidate: unknown): Readonly<LegacyRbacEdgeMysqlR
 
 function decodeLegacyRbacItem(candidate: unknown): Readonly<LegacyRbacItemMysqlRawRecord> {
   const row = exactRecord(candidate, ["name", "type", "description", "rule_name"]);
-  if (row.rule_name !== null) throw new Error("named Yii RBAC rules are unsupported");
   return Object.freeze({
     itemName: canonicalText(row.name, 255),
     itemType: rbacItemType(row.type),
     description: nullableCanonicalText(row.description, 65_535),
-    ruleName: null
+    ruleName: row.rule_name === null ? null : canonicalText(row.rule_name, 64)
   });
 }
 
