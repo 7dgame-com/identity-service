@@ -145,6 +145,8 @@ describe("xrteeth Develop compiled physical probe", () => {
       expect(sql).not.toMatch(/^(?:INSERT|UPDATE|DELETE|REPLACE|ALTER|CREATE|DROP|TRUNCATE|GRANT|REVOKE)/);
     }
     const allSql = [...legacy.sql, ...identity.sql, ...plugin.sql];
+    expect(allSql.filter((sql) => sql.startsWith("SELECT DATABASE()")))
+      .toEqual(Array(6).fill("SELECT DATABASE() AS database_name, CURRENT_USER() AS `current_user`"));
     expect(allSql.filter((sql) => sql.includes("FROM INFORMATION_SCHEMA.TABLES"))
       .every((sql) => sql.endsWith("LIMIT 65"))).toBe(true);
     expect(allSql.filter((sql) => sql.includes("FROM INFORMATION_SCHEMA.COLUMNS"))

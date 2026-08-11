@@ -25,7 +25,7 @@ const START_READ_ONLY = "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY";
 const ROLLBACK = "ROLLBACK";
 const SHOW_CURRENT_GRANTS = "SHOW GRANTS FOR CURRENT_USER()";
 const SOURCE_IDENTITY_QUERY =
-  "SELECT DATABASE() AS database_name, CURRENT_USER() AS current_user";
+  "SELECT DATABASE() AS database_name, CURRENT_USER() AS `current_user`";
 const SESSION_ISOLATION_QUERY =
   "SELECT @@SESSION.transaction_isolation AS session_transaction_isolation";
 // U+E000 sorts after U+10000 by JavaScript UTF-16 code units but before it by
