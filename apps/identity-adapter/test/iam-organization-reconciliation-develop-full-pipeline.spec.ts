@@ -409,7 +409,6 @@ function createAlignedRows(): ComponentRows {
         operation_key: "membership-2"
       }],
       "identity-membership-candidate-snapshot-page/v1": [
-        identityMembershipSnapshot(1, 0),
         identityMembershipSnapshot(2, 1),
         identityMembershipSnapshot(3, 0)
       ],

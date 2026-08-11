@@ -115,10 +115,22 @@ describe("xrteeth Develop basic organization projections", () => {
     expect(() => projectDevelopIdentityBasicSurfaces(views.identity, REGISTRY_SHA))
       .toThrow("membership snapshot universe is incomplete");
   });
+
+  it("keeps protected roots outside the candidate snapshot and membership surfaces", async () => {
+    const fixtures = createFixtures({ protectedRootWithoutSnapshot: true });
+    const views = createDevelopProjectionSnapshotViews(await collect(fixtures));
+
+    expect(projectDevelopIdentityBasicSurfaces(views.identity, REGISTRY_SHA).memberships).toEqual([
+      { subjectRef: "legacy-user:1", legacyOrganizationId: "7", active: true }
+    ]);
+  });
 });
 
 function createFixtures(
-  options: Readonly<{ omitEmptyIdentityMembershipSnapshot?: boolean }> = {}
+  options: Readonly<{
+    omitEmptyIdentityMembershipSnapshot?: boolean;
+    protectedRootWithoutSnapshot?: boolean;
+  }> = {}
 ): Fixture[] {
   const recordsByComponent: Record<OrganizationReconciliationPhysicalSource, Record<string, JsonRecord[]>> = {
     "legacy-main": {
@@ -157,14 +169,19 @@ function createFixtures(
           identityUserId: "legacy:1", legacyUserId: "1", operationKey: "op-1", organizationCount: 1,
           source: "legacy", candidateStatus: "candidate"
         },
-        ...options.omitEmptyIdentityMembershipSnapshot ? [] : [{
+        ...options.omitEmptyIdentityMembershipSnapshot || options.protectedRootWithoutSnapshot ? [] : [{
           identityUserId: "legacy:2", legacyUserId: "2", operationKey: "op-2", organizationCount: 0,
           source: "legacy", candidateStatus: "candidate"
         }]
       ],
       "identity-role-shadow": [
         { legacyUserId: "1", roleName: "admin", source: "legacy-shadow", status: "shadow" },
-        { legacyUserId: "2", roleName: "user", source: "legacy-shadow", status: "shadow" }
+        {
+          legacyUserId: "2",
+          roleName: options.protectedRootWithoutSnapshot ? "root" : "user",
+          source: "legacy-shadow",
+          status: "shadow"
+        }
       ]
     },
     plugin: {

@@ -180,6 +180,8 @@ describe(
         .find((row) => row.legacyUserId === "1");
       if (!identityRoot) throw new Error("missing Identity root fixture");
       identityRoot.itemName = "user";
+      records.identity["identity-membership-candidate-snapshot"]!
+        .push(membershipSnapshot("1", 0));
     })));
     const registrySha256 = ORGANIZATION_OWNER_DEVELOP_APPROVED_REGISTRY_CANDIDATE.registrySha256;
     const legacy = projectDevelopLegacyEffectiveDecisions(views.legacy, registrySha256);
@@ -553,7 +555,7 @@ function baseRecords(): RecordsByComponent {
         candidateStatus: "candidate", operationKey: "op-2"
       }],
       "identity-membership-candidate-snapshot": [
-        membershipSnapshot("1", 0), membershipSnapshot("2", 1), membershipSnapshot("3", 0)
+        membershipSnapshot("2", 1), membershipSnapshot("3", 0)
       ],
       // Deliberately contradicts the exact IAM graph: the evaluator must not use this fallback.
       "identity-role-shadow": [

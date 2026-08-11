@@ -94,13 +94,15 @@ export function projectDevelopIdentityBasicSurfaces(
   const organizations = rows<IdentityOrganizationCandidateMysqlRawRecord>(view, "identity-organization-candidate");
   const mappings = rows<IdentityOrganizationIdMapMysqlRawRecord>(view, "identity-organization-id-map");
   const memberships = rows<IdentityOrganizationMembershipCandidateMysqlRawRecord>(view, "identity-membership-candidate");
+  const roles = rows<IdentityRoleAssignmentShadowMysqlRawRecord>(view, "identity-role-shadow");
   validateMembershipSnapshots(
     subjects,
     memberships,
     rows<IdentityOrganizationMembershipCandidateSnapshotMysqlRawRecord>(
       view,
       "identity-membership-candidate-snapshot"
-    )
+    ),
+    roles
   );
   return result(
     organizations.map((row) => ({
@@ -121,8 +123,7 @@ export function projectDevelopIdentityBasicSurfaces(
     })),
     projectScopedRoles(
       memberships,
-      rows<IdentityRoleAssignmentShadowMysqlRawRecord>(view, "identity-role-shadow")
-        .map((row) => ({ legacyUserId: row.legacyUserId, roleName: row.roleName }))
+      roles.map((row) => ({ legacyUserId: row.legacyUserId, roleName: row.roleName }))
     ),
     semanticRegistrySha256
   );
@@ -186,16 +187,32 @@ function projectScopedRoles(
 function validateMembershipSnapshots(
   subjects: readonly IdentitySubjectUniverseMysqlRawRecord[],
   memberships: readonly IdentityOrganizationMembershipCandidateMysqlRawRecord[],
-  snapshots: readonly IdentityOrganizationMembershipCandidateSnapshotMysqlRawRecord[]
+  snapshots: readonly IdentityOrganizationMembershipCandidateSnapshotMysqlRawRecord[],
+  roles: readonly IdentityRoleAssignmentShadowMysqlRawRecord[]
 ): void {
   const subjectIds = new Set(subjects.map((subject) => subject.legacyUserId));
   if (subjectIds.size !== subjects.length) throw new Error("The Identity subject universe is duplicate.");
   const snapshotBySubject = uniqueMap(snapshots, (snapshot) => snapshot.legacyUserId);
   const membershipsBySubject = group(memberships, (membership) => membership.legacyUserId);
-  if (snapshotBySubject.size !== subjectIds.size) {
+  const protectedRootIds = new Set(
+    roles.filter((role) => role.roleName === "root").map((role) => role.legacyUserId)
+  );
+  if ([...protectedRootIds].some((legacyUserId) => !subjectIds.has(legacyUserId))) {
+    throw new Error("A protected Identity root is outside the approved subject universe.");
+  }
+  const expectedSnapshotIds = new Set(
+    [...subjectIds].filter((legacyUserId) => !protectedRootIds.has(legacyUserId))
+  );
+  if (
+    snapshotBySubject.size !== expectedSnapshotIds.size ||
+    [...snapshotBySubject.keys()].some((legacyUserId) => !expectedSnapshotIds.has(legacyUserId))
+  ) {
     throw new Error("The Identity membership snapshot universe is incomplete.");
   }
-  for (const legacyUserId of subjectIds) {
+  if ([...protectedRootIds].some((legacyUserId) => (membershipsBySubject.get(legacyUserId) ?? []).length !== 0)) {
+    throw new Error("A protected Identity root cannot enter the membership candidate surface.");
+  }
+  for (const legacyUserId of expectedSnapshotIds) {
     const snapshot = snapshotBySubject.get(legacyUserId);
     const values = membershipsBySubject.get(legacyUserId) ?? [];
     if (!snapshot || snapshot.organizationCount !== values.length ||
