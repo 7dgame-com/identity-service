@@ -324,7 +324,7 @@ type MutableReport = ReturnType<typeof mutableReport>;
 
 function mutableReport() {
   return {
-    contract: "iam-organization-reconciliation-xrteeth-develop-source-preflight/v3" as const,
+    contract: "iam-organization-reconciliation-xrteeth-develop-source-preflight/v4" as const,
     environment: "xrteeth-develop" as const,
     mode: "read-only" as const,
     checkedAt: "2026-08-10T08:00:00.000Z",
@@ -383,8 +383,11 @@ function mutableReport() {
     },
     membershipSnapshotComparison: {
       legacySubjectCount: 2,
+      protectedLegacySubjectCount: 0,
+      expectedSnapshotSubjectCount: 2,
       snapshotSubjectCount: 2,
-      missingLegacySnapshotCount: 0,
+      missingExpectedSnapshotCount: 0,
+      unexpectedProtectedSnapshotCount: 0,
       extraSnapshotCount: 0
     },
     checks: CHECK_IDS.map((checkId) => ({ checkId, passed: true })),

@@ -122,8 +122,11 @@ const rbacScopeSchema = z.object({
 }).strict();
 const membershipSnapshotSchema = z.object({
   legacySubjectCount: safeCount,
+  protectedLegacySubjectCount: safeCount,
+  expectedSnapshotSubjectCount: safeCount,
   snapshotSubjectCount: safeCount,
-  missingLegacySnapshotCount: z.literal(0),
+  missingExpectedSnapshotCount: z.literal(0),
+  unexpectedProtectedSnapshotCount: z.literal(0),
   extraSnapshotCount: z.literal(0)
 }).strict();
 const sourceReportSchema = z.object({
@@ -272,6 +275,9 @@ function validateReportInvariants(
   if (
     report.legacyRbacScope.targetCount !== report.legacyRbacScope.presentTargetCount ||
     report.membershipSnapshotComparison.legacySubjectCount !==
+      report.membershipSnapshotComparison.expectedSnapshotSubjectCount +
+        report.membershipSnapshotComparison.protectedLegacySubjectCount ||
+    report.membershipSnapshotComparison.expectedSnapshotSubjectCount !==
       report.membershipSnapshotComparison.snapshotSubjectCount
   ) fail();
 }
