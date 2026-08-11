@@ -377,7 +377,7 @@ function organization(id: number): LegacyOrganization {
 
 function enableBatchMaterialization(): void {
   process.env.IDENTITY_DB_NAME = "xrugc_identity_dev";
-  process.env.LEGACY_DB_NAME = "bujiaban";
+  process.env.LEGACY_DB_NAME = "bujiaban_development";
   process.env.IDENTITY_IAM_ENABLED = "true";
   process.env.IDENTITY_IAM_MODE = "readonly";
   process.env.IDENTITY_IAM_FALLBACK_ENABLED = "true";

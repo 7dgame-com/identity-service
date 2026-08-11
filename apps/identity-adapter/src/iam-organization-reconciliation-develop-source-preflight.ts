@@ -23,7 +23,7 @@ import type {
 } from "./iam-organization-reconciliation/mysql-repeatable-read-snapshot.js";
 
 export const ORGANIZATION_RECONCILIATION_DEVELOP_SOURCE_PREFLIGHT_CONTRACT =
-  "iam-organization-reconciliation-xrteeth-develop-source-preflight/v3" as const;
+  "iam-organization-reconciliation-xrteeth-develop-source-preflight/v4" as const;
 
 const SET_REPEATABLE_READ = "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ";
 const START_READ_ONLY = "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY";
@@ -35,6 +35,8 @@ const MAX_RBAC_ITEM_ROWS = 4_096;
 const MAX_RBAC_EDGE_ROWS = 16_384;
 
 const LEGACY_SUBJECT_IDS_QUERY = "SELECT id AS subject_id FROM `user` ORDER BY id ASC";
+const LEGACY_PROTECTED_SUBJECT_IDS_QUERY =
+  "SELECT DISTINCT u.id AS subject_id FROM `user` AS u LEFT JOIN auth_assignment AS aa ON aa.user_id = CAST(u.id AS CHAR) LEFT JOIN auth_item AS ai ON ai.name = aa.item_name AND ai.type = 1 WHERE LOWER(TRIM(COALESCE(u.username, ''))) = 'root' OR LOWER(TRIM(COALESCE(ai.name, ''))) = 'root' ORDER BY u.id ASC";
 const IDENTITY_SUBJECT_IDS_QUERY =
   "SELECT legacy_user_id AS subject_id FROM identity_users WHERE legacy_user_id IS NOT NULL AND source = 'legacy-shadow' AND status IN ('active', 'inactive') ORDER BY legacy_user_id ASC";
 const IDENTITY_MEMBERSHIP_SNAPSHOT_SUBJECT_IDS_QUERY =
@@ -176,8 +178,11 @@ export interface OrganizationReconciliationDevelopSourcePreflightReport {
   };
   readonly membershipSnapshotComparison: {
     readonly legacySubjectCount: number;
+    readonly protectedLegacySubjectCount: number;
+    readonly expectedSnapshotSubjectCount: number;
     readonly snapshotSubjectCount: number;
-    readonly missingLegacySnapshotCount: number;
+    readonly missingExpectedSnapshotCount: number;
+    readonly unexpectedProtectedSnapshotCount: number;
     readonly extraSnapshotCount: number;
   };
   readonly checks: readonly { readonly checkId: string; readonly passed: boolean }[];
@@ -273,6 +278,7 @@ export async function runOrganizationReconciliationDevelopSourcePreflight(
   });
   const membershipSnapshotComparison = compareMembershipSnapshotSubjects(
     legacyInspection?.subjectIds ?? [],
+    legacyInspection?.protectedLegacySubjectIds ?? [],
     identityInspection?.membershipSnapshotSubjectIds ?? []
   );
   const checks = Object.freeze([
@@ -296,7 +302,8 @@ export async function runOrganizationReconciliationDevelopSourcePreflight(
       identity.identity_organization_id_map_count === legacy.legacy_organization_count),
     check("identity-legacy-membership-snapshots-complete",
       legacyInspection !== undefined && identityInspection !== undefined &&
-      membershipSnapshotComparison.missingLegacySnapshotCount === 0 &&
+      membershipSnapshotComparison.missingExpectedSnapshotCount === 0 &&
+      membershipSnapshotComparison.unexpectedProtectedSnapshotCount === 0 &&
       membershipSnapshotComparison.extraSnapshotCount === 0),
     check("identity-membership-counts-complete",
       identity.identity_membership_candidate_count === identity.identity_membership_snapshot_organization_sum),
@@ -345,6 +352,7 @@ interface PhysicalSourceInspection {
   readonly observedColumnCount: number;
   readonly aggregateCounts: Readonly<Record<string, number>>;
   readonly subjectIds: readonly string[];
+  readonly protectedLegacySubjectIds: readonly string[];
   readonly membershipSnapshotSubjectIds: readonly string[];
   readonly legacyRbacScope: OrganizationReconciliationDevelopSourcePreflightReport["legacyRbacScope"] | null;
 }
@@ -374,6 +382,9 @@ async function inspectPhysicalSource(
       : componentId === "identity"
         ? captureSubjectIds(rows(await connection.query(IDENTITY_SUBJECT_IDS_QUERY)))
         : Object.freeze([] as string[]);
+    const protectedLegacySubjectIds = componentId === "legacy-main"
+      ? captureSubjectIds(rows(await connection.query(LEGACY_PROTECTED_SUBJECT_IDS_QUERY)))
+      : Object.freeze([] as string[]);
     const membershipSnapshotSubjectIds = componentId === "identity"
       ? captureSubjectIds(rows(await connection.query(IDENTITY_MEMBERSHIP_SNAPSHOT_SUBJECT_IDS_QUERY)))
       : Object.freeze([] as string[]);
@@ -400,6 +411,7 @@ async function inspectPhysicalSource(
       observedColumnCount: schema.length,
       aggregateCounts: captureAggregateRows(aggregateRows),
       subjectIds,
+      protectedLegacySubjectIds,
       membershipSnapshotSubjectIds,
       legacyRbacScope
     });
@@ -571,18 +583,31 @@ function compareSubjectUniverses(
 
 function compareMembershipSnapshotSubjects(
   legacySubjectIds: readonly string[],
+  protectedLegacySubjectIds: readonly string[],
   snapshotSubjectIds: readonly string[]
 ): OrganizationReconciliationDevelopSourcePreflightReport["membershipSnapshotComparison"] {
   const legacy = new Set(legacySubjectIds);
+  const protectedLegacy = new Set(protectedLegacySubjectIds);
+  if ([...protectedLegacy].some((subjectId) => !legacy.has(subjectId))) {
+    throw new Error("The protected Legacy subject universe is invalid.");
+  }
+  const expectedSnapshots = new Set([...legacy].filter((subjectId) => !protectedLegacy.has(subjectId)));
   const snapshots = new Set(snapshotSubjectIds);
-  let missingLegacySnapshotCount = 0;
+  let missingExpectedSnapshotCount = 0;
+  let unexpectedProtectedSnapshotCount = 0;
   let extraSnapshotCount = 0;
-  for (const subjectId of legacy) if (!snapshots.has(subjectId)) missingLegacySnapshotCount += 1;
+  for (const subjectId of expectedSnapshots) if (!snapshots.has(subjectId)) missingExpectedSnapshotCount += 1;
+  for (const subjectId of snapshots) {
+    if (protectedLegacy.has(subjectId)) unexpectedProtectedSnapshotCount += 1;
+  }
   for (const subjectId of snapshots) if (!legacy.has(subjectId)) extraSnapshotCount += 1;
   return Object.freeze({
     legacySubjectCount: legacy.size,
+    protectedLegacySubjectCount: protectedLegacy.size,
+    expectedSnapshotSubjectCount: expectedSnapshots.size,
     snapshotSubjectCount: snapshots.size,
-    missingLegacySnapshotCount,
+    missingExpectedSnapshotCount,
+    unexpectedProtectedSnapshotCount,
     extraSnapshotCount
   });
 }

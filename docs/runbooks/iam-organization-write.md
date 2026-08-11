@@ -306,7 +306,8 @@ IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_EXPECTED_LEGACY_SUBJECT_COUNT: "0"
 IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_EXPECTED_PROTECTED_SUBJECT_COUNT: "0"
 ```
 
-受控 preview/apply 要求 Identity DB 精确为 `xrugc_identity_dev`、Legacy DB 精确为 `bujiaban`，并要求
+受控 preview/apply 要求 Identity DB 精确为 `xrugc_identity_dev`、Legacy DB 精确为
+`bujiaban_development`，并要求
 现有单主体 materialization 已恢复为 disabled/target `0`。preview 只返回聚合计数和 HMAC plan token，
 不返回 Legacy user ID、用户名、角色或组织；plan token 绑定完整 Legacy source snapshot、状态、受保护分类
 和组织 fingerprint。Preview 阶段必须保持 batch `ENABLED=false`；审核 token/计数并取得独立写批准后，

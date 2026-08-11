@@ -31,6 +31,8 @@ import {
   type LegacyOrganizationCandidateSourceUser
 } from "./legacy-identity.reader.js";
 import { PluginUserWriteRequest, PluginUserWriteService } from "./plugin-user-write.service.js";
+import { ORGANIZATION_RECONCILIATION_DEVELOP_LEGACY_DATABASE } from
+  "./iam-organization-reconciliation-develop-source-catalog.js";
 
 export interface IamOrganizationWriteProxyResponse {
   status: number;
@@ -1099,7 +1101,9 @@ export class IamOrganizationWriteService {
         ? ["candidate-batch-environment-not-xrteeth-develop"]
         : []),
       ...(identityDb.name !== "xrugc_identity_dev" ? ["candidate-batch-identity-database-mismatch"] : []),
-      ...(legacyDb.name !== "bujiaban" ? ["candidate-batch-legacy-database-mismatch"] : []),
+      ...(legacyDb.name !== ORGANIZATION_RECONCILIATION_DEVELOP_LEGACY_DATABASE
+        ? ["candidate-batch-legacy-database-mismatch"]
+        : []),
       ...(!candidateBatchPlanHmacKeyConfigured(iam) ? ["candidate-batch-plan-hmac-key-not-configured"] : []),
       ...(iam.organizationWriteCandidateBatchExpectedLegacySubjectCount <= 0
         ? ["candidate-batch-expected-legacy-subject-count-not-configured"]

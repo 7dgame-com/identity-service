@@ -64,7 +64,7 @@ describe("xrteeth Develop organization reconciliation source preflight", () => {
     });
 
     expect(report).toMatchObject({
-      contract: "iam-organization-reconciliation-xrteeth-develop-source-preflight/v3",
+      contract: "iam-organization-reconciliation-xrteeth-develop-source-preflight/v4",
       environment: "xrteeth-develop",
       mode: "read-only",
       checkedAt: "2026-08-10T08:00:00.000Z",
@@ -86,8 +86,11 @@ describe("xrteeth Develop organization reconciliation source preflight", () => {
     });
     expect(report.membershipSnapshotComparison).toEqual({
       legacySubjectCount: 2,
+      protectedLegacySubjectCount: 0,
+      expectedSnapshotSubjectCount: 2,
       snapshotSubjectCount: 2,
-      missingLegacySnapshotCount: 0,
+      missingExpectedSnapshotCount: 0,
+      unexpectedProtectedSnapshotCount: 0,
       extraSnapshotCount: 0
     });
     expect(report.components.map((component) => component.datasetProbeCount)).toEqual([7, 13, 1]);
@@ -118,8 +121,52 @@ describe("xrteeth Develop organization reconciliation source preflight", () => {
     });
     expect(report.passed).toBe(false);
     expect(report.failures).toContain("identity-legacy-membership-snapshots-complete");
-    expect(report.membershipSnapshotComparison.missingLegacySnapshotCount).toBe(1);
+    expect(report.membershipSnapshotComparison.missingExpectedSnapshotCount).toBe(1);
     expect(report.productionReady).toBe(false);
+  });
+
+  it("requires snapshots only for ordinary subjects and proves protected subjects remain unwritten", async () => {
+    const accepted = await runOrganizationReconciliationDevelopSourcePreflight({
+      legacyConnectionFactory: fakeFactory("legacy-main", aggregateRows("legacy-main"), {
+        subjectIds: [1, 2, 3],
+        protectedSubjectIds: [1]
+      }).factory,
+      identityConnectionFactory: fakeFactory("identity", aggregateRows("identity"), {
+        subjectIds: [1, 2, 3],
+        membershipSnapshotSubjectIds: [2, 3]
+      }).factory,
+      pluginConnectionFactory: fakeFactory("plugin", aggregateRows("plugin")).factory,
+      expectedDatabaseUsers: TEST_DATABASE_USERS,
+      buildRevision: "6".repeat(40),
+      now: () => new Date("2026-08-10T08:00:00.000Z")
+    });
+    expect(accepted.failures).not.toContain("identity-legacy-membership-snapshots-complete");
+    expect(accepted.membershipSnapshotComparison).toEqual({
+      legacySubjectCount: 3,
+      protectedLegacySubjectCount: 1,
+      expectedSnapshotSubjectCount: 2,
+      snapshotSubjectCount: 2,
+      missingExpectedSnapshotCount: 0,
+      unexpectedProtectedSnapshotCount: 0,
+      extraSnapshotCount: 0
+    });
+
+    const protectedWrite = await runOrganizationReconciliationDevelopSourcePreflight({
+      legacyConnectionFactory: fakeFactory("legacy-main", aggregateRows("legacy-main"), {
+        subjectIds: [1, 2, 3],
+        protectedSubjectIds: [1]
+      }).factory,
+      identityConnectionFactory: fakeFactory("identity", aggregateRows("identity"), {
+        subjectIds: [1, 2, 3],
+        membershipSnapshotSubjectIds: [1, 2, 3]
+      }).factory,
+      pluginConnectionFactory: fakeFactory("plugin", aggregateRows("plugin")).factory,
+      expectedDatabaseUsers: TEST_DATABASE_USERS,
+      buildRevision: "5".repeat(40),
+      now: () => new Date("2026-08-10T08:00:00.000Z")
+    });
+    expect(protectedWrite.failures).toContain("identity-legacy-membership-snapshots-complete");
+    expect(protectedWrite.membershipSnapshotComparison.unexpectedProtectedSnapshotCount).toBe(1);
   });
 
   it("proves every Legacy subject is represented while reporting Identity-only subjects separately", async () => {
@@ -367,6 +414,7 @@ function fakeFactory(
   aggregates: readonly Record<string, unknown>[],
   options: {
     readonly subjectIds?: readonly number[];
+    readonly protectedSubjectIds?: readonly number[];
     readonly membershipSnapshotSubjectIds?: readonly number[];
     readonly additionalRbacItems?: readonly Record<string, unknown>[];
     readonly rbacEdges?: readonly Record<string, unknown>[];
@@ -402,6 +450,9 @@ function fakeFactory(
       if (statement === "SELECT id AS subject_id FROM `user` ORDER BY id ASC" ||
         statement.startsWith("SELECT legacy_user_id AS subject_id FROM identity_users")) {
         return [(options.subjectIds ?? [1, 2]).map((subjectId) => ({ subject_id: subjectId })), []];
+      }
+      if (statement.startsWith("SELECT DISTINCT u.id AS subject_id FROM `user` AS u")) {
+        return [(options.protectedSubjectIds ?? []).map((subjectId) => ({ subject_id: subjectId })), []];
       }
       if (statement.startsWith("SELECT legacy_user_id AS subject_id FROM identity_organization_membership_snapshots")) {
         return [(options.membershipSnapshotSubjectIds ?? [1, 2]).map((subjectId) => ({ subject_id: subjectId })), []];
