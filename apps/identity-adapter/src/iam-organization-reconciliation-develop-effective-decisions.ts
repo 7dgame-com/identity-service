@@ -205,13 +205,25 @@ export function projectDevelopIdentityEffectiveDecisions(
   const approvedRoles = readApprovedRoleCatalog();
   const subjects = readIdentitySubjects(view);
   const organizations = readIdentityOrganizations(view);
-  const memberships = readIdentityMemberships(view, subjects, organizations);
+  const identityUserIdBySubject = readIdentityAssignmentSnapshotUserIds(view, subjects);
   const graph = buildIdentityRuleFreeGraph(
     view,
     subjects,
     capabilities,
     approvedRoles,
-    memberships.identityUserIdBySubject
+    identityUserIdBySubject
+  );
+  const protectedRootIds = new Set(
+    [...graph.effectiveItemsBySubject]
+      .filter(([, effectiveItems]) => effectiveItems.has("root"))
+      .map(([legacyUserId]) => legacyUserId)
+  );
+  const memberships = readIdentityMemberships(
+    view,
+    subjects,
+    organizations,
+    protectedRootIds,
+    identityUserIdBySubject
   );
   const rows: EffectiveOrganizationDecisionRecord[] = [];
 
@@ -500,7 +512,7 @@ function buildIdentityRuleFreeGraph(
     if (!snapshot) fail("An Identity IAM assignment references a subject outside the explicit snapshot universe.");
     const identityUserId = canonicalText(row.identityUserId, "Identity IAM assignment identity user ID");
     if (identityUserId !== snapshot.identityUserId) {
-      fail("An Identity IAM assignment conflicts with the subject snapshot identity.");
+      fail("An Identity IAM assignment conflicts with the exact candidate subject identity.");
     }
     const itemName = canonicalText(row.itemName, "Identity IAM assignment item");
     const itemType = itemTypeValue(row.itemType, "Identity IAM assignment item type");
@@ -669,10 +681,47 @@ function readLegacyMemberships(
   return memberships;
 }
 
+function readIdentityAssignmentSnapshotUserIds(
+  view: IdentityDevelopProjectionSnapshotView,
+  subjects: ReadonlyMap<string, SubjectState>
+): ReadonlyMap<string, string> {
+  const identityUserIdBySubject = new Map<string, string>();
+  const identityUserIds = new Set<string>();
+  for (const candidate of datasetRows(view, "identity-iam-subject-assignment-snapshot")) {
+    const row = exactRecord(candidate, [
+      "identityUserId", "legacyUserId", "policyChecksum", "snapshotKey", "assignmentCount", "source", "status"
+    ], "Identity IAM assignment snapshot identity");
+    requirePinnedPolicyRow(row, "Identity IAM assignment snapshot identity");
+    if (row.snapshotKey !== ORGANIZATION_RECONCILIATION_DEVELOP_IAM_POLICY_CHECKSUM) {
+      fail("The Identity IAM assignment snapshot identity is not bound to the exact policy checksum.");
+    }
+    const legacyUserId = positiveId(row.legacyUserId, "Identity IAM assignment snapshot identity subject");
+    const identityUserId = canonicalText(
+      row.identityUserId,
+      "Identity IAM assignment snapshot identity user ID"
+    );
+    if (!subjects.has(legacyUserId)) {
+      fail("An Identity IAM assignment snapshot identity references an unknown subject.");
+    }
+    if (identityUserIdBySubject.has(legacyUserId) || identityUserIds.has(identityUserId)) {
+      fail("The Identity IAM assignment snapshot identity contains a duplicate subject identity.");
+    }
+    nonNegativeInteger(row.assignmentCount, "Identity IAM assignment snapshot identity count");
+    identityUserIds.add(identityUserId);
+    identityUserIdBySubject.set(legacyUserId, identityUserId);
+  }
+  if (identityUserIdBySubject.size !== subjects.size) {
+    fail("The Identity IAM assignment snapshot identity universe is incomplete; explicit zero rows are required.");
+  }
+  return identityUserIdBySubject;
+}
+
 function readIdentityMemberships(
   view: IdentityDevelopProjectionSnapshotView,
   subjects: ReadonlyMap<string, SubjectState>,
-  organizations: ReadonlyMap<string, OrganizationState>
+  organizations: ReadonlyMap<string, OrganizationState>,
+  protectedRootIds: ReadonlySet<string>,
+  identityUserIdBySubject: ReadonlyMap<string, string>
 ): IdentityMembershipState {
   const snapshots = new Map<string, Readonly<{
     identityUserId: string;
@@ -700,8 +749,19 @@ function readIdentityMemberships(
       organizationCount: nonNegativeInteger(row.organizationCount, "Identity membership snapshot count")
     }));
   }
-  if (snapshots.size !== subjects.size) {
+  const expectedSnapshotIds = new Set(
+    [...subjects.keys()].filter((legacyUserId) => !protectedRootIds.has(legacyUserId))
+  );
+  if (
+    snapshots.size !== expectedSnapshotIds.size ||
+    [...snapshots.keys()].some((legacyUserId) => !expectedSnapshotIds.has(legacyUserId))
+  ) {
     fail("The Identity membership snapshot universe is incomplete; explicit zero rows are required.");
+  }
+  for (const [legacyUserId, snapshot] of snapshots) {
+    if (identityUserIdBySubject.get(legacyUserId) !== snapshot.identityUserId) {
+      fail("An Identity membership snapshot conflicts with the exact candidate subject identity.");
+    }
   }
 
   const memberships = new Set<string>();
@@ -736,6 +796,9 @@ function readIdentityMemberships(
     if ((countBySubject.get(legacyUserId) ?? 0) !== snapshot.organizationCount) {
       fail("The Identity membership count does not match its explicit snapshot.");
     }
+  }
+  if ([...protectedRootIds].some((legacyUserId) => countBySubject.has(legacyUserId))) {
+    fail("A protected Identity root cannot enter the membership candidate surface.");
   }
   return Object.freeze({
     membershipKeys: memberships,

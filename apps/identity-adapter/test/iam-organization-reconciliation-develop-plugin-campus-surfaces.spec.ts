@@ -325,13 +325,13 @@ function createFixtures(options: FixtureOptions = {}): Fixture[] {
         candidateStatus: "candidate", operationKey: "membership-2"
       }],
       "identity-membership-candidate-snapshot": [
-        membershipSnapshot("1", 0),
+        ...options.identityUser1GlobalRole === "user" ? [membershipSnapshot("1", 0)] : [],
         membershipSnapshot("2", 1),
         membershipSnapshot("3", 0),
         membershipSnapshot("4", 0)
       ],
       "identity-role-shadow": [
-        roleShadow("1", "root"),
+        roleShadow("1", options.identityUser1GlobalRole ?? "root"),
         roleShadow("2", "manager"),
         roleShadow("3", "user"),
         roleShadow("4", "user")
