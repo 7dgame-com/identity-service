@@ -312,7 +312,7 @@ function buildLegacyRuleFreeGraph(
     if (items.has(itemName)) fail("The Legacy Yii RBAC item graph contains a duplicate item.");
     items.set(itemName, itemType);
   }
-  requireCatalogItems(items, capabilities, approvedRoles, "Legacy");
+  requireCatalogItems(items, capabilities, approvedRoles, "Legacy", true);
 
   const children = new Map<string, Set<string>>();
   const parents = new Map<string, Set<string>>();
@@ -338,6 +338,13 @@ function buildLegacyRuleFreeGraph(
     parents.set(child, parentValues);
   }
   assertAcyclic(items.keys(), children, "Legacy Yii RBAC");
+  assertUnknownLegacyRolesAreOutsideApprovedScope(
+    items,
+    children,
+    parents,
+    capabilities,
+    approvedRoles
+  );
   assertApprovedLegacyScopeHasNoNamedRules(
     namedRuleItems,
     parents,
@@ -910,10 +917,14 @@ function requireCatalogItems(
   items: ReadonlyMap<string, ItemType>,
   capabilities: readonly ApprovedCapabilityEntry[],
   approvedRoles: ReadonlySet<string>,
-  side: "Legacy" | "Identity"
+  side: "Legacy" | "Identity",
+  allowLegacyRolesOutsideApprovedScope = false
 ): void {
   for (const [itemName, itemType] of items) {
-    if (itemType === "role" && !approvedRoles.has(itemName)) {
+    if (
+      itemType === "role" && !approvedRoles.has(itemName) &&
+      !allowLegacyRolesOutsideApprovedScope
+    ) {
       fail(`The ${side} rule-free graph contains an unknown owner-scoped role.`);
     }
   }
@@ -928,6 +939,38 @@ function requireCatalogItems(
       if (items.get(permission) !== "permission") {
         fail(`The ${side} rule-free graph is missing an owner-approved permission.`);
       }
+    }
+  }
+}
+
+function assertUnknownLegacyRolesAreOutsideApprovedScope(
+  items: ReadonlyMap<string, ItemType>,
+  children: ReadonlyMap<string, ReadonlySet<string>>,
+  parents: ReadonlyMap<string, ReadonlySet<string>>,
+  capabilities: readonly ApprovedCapabilityEntry[],
+  approvedRoles: ReadonlySet<string>
+): void {
+  const approvedScope = new Set<string>(approvedRoles);
+  for (const capability of capabilities) {
+    for (const permission of capability.permissionItems) approvedScope.add(permission);
+  }
+
+  const connectedToApprovedScope = new Set<string>();
+  const pending = [...approvedScope];
+  while (pending.length > 0) {
+    const item = pending.pop()!;
+    if (connectedToApprovedScope.has(item)) continue;
+    connectedToApprovedScope.add(item);
+    for (const child of children.get(item) ?? []) pending.push(child);
+    for (const parent of parents.get(item) ?? []) pending.push(parent);
+  }
+
+  for (const [itemName, itemType] of items) {
+    if (
+      itemType === "role" && !approvedRoles.has(itemName) &&
+      connectedToApprovedScope.has(itemName)
+    ) {
+      fail("The Legacy rule-free graph contains an unknown owner-scoped role.");
     }
   }
 }

@@ -281,6 +281,9 @@ describe(
         records["legacy-main"]["legacy-rbac-item"]!.push({
           itemName: "rogue-role", itemType: "role", description: null, ruleName: null
         });
+        records["legacy-main"]["legacy-rbac-edge"]!.push({
+          parentName: "rogue-role", childName: "organization.update"
+        });
       },
       error: "unknown owner-scoped role"
     }
@@ -290,6 +293,30 @@ describe(
       views.legacy,
       ORGANIZATION_OWNER_DEVELOP_APPROVED_REGISTRY_CANDIDATE.registrySha256
     )).toThrow(error);
+  });
+
+  it("keeps disconnected Legacy-only roles outside the approved organization decision scope", async () => {
+    const registrySha256 = ORGANIZATION_OWNER_DEVELOP_APPROVED_REGISTRY_CANDIDATE.registrySha256;
+    const baselineViews = createDevelopProjectionSnapshotViews(await collect(createFixtures()));
+    const baseline = projectDevelopLegacyEffectiveDecisions(baselineViews.legacy, registrySha256);
+    const legacyOnlyViews = createDevelopProjectionSnapshotViews(await collect(createFixtures((records) => {
+      records["legacy-main"]["legacy-rbac-item"]!.push(
+        { itemName: "developer", itemType: "role", description: null, ruleName: null },
+        { itemName: "scene-package.export", itemType: "permission", description: null, ruleName: null }
+      );
+      records["legacy-main"]["legacy-rbac-edge"]!.push({
+        parentName: "developer", childName: "scene-package.export"
+      });
+      records["legacy-main"]["legacy-rbac-assignment"]!.push({
+        legacyUserId: "3", itemName: "developer", itemType: "role"
+      });
+    })));
+    const withLegacyOnlyRole = projectDevelopLegacyEffectiveDecisions(
+      legacyOnlyViews.legacy,
+      registrySha256
+    );
+
+    expect(withLegacyOnlyRole.effectiveDecisions).toEqual(baseline.effectiveDecisions);
   });
 
   it.each([
