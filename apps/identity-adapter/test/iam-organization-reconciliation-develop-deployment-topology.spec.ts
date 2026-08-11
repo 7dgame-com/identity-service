@@ -13,8 +13,8 @@ import { createOrganizationReconciliationDevelopDeploymentTopologyForTest } from
   "./iam-organization-reconciliation-develop-deployment-topology.test-fixture.js";
 
 describe("Develop compiled deployment topology", () => {
-  it("keeps production unprovisioned and compiles a revision/image-independent fixture", () => {
-    expect(compiledOrganizationReconciliationDevelopDeploymentTopologyCount).toBe(0);
+  it("ships one reviewed Develop topology and compiles a revision/image-independent fixture", () => {
+    expect(compiledOrganizationReconciliationDevelopDeploymentTopologyCount).toBe(1);
     const evidence = createOrganizationReconciliationDevelopDeploymentEvidenceForTest();
     const topology = createOrganizationReconciliationDevelopDeploymentTopologyForTest(evidence);
     expect(topology).not.toHaveProperty("buildRevision");
@@ -50,7 +50,7 @@ describe("Develop compiled deployment topology", () => {
     )).toBeUndefined();
   });
 
-  it("rejects runtime evidence when production has no sole compiled topology", () => {
+  it("rejects runtime evidence that does not match the sole compiled topology", () => {
     expect(() => bindOrganizationReconciliationDevelopDeploymentEvidenceToCompiledTopology(
       createOrganizationReconciliationDevelopDeploymentEvidenceForTest(),
       "develop-profile"
