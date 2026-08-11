@@ -58,7 +58,7 @@ const DEVELOP_RECONCILIATION_CAPABILITY_ITEMS = Object.freeze([
 ]);
 
 const SOURCE_IDENTITY_QUERY =
-  "SELECT DATABASE() AS database_name, CURRENT_USER() AS current_user, @@hostname AS server_hostname, @@port AS server_port, @@version AS server_version";
+  "SELECT DATABASE() AS database_name, CURRENT_USER() AS `current_user`, @@hostname AS server_hostname, @@port AS server_port, @@version AS server_version";
 
 const EXPECTED_DATABASES = Object.freeze({
   "legacy-main": ORGANIZATION_RECONCILIATION_DEVELOP_LEGACY_DATABASE,
