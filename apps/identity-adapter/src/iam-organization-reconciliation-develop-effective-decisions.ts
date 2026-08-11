@@ -287,18 +287,23 @@ function buildLegacyRuleFreeGraph(
   approvedRoles: ReadonlySet<string>
 ): RuleFreeGraph {
   const items = new Map<string, ItemType>();
+  const namedRuleItems = new Set<string>();
   for (const candidate of datasetRows(view, "legacy-rbac-item")) {
     const row = exactRecord(candidate, ["itemName", "itemType", "description", "ruleName"], "Legacy RBAC item");
     const itemName = canonicalText(row.itemName, "Legacy RBAC item name");
     const itemType = itemTypeValue(row.itemType, "Legacy RBAC item type");
     if (row.description !== null) canonicalText(row.description, "Legacy RBAC item description", 65_535);
-    if (row.ruleName !== null) fail("A named Legacy Yii RBAC rule is unsupported.");
+    if (row.ruleName !== null) {
+      canonicalText(row.ruleName, "Legacy Yii RBAC rule name", 64);
+      namedRuleItems.add(itemName);
+    }
     if (items.has(itemName)) fail("The Legacy Yii RBAC item graph contains a duplicate item.");
     items.set(itemName, itemType);
   }
   requireCatalogItems(items, capabilities, approvedRoles, "Legacy");
 
   const children = new Map<string, Set<string>>();
+  const parents = new Map<string, Set<string>>();
   const edgeKeys = new Set<string>();
   for (const candidate of datasetRows(view, "legacy-rbac-edge")) {
     const row = exactRecord(candidate, ["parentName", "childName"], "Legacy RBAC edge");
@@ -316,8 +321,17 @@ function buildLegacyRuleFreeGraph(
     const values = children.get(parent) ?? new Set<string>();
     values.add(child);
     children.set(parent, values);
+    const parentValues = parents.get(child) ?? new Set<string>();
+    parentValues.add(parent);
+    parents.set(child, parentValues);
   }
   assertAcyclic(items.keys(), children, "Legacy Yii RBAC");
+  assertApprovedLegacyScopeHasNoNamedRules(
+    namedRuleItems,
+    parents,
+    capabilities,
+    approvedRoles
+  );
 
   const assignmentsBySubject = new Map<string, Set<string>>();
   const assignmentKeys = new Set<string>();
@@ -349,6 +363,29 @@ function buildLegacyRuleFreeGraph(
     effectiveItemsBySubject.set(legacyUserId, effective);
   }
   return Object.freeze({ itemTypes: items, effectiveItemsBySubject });
+}
+
+function assertApprovedLegacyScopeHasNoNamedRules(
+  namedRuleItems: ReadonlySet<string>,
+  parents: ReadonlyMap<string, ReadonlySet<string>>,
+  capabilities: readonly ApprovedCapabilityEntry[],
+  approvedRoles: ReadonlySet<string>
+): void {
+  const targets = new Set<string>(approvedRoles);
+  for (const capability of capabilities) {
+    for (const permission of capability.permissionItems) targets.add(permission);
+  }
+  const visited = new Set<string>();
+  const pending = [...targets];
+  while (pending.length > 0) {
+    const item = pending.pop()!;
+    if (visited.has(item)) continue;
+    visited.add(item);
+    if (namedRuleItems.has(item)) {
+      fail("A named Legacy Yii RBAC rule intersects the owner-approved capability scope.");
+    }
+    for (const parent of parents.get(item) ?? []) pending.push(parent);
+  }
 }
 
 function buildIdentityRuleFreeGraph(

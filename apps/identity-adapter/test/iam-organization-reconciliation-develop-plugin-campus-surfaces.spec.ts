@@ -57,6 +57,8 @@ interface FixtureOptions {
   readonly identityUser1GlobalRole?: "root" | "user";
   readonly legacyGraphCycle?: boolean;
   readonly identityGraphCycle?: boolean;
+  readonly unrelatedNamedLegacyPermission?: boolean;
+  readonly directlyAssignNamedLegacyPermission?: boolean;
 }
 
 const BASE_TIME = Date.parse("2026-08-11T01:00:00.000Z");
@@ -153,6 +155,20 @@ describe("xrteeth Develop plugin and campus candidate projections", () => {
     })));
     expect(() => projectDevelopIdentityPluginCampusSurfaces(identityCycleViews.identity))
       .toThrow(/cycle/);
+  });
+
+  it("retains unrelated named Legacy permissions but rejects their direct assignment", async () => {
+    const retainedViews = createDevelopProjectionSnapshotViews(await collect(createFixtures({
+      unrelatedNamedLegacyPermission: true
+    })));
+    expect(() => projectDevelopLegacyPluginCampusSurfaces(retainedViews.legacy)).not.toThrow();
+
+    const assignedViews = createDevelopProjectionSnapshotViews(await collect(createFixtures({
+      unrelatedNamedLegacyPermission: true,
+      directlyAssignNamedLegacyPermission: true
+    })));
+    expect(() => projectDevelopLegacyPluginCampusSurfaces(assignedViews.legacy))
+      .toThrow(/named Legacy Yii RBAC permission is directly assigned/);
   });
 
   it("rejects getter-bearing clones and proxies before invoking attacker code", async () => {
@@ -268,13 +284,24 @@ function createFixtures(options: FixtureOptions = {}): Fixture[] {
       "legacy-rbac-item": [
         { itemName: "manager", itemType: "role", description: null, ruleName: null },
         { itemName: "root", itemType: "role", description: null, ruleName: null },
-        { itemName: "user", itemType: "role", description: null, ruleName: null }
+        { itemName: "user", itemType: "role", description: null, ruleName: null },
+        ...options.unrelatedNamedLegacyPermission ? [{
+          itemName: "legacy-unrelated-named-permission",
+          itemType: "permission",
+          description: null,
+          ruleName: "legacy-unrelated-rule"
+        }] : []
       ],
       "legacy-rbac-assignment": [
         { legacyUserId: "1", itemName: "root", itemType: "role" },
         { legacyUserId: "2", itemName: "manager", itemType: "role" },
         { legacyUserId: "3", itemName: "user", itemType: "role" },
-        { legacyUserId: "4", itemName: "user", itemType: "role" }
+        { legacyUserId: "4", itemName: "user", itemType: "role" },
+        ...options.directlyAssignNamedLegacyPermission ? [{
+          legacyUserId: "1",
+          itemName: "legacy-unrelated-named-permission",
+          itemType: "permission"
+        }] : []
       ],
       "legacy-rbac-edge": options.legacyGraphCycle
         ? [{ parentName: "root", childName: "root" }]

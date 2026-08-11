@@ -315,7 +315,14 @@ describe("organization reconciliation source-specific MySQL raw adapters", () =>
     });
     const namedRuleSnapshot = await openLegacyMainMysqlRawSnapshot(optionsFor(namedRule, "legacy-main-db"));
     await expect(namedRuleSnapshot.readRbacItemPage({ requestCursor: null, pageSize: 20 }))
-      .rejects.toThrow("Reading the Legacy main MySQL reconciliation snapshot page failed");
+      .resolves.toMatchObject({
+        records: [{
+          itemName: "organization.update",
+          itemType: "permission",
+          description: null,
+          ruleName: "UnsafeRule"
+        }]
+      });
     await namedRuleSnapshot.close("failed");
     expect(namedRule.queries.at(-1)?.[0]).toBe("ROLLBACK");
   });
