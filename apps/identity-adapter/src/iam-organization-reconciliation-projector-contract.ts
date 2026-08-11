@@ -2,6 +2,7 @@ import {
   canonicalizeOrganizationReconciliationEvidenceValue,
   type OrganizationReconciliationEvidenceJsonValue
 } from "./iam-organization-reconciliation-component-manifest.js";
+import { isProxy } from "node:util/types";
 import type {
   CampusContextRecord,
   EffectiveOrganizationDecisionRecord,
@@ -14,10 +15,52 @@ import type {
 } from "./iam-organization-reconciliation-validator.js";
 
 export const LEGACY_ORGANIZATION_SURFACE_PROJECTOR_CONTRACT =
-  "iam-organization-legacy-surface-projector/v1" as const;
+  "iam-organization-legacy-surface-projector/v2" as const;
 export const IDENTITY_ORGANIZATION_SURFACE_PROJECTOR_CONTRACT =
-  "iam-organization-identity-surface-projector/v1" as const;
+  "iam-organization-identity-surface-projector/v2" as const;
+export const ORGANIZATION_SURFACE_PROJECTION_BINDING_CONTRACT =
+  "iam-organization-reconciliation-projection-binding/v1" as const;
 export const ORGANIZATION_SURFACE_PROJECTORS_READY = false as const;
+
+export interface OrganizationSurfaceProjectionSourceBinding {
+  readonly sourceVersion: string;
+  readonly snapshotId: string;
+}
+
+export interface OrganizationSurfaceProjectionRunDescriptor {
+  readonly lineageManifestSha256: string;
+  readonly primarySource: OrganizationSurfaceProjectionSourceBinding;
+  readonly pluginSource: OrganizationSurfaceProjectionSourceBinding;
+}
+
+export interface OrganizationSurfaceProjectionBinding {
+  readonly contract: typeof ORGANIZATION_SURFACE_PROJECTION_BINDING_CONTRACT;
+  readonly semanticRegistrySha256: string;
+  readonly lineageManifestSha256: string;
+  readonly legacy: Readonly<{
+    projectorContract: typeof LEGACY_ORGANIZATION_SURFACE_PROJECTOR_CONTRACT;
+    evaluatorId: string;
+    evaluatorBuildSha256: string;
+    primarySource: OrganizationSurfaceProjectionSourceBinding;
+  }>;
+  readonly identity: Readonly<{
+    projectorContract: typeof IDENTITY_ORGANIZATION_SURFACE_PROJECTOR_CONTRACT;
+    evaluatorId: string;
+    evaluatorBuildSha256: string;
+    primarySource: OrganizationSurfaceProjectionSourceBinding;
+  }>;
+  readonly pluginSource: OrganizationSurfaceProjectionSourceBinding;
+}
+
+export interface CreateOrganizationSurfaceProjectionBindingInput {
+  readonly legacyProjection: LegacyOrganizationSurfaceProjection;
+  readonly identityProjection: IdentityOrganizationSurfaceProjection;
+  readonly semanticRegistrySha256: string;
+  readonly lineageManifestSha256: string;
+  readonly legacyPrimarySource: OrganizationSurfaceProjectionSourceBinding;
+  readonly identityPrimarySource: OrganizationSurfaceProjectionSourceBinding;
+  readonly pluginSource: OrganizationSurfaceProjectionSourceBinding;
+}
 
 export interface OrganizationSurfaceProjectionRecords {
   readonly organizationDirectory: readonly OrganizationDirectoryRecord[];
@@ -85,7 +128,8 @@ export interface OrganizationSurfaceProjectorReadiness {
     "compiled-owner-semantic-registry-selection-not-implemented",
     "legacy-projector-not-registered",
     "identity-projector-not-registered",
-    "independent-projector-artifact-provenance-not-attested"
+    "independent-projector-artifact-provenance-not-attested",
+    "projection-lineage-binding-not-integrated"
   ];
 }
 
@@ -116,6 +160,8 @@ interface CapturedOrganizationSurfaceProjector<TSnapshotView> {
 const legacyProjectionBrand = new WeakSet<object>();
 const identityProjectionBrand = new WeakSet<object>();
 const projectionOrigins = new WeakMap<object, object>();
+const projectionRunBindings = new WeakMap<object, Readonly<OrganizationSurfaceProjectionRunDescriptor>>();
+const projectionBindingBrands = new WeakSet<object>();
 
 export class OrganizationSurfaceProjectorContractError extends Error {
   constructor(message: string) {
@@ -132,7 +178,8 @@ export function organizationSurfaceProjectorReadiness(): OrganizationSurfaceProj
       "compiled-owner-semantic-registry-selection-not-implemented",
       "legacy-projector-not-registered",
       "identity-projector-not-registered",
-      "independent-projector-artifact-provenance-not-attested"
+      "independent-projector-artifact-provenance-not-attested",
+      "projection-lineage-binding-not-integrated"
     ] as const)
   });
 }
@@ -145,9 +192,13 @@ export function organizationSurfaceProjectorReadiness(): OrganizationSurfaceProj
 export async function executeLegacyOrganizationSurfaceProjector<TSnapshotView>(
   projector: LegacyOrganizationSurfaceProjector<TSnapshotView>,
   snapshotView: TSnapshotView,
-  semanticRegistrySha256: string
+  semanticRegistrySha256: string,
+  runDescriptor?: OrganizationSurfaceProjectionRunDescriptor
 ): Promise<LegacyOrganizationSurfaceProjection> {
   const canonicalRegistrySha256 = requireSha256(semanticRegistrySha256, "semantic registry");
+  const capturedRunDescriptor = runDescriptor === undefined
+    ? undefined
+    : captureProjectionRunDescriptor(runDescriptor);
   const captured = captureProjector(
     projector,
     "legacy",
@@ -166,6 +217,7 @@ export async function executeLegacyOrganizationSurfaceProjector<TSnapshotView>(
   ) as LegacyOrganizationSurfaceProjection;
   legacyProjectionBrand.add(projection);
   projectionOrigins.set(projection, captured.origin);
+  if (capturedRunDescriptor) projectionRunBindings.set(projection, capturedRunDescriptor);
   return projection;
 }
 
@@ -173,9 +225,13 @@ export async function executeLegacyOrganizationSurfaceProjector<TSnapshotView>(
 export async function executeIdentityOrganizationSurfaceProjector<TSnapshotView>(
   projector: IdentityOrganizationSurfaceProjector<TSnapshotView>,
   snapshotView: TSnapshotView,
-  semanticRegistrySha256: string
+  semanticRegistrySha256: string,
+  runDescriptor?: OrganizationSurfaceProjectionRunDescriptor
 ): Promise<IdentityOrganizationSurfaceProjection> {
   const canonicalRegistrySha256 = requireSha256(semanticRegistrySha256, "semantic registry");
+  const capturedRunDescriptor = runDescriptor === undefined
+    ? undefined
+    : captureProjectionRunDescriptor(runDescriptor);
   const captured = captureProjector(
     projector,
     "identity",
@@ -194,6 +250,7 @@ export async function executeIdentityOrganizationSurfaceProjector<TSnapshotView>
   ) as IdentityOrganizationSurfaceProjection;
   identityProjectionBrand.add(projection);
   projectionOrigins.set(projection, captured.origin);
+  if (capturedRunDescriptor) projectionRunBindings.set(projection, capturedRunDescriptor);
   return projection;
 }
 
@@ -243,6 +300,96 @@ export function assertIndependentOrganizationSurfaceProjections(
   assertNoSharedObjectIdentity(legacy.surfaces, identity.surfaces);
 }
 
+/**
+ * Creates the first projection-to-lineage run binding. Projection brands alone
+ * are insufficient: both projections must have been executed with descriptors
+ * for the same manifest/plugin snapshot, and every caller descriptor must
+ * exactly match the captured run metadata.
+ */
+export function createOrganizationSurfaceProjectionBinding(
+  candidate: CreateOrganizationSurfaceProjectionBindingInput
+): OrganizationSurfaceProjectionBinding {
+  const captured = captureExactDataObject(candidate, [
+    "legacyProjection",
+    "identityProjection",
+    "semanticRegistrySha256",
+    "lineageManifestSha256",
+    "legacyPrimarySource",
+    "identityPrimarySource",
+    "pluginSource"
+  ], "projection binding input");
+  const legacy = captured.legacyProjection as LegacyOrganizationSurfaceProjection;
+  const identity = captured.identityProjection as IdentityOrganizationSurfaceProjection;
+  assertIndependentOrganizationSurfaceProjections(legacy, identity);
+
+  const semanticRegistrySha256 = requireSha256(
+    captured.semanticRegistrySha256 as string,
+    "semantic registry"
+  );
+  const lineageManifestSha256 = requireSha256(
+    captured.lineageManifestSha256 as string,
+    "lineage manifest"
+  );
+  const legacyPrimarySource = captureProjectionSourceBinding(
+    captured.legacyPrimarySource,
+    "Legacy primary source"
+  );
+  const identityPrimarySource = captureProjectionSourceBinding(
+    captured.identityPrimarySource,
+    "Identity primary source"
+  );
+  const pluginSource = captureProjectionSourceBinding(captured.pluginSource, "plugin source");
+  const legacyRun = projectionRunBindings.get(legacy);
+  const identityRun = projectionRunBindings.get(identity);
+  if (!legacyRun || !identityRun) {
+    throw new OrganizationSurfaceProjectorContractError(
+      "Both projections must carry a captured lineage run descriptor."
+    );
+  }
+  if (
+    legacy.semanticRegistrySha256 !== semanticRegistrySha256 ||
+    identity.semanticRegistrySha256 !== semanticRegistrySha256 ||
+    legacyRun.lineageManifestSha256 !== lineageManifestSha256 ||
+    identityRun.lineageManifestSha256 !== lineageManifestSha256 ||
+    !sameProjectionSource(legacyRun.primarySource, legacyPrimarySource) ||
+    !sameProjectionSource(identityRun.primarySource, identityPrimarySource) ||
+    !sameProjectionSource(legacyRun.pluginSource, pluginSource) ||
+    !sameProjectionSource(identityRun.pluginSource, pluginSource)
+  ) {
+    throw new OrganizationSurfaceProjectorContractError(
+      "The projection pair, manifest, registry, or physical snapshot run binding does not match."
+    );
+  }
+
+  const binding = Object.freeze({
+    contract: ORGANIZATION_SURFACE_PROJECTION_BINDING_CONTRACT,
+    semanticRegistrySha256,
+    lineageManifestSha256,
+    legacy: Object.freeze({
+      projectorContract: legacy.contract,
+      evaluatorId: legacy.evaluatorId,
+      evaluatorBuildSha256: legacy.evaluatorBuildSha256,
+      primarySource: legacyPrimarySource
+    }),
+    identity: Object.freeze({
+      projectorContract: identity.contract,
+      evaluatorId: identity.evaluatorId,
+      evaluatorBuildSha256: identity.evaluatorBuildSha256,
+      primarySource: identityPrimarySource
+    }),
+    pluginSource
+  });
+  projectionBindingBrands.add(binding);
+  return binding;
+}
+
+export function isOrganizationSurfaceProjectionBinding(
+  candidate: unknown
+): candidate is OrganizationSurfaceProjectionBinding {
+  return typeof candidate === "object" && candidate !== null &&
+    projectionBindingBrands.has(candidate) && Object.isFrozen(candidate);
+}
+
 function createProjection(
   projector: Readonly<{ evaluatorId: string; evaluatorBuildSha256: string }>,
   candidateDraft: unknown,
@@ -283,6 +430,79 @@ function createProjection(
   });
 }
 
+function captureProjectionRunDescriptor(
+  candidate: OrganizationSurfaceProjectionRunDescriptor
+): Readonly<OrganizationSurfaceProjectionRunDescriptor> {
+  const captured = captureExactDataObject(candidate, [
+    "lineageManifestSha256",
+    "primarySource",
+    "pluginSource"
+  ], "projection run descriptor");
+  return Object.freeze({
+    lineageManifestSha256: requireSha256(
+      captured.lineageManifestSha256 as string,
+      "lineage manifest"
+    ),
+    primarySource: captureProjectionSourceBinding(captured.primarySource, "primary source"),
+    pluginSource: captureProjectionSourceBinding(captured.pluginSource, "plugin source")
+  });
+}
+
+function captureProjectionSourceBinding(
+  candidate: unknown,
+  label: string
+): Readonly<OrganizationSurfaceProjectionSourceBinding> {
+  const captured = captureExactDataObject(candidate, ["sourceVersion", "snapshotId"], label);
+  return Object.freeze({
+    sourceVersion: requireOpaqueMetadata(captured.sourceVersion, `${label} version`),
+    snapshotId: requireOpaqueMetadata(captured.snapshotId, `${label} snapshot ID`)
+  });
+}
+
+function sameProjectionSource(
+  left: OrganizationSurfaceProjectionSourceBinding,
+  right: OrganizationSurfaceProjectionSourceBinding
+): boolean {
+  return left.sourceVersion === right.sourceVersion && left.snapshotId === right.snapshotId;
+}
+
+function captureExactDataObject(
+  candidate: unknown,
+  expectedKeys: readonly string[],
+  label: string
+): Readonly<Record<string, unknown>> {
+  if (
+    typeof candidate !== "object" ||
+    candidate === null ||
+    Array.isArray(candidate) ||
+    isProxy(candidate) ||
+    Object.getPrototypeOf(candidate) !== Object.prototype
+  ) {
+    throw new OrganizationSurfaceProjectorContractError(`The ${label} is invalid.`);
+  }
+  const ownKeys = Reflect.ownKeys(candidate);
+  if (
+    ownKeys.some((key) => typeof key !== "string") ||
+    JSON.stringify((ownKeys as string[]).sort()) !== JSON.stringify([...expectedKeys].sort())
+  ) {
+    throw new OrganizationSurfaceProjectorContractError(
+      `The ${label} has hidden, symbolic, missing, or unknown fields.`
+    );
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(candidate);
+  const captured: Record<string, unknown> = Object.create(null);
+  for (const key of expectedKeys) {
+    const descriptor = descriptors[key];
+    if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) {
+      throw new OrganizationSurfaceProjectorContractError(
+        `The ${label} must use enumerable data descriptors.`
+      );
+    }
+    captured[key] = descriptor.value;
+  }
+  return Object.freeze(captured);
+}
+
 /**
  * Captures all projector fields exactly once from own enumerable data
  * descriptors. Accessors, symbols, hidden/unknown fields, and custom
@@ -301,6 +521,7 @@ function captureProjector<TSnapshotView>(
     typeof candidate !== "object" ||
     candidate === null ||
     Array.isArray(candidate) ||
+    isProxy(candidate) ||
     Object.getPrototypeOf(candidate) !== Object.prototype
   ) {
     throw new OrganizationSurfaceProjectorContractError("The surface projector object is invalid.");
@@ -387,6 +608,18 @@ function requireEvaluatorId(value: string): string {
 function requireSha256(value: string, label: string): string {
   if (!/^[a-f0-9]{64}$/.test(value)) {
     throw new OrganizationSurfaceProjectorContractError(`The ${label} digest is invalid.`);
+  }
+  return value;
+}
+
+function requireOpaqueMetadata(value: unknown, label: string): string {
+  if (
+    typeof value !== "string" ||
+    value.length < 1 ||
+    value.length > 1_024 ||
+    value.trim() !== value
+  ) {
+    throw new OrganizationSurfaceProjectorContractError(`The ${label} is invalid.`);
   }
   return value;
 }

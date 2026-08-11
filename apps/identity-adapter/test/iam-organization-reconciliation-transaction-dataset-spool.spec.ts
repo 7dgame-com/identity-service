@@ -43,7 +43,7 @@ describe("incremental string-array evidence HMAC", () => {
       const builder = createOrganizationReconciliationStringArrayEvidenceHashBuilder(NONCE);
       for (const value of values) builder.append(value);
       const expected = createHmac("sha256", NONCE)
-        .update("iam-organization-reconciliation:v3\u001f")
+        .update("iam-organization-reconciliation:v4\u001f")
         .update(`[${values.map((value) => JSON.stringify(value)).join(",")}]`)
         .digest("hex");
       expect(builder.seal()).toBe(expected);
@@ -56,7 +56,7 @@ describe("incremental string-array evidence HMAC", () => {
       expect(bufferBuilder.seal()).toBe(expected);
     }
     const arbitraryObjectExpected = createHmac("sha256", NONCE)
-      .update("iam-organization-reconciliation:v3\u001f")
+      .update("iam-organization-reconciliation:v4\u001f")
       .update('{"values":["b","a"]}')
       .digest("hex");
     expect(createOrganizationReconciliationEvidenceHash(NONCE, { values: ["b", "a"] }))
@@ -93,7 +93,7 @@ describe("incremental string-array evidence HMAC", () => {
 
   it("preserves the legacy single-read behavior for accessor, Proxy, and mid-scan mutation arrays", () => {
     const expected = (values: readonly string[]) => createHmac("sha256", NONCE)
-      .update("iam-organization-reconciliation:v3\u001f")
+      .update("iam-organization-reconciliation:v4\u001f")
       .update(`[${values.map((value) => JSON.stringify(value)).join(",")}]`)
       .digest("hex");
 

@@ -12,16 +12,22 @@ import type {
   PluginVisibilityRecord
 } from "./iam-organization-reconciliation-validator.js";
 import {
+  ORGANIZATION_RECONCILIATION_PLATFORM_GLOBAL_CONTEXT_REF,
   ORGANIZATION_RECONCILIATION_PUBLIC_CONTEXT_REF,
   ORGANIZATION_RECONCILIATION_PROJECTION_CATALOGS_READY,
+  type AuthorizationContext,
+  type AuthorizationContextKind,
+  authorizationContextForLegacyOrganizationId,
   canonicalLegacyOrganizationId,
   canonicalReconciliationToken,
+  isCanonicalAuthorizationContext,
   isCanonicalLegacyUserSubjectRef,
   organizationRefForLegacyId,
   pluginRefForId
 } from "./iam-organization-reconciliation-refs.js";
 
 export {
+  ORGANIZATION_RECONCILIATION_PLATFORM_GLOBAL_CONTEXT_REF,
   ORGANIZATION_RECONCILIATION_PUBLIC_CONTEXT_REF,
   ORGANIZATION_RECONCILIATION_PROJECTION_CATALOGS_READY,
   organizationRefForLegacyId,
@@ -29,9 +35,9 @@ export {
 } from "./iam-organization-reconciliation-refs.js";
 
 export const ORGANIZATION_RECONCILIATION_PROJECTION_CONTRACT =
-  "iam-organization-reconciliation-projections/v1" as const;
+  "iam-organization-reconciliation-projections/v2" as const;
 const ORGANIZATION_RECONCILIATION_PROJECTION_CATALOG_DIGEST_DOMAIN =
-  "iam-organization-reconciliation:projection-catalog-digest:v1\u001f";
+  "iam-organization-reconciliation:projection-catalog-digest:v2\u001f";
 
 /**
  * Production catalogs are deliberately absent. Supplying data to the pure
@@ -72,8 +78,8 @@ export interface OrganizationReconciliationPlugin {
 }
 
 export interface OrganizationReconciliationCampusCatalogEntry {
-  readonly campusRef: string;
-  readonly legacyOrganizationId: string | number;
+  readonly contextKind: AuthorizationContextKind;
+  readonly contextRef: string;
 }
 
 export interface OrganizationReconciliationCapabilityRule {
@@ -98,7 +104,10 @@ export interface OrganizationReconciliationProjectionReadiness {
     "identity-directory-read-model-incomplete",
     "identity-mapping-read-model-incomplete",
     "campus-catalog-not-owner-approved",
-    "effective-capability-catalog-not-owner-approved"
+    "campus-platform-global-public-summary-not-owner-approved",
+    "effective-capability-catalog-not-owner-approved",
+    "exact-capability-context-execution-not-authorized",
+    "projection-binding-not-integrated"
   ];
 }
 
@@ -125,7 +134,10 @@ export function organizationReconciliationProjectionReadiness(): OrganizationRec
       "identity-directory-read-model-incomplete",
       "identity-mapping-read-model-incomplete",
       "campus-catalog-not-owner-approved",
-      "effective-capability-catalog-not-owner-approved"
+      "campus-platform-global-public-summary-not-owner-approved",
+      "effective-capability-catalog-not-owner-approved",
+      "exact-capability-context-execution-not-authorized",
+      "projection-binding-not-integrated"
     ]
   };
 }
@@ -233,27 +245,38 @@ export function projectCampusContexts(
 ): CampusContextRecord[] {
   const state = validateProjectionInput(input);
   const campusIndex = uniqueIndex(catalog, (entry) => {
-    canonicalLegacyOrganizationId(entry.legacyOrganizationId);
-    return canonicalReconciliationToken(entry.campusRef, "campus ref");
+    if (!isCanonicalAuthorizationContext(entry.contextKind, entry.contextRef)) {
+      throw new Error("A campus catalog entry has an invalid authorization context.");
+    }
+    return authorizationContextKey(entry.contextKind, entry.contextRef);
   });
+  const contexts = canonicalAuthorizationContextsForOrganizations(state.organizations);
+  if (
+    campusIndex.size !== contexts.length ||
+    contexts.some((context) => !campusIndex.has(authorizationContextKey(context.contextKind, context.contextRef)))
+  ) {
+    throw new Error("The campus catalog does not cover the exact organization/platform-global/public universe.");
+  }
   const records: CampusContextRecord[] = [];
 
-  for (const [campusRef, campus] of campusIndex) {
-    const organizationId = canonicalLegacyOrganizationId(campus.legacyOrganizationId);
-    const organization = state.organizations.byId.get(organizationId);
-    if (!organization) throw new Error("A campus catalog entry references an unknown organization.");
-    const organizationRef = organizationRefForLegacyId(organization.legacyOrganizationId);
+  for (const context of contexts) {
+    const organization = context.contextKind === "organization"
+      ? organizationForContextRef(state.organizations, context.contextRef)
+      : undefined;
     for (const [subjectRef, subject] of state.subjects) {
       const roles = state.rolesBySubject.get(subjectRef) ?? new Set<string>();
-      const rootAllowed = roles.has("root");
-      const organizationManager =
-        (roles.has("admin") || roles.has("manager")) &&
-        state.organizationRefsBySubject.get(subjectRef)?.has(organizationRef) === true;
+      const organizationAllowed = organization !== undefined && (
+        roles.has("root") ||
+        ((roles.has("admin") || roles.has("manager")) &&
+          state.organizationRefsBySubject.get(subjectRef)?.has(context.contextRef) === true)
+      );
       records.push({
         subjectRef,
-        campusRef,
-        organizationRef,
-        decision: subject.active && subject.authenticated && organization.active && (rootAllowed || organizationManager)
+        contextKind: context.contextKind,
+        contextRef: context.contextRef,
+        // The two reserved contexts are deliberately conservative until their
+        // owner-approved summary rules are compiled and pinned.
+        decision: subject.active && subject.authenticated && organization?.active === true && organizationAllowed
           ? "allow"
           : "deny"
       });
@@ -261,7 +284,7 @@ export function projectCampusContexts(
   }
 
   return sortAndRejectDuplicateRecords(records, (record) =>
-    [record.subjectRef, record.campusRef, record.organizationRef].join("\u0000")
+    [record.subjectRef, record.contextKind, record.contextRef].join("\u0000")
   );
 }
 
@@ -282,9 +305,11 @@ export function projectEffectiveDecisions(
   for (const [subjectRef, subject] of state.subjects) {
     const roles = state.rolesBySubject.get(subjectRef) ?? new Set<string>();
     const roleLevel = highestRoleLevel(roles);
-    for (const organization of state.organizations.ordered) {
-      const organizationRef = organizationRefForLegacyId(organization.legacyOrganizationId);
-      const isMember = state.organizationRefsBySubject.get(subjectRef)?.has(organizationRef) === true;
+    for (const context of canonicalAuthorizationContextsForOrganizations(state.organizations)) {
+      const organization = context.contextKind === "organization"
+        ? organizationForContextRef(state.organizations, context.contextRef)
+        : undefined;
+      const isMember = state.organizationRefsBySubject.get(subjectRef)?.has(context.contextRef) === true;
       for (const rule of ruleIndex.values()) {
         const membershipAllowed =
           !rule.membershipRequired ||
@@ -292,13 +317,14 @@ export function projectEffectiveDecisions(
           (rule.rootMayBypassMembership && roles.has("root"));
         records.push({
           subjectRef,
-          organizationRef,
+          contextKind: context.contextKind,
+          contextRef: context.contextRef,
           resourceRef: rule.resourceRef,
           capabilityRef: rule.capabilityRef,
           decision:
             subject.active &&
             subject.authenticated &&
-            organization.active &&
+            organization?.active === true &&
             membershipAllowed &&
             roleLevel >= ROLE_LEVELS[rule.minimumRole]!
               ? "allow"
@@ -309,7 +335,13 @@ export function projectEffectiveDecisions(
   }
 
   return sortAndRejectDuplicateRecords(records, (record) =>
-    [record.subjectRef, record.organizationRef, record.resourceRef, record.capabilityRef].join("\u0000")
+    [
+      record.subjectRef,
+      record.contextKind,
+      record.contextRef,
+      record.resourceRef,
+      record.capabilityRef
+    ].join("\u0000")
   );
 }
 
@@ -337,6 +369,7 @@ export function canonicalizeOrganizationReconciliationProjectionCatalog<T>(
 interface OrganizationState {
   readonly ordered: readonly OrganizationDirectoryRecord[];
   readonly byId: ReadonlyMap<string, OrganizationDirectoryRecord>;
+  readonly byRef: ReadonlyMap<string, OrganizationDirectoryRecord>;
   readonly activeByExactName: ReadonlyMap<string, OrganizationDirectoryRecord>;
 }
 
@@ -400,6 +433,7 @@ function validateProjectionInput(input: OrganizationReconciliationProjectionInpu
 
 function validateOrganizations(organizations: readonly OrganizationDirectoryRecord[]): OrganizationState {
   const byId = new Map<string, OrganizationDirectoryRecord>();
+  const byRef = new Map<string, OrganizationDirectoryRecord>();
   const activeByExactName = new Map<string, OrganizationDirectoryRecord>();
   const ordered = [...organizations].sort((left, right) =>
     canonicalLegacyOrganizationId(left.legacyOrganizationId).localeCompare(canonicalLegacyOrganizationId(right.legacyOrganizationId))
@@ -410,12 +444,47 @@ function validateOrganizations(organizations: readonly OrganizationDirectoryReco
     const name = canonicalReconciliationToken(organization.name, "organization name");
     if (byId.has(id)) throw new Error("The organization directory contains a duplicate Legacy ID.");
     byId.set(id, organization);
+    byRef.set(organizationRefForLegacyId(id), organization);
     if (organization.active) {
       if (activeByExactName.has(name)) throw new Error("The active organization directory contains an ambiguous name.");
       activeByExactName.set(name, organization);
     }
   }
-  return { ordered, byId, activeByExactName };
+  return { ordered, byId, byRef, activeByExactName };
+}
+
+function canonicalAuthorizationContextsForOrganizations(
+  organizations: OrganizationState
+): readonly Readonly<AuthorizationContext>[] {
+  return Object.freeze([
+    ...organizations.ordered.map((organization) =>
+      authorizationContextForLegacyOrganizationId(organization.legacyOrganizationId)
+    ),
+    Object.freeze({
+      contextKind: "platform-global" as const,
+      contextRef: ORGANIZATION_RECONCILIATION_PLATFORM_GLOBAL_CONTEXT_REF
+    }),
+    Object.freeze({
+      contextKind: "public" as const,
+      contextRef: ORGANIZATION_RECONCILIATION_PUBLIC_CONTEXT_REF
+    })
+  ]);
+}
+
+function organizationForContextRef(
+  organizations: OrganizationState,
+  contextRef: string
+): OrganizationDirectoryRecord {
+  const organization = organizations.byRef.get(contextRef);
+  if (!organization) throw new Error("An organization authorization context is unresolved.");
+  return organization;
+}
+
+function authorizationContextKey(
+  contextKind: AuthorizationContextKind,
+  contextRef: string
+): string {
+  return `${contextKind}\u0000${contextRef}`;
 }
 
 function resolvePluginOrganizationRef(

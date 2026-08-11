@@ -18,6 +18,11 @@ import {
   resolveCompiledOrganizationReconciliationTrustProfile
 } from "../apps/identity-adapter/src/iam-organization-reconciliation-trust-profiles.js";
 import {
+  createOrganizationReconciliationDevelopDeploymentEvidenceSha256,
+  parseOrganizationReconciliationDevelopDeploymentEvidence
+} from "../apps/identity-adapter/src/iam-organization-reconciliation-develop-deployment-evidence.js";
+import {
+  isCanonicalAuthorizationContext,
   isCanonicalLegacyOrganizationId,
   isCanonicalLegacyUserSubjectRef,
   isCanonicalOrganizationRef,
@@ -26,12 +31,17 @@ import {
 } from "../apps/identity-adapter/src/iam-organization-reconciliation-refs.js";
 import {
   ORGANIZATION_RECONCILIATION_COMPOSITE_CONSISTENCY_MODEL,
-  ORGANIZATION_RECONCILIATION_COMPOSITE_MANIFEST_CONTRACT,
+  ORGANIZATION_RECONCILIATION_OPERATION_COMPOSITE_MANIFEST_CONTRACT,
   ORGANIZATION_RECONCILIATION_OPERATION_EVIDENCE_CONTRACT,
   ORGANIZATION_RECONCILIATION_PAGINATION_MODE,
   ORGANIZATION_RECONCILIATION_SNAPSHOT_MODE,
-  validateOrganizationReconciliationCompositeManifest
+  validateOrganizationReconciliationOperationCompositeManifest
 } from "../apps/identity-adapter/src/iam-organization-reconciliation-component-manifest.js";
+import {
+  IDENTITY_ORGANIZATION_SURFACE_PROJECTOR_CONTRACT,
+  LEGACY_ORGANIZATION_SURFACE_PROJECTOR_CONTRACT,
+  ORGANIZATION_SURFACE_PROJECTION_BINDING_CONTRACT
+} from "../apps/identity-adapter/src/iam-organization-reconciliation-projector-contract.js";
 
 export type OrganizationReconciliationCliOptions =
   | { readonly mode: "help" }
@@ -41,6 +51,7 @@ export type OrganizationReconciliationCliOptions =
       readonly trustedProvenance?: {
         readonly attestationPath: string;
         readonly trustPolicyPath: string;
+        readonly deploymentEvidencePath: string;
         readonly trustProfile: string;
       };
     };
@@ -59,6 +70,7 @@ export const organizationReconciliationCliHelp = `Usage:
   npm run iam:organization-reconciliation:validate -- --input=<local-json-file>
   npm run iam:organization-reconciliation:validate -- --input=<local-json-file> \\
     --attestation=<local-json-file> --trust-policy=<local-json-file> \\
+    --deployment-evidence=<local-json-file> \\
     --trust-profile=<compiled-profile-id>
 
 Options:
@@ -69,14 +81,18 @@ Options:
   --trust-policy=<local-json-file>
                              Change-controlled Ed25519 public-key policy
                              (optional; requires attestation and trust-profile).
+  --deployment-evidence=<local-json-file>
+                             Independently observed Develop deployment manifest
+                             required with provenance v4 trusted verification.
   --trust-profile=<identifier>
                              Resolved only from the immutable compiled trust
                              registry (optional; requires both files).
   --help                     Show this help.
 
 The command performs no network or database access. URL, token, stdin, and
-network parameters are not supported. Input requires the v3 collector envelope
-plus a v3 three-source composite manifest whose operation-evidence digest binds
+network parameters are not supported. Input requires the v4 collector envelope
+plus a v4 final operation composite manifest whose parent lineage and
+operation-evidence digests bind
 the exact manifest-free input body. This artifact intentionally reports
 realSourceAdaptersReady=false and a coverage blocker until every reviewed
 authoritative adapter is registered in source; caller JSON cannot override it.
@@ -84,8 +100,9 @@ The trusted-provenance verifier cannot override this compiled blocker. Trusted
 mode additionally
 requires a provisioned compiled trust profile; no policy pin is accepted from
 arguments, environment, evidence, attestations, or policy JSON. It verifies
-every policy-required Ed25519 collector against
-the complete evidence digest, environment/node binding, collection window, and
+every policy-required Ed25519 collector against the complete evidence digest,
+independently domain-hashed deployment evidence, environment/node binding, and
+collection window and
 freshness limits. Invalid or absent provenance fails closed. Argument, file,
 JSON, schema, or unknown/unprovisioned-profile errors exit with status 2.
 `;
@@ -97,8 +114,9 @@ const canonicalRecordString = z.string().refine(isCanonicalReconciliationToken);
 const subjectRef = z.string().refine(isCanonicalLegacyUserSubjectRef);
 const pluginRef = z.string().refine(isCanonicalPluginRef);
 const organizationId = z.union([z.number(), z.string()]).refine(isCanonicalLegacyOrganizationId);
-const organizationRef = z.string().refine((value) => isCanonicalOrganizationRef(value, false));
 const publicOrganizationRef = z.string().refine((value) => isCanonicalOrganizationRef(value, true));
+const authorizationContextKind = z.enum(["organization", "platform-global", "public"]);
+const authorizationContextRef = z.string().min(1).max(256);
 const decision = z.enum(["allow", "deny"]);
 const hash = z.string().regex(/^[a-f0-9]{64}$/i);
 const cursor = z.string().nullable();
@@ -139,17 +157,24 @@ const pluginVisibilityRecord = z.object({
 }).strict();
 const campusContextRecord = z.object({
   subjectRef,
-  campusRef: canonicalRecordString,
-  organizationRef,
+  contextKind: authorizationContextKind,
+  contextRef: authorizationContextRef,
   decision
-}).strict();
+}).strict().refine(
+  (value) => isCanonicalAuthorizationContext(value.contextKind, value.contextRef),
+  "context kind/ref mismatch"
+);
 const effectiveDecisionRecord = z.object({
   subjectRef,
-  organizationRef,
+  contextKind: authorizationContextKind,
+  contextRef: authorizationContextRef,
   resourceRef: canonicalRecordString,
   capabilityRef: canonicalRecordString,
   decision
-}).strict();
+}).strict().refine(
+  (value) => isCanonicalAuthorizationContext(value.contextKind, value.contextRef),
+  "context kind/ref mismatch"
+);
 
 const pageEvidence = z.object({
   pageNumber: z.number().int().positive(),
@@ -202,12 +227,11 @@ const decisionUniverses = z.object({
   }),
   campusContexts: decisionUniverseSchema({
     subjects: decisionDimension,
-    campuses: decisionDimension,
-    organizations: decisionDimension
+    contexts: decisionDimension
   }),
   effectiveDecisions: decisionUniverseSchema({
     subjects: decisionDimension,
-    organizations: decisionDimension,
+    contexts: decisionDimension,
     resources: decisionDimension,
     capabilities: decisionDimension,
     rulePairs: decisionDimension
@@ -243,8 +267,40 @@ const collectionEnvelope = z.object({
   }).strict()
 }).strict();
 
+const projectionMetadata = z.string().min(1).max(1_024)
+  .refine((value) => value.trim() === value);
+const projectionHash = z.string().regex(/^[a-f0-9]{64}$/);
+const projectionSourceBinding = z.object({
+  sourceVersion: projectionMetadata,
+  snapshotId: projectionMetadata
+}).strict();
+
+function projectionSideBinding(projectorContract: string) {
+  return z.object({
+    projectorContract: z.literal(projectorContract),
+    evaluatorId: z.string().regex(/^[a-z0-9][a-z0-9./:-]{0,127}$/)
+      .refine((value) => !value.includes("..")),
+    evaluatorBuildSha256: projectionHash,
+    primarySource: projectionSourceBinding
+  }).strict();
+}
+
+const projectionBinding = z.object({
+  contract: z.literal(ORGANIZATION_SURFACE_PROJECTION_BINDING_CONTRACT),
+  semanticRegistrySha256: projectionHash,
+  lineageManifestSha256: projectionHash,
+  legacy: projectionSideBinding(LEGACY_ORGANIZATION_SURFACE_PROJECTOR_CONTRACT),
+  identity: projectionSideBinding(IDENTITY_ORGANIZATION_SURFACE_PROJECTOR_CONTRACT),
+  pluginSource: projectionSourceBinding
+}).strict().refine(
+  (value) => value.legacy.evaluatorId !== value.identity.evaluatorId &&
+    value.legacy.evaluatorBuildSha256 !== value.identity.evaluatorBuildSha256,
+  "projector sides must be independent"
+);
+
 const componentManifest = z.object({
-  contract: z.literal(ORGANIZATION_RECONCILIATION_COMPOSITE_MANIFEST_CONTRACT),
+  contract: z.literal(ORGANIZATION_RECONCILIATION_OPERATION_COMPOSITE_MANIFEST_CONTRACT),
+  parentLineageManifestSha256: hash,
   consistencyModel: z.literal(ORGANIZATION_RECONCILIATION_COMPOSITE_CONSISTENCY_MODEL),
   crossDatabaseAtomic: z.literal(false),
   windowStartedAt: nonBlankString,
@@ -300,6 +356,7 @@ const componentManifest = z.object({
 
 const organizationReconciliationInputSchema = z.object({
   componentManifest,
+  projectionBinding,
   collectionEnvelope,
   organizationDirectory: pairSchema(directoryRecord).optional(),
   organizationMappings: pairSchema(mappingRecord).optional(),
@@ -342,6 +399,7 @@ export function parseOrganizationReconciliationCliArgs(argv: readonly string[]):
   let inputPath: string | null = null;
   let attestationPath: string | null = null;
   let trustPolicyPath: string | null = null;
+  let deploymentEvidencePath: string | null = null;
   let trustProfile: string | null = null;
   for (const arg of argv) {
     if (arg.startsWith("--input=")) {
@@ -365,6 +423,19 @@ export function parseOrganizationReconciliationCliArgs(argv: readonly string[]):
       trustPolicyPath = parseLocalPathArgument("--trust-policy", arg.slice("--trust-policy=".length));
       continue;
     }
+    if (arg.startsWith("--deployment-evidence=")) {
+      if (deploymentEvidencePath !== null) {
+        throw new OrganizationReconciliationCliError(
+          "argument-invalid",
+          "--deployment-evidence may be provided only once."
+        );
+      }
+      deploymentEvidencePath = parseLocalPathArgument(
+        "--deployment-evidence",
+        arg.slice("--deployment-evidence=".length)
+      );
+      continue;
+    }
     if (arg.startsWith("--trust-profile=")) {
       if (trustProfile !== null) {
         throw new OrganizationReconciliationCliError("argument-invalid", "--trust-profile may be provided only once.");
@@ -380,29 +451,30 @@ export function parseOrganizationReconciliationCliArgs(argv: readonly string[]):
   if (inputPath === null) {
     throw new OrganizationReconciliationCliError("argument-invalid", "--input=<local-json-file> is required.");
   }
-  const trustedArgumentCount = [attestationPath, trustPolicyPath, trustProfile]
+  const trustedArgumentCount = [attestationPath, trustPolicyPath, deploymentEvidencePath, trustProfile]
     .filter((value) => value !== null).length;
-  if (trustedArgumentCount !== 0 && trustedArgumentCount !== 3) {
+  if (trustedArgumentCount !== 0 && trustedArgumentCount !== 4) {
     throw new OrganizationReconciliationCliError(
       "argument-invalid",
-      "--attestation, --trust-policy, and --trust-profile must be provided together."
+      "--attestation, --trust-policy, --deployment-evidence, and --trust-profile must be provided together."
     );
   }
   if (
     attestationPath !== null &&
     trustPolicyPath !== null &&
-    new Set([inputPath, attestationPath, trustPolicyPath]).size !== 3
+    deploymentEvidencePath !== null &&
+    new Set([inputPath, attestationPath, trustPolicyPath, deploymentEvidencePath]).size !== 4
   ) {
     throw new OrganizationReconciliationCliError(
       "argument-invalid",
-      "Input, attestation, and trust-policy must be distinct local files."
+      "Input, attestation, trust-policy, and deployment-evidence must be distinct local files."
     );
   }
   return {
     mode: "validate",
     inputPath,
-    ...(attestationPath !== null && trustPolicyPath !== null && trustProfile !== null
-      ? { trustedProvenance: { attestationPath, trustPolicyPath, trustProfile } }
+    ...(attestationPath !== null && trustPolicyPath !== null && deploymentEvidencePath !== null && trustProfile !== null
+      ? { trustedProvenance: { attestationPath, trustPolicyPath, deploymentEvidencePath, trustProfile } }
       : {})
   };
 }
@@ -445,7 +517,7 @@ export function parseOrganizationReconciliationJson(raw: string): OrganizationRe
     );
   }
   try {
-    validateOrganizationReconciliationCompositeManifest(result.data.componentManifest);
+    validateOrganizationReconciliationOperationCompositeManifest(result.data.componentManifest);
   } catch {
     throw new OrganizationReconciliationCliError(
       "input-schema-invalid",
@@ -506,17 +578,26 @@ export async function runOrganizationReconciliationCli(
           "The requested compiled trust profile is unknown or unprovisioned."
         );
       }
-      const [attestationRaw, trustPolicyRaw] = await Promise.all([
+      const [attestationRaw, trustPolicyRaw, deploymentEvidenceRaw] = await Promise.all([
         readTrustedArtifact(io, options.trustedProvenance.attestationPath),
-        readTrustedArtifact(io, options.trustedProvenance.trustPolicyPath)
+        readTrustedArtifact(io, options.trustedProvenance.trustPolicyPath),
+        readTrustedArtifact(io, options.trustedProvenance.deploymentEvidencePath)
       ]);
       const attestationValue = parseTrustedArtifactJson(attestationRaw);
       const trustPolicyValue = parseTrustedArtifactJson(trustPolicyRaw);
+      const deploymentEvidenceValue = parseTrustedArtifactJson(deploymentEvidenceRaw);
       try {
+        const deploymentEvidence = parseOrganizationReconciliationDevelopDeploymentEvidence(
+          deploymentEvidenceValue
+        );
+        const trustPolicy = parseOrganizationReconciliationTrustPolicy(trustPolicyValue);
+        assertDeploymentEvidenceMatchesTrustPolicy(deploymentEvidence, trustPolicy);
         trustedProvenance = {
           trustedProfile,
           attestationBundle: parseOrganizationReconciliationAttestationBundle(attestationValue),
-          trustPolicy: parseOrganizationReconciliationTrustPolicy(trustPolicyValue),
+          trustPolicy,
+          expectedDeploymentEvidenceSha256:
+            createOrganizationReconciliationDevelopDeploymentEvidenceSha256(deploymentEvidence),
           now: io.now?.() ?? new Date()
         };
       } catch {
@@ -532,6 +613,30 @@ export async function runOrganizationReconciliationCli(
   } catch (error) {
     writeSanitizedError(io, error);
     return 2;
+  }
+}
+
+function assertDeploymentEvidenceMatchesTrustPolicy(
+  deploymentEvidence: ReturnType<typeof parseOrganizationReconciliationDevelopDeploymentEvidence>,
+  trustPolicy: ReturnType<typeof parseOrganizationReconciliationTrustPolicy>
+): void {
+  if (
+    deploymentEvidence.environment !== trustPolicy.environment ||
+    trustPolicy.requiredCollectors.length !== 1 ||
+    deploymentEvidence.signers.length !== trustPolicy.requiredCollectors.length
+  ) throw new Error("deployment-policy-mismatch");
+  const deployedByKey = new Map(
+    deploymentEvidence.signers.map((signer) => [signer.keyId, signer])
+  );
+  for (const collector of trustPolicy.requiredCollectors) {
+    const deployed = deployedByKey.get(collector.keyId);
+    if (
+      !deployed ||
+      deployed.collectorId !== collector.collectorId ||
+      deployed.nodeId !== collector.nodeId ||
+      deployed.publicKeySha256 !== collector.publicKeySha256 ||
+      collector.buildRevision !== deploymentEvidence.buildRevision
+    ) throw new Error("deployment-policy-mismatch");
   }
 }
 

@@ -1,5 +1,14 @@
 export const ORGANIZATION_RECONCILIATION_PUBLIC_CONTEXT_REF = "org:public" as const;
+export const ORGANIZATION_RECONCILIATION_PLATFORM_GLOBAL_CONTEXT_REF =
+  "org:platform-global" as const;
 export const ORGANIZATION_RECONCILIATION_PROJECTION_CATALOGS_READY = false as const;
+
+export type AuthorizationContextKind = "organization" | "platform-global" | "public";
+
+export interface AuthorizationContext {
+  readonly contextKind: AuthorizationContextKind;
+  readonly contextRef: string;
+}
 
 export function canonicalLegacyOrganizationId(value: string | number): string {
   if (typeof value === "number") {
@@ -77,6 +86,48 @@ export function isCanonicalOrganizationRef(
   } catch {
     return false;
   }
+}
+
+/**
+ * Validates the authorization-context namespace without widening the generic
+ * organization-ref predicate above. The kind/ref pair is a strict bijection:
+ * organization contexts use only legacy-org:<canonical-id>, while the two
+ * non-organization contexts each have exactly one reserved ref.
+ */
+export function isCanonicalAuthorizationContext(
+  contextKind: unknown,
+  contextRef: unknown
+): contextKind is AuthorizationContextKind {
+  if (contextKind === "platform-global") {
+    return contextRef === ORGANIZATION_RECONCILIATION_PLATFORM_GLOBAL_CONTEXT_REF;
+  }
+  if (contextKind === "public") {
+    return contextRef === ORGANIZATION_RECONCILIATION_PUBLIC_CONTEXT_REF;
+  }
+  return contextKind === "organization" && isCanonicalOrganizationRef(contextRef, false);
+}
+
+export function authorizationContextForLegacyOrganizationId(
+  legacyOrganizationId: string | number
+): Readonly<AuthorizationContext> {
+  return Object.freeze({
+    contextKind: "organization" as const,
+    contextRef: organizationRefForLegacyId(legacyOrganizationId)
+  });
+}
+
+export function platformGlobalAuthorizationContext(): Readonly<AuthorizationContext> {
+  return Object.freeze({
+    contextKind: "platform-global" as const,
+    contextRef: ORGANIZATION_RECONCILIATION_PLATFORM_GLOBAL_CONTEXT_REF
+  });
+}
+
+export function publicAuthorizationContext(): Readonly<AuthorizationContext> {
+  return Object.freeze({
+    contextKind: "public" as const,
+    contextRef: ORGANIZATION_RECONCILIATION_PUBLIC_CONTEXT_REF
+  });
 }
 
 export function isCanonicalReconciliationToken(value: unknown): value is string {

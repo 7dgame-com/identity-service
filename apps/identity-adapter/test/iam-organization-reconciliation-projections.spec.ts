@@ -16,6 +16,10 @@ import {
   type OrganizationReconciliationPlugin,
   type OrganizationReconciliationProjectionInput
 } from "../src/iam-organization-reconciliation-projections.js";
+import {
+  isCanonicalAuthorizationContext,
+  isCanonicalOrganizationRef
+} from "../src/iam-organization-reconciliation-refs.js";
 
 describe("organization reconciliation authoritative projections", () => {
   it("keeps production catalogs fail-closed", () => {
@@ -27,7 +31,10 @@ describe("organization reconciliation authoritative projections", () => {
         "identity-directory-read-model-incomplete",
         "identity-mapping-read-model-incomplete",
         "campus-catalog-not-owner-approved",
-        "effective-capability-catalog-not-owner-approved"
+        "campus-platform-global-public-summary-not-owner-approved",
+        "effective-capability-catalog-not-owner-approved",
+        "exact-capability-context-execution-not-authorized",
+        "projection-binding-not-integrated"
       ]
     });
   });
@@ -44,6 +51,13 @@ describe("organization reconciliation authoritative projections", () => {
     expect(() => pluginRefForId("校园")).toThrow(/canonical ID token/);
     expect(() => pluginRefForId("a".repeat(65))).toThrow(/canonical ID token/);
     expect(() => pluginRefForId("plugin:campus")).toThrow(/namespace prefix/);
+    expect(isCanonicalAuthorizationContext("organization", "legacy-org:17")).toBe(true);
+    expect(isCanonicalAuthorizationContext("platform-global", "org:platform-global")).toBe(true);
+    expect(isCanonicalAuthorizationContext("public", "org:public")).toBe(true);
+    expect(isCanonicalAuthorizationContext("organization", "org:public")).toBe(false);
+    expect(isCanonicalAuthorizationContext("public", "org:platform-global")).toBe(false);
+    expect(isCanonicalAuthorizationContext("platform-global", "legacy-org:17")).toBe(false);
+    expect(isCanonicalOrganizationRef("org:platform-global", true)).toBe(false);
   });
 
   it("projects only explicitly member-scoped roles and never expands root", () => {
@@ -127,19 +141,34 @@ describe("organization reconciliation authoritative projections", () => {
 
   it("projects campus context with root-global and manager/admin membership semantics", () => {
     const records = projectCampusContexts(input(), [
-      { campusRef: "campus:north", legacyOrganizationId: 1 },
-      { campusRef: "campus:south", legacyOrganizationId: 2 }
+      { contextKind: "organization", contextRef: "legacy-org:1" },
+      { contextKind: "organization", contextRef: "legacy-org:2" },
+      { contextKind: "platform-global", contextRef: "org:platform-global" },
+      { contextKind: "public", contextRef: "org:public" }
     ]);
-    expect(records).toHaveLength(8);
-    expect(campusDecision(records, "legacy-user:1", "campus:north")).toBe("allow");
-    expect(campusDecision(records, "legacy-user:1", "campus:south")).toBe("allow");
-    expect(campusDecision(records, "legacy-user:2", "campus:north")).toBe("allow");
-    expect(campusDecision(records, "legacy-user:2", "campus:south")).toBe("deny");
-    expect(campusDecision(records, "legacy-user:3", "campus:south")).toBe("deny");
-    expect(campusDecision(records, "legacy-user:4", "campus:north")).toBe("deny");
+    expect(records).toHaveLength(16);
+    expect(campusDecision(records, "legacy-user:1", "legacy-org:1")).toBe("allow");
+    expect(campusDecision(records, "legacy-user:1", "legacy-org:2")).toBe("allow");
+    expect(campusDecision(records, "legacy-user:2", "legacy-org:1")).toBe("allow");
+    expect(campusDecision(records, "legacy-user:2", "legacy-org:2")).toBe("deny");
+    expect(campusDecision(records, "legacy-user:3", "legacy-org:2")).toBe("deny");
+    expect(campusDecision(records, "legacy-user:4", "legacy-org:1")).toBe("deny");
+    expect(campusDecision(records, "legacy-user:1", "org:platform-global")).toBe("deny");
+    expect(campusDecision(records, "legacy-user:1", "org:public")).toBe("deny");
   });
 
-  it("projects the complete subject x organization x capability decision universe", () => {
+  it("keeps the two reserved campus contexts when O=0", () => {
+    const emptyOrganizations = { ...input(), organizations: [], memberships: [] };
+    const records = projectCampusContexts(emptyOrganizations, [
+      { contextKind: "platform-global", contextRef: "org:platform-global" },
+      { contextKind: "public", contextRef: "org:public" }
+    ]);
+    expect(records).toHaveLength(emptyOrganizations.subjects.length * 2);
+    expect(new Set(records.map((record) => `${record.contextKind}\u0000${record.contextRef}`)))
+      .toEqual(new Set(["platform-global\u0000org:platform-global", "public\u0000org:public"]));
+  });
+
+  it("projects the structural subject x (organization + 2) x capability universe", () => {
     const records = projectEffectiveDecisions(input(), [
       {
         resourceRef: "organization-users",
@@ -156,13 +185,15 @@ describe("organization reconciliation authoritative projections", () => {
         rootMayBypassMembership: true
       }
     ]);
-    expect(records).toHaveLength(16);
+    expect(records).toHaveLength(32);
     expect(effectiveDecision(records, "legacy-user:1", "legacy-org:2", "manage")).toBe("allow");
     expect(effectiveDecision(records, "legacy-user:2", "legacy-org:1", "manage")).toBe("allow");
     expect(effectiveDecision(records, "legacy-user:2", "legacy-org:2", "manage")).toBe("deny");
     expect(effectiveDecision(records, "legacy-user:3", "legacy-org:2", "read")).toBe("allow");
     expect(effectiveDecision(records, "legacy-user:3", "legacy-org:2", "manage")).toBe("deny");
     expect(effectiveDecision(records, "legacy-user:4", "legacy-org:1", "manage")).toBe("deny");
+    expect(effectiveDecision(records, "legacy-user:1", "org:platform-global", "manage")).toBe("deny");
+    expect(effectiveDecision(records, "legacy-user:1", "org:public", "manage")).toBe("deny");
   });
 
   it("rejects unknown references, duplicate active keys, and ambiguous names", () => {
@@ -281,9 +312,9 @@ function decision(
 function campusDecision(
   records: ReturnType<typeof projectCampusContexts>,
   subjectRef: string,
-  campusRef: string
+  contextRef: string
 ): string | undefined {
-  return records.find((record) => record.subjectRef === subjectRef && record.campusRef === campusRef)?.decision;
+  return records.find((record) => record.subjectRef === subjectRef && record.contextRef === contextRef)?.decision;
 }
 
 function effectiveDecision(
@@ -294,7 +325,7 @@ function effectiveDecision(
 ): string | undefined {
   return records.find((record) =>
     record.subjectRef === subjectRef &&
-    record.organizationRef === organizationRef &&
+    record.contextRef === organizationRef &&
     record.capabilityRef === capabilityRef
   )?.decision;
 }

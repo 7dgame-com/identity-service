@@ -82,7 +82,8 @@ export async function runOrganizationReconciliationDevelopDualNodePreflightCli(
 
 export async function readCanonicalDevelopPreflightReportFile(path: string): Promise<unknown> {
   if (!safeLocalPath(path)) throw new Error("invalid-local-report");
-  const flags = constants.O_RDONLY | constants.O_NOFOLLOW;
+  if (typeof constants.O_NONBLOCK !== "number") throw new Error("invalid-local-report");
+  const flags = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
   const handle = await open(path, flags);
   let content: Buffer | undefined;
   try {

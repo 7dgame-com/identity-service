@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
   createOrganizationReconciliationCompositeManifestSha256,
+  createOrganizationReconciliationCompositeManifestForEvidence,
   createOrganizationReconciliationOperationEvidenceSha256,
   ORGANIZATION_RECONCILIATION_COMPOSITE_CONSISTENCY_MODEL,
   ORGANIZATION_RECONCILIATION_COMPOSITE_MANIFEST_CONTRACT,
@@ -71,7 +72,9 @@ export function attachTestOrganizationReconciliationComponentManifest(
       Date.parse(envelope.windowEndedAt) - Date.parse(envelope.windowStartedAt)
     ),
     evidenceContract: ORGANIZATION_RECONCILIATION_OPERATION_EVIDENCE_CONTRACT,
-    evidenceSha256: createOrganizationReconciliationOperationEvidenceSha256(boundEvidenceBody),
+    evidenceSha256: createOrganizationReconciliationOperationEvidenceSha256({
+      contract: "iam-organization-reconciliation-test-lineage-root/v1"
+    }),
     components: [
       {
         componentId: "legacy-main",
@@ -133,12 +136,16 @@ export function attachTestOrganizationReconciliationComponentManifest(
     ]
   } as const satisfies OrganizationReconciliationCompositeManifestUnsigned;
 
+  const lineageManifest = Object.freeze({
+    ...unsigned,
+    manifestSha256: createOrganizationReconciliationCompositeManifestSha256(unsigned)
+  });
   return {
     ...boundEvidenceBody,
-    componentManifest: {
-      ...unsigned,
-      manifestSha256: createOrganizationReconciliationCompositeManifestSha256(unsigned)
-    }
+    componentManifest: createOrganizationReconciliationCompositeManifestForEvidence(
+      lineageManifest,
+      boundEvidenceBody
+    )
   };
 }
 

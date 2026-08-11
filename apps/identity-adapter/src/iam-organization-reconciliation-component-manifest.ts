@@ -8,6 +8,8 @@ import {
 
 export const ORGANIZATION_RECONCILIATION_COMPOSITE_MANIFEST_CONTRACT =
   "iam-organization-reconciliation-composite-manifest/v3" as const;
+export const ORGANIZATION_RECONCILIATION_OPERATION_COMPOSITE_MANIFEST_CONTRACT =
+  "iam-organization-reconciliation-composite-manifest/v4" as const;
 export const ORGANIZATION_RECONCILIATION_COMPOSITE_CONSISTENCY_MODEL =
   "independent-immutable-snapshots-bounded-window" as const;
 export const ORGANIZATION_RECONCILIATION_OPERATION_EVIDENCE_CONTRACT =
@@ -71,8 +73,24 @@ export interface OrganizationReconciliationCompositeManifest
   readonly manifestSha256: string;
 }
 
+/** Final operation manifest; its parent is the immutable v3 lineage manifest. */
+export interface OrganizationReconciliationOperationCompositeManifestUnsigned
+  extends Omit<OrganizationReconciliationCompositeManifestUnsigned, "contract"> {
+  readonly contract: typeof ORGANIZATION_RECONCILIATION_OPERATION_COMPOSITE_MANIFEST_CONTRACT;
+  readonly parentLineageManifestSha256: string;
+}
+
+export interface OrganizationReconciliationOperationCompositeManifest
+  extends OrganizationReconciliationOperationCompositeManifestUnsigned {
+  readonly manifestSha256: string;
+}
+
 const MANIFEST_HASH_DOMAIN = Buffer.from(
   "iam-organization-reconciliation:composite-manifest:v3\u001f",
+  "utf8"
+);
+const OPERATION_MANIFEST_HASH_DOMAIN = Buffer.from(
+  "iam-organization-reconciliation:composite-manifest:v4\u001f",
   "utf8"
 );
 const OPERATION_EVIDENCE_HASH_DOMAIN = Buffer.from(
@@ -302,6 +320,70 @@ export function createOrganizationReconciliationCompositeManifestSha256(
     .digest("hex");
 }
 
+/** Strict final-operation v4 manifest validation; v3 lineage manifests are rejected here. */
+export function validateOrganizationReconciliationOperationCompositeManifestUnsigned(
+  candidate: unknown
+): OrganizationReconciliationOperationCompositeManifestUnsigned {
+  const canonicalCandidate = canonicalizeOrganizationReconciliationEvidenceValue(candidate);
+  requireExactKeys(canonicalCandidate, [
+    "contract",
+    "parentLineageManifestSha256",
+    "consistencyModel",
+    "crossDatabaseAtomic",
+    "windowStartedAt",
+    "windowEndedAt",
+    "maxWindowMilliseconds",
+    "evidenceContract",
+    "evidenceSha256",
+    "components"
+  ], "operation composite manifest");
+  const manifest = canonicalCandidate as Record<string, unknown>;
+  if (manifest.contract !== ORGANIZATION_RECONCILIATION_OPERATION_COMPOSITE_MANIFEST_CONTRACT) {
+    throw new OrganizationReconciliationComponentManifestError(
+      "The final operation composite manifest contract is invalid."
+    );
+  }
+  const parentLineageManifestSha256 = requireSha256(
+    manifest.parentLineageManifestSha256,
+    "parent lineage manifest digest"
+  );
+  const shared = validateOrganizationReconciliationCompositeManifestUnsigned({
+    contract: ORGANIZATION_RECONCILIATION_COMPOSITE_MANIFEST_CONTRACT,
+    consistencyModel: manifest.consistencyModel,
+    crossDatabaseAtomic: manifest.crossDatabaseAtomic,
+    windowStartedAt: manifest.windowStartedAt,
+    windowEndedAt: manifest.windowEndedAt,
+    maxWindowMilliseconds: manifest.maxWindowMilliseconds,
+    evidenceContract: manifest.evidenceContract,
+    evidenceSha256: manifest.evidenceSha256,
+    components: manifest.components
+  });
+  return Object.freeze({
+    contract: ORGANIZATION_RECONCILIATION_OPERATION_COMPOSITE_MANIFEST_CONTRACT,
+    parentLineageManifestSha256,
+    consistencyModel: shared.consistencyModel,
+    crossDatabaseAtomic: shared.crossDatabaseAtomic,
+    windowStartedAt: shared.windowStartedAt,
+    windowEndedAt: shared.windowEndedAt,
+    maxWindowMilliseconds: shared.maxWindowMilliseconds,
+    evidenceContract: shared.evidenceContract,
+    evidenceSha256: shared.evidenceSha256,
+    components: shared.components
+  });
+}
+
+/** Canonical v4 digest; the parent lineage digest is part of the hash body. */
+export function createOrganizationReconciliationOperationCompositeManifestSha256(
+  manifest: OrganizationReconciliationOperationCompositeManifestUnsigned
+): string {
+  const canonicalManifest =
+    validateOrganizationReconciliationOperationCompositeManifestUnsigned(manifest);
+  return createHash("sha256")
+    .update(OPERATION_MANIFEST_HASH_DOMAIN)
+    .update(canonicalJson(canonicalManifest), "utf8")
+    .digest("hex");
+}
+
 /**
  * Copies an operation result into deeply frozen canonical JSON. Accessors,
  * sparse arrays, symbols, cycles, non-finite numbers, and class instances are
@@ -376,6 +458,47 @@ export function validateOrganizationReconciliationCompositeManifest(
   return Object.freeze({ ...unsigned, manifestSha256 });
 }
 
+/** Strictly validates the final v4 operation manifest and its parent-covering digest. */
+export function validateOrganizationReconciliationOperationCompositeManifest(
+  candidate: unknown
+): OrganizationReconciliationOperationCompositeManifest {
+  const canonicalCandidate = canonicalizeOrganizationReconciliationEvidenceValue(candidate);
+  requireExactKeys(canonicalCandidate, [
+    "contract",
+    "parentLineageManifestSha256",
+    "consistencyModel",
+    "crossDatabaseAtomic",
+    "windowStartedAt",
+    "windowEndedAt",
+    "maxWindowMilliseconds",
+    "evidenceContract",
+    "evidenceSha256",
+    "components",
+    "manifestSha256"
+  ], "signed operation composite manifest");
+  const manifest = canonicalCandidate as Record<string, unknown>;
+  const unsigned = validateOrganizationReconciliationOperationCompositeManifestUnsigned({
+    contract: manifest.contract,
+    parentLineageManifestSha256: manifest.parentLineageManifestSha256,
+    consistencyModel: manifest.consistencyModel,
+    crossDatabaseAtomic: manifest.crossDatabaseAtomic,
+    windowStartedAt: manifest.windowStartedAt,
+    windowEndedAt: manifest.windowEndedAt,
+    maxWindowMilliseconds: manifest.maxWindowMilliseconds,
+    evidenceContract: manifest.evidenceContract,
+    evidenceSha256: manifest.evidenceSha256,
+    components: manifest.components
+  });
+  const manifestSha256 = requireSha256(manifest.manifestSha256, "operation composite manifest digest");
+  const expectedSha256 = createOrganizationReconciliationOperationCompositeManifestSha256(unsigned);
+  if (!safeDigestEqual(manifestSha256, expectedSha256)) {
+    throw new OrganizationReconciliationComponentManifestError(
+      "The operation composite manifest digest does not match its canonical content."
+    );
+  }
+  return Object.freeze({ ...unsigned, manifestSha256 });
+}
+
 /** Rejects pairing snapshot manifest A with operation evidence B. */
 export function validateOrganizationReconciliationCompositeManifestEvidenceBinding(
   candidateManifest: unknown,
@@ -389,6 +512,53 @@ export function validateOrganizationReconciliationCompositeManifestEvidenceBindi
     );
   }
   return manifest;
+}
+
+/** Rejects final operation manifest/evidence A+B pairing, including parent changes. */
+export function validateOrganizationReconciliationOperationCompositeManifestEvidenceBinding(
+  candidateManifest: unknown,
+  candidateEvidence: unknown
+): OrganizationReconciliationOperationCompositeManifest {
+  const manifest = validateOrganizationReconciliationOperationCompositeManifest(candidateManifest);
+  const evidenceSha256 = createOrganizationReconciliationOperationEvidenceSha256(candidateEvidence);
+  if (!safeDigestEqual(manifest.evidenceSha256, evidenceSha256)) {
+    throw new OrganizationReconciliationComponentManifestError(
+      "The operation evidence does not match the final composite manifest binding."
+    );
+  }
+  return manifest;
+}
+
+/**
+ * Rebinds one already validated three-source snapshot manifest to a later
+ * operation-evidence body. The component snapshots and bounded collection
+ * window are preserved byte-for-byte; only the evidence and manifest digests
+ * are recomputed. This is the non-circular bridge from lineage collection to
+ * projected reconciliation evidence.
+ */
+export function createOrganizationReconciliationCompositeManifestForEvidence(
+  candidateLineageManifest: unknown,
+  candidateEvidence: unknown
+): OrganizationReconciliationOperationCompositeManifest {
+  const lineageManifest = validateOrganizationReconciliationCompositeManifest(
+    candidateLineageManifest
+  );
+  const unsigned = validateOrganizationReconciliationOperationCompositeManifestUnsigned({
+    contract: ORGANIZATION_RECONCILIATION_OPERATION_COMPOSITE_MANIFEST_CONTRACT,
+    parentLineageManifestSha256: lineageManifest.manifestSha256,
+    consistencyModel: lineageManifest.consistencyModel,
+    crossDatabaseAtomic: lineageManifest.crossDatabaseAtomic,
+    windowStartedAt: lineageManifest.windowStartedAt,
+    windowEndedAt: lineageManifest.windowEndedAt,
+    maxWindowMilliseconds: lineageManifest.maxWindowMilliseconds,
+    evidenceContract: lineageManifest.evidenceContract,
+    evidenceSha256: createOrganizationReconciliationOperationEvidenceSha256(candidateEvidence),
+    components: lineageManifest.components
+  });
+  return Object.freeze({
+    ...unsigned,
+    manifestSha256: createOrganizationReconciliationOperationCompositeManifestSha256(unsigned)
+  });
 }
 
 function canonicalizeEvidenceValue(

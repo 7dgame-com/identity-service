@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { spawnSync } from "node:child_process";
 import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -290,6 +291,14 @@ describe("xrteeth Develop dual-node source-preflight alignment", () => {
       await expect(readCanonicalDevelopPreflightReportFile("https://example.invalid/report.json"))
         .rejects.toThrow("invalid-local-report");
       await expect(readCanonicalDevelopPreflightReportFile("-")).rejects.toThrow("invalid-local-report");
+
+      const fifoPath = join(directory, "blocked.fifo");
+      const mkfifo = spawnSync("mkfifo", [fifoPath], { encoding: "utf8" });
+      expect(mkfifo.status).toBe(0);
+      await expect(Promise.race([
+        readCanonicalDevelopPreflightReportFile(fifoPath),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("fifo-open-blocked")), 1_000))
+      ])).rejects.toThrow("invalid-local-report");
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

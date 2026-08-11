@@ -2,12 +2,15 @@ import { describe, expect, it } from "vitest";
 import {
   IDENTITY_ORGANIZATION_SURFACE_PROJECTOR_CONTRACT,
   LEGACY_ORGANIZATION_SURFACE_PROJECTOR_CONTRACT,
+  ORGANIZATION_SURFACE_PROJECTION_BINDING_CONTRACT,
   OrganizationSurfaceProjectorContractError,
   assertIndependentOrganizationSurfaceProjections,
+  createOrganizationSurfaceProjectionBinding,
   executeIdentityOrganizationSurfaceProjector,
   executeLegacyOrganizationSurfaceProjector,
   isIdentityOrganizationSurfaceProjection,
   isLegacyOrganizationSurfaceProjection,
+  isOrganizationSurfaceProjectionBinding,
   organizationSurfaceProjectorReadiness,
   type IdentityOrganizationSurfaceProjector,
   type LegacyOrganizationSurfaceProjector,
@@ -27,7 +30,8 @@ describe("organization surface projector contract", () => {
         "compiled-owner-semantic-registry-selection-not-implemented",
         "legacy-projector-not-registered",
         "identity-projector-not-registered",
-        "independent-projector-artifact-provenance-not-attested"
+        "independent-projector-artifact-provenance-not-attested",
+        "projection-lineage-binding-not-integrated"
       ]
     });
   });
@@ -127,6 +131,132 @@ describe("organization surface projector contract", () => {
       { ...legacy } as typeof legacy,
       identity
     )).toThrow(/trusted side brand/);
+  });
+
+  it("creates a detached frozen projection-binding/v1 for one exact lineage run", async () => {
+    const lineageManifestSha256 = "d".repeat(64);
+    const pluginSource = { sourceVersion: "plugin-v1", snapshotId: "plugin-snapshot-1" };
+    const legacyPrimarySource = { sourceVersion: "legacy-v1", snapshotId: "legacy-snapshot-1" };
+    const identityPrimarySource = { sourceVersion: "identity-v1", snapshotId: "identity-snapshot-1" };
+    const legacy = await executeLegacyOrganizationSurfaceProjector(
+      legacyProjector(draft("deny")),
+      {},
+      REGISTRY_SHA256,
+      { lineageManifestSha256, primarySource: legacyPrimarySource, pluginSource }
+    );
+    const identity = await executeIdentityOrganizationSurfaceProjector(
+      identityProjector(draft("deny")),
+      {},
+      REGISTRY_SHA256,
+      { lineageManifestSha256, primarySource: identityPrimarySource, pluginSource }
+    );
+
+    const binding = createOrganizationSurfaceProjectionBinding({
+      legacyProjection: legacy,
+      identityProjection: identity,
+      semanticRegistrySha256: REGISTRY_SHA256,
+      lineageManifestSha256,
+      legacyPrimarySource,
+      identityPrimarySource,
+      pluginSource
+    });
+    expect(binding.contract).toBe(ORGANIZATION_SURFACE_PROJECTION_BINDING_CONTRACT);
+    expect(isOrganizationSurfaceProjectionBinding(binding)).toBe(true);
+    expect(binding.legacy.projectorContract).toBe(LEGACY_ORGANIZATION_SURFACE_PROJECTOR_CONTRACT);
+    expect(binding.identity.projectorContract).toBe(IDENTITY_ORGANIZATION_SURFACE_PROJECTOR_CONTRACT);
+    expect(Object.isFrozen(binding)).toBe(true);
+    expect(Object.isFrozen(binding.legacy)).toBe(true);
+    expect(Object.isFrozen(binding.legacy.primarySource)).toBe(true);
+    legacyPrimarySource.sourceVersion = "mutated";
+    pluginSource.snapshotId = "mutated";
+    expect(binding.legacy.primarySource.sourceVersion).toBe("legacy-v1");
+    expect(binding.pluginSource.snapshotId).toBe("plugin-snapshot-1");
+  });
+
+  it("rejects projection run A with manifest B and cross-run A/B pairs", async () => {
+    const manifestA = "d".repeat(64);
+    const manifestB = "e".repeat(64);
+    const plugin = { sourceVersion: "plugin-v1", snapshotId: "plugin-snapshot-1" };
+    const legacySource = { sourceVersion: "legacy-v1", snapshotId: "legacy-snapshot-1" };
+    const identitySource = { sourceVersion: "identity-v1", snapshotId: "identity-snapshot-1" };
+    const legacy = await executeLegacyOrganizationSurfaceProjector(
+      legacyProjector(draft("deny")), {}, REGISTRY_SHA256,
+      { lineageManifestSha256: manifestA, primarySource: legacySource, pluginSource: plugin }
+    );
+    const identityA = await executeIdentityOrganizationSurfaceProjector(
+      identityProjector(draft("deny")), {}, REGISTRY_SHA256,
+      { lineageManifestSha256: manifestA, primarySource: identitySource, pluginSource: plugin }
+    );
+    const identityB = await executeIdentityOrganizationSurfaceProjector(
+      identityProjector(draft("deny"), "test/identity-b", "f".repeat(64)), {}, REGISTRY_SHA256,
+      { lineageManifestSha256: manifestB, primarySource: identitySource, pluginSource: plugin }
+    );
+    const exact = {
+      legacyProjection: legacy,
+      identityProjection: identityA,
+      semanticRegistrySha256: REGISTRY_SHA256,
+      lineageManifestSha256: manifestA,
+      legacyPrimarySource: legacySource,
+      identityPrimarySource: identitySource,
+      pluginSource: plugin
+    };
+    expect(() => createOrganizationSurfaceProjectionBinding({
+      ...exact,
+      lineageManifestSha256: manifestB
+    })).toThrow(/run binding does not match/);
+    expect(() => createOrganizationSurfaceProjectionBinding({
+      ...exact,
+      identityProjection: identityB
+    })).toThrow(/run binding does not match/);
+    expect(() => createOrganizationSurfaceProjectionBinding({
+      ...exact,
+      pluginSource: { ...plugin, snapshotId: "plugin-snapshot-2" }
+    })).toThrow(/run binding does not match/);
+  });
+
+  it("rejects accessor-backed binding descriptors without invoking accessors", async () => {
+    let getterInvoked = false;
+    let projectorInvoked = false;
+    const descriptor = {
+      lineageManifestSha256: "d".repeat(64),
+      primarySource: { sourceVersion: "legacy-v1", snapshotId: "legacy-snapshot-1" },
+      pluginSource: { sourceVersion: "plugin-v1", snapshotId: "plugin-snapshot-1" }
+    } as Record<string, unknown>;
+    Object.defineProperty(descriptor, "lineageManifestSha256", {
+      enumerable: true,
+      get: () => {
+        getterInvoked = true;
+        return "d".repeat(64);
+      }
+    });
+    const projector = legacyProjector(draft("deny"));
+    projector.project = () => {
+      projectorInvoked = true;
+      return draft("deny");
+    };
+    await expect(executeLegacyOrganizationSurfaceProjector(
+      projector,
+      {},
+      REGISTRY_SHA256,
+      descriptor as unknown as Parameters<typeof executeLegacyOrganizationSurfaceProjector>[3]
+    )).rejects.toThrow(/data descriptors/);
+    expect(getterInvoked).toBe(false);
+    expect(projectorInvoked).toBe(false);
+  });
+
+  it("rejects the retired v1 side projector contract before invocation", async () => {
+    let invoked = false;
+    const projector = {
+      ...legacyProjector(draft("deny")),
+      contract: "iam-organization-legacy-surface-projector/v1",
+      project: () => {
+        invoked = true;
+        return draft("deny");
+      }
+    } as unknown as LegacyOrganizationSurfaceProjector<unknown>;
+    await expect(executeLegacyOrganizationSurfaceProjector(projector, {}, REGISTRY_SHA256))
+      .rejects.toThrow(/side contract/);
+    expect(invoked).toBe(false);
   });
 
   it("rejects a wrong side contract before invoking a projector", async () => {
@@ -349,7 +479,8 @@ function draft(decision: "allow" | "deny"): OrganizationSurfaceProjectionDraft {
       effectiveDecisions: [
         {
           subjectRef: "legacy-user:1",
-          organizationRef: "legacy-org:1",
+          contextKind: "organization",
+          contextRef: "legacy-org:1",
           resourceRef: "organization",
           capabilityRef: "organization.list",
           decision

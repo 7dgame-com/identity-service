@@ -9,12 +9,15 @@ import { z } from "zod";
 import type { OrganizationReconciliationInput } from "./iam-organization-reconciliation-validator.js";
 
 export const ORGANIZATION_RECONCILIATION_PROVENANCE_CONTRACT =
-  "iam-organization-reconciliation-provenance/v3";
+  "iam-organization-reconciliation-provenance/v4";
 export const ORGANIZATION_RECONCILIATION_TRUST_POLICY_CONTRACT =
   "iam-organization-reconciliation-trust-policy/v3";
 export const ORGANIZATION_RECONCILIATION_PROVENANCE_AUDIENCE =
   "identity-service/iam-organization-reconciliation";
 export const ORGANIZATION_RECONCILIATION_PROVENANCE_ALGORITHM = "Ed25519";
+/** Immutable prefix for the exact bytes accepted by external hash-only signers. */
+export const ORGANIZATION_RECONCILIATION_PROVENANCE_SIGNATURE_DOMAIN =
+  "iam-organization-reconciliation:provenance:v4\u001f";
 
 const identifier = z.string().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9._:-]*$/);
 const sha256 = z.string().regex(/^[a-f0-9]{64}$/);
@@ -27,6 +30,7 @@ const publicKeyPem = z.string().min(1).max(8192);
 
 const provenanceBindingSchema = z.object({
   evidenceSha256: sha256,
+  deploymentEvidenceSha256: sha256,
   collectorContractHash: sha256,
   collectorBuildRevision: fullBuildRevision,
   logicalSnapshotIdHash: sha256,
@@ -58,8 +62,13 @@ const trustPolicySchema = z.object({
   maxAttestationTtlSeconds: z.number().int().min(1).max(3_600),
   maxCollectionWindowSeconds: z.number().int().min(1).max(3_600),
   clockSkewSeconds: z.number().int().min(0).max(300),
-  requiredCollectors: z.array(trustedCollectorSchema).min(2).max(8)
-}).strict();
+  requiredCollectors: z.array(trustedCollectorSchema).min(1).max(8)
+}).strict().superRefine((policy, context) => {
+  if ((policy.environment === "xrteeth-develop" && policy.requiredCollectors.length !== 1) ||
+    (policy.environment !== "xrteeth-develop" && policy.requiredCollectors.length < 2)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["requiredCollectors"] });
+  }
+});
 
 const provenancePayloadSchema = provenanceBindingSchema.extend({
   contract: z.literal(ORGANIZATION_RECONCILIATION_PROVENANCE_CONTRACT),
@@ -97,8 +106,13 @@ const trustedProfileSchema = z.object({
   profileId: identifier,
   policySha256: sha256,
   expectedEnvironment: identifier,
-  requiredCollectors: z.array(trustedProfileCollectorSchema).min(2).max(8)
-}).strict();
+  requiredCollectors: z.array(trustedProfileCollectorSchema).min(1).max(8)
+}).strict().superRefine((profile, context) => {
+  if ((profile.expectedEnvironment === "xrteeth-develop" && profile.requiredCollectors.length !== 1) ||
+    (profile.expectedEnvironment !== "xrteeth-develop" && profile.requiredCollectors.length < 2)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["requiredCollectors"] });
+  }
+});
 
 export type OrganizationReconciliationProvenanceBinding = z.infer<typeof provenanceBindingSchema>;
 export type OrganizationReconciliationTrustedCollector = z.infer<typeof trustedCollectorSchema>;
@@ -113,6 +127,8 @@ export interface OrganizationReconciliationTrustedProvenanceContext {
   readonly trustedProfile: OrganizationReconciliationTrustedProfile;
   readonly trustPolicy: OrganizationReconciliationTrustPolicy;
   readonly attestationBundle: OrganizationReconciliationAttestationBundle;
+  /** Independently parsed deployment-evidence digest; it is not supplied by the policy or payload. */
+  readonly expectedDeploymentEvidenceSha256: string;
   /** Trusted verifier time. It must not be read from caller-controlled evidence. */
   readonly now: Date;
 }
@@ -144,7 +160,7 @@ export interface OrganizationReconciliationProvenanceVerification {
   readonly environment?: string;
 }
 
-const SIGNATURE_DOMAIN = Buffer.from("iam-organization-reconciliation:provenance:v3\u001f", "utf8");
+const SIGNATURE_DOMAIN = Buffer.from(ORGANIZATION_RECONCILIATION_PROVENANCE_SIGNATURE_DOMAIN, "utf8");
 
 /**
  * Verifies a complete evidence digest against a separately pinned trust policy.
@@ -162,6 +178,7 @@ export function verifyOrganizationReconciliationProvenance(
     !policyResult.success ||
     !bundleResult.success ||
     !trustedProfileResult.success ||
+    !sha256.safeParse(context.expectedDeploymentEvidenceSha256).success ||
     !(context.now instanceof Date) ||
     !Number.isFinite(context.now.getTime())
   ) {
@@ -193,6 +210,11 @@ export function verifyOrganizationReconciliationProvenance(
   }
 
   const evidence = bindingResult.data;
+  if (
+    !safeHexEqual(evidence.deploymentEvidenceSha256, context.expectedDeploymentEvidenceSha256)
+  ) {
+    return failed("evidence-binding-invalid", requiredCount, policySha256);
+  }
   const windowStart = Date.parse(evidence.windowStartedAt);
   const windowEnd = Date.parse(evidence.windowEndedAt);
   if (
@@ -348,10 +370,12 @@ export function createOrganizationReconciliationProvenanceBinding(
   logicalSnapshotId: string,
   windowId: string,
   windowStartedAt: string,
-  windowEndedAt: string
+  windowEndedAt: string,
+  deploymentEvidenceSha256: string
 ): OrganizationReconciliationProvenanceBinding {
   return provenanceBindingSchema.parse({
     evidenceSha256: createCanonicalSha256(evidence),
+    deploymentEvidenceSha256,
     collectorContractHash: collectorContractHash.toLowerCase(),
     collectorBuildRevision,
     logicalSnapshotIdHash: createSha256(logicalSnapshotId),
@@ -367,7 +391,8 @@ export function createOrganizationReconciliationProvenanceBinding(
  * the narrower logical collection-envelope window nested inside the evidence.
  */
 export function createOrganizationReconciliationProvenanceBindingFromInput(
-  input: OrganizationReconciliationInput
+  input: OrganizationReconciliationInput,
+  deploymentEvidenceSha256: string
 ): OrganizationReconciliationProvenanceBinding {
   const envelope = input.collectionEnvelope;
   const componentManifest = input.componentManifest;
@@ -381,7 +406,8 @@ export function createOrganizationReconciliationProvenanceBindingFromInput(
     envelope.logicalSnapshotId,
     envelope.windowId,
     componentManifest.windowStartedAt,
-    componentManifest.windowEndedAt
+    componentManifest.windowEndedAt,
+    deploymentEvidenceSha256
   );
 }
 
@@ -486,6 +512,7 @@ function payloadMatchesBinding(
   binding: OrganizationReconciliationProvenanceBinding
 ): boolean {
   return safeHexEqual(payload.evidenceSha256, binding.evidenceSha256) &&
+    safeHexEqual(payload.deploymentEvidenceSha256, binding.deploymentEvidenceSha256) &&
     safeHexEqual(payload.collectorContractHash, binding.collectorContractHash) &&
     payload.collectorBuildRevision === binding.collectorBuildRevision &&
     safeHexEqual(payload.logicalSnapshotIdHash, binding.logicalSnapshotIdHash) &&

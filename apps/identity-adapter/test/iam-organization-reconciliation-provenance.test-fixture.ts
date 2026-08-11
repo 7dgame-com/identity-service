@@ -15,6 +15,7 @@ import {
 } from "../src/iam-organization-reconciliation-provenance.js";
 
 export const TEST_COLLECTOR_BUILD_REVISION = "a".repeat(40);
+export const TEST_DEPLOYMENT_EVIDENCE_SHA256 = "d".repeat(64);
 
 export function createOrganizationReconciliationPolicyForTest(
   collectors: readonly {
