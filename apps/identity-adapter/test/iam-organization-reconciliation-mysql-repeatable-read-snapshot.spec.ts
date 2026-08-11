@@ -148,6 +148,17 @@ describe("organization reconciliation MySQL repeatable-read snapshot", () => {
       .toContain("source = 'legacy-shadow' AND status = 'shadow'");
   });
 
+  it("excludes inactive Identity-only tombstones from both reconciliation subject snapshots", () => {
+    expect(ORGANIZATION_RECONCILIATION_MYSQL_STATEMENTS["identity-subject-universe-page/v3"])
+      .toContain("source = 'legacy-shadow' AND status = 'active'");
+    expect(ORGANIZATION_RECONCILIATION_MYSQL_STATEMENTS["identity-iam-subject-assignment-snapshot-page/v1"])
+      .toContain("iu.source = 'legacy-shadow' AND iu.status = 'active'");
+    expect(ORGANIZATION_RECONCILIATION_MYSQL_STATEMENTS["identity-subject-universe-page/v3"])
+      .not.toContain("'inactive'");
+    expect(ORGANIZATION_RECONCILIATION_MYSQL_STATEMENTS["identity-iam-subject-assignment-snapshot-page/v1"])
+      .not.toContain("'inactive'");
+  });
+
   it("pins the Legacy RBAC edge statement to binary keyset ordering and exact cursor parameters", async () => {
     expect(ORGANIZATION_RECONCILIATION_MYSQL_STATEMENTS[RBAC_EDGE_STATEMENT_ID]).toBe(RBAC_EDGE_SQL);
     const fake = fakeConnection();
