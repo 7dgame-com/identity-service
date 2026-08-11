@@ -1,6 +1,9 @@
 import { createHash, createPublicKey } from "node:crypto";
 import { isProxy } from "node:util/types";
 import {
+  ORGANIZATION_RECONCILIATION_PROVENANCE_ALGORITHM,
+  ORGANIZATION_RECONCILIATION_PROVENANCE_AUDIENCE,
+  ORGANIZATION_RECONCILIATION_TRUST_POLICY_CONTRACT,
   createOrganizationReconciliationTrustPolicySha256,
   parseOrganizationReconciliationTrustPolicy,
   type OrganizationReconciliationTrustPolicy,
@@ -44,7 +47,35 @@ export type OrganizationReconciliationCompiledTrustBindingRegistry =
 
 const COMPILED_TRUST_PROFILE_TEMPLATES:
 Readonly<Record<string, OrganizationReconciliationTrustPolicyTemplate>> =
-  Object.freeze({});
+  Object.freeze({
+    "xrteeth-develop-task72-v1": Object.freeze({
+      contract: ORGANIZATION_RECONCILIATION_TRUST_POLICY_CONTRACT,
+      profileId: "xrteeth-develop-task72-v1",
+      audience: ORGANIZATION_RECONCILIATION_PROVENANCE_AUDIENCE,
+      environment: "xrteeth-develop",
+      validFrom: "2026-08-11T00:00:00.000Z",
+      validUntil: "2026-09-10T00:00:00.000Z",
+      maxEvidenceAgeSeconds: 3_600,
+      maxAttestationTtlSeconds: 300,
+      maxCollectionWindowSeconds: 3_600,
+      clockSkewSeconds: 60,
+      requiredCollectors: Object.freeze([
+        Object.freeze({
+          collectorId: "xrteeth-develop-task72-signer-1",
+          nodeId: "xrteeth-develop-portainer-local",
+          keyId: "xrteeth-develop-task72-ed25519-1",
+          algorithm: ORGANIZATION_RECONCILIATION_PROVENANCE_ALGORITHM,
+          publicKeyPem:
+            "-----BEGIN PUBLIC KEY-----\n" +
+            "MCowBQYDK2VwAyEAbVnKwvawsZJ8RcvudPtveaaZFEoq5cRg0fc401nkqLI=\n" +
+            "-----END PUBLIC KEY-----\n",
+          publicKeySha256: "13aabcff0db9a4f9c077b23a30ce95eb9f91be684a5cf6cffa6dc62708655392",
+          validFrom: "2026-08-11T00:00:00.000Z",
+          validUntil: "2026-09-10T00:00:00.000Z"
+        })
+      ])
+    })
+  });
 
 const TRUST_PROFILE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const FULL_BUILD_REVISION = /^[a-f0-9]{40}$/;

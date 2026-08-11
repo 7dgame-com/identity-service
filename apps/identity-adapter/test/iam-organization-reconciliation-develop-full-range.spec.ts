@@ -44,7 +44,7 @@ afterEach(async () => {
 });
 
 describe("xrteeth Develop full-range compiled trust-profile gate", () => {
-  it("returns the fixed trust-profile-not-provisioned failure with zero connection, RNG-adjacent clock, signer, or output calls", async () => {
+  it("rejects an invalid public policy before connection, RNG-adjacent clock, signer, or output calls", async () => {
     let connectionOpens = 0;
     let clockCalls = 0;
     let signerCalls = 0;
@@ -59,8 +59,8 @@ describe("xrteeth Develop full-range compiled trust-profile gate", () => {
     await expect(runOrganizationReconciliationDevelopFullRange(dependencies)).rejects.toEqual(
       expect.objectContaining({
         name: "OrganizationReconciliationDevelopFullRangeError",
-        message: "trust-profile-not-provisioned",
-        failureId: "trust-profile-not-provisioned"
+        message: "trust-policy-invalid",
+        failureId: "trust-policy-invalid"
       })
     );
     expect(connectionOpens).toBe(0);
@@ -211,7 +211,7 @@ describe("xrteeth Develop full-range CLI", () => {
     await expect(stat(outputPath)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("keeps the real unprovisioned CLI at zero connection opens and does not touch its output path", async () => {
+  it("keeps a CLI with missing public inputs at zero connection opens and does not touch its output path", async () => {
     const root = await temporaryRoot();
     const outputPath = join(root, "blocked.json");
     let connectionOpens = 0;
@@ -229,14 +229,14 @@ describe("xrteeth Develop full-range CLI", () => {
         }
       }
     );
-    expect(code).toBe(1);
+    expect(code).toBe(2);
     expect(connectionOpens).toBe(0);
     expect(stdout).toEqual([]);
     expect(JSON.parse(stderr.join(""))).toMatchObject({
       environment: "xrteeth-develop",
       mode: "read-only",
       status: "failed",
-      failure: "trust-profile-not-provisioned"
+      failure: "invalid-configuration"
     });
     await expect(stat(outputPath)).rejects.toMatchObject({ code: "ENOENT" });
   });

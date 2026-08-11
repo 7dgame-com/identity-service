@@ -66,7 +66,30 @@ export class OrganizationReconciliationDevelopDeploymentTopologyError extends Er
  */
 const COMPILED_DEVELOP_DEPLOYMENT_TOPOLOGY_TEMPLATES:
 Readonly<Record<string, OrganizationReconciliationDevelopDeploymentTopologyTemplate>> =
-  Object.freeze({});
+  Object.freeze({
+    "xrteeth-develop-task72-v1": Object.freeze({
+      contract: ORGANIZATION_RECONCILIATION_DEVELOP_DEPLOYMENT_TOPOLOGY_CONTRACT,
+      environment: "xrteeth-develop",
+      profileId: "xrteeth-develop-task72-v1",
+      executor: Object.freeze({
+        portainerEndpointIdHash: "9de4c993d51534cef1863092fad565ea6ed407cf9ea4163b67d0837fb03d379d",
+        dockerEngineIdHash: "84e73bc9a955d6ed9363522a442089216428bdce07d00ecb8a39fbb832fecc4b",
+        physicalHostIdentityHash: "3f0c1174455eb2a30c505b87f582171f5d80df86840c6ec8637e915c977bc3ac"
+      }),
+      signers: Object.freeze([
+        Object.freeze({
+          collectorId: "xrteeth-develop-task72-signer-1",
+          nodeId: "xrteeth-develop-portainer-local",
+          keyId: "xrteeth-develop-task72-ed25519-1",
+          publicKeySha256: "13aabcff0db9a4f9c077b23a30ce95eb9f91be684a5cf6cffa6dc62708655392",
+          tlsCertificateSha256: "2cbe907e890eaa847b30c605ded99a407f51212d3f53005297891f6f32c94424",
+          portainerEndpointIdHash: "9de4c993d51534cef1863092fad565ea6ed407cf9ea4163b67d0837fb03d379d",
+          dockerEngineIdHash: "84e73bc9a955d6ed9363522a442089216428bdce07d00ecb8a39fbb832fecc4b",
+          physicalHostIdentityHash: "3f0c1174455eb2a30c505b87f582171f5d80df86840c6ec8637e915c977bc3ac"
+        })
+      ]) as OrganizationReconciliationDevelopDeploymentTopologyTemplate["signers"]
+    })
+  });
 
 const COMPILED_DEVELOP_DEPLOYMENT_TOPOLOGIES =
   compileOrganizationReconciliationDevelopDeploymentTopologyTemplates(

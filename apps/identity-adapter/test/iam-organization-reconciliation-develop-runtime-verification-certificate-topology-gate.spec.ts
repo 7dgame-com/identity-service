@@ -10,8 +10,8 @@ import { createOrganizationReconciliationDevelopRuntimeCertificateTestFixture } 
   "./iam-organization-reconciliation-develop-runtime-verification-certificate.test-fixture.js";
 
 describe("runtime certificate compiled topology gate", () => {
-  it("rejects otherwise complete raw/profile evidence when production topology count is zero", () => {
-    expect(compiledOrganizationReconciliationDevelopDeploymentTopologyCount).toBe(0);
+  it("rejects otherwise complete raw/profile evidence that does not match the sole topology", () => {
+    expect(compiledOrganizationReconciliationDevelopDeploymentTopologyCount).toBe(1);
     const fixture = createOrganizationReconciliationDevelopRuntimeCertificateTestFixture();
     expect(() => createOrganizationReconciliationDevelopRuntimeCertificate(fixture.input))
       .toThrowError(OrganizationReconciliationDevelopRuntimeCertificateError);
