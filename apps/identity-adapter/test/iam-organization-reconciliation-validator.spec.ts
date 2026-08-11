@@ -16,10 +16,17 @@ import {
 } from "./fixtures/iam-organization-reconciliation-component-manifest.js";
 import {
   createOrganizationReconciliationCompositeManifestSha256,
+  createOrganizationReconciliationCompositeManifestForEvidence,
+  createOrganizationReconciliationOperationEvidenceSha256,
+  createOrganizationReconciliationOperationCompositeManifestSha256,
+  ORGANIZATION_RECONCILIATION_COMPOSITE_MANIFEST_CONTRACT,
   ORGANIZATION_RECONCILIATION_PAGINATION_MODE,
   ORGANIZATION_RECONCILIATION_SNAPSHOT_MODE,
   type OrganizationReconciliationEvidenceJsonValue,
-  type OrganizationReconciliationCompositeManifestUnsigned
+  type OrganizationReconciliationCompositeManifest,
+  type OrganizationReconciliationOperationCompositeManifest,
+  type OrganizationReconciliationCompositeManifestUnsigned,
+  type OrganizationReconciliationOperationCompositeManifestUnsigned
 } from "../src/iam-organization-reconciliation-component-manifest.js";
 import {
   assembleCoordinatedOrganizationReconciliationInput,
@@ -138,6 +145,21 @@ describe("work-package 4 full-scope organization reconciliation validator", () =
       code: "component-manifest-invalid"
     });
 
+    const fourthCampusComponent = validateOrganizationReconciliationRaw({
+      ...evidenceBody,
+      componentManifest: {
+        ...componentManifest!,
+        components: [
+          ...componentManifest!.components,
+          { ...componentManifest!.components[0]!, componentId: "campus" }
+        ]
+      } as never
+    });
+    expect(fourthCampusComponent.coverageBlockers).toContainEqual({
+      surface: "collection-envelope",
+      code: "component-manifest-invalid"
+    });
+
     const { manifestSha256: _manifestSha256, ...unsignedManifest } = componentManifest!;
     const wrongSourceManifest = {
       ...unsignedManifest,
@@ -146,8 +168,8 @@ describe("work-package 4 full-scope organization reconciliation validator", () =
           ? { ...component, sourceVersion: "other-legacy-source-version" }
           : component
       )
-    } satisfies OrganizationReconciliationCompositeManifestUnsigned;
-    expect(() => createOrganizationReconciliationCompositeManifestSha256(wrongSourceManifest))
+    } satisfies OrganizationReconciliationOperationCompositeManifestUnsigned;
+    expect(() => createOrganizationReconciliationOperationCompositeManifestSha256(wrongSourceManifest))
       .toThrow("content binding is invalid");
     const wrongSnapshotManifest = {
       ...unsignedManifest,
@@ -156,8 +178,8 @@ describe("work-package 4 full-scope organization reconciliation validator", () =
           ? { ...component, snapshotId: "other-identity-snapshot" }
           : component
       )
-    } satisfies OrganizationReconciliationCompositeManifestUnsigned;
-    expect(() => createOrganizationReconciliationCompositeManifestSha256(wrongSnapshotManifest))
+    } satisfies OrganizationReconciliationOperationCompositeManifestUnsigned;
+    expect(() => createOrganizationReconciliationOperationCompositeManifestSha256(wrongSnapshotManifest))
       .toThrow("content binding is invalid");
 
     const wrongSubjectManifest = {
@@ -167,12 +189,12 @@ describe("work-package 4 full-scope organization reconciliation validator", () =
           ? component
           : { ...component, subjectUniverse: { ...component.subjectUniverse, sha256: "f".repeat(64) } }
       )
-    } satisfies OrganizationReconciliationCompositeManifestUnsigned;
+    } satisfies OrganizationReconciliationOperationCompositeManifestUnsigned;
     const subjectMismatch = validateOrganizationReconciliationRaw({
       ...evidenceBody,
       componentManifest: {
         ...wrongSubjectManifest,
-        manifestSha256: createOrganizationReconciliationCompositeManifestSha256(wrongSubjectManifest)
+        manifestSha256: createOrganizationReconciliationOperationCompositeManifestSha256(wrongSubjectManifest)
       }
     });
     expect(subjectMismatch.coverageBlockers).toContainEqual({
@@ -187,17 +209,162 @@ describe("work-package 4 full-scope organization reconciliation validator", () =
           ? { ...component, openedAt: "2026-08-09T00:01:00.000Z" }
           : component
       )
-    } satisfies OrganizationReconciliationCompositeManifestUnsigned;
+    } satisfies OrganizationReconciliationOperationCompositeManifestUnsigned;
     const intervalMismatch = validateOrganizationReconciliationRaw({
       ...evidenceBody,
       componentManifest: {
         ...envelopeOutsidePluginSnapshot,
-        manifestSha256: createOrganizationReconciliationCompositeManifestSha256(envelopeOutsidePluginSnapshot)
+        manifestSha256: createOrganizationReconciliationOperationCompositeManifestSha256(envelopeOutsidePluginSnapshot)
       }
     });
     expect(intervalMismatch.coverageBlockers).toContainEqual({
       surface: "collection-envelope",
       code: "component-manifest-envelope-mismatch"
+    });
+  });
+
+  it("binds the exact projection metadata and rejects projection A/evidence B splices", () => {
+    const input = alignedInput();
+    const { componentManifest, ...evidenceBody } = input;
+    const lineageManifest = lineageManifestForFinal(componentManifest!);
+    const projectionBinding = evidenceBody.projectionBinding!;
+    const changedProjectionEvidence = {
+      ...evidenceBody,
+      projectionBinding: {
+        ...projectionBinding,
+        identity: {
+          ...projectionBinding.identity,
+          evaluatorId: "test/identity/spliced"
+        }
+      }
+    };
+
+    const staleManifest = validateOrganizationReconciliationRaw({
+      ...changedProjectionEvidence,
+      componentManifest
+    });
+    expect(staleManifest.coverageBlockers).toContainEqual({
+      surface: "collection-envelope",
+      code: "component-manifest-evidence-mismatch"
+    });
+
+    const foreignSourceEvidence = {
+      ...evidenceBody,
+      projectionBinding: {
+        ...projectionBinding,
+        identity: {
+          ...projectionBinding.identity,
+          primarySource: {
+            ...projectionBinding.identity.primarySource,
+            snapshotId: "foreign-identity-snapshot"
+          }
+        }
+      }
+    };
+    const reboundManifest = createOrganizationReconciliationCompositeManifestForEvidence(
+      lineageManifest,
+      foreignSourceEvidence
+    );
+    expect(reboundManifest.components).toEqual(componentManifest!.components);
+    expect(reboundManifest.manifestSha256).not.toBe(componentManifest!.manifestSha256);
+    const foreignSource = validateOrganizationReconciliationRaw({
+      ...foreignSourceEvidence,
+      componentManifest: reboundManifest
+    });
+    expect(foreignSource.coverageBlockers).toContainEqual({
+      surface: "collection-envelope",
+      code: "projection-binding-component-mismatch"
+    });
+
+    const { projectionBinding: _missingProjection, ...missingProjectionEvidence } = evidenceBody;
+    const missingProjectionManifest = createOrganizationReconciliationCompositeManifestForEvidence(
+      lineageManifest,
+      missingProjectionEvidence
+    );
+    const missingProjection = validateOrganizationReconciliationRaw({
+      ...missingProjectionEvidence,
+      componentManifest: missingProjectionManifest
+    });
+    expect(missingProjection.coverageBlockers).toContainEqual({
+      surface: "collection-envelope",
+      code: "projection-binding-missing"
+    });
+
+    const invalidProjectionEvidence = {
+      ...evidenceBody,
+      projectionBinding: {
+        ...projectionBinding,
+        untrustedOverride: true
+      }
+    } as unknown as OrganizationReconciliationInput;
+    const invalidProjectionManifest = createOrganizationReconciliationCompositeManifestForEvidence(
+      lineageManifest,
+      invalidProjectionEvidence
+    );
+    const invalidProjection = validateOrganizationReconciliationRaw({
+      ...invalidProjectionEvidence,
+      componentManifest: invalidProjectionManifest
+    });
+    expect(invalidProjection.coverageBlockers).toContainEqual({
+      surface: "collection-envelope",
+      code: "projection-binding-invalid"
+    });
+
+    const changedLineageEvidence = {
+      ...evidenceBody,
+      projectionBinding: {
+        ...projectionBinding,
+        lineageManifestSha256: "a".repeat(64)
+      }
+    };
+    const changedLineageManifest = createOrganizationReconciliationCompositeManifestForEvidence(
+      lineageManifest,
+      changedLineageEvidence
+    );
+    const changedLineage = validateOrganizationReconciliationRaw({
+      ...changedLineageEvidence,
+      componentManifest: changedLineageManifest
+    });
+    expect(changedLineage.coverageBlockers).toContainEqual({
+      surface: "collection-envelope",
+      code: "projection-binding-lineage-mismatch"
+    });
+
+    const { manifestSha256: _lineageSha, ...lineageUnsigned } = lineageManifest;
+    const alternateLineageUnsigned = {
+      ...lineageUnsigned,
+      evidenceSha256: "f".repeat(64)
+    } satisfies OrganizationReconciliationCompositeManifestUnsigned;
+    const alternateLineageManifest = {
+      ...alternateLineageUnsigned,
+      manifestSha256: createOrganizationReconciliationCompositeManifestSha256(
+        alternateLineageUnsigned
+      )
+    };
+    const parentSplicedManifest = createOrganizationReconciliationCompositeManifestForEvidence(
+      alternateLineageManifest,
+      evidenceBody
+    );
+    const parentSplice = validateOrganizationReconciliationRaw({
+      ...evidenceBody,
+      componentManifest: parentSplicedManifest
+    });
+    expect(parentSplice.coverageBlockers).toContainEqual({
+      surface: "collection-envelope",
+      code: "projection-binding-lineage-mismatch"
+    });
+    expect(parentSplice.coverageBlockers).not.toContainEqual({
+      surface: "collection-envelope",
+      code: "projection-binding-component-mismatch"
+    });
+
+    const oldV3Final = validateOrganizationReconciliationRaw({
+      ...evidenceBody,
+      componentManifest: lineageManifest as never
+    });
+    expect(oldV3Final.coverageBlockers).toContainEqual({
+      surface: "collection-envelope",
+      code: "component-manifest-invalid"
     });
   });
 
@@ -330,11 +497,261 @@ describe("work-package 4 full-scope organization reconciliation validator", () =
     ]));
   });
 
-  it("domain-separates v3 evidence HMACs from the retired v2 contract", () => {
+  it("accepts only strict authorization context kind/ref bijections and rejects the old record shape", () => {
+    const input = alignedInput();
+    for (const [contextKind, contextRef] of [
+      ["organization", "org:public"],
+      ["organization", "org:platform-global"],
+      ["public", "legacy-org:1"],
+      ["public", "org:platform-global"],
+      ["platform-global", "legacy-org:1"],
+      ["platform-global", "org:public"]
+    ] as const) {
+      const campus = { subjectRef: "legacy-user:581", contextKind, contextRef, decision: "deny" };
+      const effective = {
+        subjectRef: "legacy-user:581",
+        contextKind,
+        contextRef,
+        resourceRef: "organization-one",
+        capabilityRef: "read",
+        decision: "deny"
+      };
+      const report = validateOrganizationReconciliation({
+        ...input,
+        campusContexts: pair([campus], [campus]),
+        effectiveDecisions: pair([effective], [effective])
+      } as never);
+      expect(report.coverageBlockers).toEqual(expect.arrayContaining([
+        { surface: "campus-context", code: "record-schema-invalid", side: "legacy" },
+        { surface: "campus-context", code: "record-schema-invalid", side: "identity" },
+        { surface: "effective-decision", code: "record-schema-invalid", side: "legacy" },
+        { surface: "effective-decision", code: "record-schema-invalid", side: "identity" }
+      ]));
+    }
+
+    const oldCampus = {
+      subjectRef: "legacy-user:581",
+      campusRef: "campus-one",
+      organizationRef: "legacy-org:1",
+      decision: "deny"
+    };
+    const oldEffective = {
+      subjectRef: "legacy-user:581",
+      organizationRef: "legacy-org:1",
+      resourceRef: "organization-one",
+      capabilityRef: "read",
+      decision: "deny"
+    };
+    const oldShape = validateOrganizationReconciliation({
+      ...input,
+      campusContexts: pair([oldCampus], [oldCampus]),
+      effectiveDecisions: pair([oldEffective], [oldEffective])
+    } as never);
+    expect(oldShape.coverageBlockers).toEqual(expect.arrayContaining([
+      { surface: "campus-context", code: "record-schema-invalid", side: "legacy" },
+      { surface: "campus-context", code: "record-schema-invalid", side: "identity" },
+      { surface: "effective-decision", code: "record-schema-invalid", side: "legacy" },
+      { surface: "effective-decision", code: "record-schema-invalid", side: "identity" }
+    ]));
+  });
+
+  it("retains exactly two reserved contexts when the organization directory is empty", () => {
+    const input = alignedInput();
+    const contexts = AUTHORIZATION_CONTEXTS.slice(1);
+    const contextDimensions = contexts.map((context) => JSON.stringify(context));
+    const campuses = contexts.map(([contextKind, contextRef]) => ({
+      subjectRef: "legacy-user:581",
+      contextKind,
+      contextRef,
+      decision: "deny" as const
+    }));
+    const effective = contexts.map(([contextKind, contextRef]) => ({
+      subjectRef: "legacy-user:581",
+      contextKind,
+      contextRef,
+      resourceRef: "organization-one",
+      capabilityRef: "read",
+      decision: "deny" as const
+    }));
+    const campusUniverse = decisionUniverse(
+      campuses.map((record) => [record.subjectRef, record.contextKind, record.contextRef]),
+      { subjects: ["legacy-user:581"], contexts: contextDimensions }
+    );
+    const effectiveUniverse = decisionUniverse(
+      effective.map((record) => [
+        record.subjectRef,
+        record.contextKind,
+        record.contextRef,
+        record.resourceRef,
+        record.capabilityRef
+      ]),
+      {
+        subjects: ["legacy-user:581"],
+        contexts: contextDimensions,
+        resources: ["organization-one"],
+        capabilities: ["read"],
+        rulePairs: [JSON.stringify(["organization-one", "read"])]
+      }
+    );
+    const publicPluginUniverse = decisionUniverse(
+      [["legacy-user:581", "plugin:campus", "org:public"]],
+      { subjects: ["legacy-user:581"], plugins: ["plugin:campus"], organizations: ["org:public"] }
+    );
+    const report = validateOrganizationReconciliation({
+      ...input,
+      organizationDirectory: pair([], []),
+      organizationMappings: pair([], []),
+      memberships: pair([], []),
+      organizationScopedRoles: pair([], []),
+      pluginBindings: pair(
+        [{ pluginRef: "plugin:campus", bindingRef: "binding-public", organizationRef: "org:public", active: true }],
+        [{ pluginRef: "plugin:campus", bindingRef: "binding-public", organizationRef: "org:public", active: true }]
+      ),
+      pluginVisibility: pair(
+        [{ subjectRef: "legacy-user:581", pluginRef: "plugin:campus", organizationRef: "org:public", decision: "allow" }],
+        [{ subjectRef: "legacy-user:581", pluginRef: "plugin:campus", organizationRef: "org:public", decision: "allow" }]
+      ),
+      campusContexts: pair(campuses, campuses),
+      effectiveDecisions: pair(effective, effective),
+      collectionEnvelope: {
+        ...input.collectionEnvelope!,
+        legacy: {
+          ...input.collectionEnvelope!.legacy,
+          decisionUniverses: {
+            pluginVisibility: publicPluginUniverse,
+            campusContexts: campusUniverse,
+            effectiveDecisions: effectiveUniverse
+          }
+        },
+        identity: {
+          ...input.collectionEnvelope!.identity,
+          decisionUniverses: {
+            pluginVisibility: publicPluginUniverse,
+            campusContexts: campusUniverse,
+            effectiveDecisions: effectiveUniverse
+          }
+        }
+      }
+    });
+    expect(report.coverageBlockers).toEqual([
+      { surface: "collection-envelope", code: "real-source-adapters-not-ready" }
+    ]);
+  });
+
+  it.each(["organization", "platform-global", "public"] as const)(
+    "rejects a re-signed input with the entire %s context group deleted",
+    (deletedKind) => {
+      const input = alignedInput();
+      const campuses = baselineCampusRecords("legacy-user:581")
+        .filter((record) => record.contextKind !== deletedKind);
+      const effective = baselineEffectiveDecisionRecords("legacy-user:581")
+        .filter((record) => record.contextKind !== deletedKind);
+      const remainingContexts = AUTHORIZATION_CONTEXTS.filter(([contextKind]) => contextKind !== deletedKind);
+      const campusUniverse = decisionUniverse(
+        campuses.map((record) => [record.subjectRef, record.contextKind, record.contextRef]),
+        {
+          subjects: ["legacy-user:581"],
+          contexts: remainingContexts.map((context) => JSON.stringify(context))
+        }
+      );
+      const effectiveUniverse = decisionUniverse(
+        effective.map((record) => [
+          record.subjectRef,
+          record.contextKind,
+          record.contextRef,
+          record.resourceRef,
+          record.capabilityRef
+        ]),
+        {
+          subjects: ["legacy-user:581"],
+          contexts: remainingContexts.map((context) => JSON.stringify(context)),
+          resources: ["organization-one"],
+          capabilities: ["read"],
+          rulePairs: [JSON.stringify(["organization-one", "read"])]
+        }
+      );
+      const report = validateOrganizationReconciliation({
+        ...input,
+        campusContexts: pair(campuses, campuses),
+        effectiveDecisions: pair(effective, effective),
+        collectionEnvelope: {
+          ...input.collectionEnvelope!,
+          legacy: {
+            ...input.collectionEnvelope!.legacy,
+            decisionUniverses: {
+              ...input.collectionEnvelope!.legacy.decisionUniverses,
+              campusContexts: campusUniverse,
+              effectiveDecisions: effectiveUniverse
+            }
+          },
+          identity: {
+            ...input.collectionEnvelope!.identity,
+            decisionUniverses: {
+              ...input.collectionEnvelope!.identity.decisionUniverses,
+              campusContexts: campusUniverse,
+              effectiveDecisions: effectiveUniverse
+            }
+          }
+        }
+      });
+      for (const side of ["legacy", "identity"] as const) {
+        expect(report.coverageBlockers).toEqual(expect.arrayContaining([
+          { surface: "campus-context", code: "decision-universe-coverage-mismatch", side },
+          { surface: "effective-decision", code: "decision-universe-coverage-mismatch", side }
+        ]));
+      }
+    }
+  );
+
+  it("fixed-rejects retired v3 collector and decision-universe contracts", () => {
+    const input = alignedInput();
+    const oldCollector = validateOrganizationReconciliation({
+      ...input,
+      collectionEnvelope: {
+        ...input.collectionEnvelope!,
+        collectorContract: "iam-organization-reconciliation-collector/v3"
+      }
+    } as never);
+    expect(oldCollector.coverageBlockers).toContainEqual({
+      surface: "collection-envelope",
+      code: "collector-contract-invalid"
+    });
+
+    const oldDecision = {
+      ...input.collectionEnvelope!.legacy.decisionUniverses.campusContexts,
+      derivationContract: "iam-organization-reconciliation-decision-universe/v3"
+    };
+    const oldDecisionReport = validateOrganizationReconciliation({
+      ...input,
+      collectionEnvelope: {
+        ...input.collectionEnvelope!,
+        legacy: {
+          ...input.collectionEnvelope!.legacy,
+          decisionUniverses: {
+            ...input.collectionEnvelope!.legacy.decisionUniverses,
+            campusContexts: oldDecision
+          }
+        },
+        identity: {
+          ...input.collectionEnvelope!.identity,
+          decisionUniverses: {
+            ...input.collectionEnvelope!.identity.decisionUniverses,
+            campusContexts: oldDecision
+          }
+        }
+      }
+    } as never);
+    expect(oldDecisionReport.coverageBlockers).toEqual(expect.arrayContaining([
+      { surface: "collection-envelope", code: "decision-universe-derivation-invalid", side: "legacy" },
+      { surface: "collection-envelope", code: "decision-universe-derivation-invalid", side: "identity" }
+    ]));
+  });
+
+  it("domain-separates v4 evidence HMACs from the retired v3 contract", () => {
     const value = "domain-test";
     const current = createOrganizationReconciliationEvidenceHash(EVIDENCE_NONCE, value);
     const retired = createHmac("sha256", EVIDENCE_NONCE)
-      .update("iam-organization-reconciliation:v2\u001f")
+      .update("iam-organization-reconciliation:v3\u001f")
       .update(JSON.stringify(value))
       .digest("hex");
     expect(current).not.toBe(retired);
@@ -368,12 +785,12 @@ describe("work-package 4 full-scope organization reconciliation validator", () =
         [{ subjectRef: "legacy-user:581", pluginRef: "plugin:campus", organizationRef: "legacy-org:999", decision: "deny" }]
       ),
       campusContexts: pair(
-        [{ subjectRef: "legacy-user:581", campusRef: "campus-one", organizationRef: "legacy-org:999", decision: "deny" }],
-        [{ subjectRef: "legacy-user:581", campusRef: "campus-one", organizationRef: "legacy-org:999", decision: "deny" }]
+        [{ subjectRef: "legacy-user:581", contextKind: "organization", contextRef: "legacy-org:999", decision: "deny" }],
+        [{ subjectRef: "legacy-user:581", contextKind: "organization", contextRef: "legacy-org:999", decision: "deny" }]
       ),
       effectiveDecisions: pair(
-        [{ subjectRef: "legacy-user:581", organizationRef: "legacy-org:999", resourceRef: "organization-one", capabilityRef: "read", decision: "deny" }],
-        [{ subjectRef: "legacy-user:581", organizationRef: "legacy-org:999", resourceRef: "organization-one", capabilityRef: "read", decision: "deny" }]
+        [{ subjectRef: "legacy-user:581", contextKind: "organization", contextRef: "legacy-org:999", resourceRef: "organization-one", capabilityRef: "read", decision: "deny" }],
+        [{ subjectRef: "legacy-user:581", contextKind: "organization", contextRef: "legacy-org:999", resourceRef: "organization-one", capabilityRef: "read", decision: "deny" }]
       )
     });
 
@@ -553,8 +970,8 @@ describe("work-package 4 full-scope organization reconciliation validator", () =
     const report = validateOrganizationReconciliation({
       ...input,
       effectiveDecisions: pair(
-        [{ subjectRef: "legacy-user:581", organizationRef: "legacy-org:1", resourceRef: "organization-one", capabilityRef: "read", decision: "allow" }],
-        [{ subjectRef: "legacy-user:581", organizationRef: "legacy-org:1", resourceRef: "organization-one", capabilityRef: "read", decision: "deny" }]
+        [{ subjectRef: "legacy-user:581", contextKind: "organization", contextRef: "legacy-org:1", resourceRef: "organization-one", capabilityRef: "read", decision: "allow" }],
+        [{ subjectRef: "legacy-user:581", contextKind: "organization", contextRef: "legacy-org:1", resourceRef: "organization-one", capabilityRef: "read", decision: "deny" }]
       )
     });
 
@@ -1067,14 +1484,24 @@ describe("work-package 4 full-scope organization reconciliation validator", () =
       { subjectRef: "legacy-user:581", pluginRef: "plugin:public", organizationRef: "org:public", decision: "allow" },
       { subjectRef: secondSubject, pluginRef: "plugin:campus", organizationRef: "legacy-org:1", decision: "deny" }
     ] as const;
-    const campuses = [
-      { subjectRef: "legacy-user:581", campusRef: "campus-one", organizationRef: "legacy-org:1", decision: "allow" },
-      { subjectRef: secondSubject, campusRef: "campus-one", organizationRef: "legacy-org:1", decision: "deny" }
-    ] as const;
-    const decisions = [
-      { subjectRef: "legacy-user:581", organizationRef: "legacy-org:1", resourceRef: "organization-one", capabilityRef: "read", decision: "allow" },
-      { subjectRef: secondSubject, organizationRef: "legacy-org:1", resourceRef: "organization-one", capabilityRef: "read", decision: "deny" }
-    ] as const;
+    const campuses = subjects.flatMap((subjectRef) => AUTHORIZATION_CONTEXTS.map(
+      ([contextKind, contextRef], index) => ({
+        subjectRef,
+        contextKind,
+        contextRef,
+        decision: subjectRef === "legacy-user:581" && index === 0 ? "allow" as const : "deny" as const
+      })
+    ));
+    const decisions = subjects.flatMap((subjectRef) => AUTHORIZATION_CONTEXTS.map(
+      ([contextKind, contextRef], index) => ({
+        subjectRef,
+        contextKind,
+        contextRef,
+        resourceRef: "organization-one",
+        capabilityRef: "read",
+        decision: subjectRef === "legacy-user:581" && index === 0 ? "allow" as const : "deny" as const
+      })
+    ));
     const universes = {
       pluginVisibility: decisionUniverse(
         visibility.map((record) => [record.subjectRef, record.pluginRef, record.organizationRef]),
@@ -1085,14 +1512,20 @@ describe("work-package 4 full-scope organization reconciliation validator", () =
         }
       ),
       campusContexts: decisionUniverse(
-        campuses.map((record) => [record.subjectRef, record.campusRef]),
-        { subjects, campuses: ["campus-one"], organizations: ["legacy-org:1"] }
+        campuses.map((record) => [record.subjectRef, record.contextKind, record.contextRef]),
+        { subjects, contexts: AUTHORIZATION_CONTEXT_DIMENSIONS }
       ),
       effectiveDecisions: decisionUniverse(
-        decisions.map((record) => [record.subjectRef, record.organizationRef, record.resourceRef, record.capabilityRef]),
+        decisions.map((record) => [
+          record.subjectRef,
+          record.contextKind,
+          record.contextRef,
+          record.resourceRef,
+          record.capabilityRef
+        ]),
         {
           subjects,
-          organizations: ["legacy-org:1"],
+          contexts: AUTHORIZATION_CONTEXT_DIMENSIONS,
           resources: ["organization-one"],
           capabilities: ["read"],
           rulePairs: [JSON.stringify(["organization-one", "read"])]
@@ -1156,7 +1589,7 @@ describe("work-package 4 full-scope organization reconciliation validator", () =
 });
 
 function alignedInput(): OrganizationReconciliationInput {
-  return attachTestOrganizationReconciliationComponentManifest({
+  return attachProjectionBoundTestManifest({
     collectionEnvelope: collectionEnvelope(),
     organizationDirectory: pair(
       [{ legacyOrganizationId: 1, name: "test-university", title: "Private title", active: true }],
@@ -1183,12 +1616,12 @@ function alignedInput(): OrganizationReconciliationInput {
       [{ subjectRef: "legacy-user:581", pluginRef: "plugin:campus", organizationRef: "legacy-org:1", decision: "allow" }]
     ),
     campusContexts: pair(
-      [{ subjectRef: "legacy-user:581", campusRef: "campus-one", organizationRef: "legacy-org:1", decision: "allow" }],
-      [{ subjectRef: "legacy-user:581", campusRef: "campus-one", organizationRef: "legacy-org:1", decision: "allow" }]
+      baselineCampusRecords("legacy-user:581"),
+      baselineCampusRecords("legacy-user:581")
     ),
     effectiveDecisions: pair(
-      [{ subjectRef: "legacy-user:581", organizationRef: "legacy-org:1", resourceRef: "organization-one", capabilityRef: "read", decision: "allow" }],
-      [{ subjectRef: "legacy-user:581", organizationRef: "legacy-org:1", resourceRef: "organization-one", capabilityRef: "read", decision: "allow" }]
+      baselineEffectiveDecisionRecords("legacy-user:581"),
+      baselineEffectiveDecisionRecords("legacy-user:581")
     )
   });
 }
@@ -1199,11 +1632,76 @@ function validateOrganizationReconciliation(
 ) {
   let rebound = input;
   try {
-    rebound = attachTestOrganizationReconciliationComponentManifest(input);
+    rebound = attachProjectionBoundTestManifest(input);
   } catch {
     // Malformed-input tests must reach the production fail-closed boundary.
   }
   return validateOrganizationReconciliationRaw(rebound, options);
+}
+
+function attachProjectionBoundTestManifest(
+  candidate: OrganizationReconciliationInput
+): OrganizationReconciliationInput {
+  const lineage = attachTestOrganizationReconciliationComponentManifest(candidate);
+  const manifest = lineage.componentManifest;
+  if (!manifest) return lineage;
+  const legacy = manifest.components.find((component) => component.componentId === "legacy-main")!;
+  const identity = manifest.components.find((component) => component.componentId === "identity")!;
+  const plugin = manifest.components.find((component) => component.componentId === "plugin")!;
+  return attachTestOrganizationReconciliationComponentManifest({
+    ...candidate,
+    projectionBinding: {
+      contract: "iam-organization-reconciliation-projection-binding/v1",
+      semanticRegistrySha256: "7".repeat(64),
+      lineageManifestSha256: manifest.parentLineageManifestSha256,
+      legacy: {
+        projectorContract: "iam-organization-legacy-surface-projector/v2",
+        evaluatorId: "test/legacy/validator",
+        evaluatorBuildSha256: "8".repeat(64),
+        primarySource: {
+          sourceVersion: legacy.sourceVersion,
+          snapshotId: legacy.snapshotId
+        }
+      },
+      identity: {
+        projectorContract: "iam-organization-identity-surface-projector/v2",
+        evaluatorId: "test/identity/validator",
+        evaluatorBuildSha256: "9".repeat(64),
+        primarySource: {
+          sourceVersion: identity.sourceVersion,
+          snapshotId: identity.snapshotId
+        }
+      },
+      pluginSource: {
+        sourceVersion: plugin.sourceVersion,
+        snapshotId: plugin.snapshotId
+      }
+    }
+  });
+}
+
+function lineageManifestForFinal(
+  manifest: OrganizationReconciliationOperationCompositeManifest
+): OrganizationReconciliationCompositeManifest {
+  const unsigned: OrganizationReconciliationCompositeManifestUnsigned = {
+    contract: ORGANIZATION_RECONCILIATION_COMPOSITE_MANIFEST_CONTRACT,
+    consistencyModel: manifest.consistencyModel,
+    crossDatabaseAtomic: manifest.crossDatabaseAtomic,
+    windowStartedAt: manifest.windowStartedAt,
+    windowEndedAt: manifest.windowEndedAt,
+    maxWindowMilliseconds: manifest.maxWindowMilliseconds,
+    evidenceContract: manifest.evidenceContract,
+    evidenceSha256: createOrganizationReconciliationOperationEvidenceSha256({
+      contract: "iam-organization-reconciliation-test-lineage-root/v1"
+    }),
+    components: manifest.components
+  };
+  const lineage = {
+    ...unsigned,
+    manifestSha256: createOrganizationReconciliationCompositeManifestSha256(unsigned)
+  };
+  expect(lineage.manifestSha256).toBe(manifest.parentLineageManifestSha256);
+  return lineage;
 }
 
 function pair<T>(legacy: readonly T[], identity: readonly T[]): ReconciliationPair<T> {
@@ -1238,6 +1736,12 @@ function page<T>(records: readonly T[], sourceVersion: string, snapshotId: strin
 }
 
 const EVIDENCE_NONCE = "a1".repeat(32);
+const AUTHORIZATION_CONTEXTS = [
+  ["organization", "legacy-org:1"],
+  ["platform-global", "org:platform-global"],
+  ["public", "org:public"]
+] as const;
+const AUTHORIZATION_CONTEXT_DIMENSIONS = AUTHORIZATION_CONTEXTS.map((context) => JSON.stringify(context));
 
 function collectionEnvelope() {
   return {
@@ -1275,20 +1779,43 @@ const DECISION_UNIVERSES = {
     { subjects: ["legacy-user:581"], plugins: ["plugin:campus"], organizations: ["legacy-org:1"] }
   ),
   campusContexts: decisionUniverse(
-    [["legacy-user:581", "campus-one"]],
-    { subjects: ["legacy-user:581"], campuses: ["campus-one"], organizations: ["legacy-org:1"] }
-  ),
-  effectiveDecisions: decisionUniverse(
-    [["legacy-user:581", "legacy-org:1", "organization-one", "read"]],
+    AUTHORIZATION_CONTEXTS.map(([contextKind, contextRef]) =>
+      ["legacy-user:581", contextKind, contextRef]
+    ),
     {
       subjects: ["legacy-user:581"],
-      organizations: ["legacy-org:1"],
+      contexts: AUTHORIZATION_CONTEXT_DIMENSIONS
+    }
+  ),
+  effectiveDecisions: decisionUniverse(
+    AUTHORIZATION_CONTEXTS.map(([contextKind, contextRef]) =>
+      ["legacy-user:581", contextKind, contextRef, "organization-one", "read"]
+    ),
+    {
+      subjects: ["legacy-user:581"],
+      contexts: AUTHORIZATION_CONTEXT_DIMENSIONS,
       resources: ["organization-one"],
       capabilities: ["read"],
       rulePairs: [JSON.stringify(["organization-one", "read"])]
     }
   )
 };
+
+function baselineCampusRecords(subjectRef: string) {
+  return [
+    { subjectRef, contextKind: "organization", contextRef: "legacy-org:1", decision: "allow" },
+    { subjectRef, contextKind: "platform-global", contextRef: "org:platform-global", decision: "deny" },
+    { subjectRef, contextKind: "public", contextRef: "org:public", decision: "deny" }
+  ] as const;
+}
+
+function baselineEffectiveDecisionRecords(subjectRef: string) {
+  return [
+    { subjectRef, contextKind: "organization", contextRef: "legacy-org:1", resourceRef: "organization-one", capabilityRef: "read", decision: "allow" },
+    { subjectRef, contextKind: "platform-global", contextRef: "org:platform-global", resourceRef: "organization-one", capabilityRef: "read", decision: "deny" },
+    { subjectRef, contextKind: "public", contextRef: "org:public", resourceRef: "organization-one", capabilityRef: "read", decision: "deny" }
+  ] as const;
+}
 
 function decisionUniverse(
   keys: readonly (readonly string[])[],

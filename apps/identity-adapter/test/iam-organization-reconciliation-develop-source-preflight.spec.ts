@@ -185,11 +185,11 @@ describe("xrteeth Develop organization reconciliation source preflight", () => {
 
   it("rejects writable, global, role-indirect or incomplete source grants", async () => {
     for (const grantStatements of [
-      ["GRANT SELECT, UPDATE ON `bujiaban_plugin`.* TO `plugin-reader`@`%`"],
+      ["GRANT SELECT, UPDATE ON `bujiaban_development_plugin`.* TO `plugin-reader`@`%`"],
       ["GRANT SELECT ON *.* TO `plugin-reader`@`%`"],
       ["GRANT `plugin-reader-role`@`%` TO `plugin-reader`@`%`"],
-      ["GRANT SELECT ON `bujiaban_plugin`.`other_table` TO `plugin-reader`@`%`"],
-      ["GRANT SELECT ON `bujiaban_plugin`.* TO `plugin-reader`@`%` WITH GRANT OPTION"]
+      ["GRANT SELECT ON `bujiaban_development_plugin`.`other_table` TO `plugin-reader`@`%`"],
+      ["GRANT SELECT ON `bujiaban_development_plugin`.* TO `plugin-reader`@`%` WITH GRANT OPTION"]
     ]) {
       const report = await runOrganizationReconciliationDevelopSourcePreflight({
         legacyConnectionFactory: fakeFactory("legacy-main", aggregateRows("legacy-main")).factory,
@@ -226,7 +226,7 @@ describe("xrteeth Develop organization reconciliation source preflight", () => {
 
   it("rejects a same-shape source connected to the wrong database or resolved account", async () => {
     for (const sourceIdentity of [
-      { databaseName: "bujiaban_plugin_clone" },
+      { databaseName: "bujiaban_development_plugin_clone" },
       { currentUser: "plugin-service@%" }
     ]) {
       const report = await runOrganizationReconciliationDevelopSourcePreflight({
@@ -305,7 +305,7 @@ describe("xrteeth Develop organization reconciliation source preflight", () => {
       IDENTITY_IAM_ORG_RECONCILIATION_IDENTITY_DB_USER: "reconciliation-identity",
       IDENTITY_IAM_ORG_RECONCILIATION_IDENTITY_DB_PASSWORD: "identity-secret",
       PLUGIN_DB_HOST: "plugin-db",
-      PLUGIN_DB_NAME: "bujiaban_plugin",
+      PLUGIN_DB_NAME: "bujiaban_development_plugin",
       PLUGIN_DB_USER: "plugin-readonly",
       PLUGIN_DB_PASSWORD: "plugin"
     };
@@ -339,7 +339,7 @@ describe("xrteeth Develop organization reconciliation source preflight", () => {
       plugin: {
         host: "plugin-db",
         port: 3306,
-        name: "bujiaban_plugin",
+        name: "bujiaban_development_plugin",
         user: "plugin-readonly",
         password: "plugin"
       }
@@ -386,7 +386,7 @@ function fakeFactory(
       if (statement.startsWith("SELECT DATABASE()")) {
         return [[{
           database_name: options.databaseName ?? (component === "identity" ? "xrugc_identity_dev" :
-            component === "plugin" ? "bujiaban_plugin" : "bujiaban_development"),
+            component === "plugin" ? "bujiaban_development_plugin" : "bujiaban_development"),
           current_user: options.currentUser ?? `${component}-reader@%`,
           server_hostname: "develop-db",
           server_port: 3306,
@@ -430,7 +430,7 @@ function fakeFactory(
 
 function defaultGrantStatements(component: Component): string[] {
   const database = component === "identity" ? "xrugc_identity_dev" :
-    component === "plugin" ? "bujiaban_plugin" : "bujiaban_development";
+    component === "plugin" ? "bujiaban_development_plugin" : "bujiaban_development";
   return [
     `GRANT USAGE ON *.* TO \`${component}-reader\`@\`%\``,
     `GRANT SELECT, SHOW VIEW ON \`${database}\`.* TO \`${component}-reader\`@\`%\``

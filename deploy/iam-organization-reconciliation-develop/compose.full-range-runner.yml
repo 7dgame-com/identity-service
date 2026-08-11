@@ -1,0 +1,80 @@
+name: identity-organization-reconciliation-develop-full-range
+
+services:
+  develop-full-range-runner:
+    image: "${IDENTITY_DEVELOP_IMAGE_REPOSITORY:?set the repository from the Develop provenance artifact}@${IDENTITY_DEVELOP_IMAGE_DIGEST:?set the sha256 digest from the Develop provenance artifact}"
+    pull_policy: always
+    user: "1000:1000"
+    working_dir: /app
+    command:
+      - node
+      - dist/scripts/iam-organization-reconciliation-develop-full-range.js
+      - --environment=xrteeth-develop
+      - "--build-revision=${IDENTITY_DEVELOP_BUILD_REVISION:?set the exact 40-character Develop commit}"
+      - --deployment-evidence=/app/develop-config/deployment-evidence.json
+      - --trust-policy=/app/develop-config/trust-policy.json
+      - --signer-transport=/app/develop-config/signer-transport.json
+      - "--output=/app/evidence/${IDENTITY_DEVELOP_EVIDENCE_FILE:?set a new evidence JSON basename}"
+    init: true
+    restart: "no"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=268435456,uid=1000,gid=1000,mode=0700
+    environment:
+      NODE_ENV: production
+      IDENTITY_READONLY_MODE: "true"
+      IDENTITY_IAM_ORG_WRITE_MODE: disabled
+      IDENTITY_IAM_ORG_WRITE_ROUTE_INTEGRATION_ENABLED: "false"
+      IDENTITY_IAM_ORG_WRITE_DUAL_WRITE_EXECUTION_ENABLED: "false"
+      LEGACY_DB_HOST: "${DEVELOP_LEGACY_DB_HOST:?set the Develop Legacy database host}"
+      LEGACY_DB_PORT: "${DEVELOP_LEGACY_DB_PORT:?set the Develop Legacy database port}"
+      LEGACY_DB_NAME: bujiaban_development
+      IDENTITY_IAM_ORG_RECONCILIATION_LEGACY_DB_USER: "${DEVELOP_LEGACY_RO_DB_USER:?set the dedicated Develop Legacy read-only user}"
+      IDENTITY_IAM_ORG_RECONCILIATION_LEGACY_DB_PASSWORD: "${DEVELOP_LEGACY_RO_DB_PASSWORD:?set the dedicated Develop Legacy read-only password}"
+      IDENTITY_DB_HOST: "${DEVELOP_IDENTITY_DB_HOST:?set the Develop Identity database host}"
+      IDENTITY_DB_PORT: "${DEVELOP_IDENTITY_DB_PORT:?set the Develop Identity database port}"
+      IDENTITY_DB_NAME: xrugc_identity_dev
+      IDENTITY_IAM_ORG_RECONCILIATION_IDENTITY_DB_USER: "${DEVELOP_IDENTITY_RO_DB_USER:?set the dedicated Develop Identity read-only user}"
+      IDENTITY_IAM_ORG_RECONCILIATION_IDENTITY_DB_PASSWORD: "${DEVELOP_IDENTITY_RO_DB_PASSWORD:?set the dedicated Develop Identity read-only password}"
+      PLUGIN_DB_HOST: "${DEVELOP_PLUGIN_DB_HOST:?set the Develop plugin database host}"
+      PLUGIN_DB_PORT: "${DEVELOP_PLUGIN_DB_PORT:?set the Develop plugin database port}"
+      PLUGIN_DB_NAME: bujiaban_development_plugin
+      PLUGIN_DB_USER: "${DEVELOP_PLUGIN_RO_DB_USER:?set the dedicated Develop plugin read-only user}"
+      PLUGIN_DB_PASSWORD: "${DEVELOP_PLUGIN_RO_DB_PASSWORD:?set the dedicated Develop plugin read-only password}"
+    volumes:
+      - type: volume
+        source: runner-local-config
+        target: /app/develop-config
+        read_only: true
+        volume:
+          nocopy: true
+      - type: volume
+        source: runner-local-evidence
+        target: /app/evidence
+        read_only: false
+        volume:
+          nocopy: true
+    networks:
+      - runner-egress
+    stop_grace_period: 30s
+    labels:
+      com.7dgame.identity.develop-only: "true"
+      com.7dgame.identity.evidence-minimum-capacity-bytes: "${DEVELOP_RUNNER_EVIDENCE_CAPACITY_BYTES:?set the independently verified evidence volume capacity, minimum 1073741824}"
+
+networks:
+  runner-egress:
+    external: true
+    name: "${DEVELOP_RUNNER_EGRESS_NETWORK:?set the pre-created restricted Develop egress network}"
+
+volumes:
+  runner-local-config:
+    external: true
+    name: "${DEVELOP_RUNNER_LOCAL_CONFIG_VOLUME:?set the pre-created node-local read-only config volume}"
+  runner-local-evidence:
+    external: true
+    name: "${DEVELOP_RUNNER_LOCAL_EVIDENCE_VOLUME:?set the pre-created node-local evidence volume with at least 1 GiB free}"

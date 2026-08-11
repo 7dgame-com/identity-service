@@ -225,7 +225,11 @@ export async function runOrganizationReconciliationDevelopSourcePreflight(
       const probes = metadata.databaseBindingPassed && metadata.readOnlyGrantPassed && metadata.schemaShapePassed
         ? await probeRawDatasets(
           input.componentId,
-          verifiedSourceConnectionFactory(input.componentId, input.factory, input.expectedDatabaseUser)
+          createVerifiedOrganizationReconciliationDevelopSourceConnectionFactory(
+            input.componentId,
+            input.factory,
+            input.expectedDatabaseUser
+          )
         )
         : Object.freeze({} as Readonly<Record<string, number>>);
       probeCounts.set(input.componentId, probes);
@@ -499,7 +503,12 @@ function inspectReadOnlyGrants(
   return Object.freeze({ passed, sha256: digest(statements) });
 }
 
-function verifiedSourceConnectionFactory(
+/**
+ * Wraps one reviewed Develop read-only factory with the same exact database
+ * and grant checks used by the source preflight. The wrapper performs no I/O
+ * until its returned factory is invoked.
+ */
+export function createVerifiedOrganizationReconciliationDevelopSourceConnectionFactory(
   componentId: OrganizationReconciliationMysqlRawComponentId,
   factory: MysqlRepeatableReadSnapshotConnectionFactory,
   expectedDatabaseUser: string

@@ -593,7 +593,7 @@ counts 与每个 dataset 的单行 strict-decoder probe，并只输出计数、�
 还在每个已连接 session 上执行 `SHOW GRANTS FOR CURRENT_USER()`：只接受精确 Develop schema 或固定表的
 `SELECT`（可附带 `SHOW VIEW`）及全局 `USAGE`，拒绝全局 SELECT、角色间接授权、写/DDL 权限、未知 scope
 和 `WITH GRANT OPTION`；公开报告只保留 grant-set digest 与通过布尔值，不回显账号或 grant 文本。它同时
-要求 `DATABASE()` 精确为 `bujiaban_development`、`xrugc_identity_dev`、`bujiaban_plugin`，并要求 MySQL
+要求 `DATABASE()` 精确为 `bujiaban_development`、`xrugc_identity_dev`、`bujiaban_development_plugin`，并要求 MySQL
 `CURRENT_USER()` 解析出的账号精确等于对应专用配置用户名，防止凭据被接到同形异库或被数据库映射为另一授权身份。
 preflight
 会在进程内比较完整 Legacy subject ID 集合与选中的 Identity legacy-shadow 集合，但公开报告只输出
@@ -607,7 +607,7 @@ membership snapshot 完整性同样以 Legacy 主体集合为边界：每个 Leg
 三源均必须使用 reconciliation 专用只读身份：Legacy 使用
 `IDENTITY_IAM_ORG_RECONCILIATION_LEGACY_DB_USER/PASSWORD`，Identity 使用
 `IDENTITY_IAM_ORG_RECONCILIATION_IDENTITY_DB_USER/PASSWORD`，plugin 使用显式
-`PLUGIN_DB_HOST/PORT/NAME/USER/PASSWORD`，其中 `PLUGIN_DB_NAME` 固定为 `bujiaban_plugin`。三个用户名必须
+`PLUGIN_DB_HOST/PORT/NAME/USER/PASSWORD`，其中 `PLUGIN_DB_NAME` 固定为 `bujiaban_development_plugin`。三个用户名必须
 互不相同，并且不得等于 Legacy/Identity 服务运行账号；不得以 system-admin 运行账号作为替代。
 用户名不同只完成配置门禁；只有实际 Develop v3 preflight 的
 `databaseBindingPassed=true`（数据库名与 session 授权账号均精确）、`readOnlyGrantPassed=true` 和 grant digest
@@ -620,9 +620,10 @@ membership snapshot 完整性同样以 Legacy 主体集合为边界：每个 Leg
 不同的专用账号。每个账号只允许 `USAGE ON *.*` 与其精确来源 schema 的 `SELECT`（可选
 `SHOW VIEW`）；不得授予全局 `SELECT`、任何写入/DDL、`WITH GRANT OPTION` 或间接 role。账号名和密码只
 通过 Portainer secret/environment 注入，不写入 Git、报告、命令输出或 closeout。Legacy 精确来源必须是
-`bujiaban_development`，Identity 必须是 `xrugc_identity_dev`。`bujiaban_plugin` 只有在数据库 owner
-书面证明其为本次 Develop 允许读取的隔离来源或不可变 Develop snapshot 后才可配置；如果它同时承载
-Production 数据，必须停止并先提供独立 Develop snapshot，禁止以“只读”绕过环境边界。
+`bujiaban_development`，Identity 必须是 `xrugc_identity_dev`。2026-08-11 从当前
+`backend_develop-system-admin-d-1` 只读核验到 `DATABASE()` 为 `bujiaban_development_plugin`；因此
+Develop preflight 固定使用该隔离库名，并明确拒绝旧的 `bujiaban_plugin`、相似库名或 Production 插件库。
+这一运行事实不替代专用只读账号、物理 schema 指纹和数据库 owner 权限证明。
 
 Portainer 只需向 identity adapter 增加以下键；值均由数据库 owner 提供，禁止从现有 service 账号复制：
 
@@ -643,13 +644,14 @@ PLUGIN_DB_PASSWORD
 该诊断不回显任何环境变量值。只有 launch 成功后的 v3 sanitized report 才能作为 schema、grant、dataset
 与完整性证据，launch failure 不能被记作 dataset mismatch。
 
-仓库另提供默认关闭的双节点结构一致性门禁：它只接受两份均已通过的 v3 sanitized report，要求两个调用方
+仓库另保留一个默认关闭的双节点结构一致性工具，供未来 Production promotion 独立评审使用；它不是 Task 7.2
+的通过条件。该工具只接受两份均已通过的 v3 sanitized report，要求两个调用方
 标签不同、时间窗口有界，并逐项核对 build revision、source/statement catalog、IAM policy checksum、三组件
 database identity/grant/schema digest、21 个 dataset probe、aggregate counts、subject universe、membership snapshot
 与 Legacy RBAC scope。任一 A/B 拼接或集合缺失都会 fail closed；输出只保留 canonical SHA-256 和固定摘要。
 该门禁的 node ID 与 expected build revision 仍是调用方提供的结构字段，hash 不是签名；当前没有 collector
 公钥、compiled trust profile 或外部 attestation，所以它只能证明“双份脱敏报告结构一致”，不能证明节点身份、
-物理来源真实性、完整八表面对账或 Task 7.2 已完成。
+物理来源真实性或完整八表面对账，也不能改变 Task 7.2 的 Develop-only 单签结论。
 
 两台节点分别把单节点命令 stdout 原样保存为本地 JSON 后，结构门禁的离线调用为：
 
@@ -663,7 +665,7 @@ npm run iam:organization-reconciliation:develop-dual-node-preflight:dist -- \
 
 输入必须是单节点 CLI 输出的 2-space canonical JSON（含结尾换行），每份不超过 1 MiB；URL、stdin、最终路径
 组件为 symlink、hard link、非普通文件、重复 JSON key、改写格式或读取期间发生变化都会拒绝。节点标签不是身份
-认证，不能用复制同一报告并更换标签的方式替代后续 Ed25519 双 collector provenance。
+认证，不能用复制同一报告并更换标签的方式替代未来 Production promotion 的物理独立性评审。
 
 该命令不做 DDL、不写数据、不翻 readiness，也不允许 main、publish、Production 或 tmrpp 目标。
 当前 semantic registry 的 compiled production table 故意为空，且不接受 argv、环境变量、JSON 或 evidence
@@ -677,12 +679,107 @@ dataset lineage、surface projector、operation-evidence projector、compiled pi
 readiness 也全部保持 `false`。`assembleCoordinatedOrganizationReconciliationInput` 不是可用入口：它在 dedicated branded
 operation-evidence projector readiness 为 false 时无条件硬拒，不能进入 validator/CLI；不存在调用参数、
 环境变量或普通 adapter 可以打开这条路径。仓库也没有已批准的公钥 policy、compiled trust profile、签名
-服务、逐页原始响应保管或双节点运行证据。因此本地测试 PASS 只证明这些默认关闭 primitive 的契约，
+服务或逐页原始响应保管。因此本地测试 PASS 只证明这些默认关闭 primitive 的契约，
 不证明外部 API/数据库实际返回完整页，也不单独完成 Task 7.2。
 
 Task 7.2 当前结论明确为 **NO-GO**。任何真实采集、runtime wiring、语义 owner 决策、pipeline 注册、部署、
 数据库访问或运行时写入都必须另行批准；Legacy 继续是唯一事实源，全部组织写入配置继续 default-off，
 不得据此切换 identity-primary、开启组织 native write 或进入 tmrpp Portainer。
+
+## Task 7.2：Develop-only Portainer 模板冻结
+
+本节只冻结部署输入，不授权或执行部署。模板固定为
+`deploy/iam-organization-reconciliation-develop/compose.signer.yml` 与
+`deploy/iam-organization-reconciliation-develop/compose.full-range-runner.yml`。两者都只接受
+`identity-develop-image-provenance-<40位Develop SHA>` CI artifact 中同一组 repository、`gitSha` 和
+`sha256:` digest；`develop`、`sha-<commit>`、`latest` 等 tag 均不得作为镜像输入。当前 CI patch 只在
+`develop` push 后保留 contract 为 `identity-service/develop-image-provenance/v1` 的 30 天 immutable image
+artifact；它不部署容器，也不授权 main、publish、Production 或 tmrpp。
+
+当前 Portainer 已核验只有一个 `local` standalone endpoint；这足以承载 Task 7.2 的一个 signer 与一个
+one-shot runner。二者允许位于同一 endpoint、Docker engine 和物理 host，但必须是两个不同容器并由外部
+Docker inspect 分别绑定。Task 7.2 证书必须固定输出 `physicalIndependenceVerified=false`、
+`productionReady=false`、`productionPromotionAllowed=false`。若未来申请 Production promotion，物理独立
+节点及其证据是届时的独立 blocker，不在本阶段新增 VM、费用或第二套 signer。
+
+单 signer 模板只启动 HTTPS launcher，固定 uid/gid `1000:1000`、read-only rootfs、`cap_drop=ALL`、
+`no-new-privileges`、16 MiB noexec tmpfs、private host bind、internal bridge 和 static container IPv4；没有
+environment、数据库配置或 Docker socket。每个 endpoint 必须预先创建一个 `Driver=local`、`Scope=local` 的
+external volume，并以只读方式挂到 `/run/identity-develop-signer`。其中所有普通文件必须由 uid 1000 拥有、
+link count 为 1，volume 根目录必须由 uid/gid 1000 拥有且模式为 `0700`；除 TLS certificate 可使用
+owner-readable 且 group/other 不可写的模式外，其余文件均为
+`0600`：
+
+- `launcher.json`：两空格 canonical JSON 且结尾换行；contract 固定为
+  `iam-organization-reconciliation-xrteeth-develop-hash-signer-https-launcher/v1`，environment 固定为
+  `xrteeth-develop`。`collectorId` 必须来自 compiled profile，`listen.host` 必须等于 Compose 的 static
+  container IPv4，`listen.port` 固定为 `8443`。
+- `trust-policy.json` 与 `deployment-evidence.json`：单 signer 使用的获批 public trust/deployment evidence；路径
+  分别固定为 `/run/identity-develop-signer/trust-policy.json` 和
+  `/run/identity-develop-signer/deployment-evidence.json`。
+- `signer-ed25519-private.pem`、`tls-private-key.pem`、`tls-certificate.pem`、`bearer-token`：其绝对路径写入
+  `launcher.json`。Ed25519 signing key 与 TLS key 必须不同；certificate DER fingerprint 必须等于 deployment
+  evidence 对本节点的 pin；Bearer token 至少 32 个 printable ASCII 字节。
+
+one-shot runner 模板使用完全相同的 repository@digest 与 compiled revision，固定 uid/gid `1000:1000`、
+read-only rootfs、`cap_drop=ALL`、`no-new-privileges`、256 MiB noexec tmpfs、`restart: "no"`，不发布端口、
+不挂载 Docker socket，也不挂载任何 Ed25519/TLS private key。runner 只接收三组彼此不同的专用只读数据库
+账号：Legacy `bujiaban_development`、Identity `xrugc_identity_dev`、plugin
+`bujiaban_development_plugin`；不得注入普通 service DB 账号。它还只读挂载 node-local external config volume
+到 `/app/develop-config`，其中只有 `trust-policy.json`、`deployment-evidence.json`、
+`signer-transport.json`、一个 signer Bearer token 和对应 private-CA certificate。所有这些文件均须
+uid 1000、link count 1、`0600`，transport 中的绝对路径必须位于该挂载点。
+
+runner 的 evidence external volume 读写挂载到 `/app/evidence`。在部署前，host/Portainer owner 必须独立核验
+该 local volume 所在文件系统实际可用容量不小于 1 GiB，并把字节数作为
+`DEVELOP_RUNNER_EVIDENCE_CAPACITY_BYTES` 输入；Compose label 和静态校验只记录/检查这个声明，不替代实际容量
+证据。config volume 根目录与 evidence volume 根目录都必须由 uid/gid 1000 拥有且模式为 `0700`，否则
+non-root runner 无权读取配置或创建输出。`IDENTITY_DEVELOP_EVIDENCE_FILE` 必须是尚不存在的安全 `.json`
+basename；runner 使用 exclusive 0600
+创建，重复文件会 fail closed。该 raw artifact 可能含敏感源记录，只能留在受控 evidence volume，不能提交
+Git 或当作脱敏 closeout 传播。
+
+部署前必须先运行以下只读校验；它只执行 `docker compose config --format json` 并在内存检查渲染结果，不会
+create/start network、volume 或 container，也不会输出数据库密码：
+
+```bash
+node deploy/iam-organization-reconciliation-develop/validate-compose-templates.mjs --self-test
+node deploy/iam-organization-reconciliation-develop/validate-compose-templates.mjs signer
+node deploy/iam-organization-reconciliation-develop/validate-compose-templates.mjs runner
+```
+
+`signer` 与 `runner` 模式要求 Compose 文件中的每个 `${NAME:?…}` 均由 Portainer/受控 shell 提供，并额外
+拒绝 mutable tag、placeholder、零 digest、非 40 位 revision、不安全 evidence filename、非 RFC1918 signer
+bind/static IP、静态 IP 不属于 subnet、重复 DB 用户、config/evidence 共用 volume，以及声明容量小于 1 GiB。
+渲染结果还必须只有获批的单一 service、network 与 volume source；额外 service/network/config/secret/device、
+非固定 mount source、非 `8443` listener 或偏离只读 config prefix 的 token/private-CA 路径一律 fail closed。
+
+两项角色的镜像一致性不得由应用容器自报。CI provenance、signer/runner 两份
+`docker compose config --format json` 输出，以及同一已批准 Develop Docker daemon 外部采集的两个 container/image
+`docker inspect` 脱敏 observation 必须写入彼此独立的普通 JSON 文件。observation 的 `source` 固定为
+`docker-inspect`，同时记录 container 的 configured repository@digest、container image ID、image inspect ID、
+RepoDigest 以及与 deployment evidence 相同的 container/endpoint/engine/physical-host 哈希。校验命令为：
+
+```bash
+npm run iam:organization-reconciliation:develop-validate-deployment-bundle -- \
+  --ci-provenance=/absolute/identity-develop-image-provenance.json \
+  --deployment-evidence=/absolute/deployment-evidence.json \
+  --signer-compose=/absolute/signer-compose.json \
+  --runner-compose=/absolute/runner-compose.json \
+  --docker-inspect-observations=/absolute/docker-inspect-observations.json
+```
+
+该 gate 要求两份 Compose image 与两份 Docker inspect RepoDigest 都精确等于 CI artifact 的同一
+`repository@sha256:digest`，container/image inspect ID 一致，deployment evidence 的 build revision 与
+release image digest 同 CI provenance 一致，并要求 deployment evidence 的 `topologyObservationSha256`
+精确等于整组外部 observation 的 domain hash。它不依赖 `sha-<commit>` tag，也不允许应用进程自省替代
+Docker inspect 证据。compiled topology registry 仍必须唯一钉住 executor 与一个 signer 的
+collector/node/key/public-key/TLS-certificate/endpoint/engine/physical-host；production registry 当前保持 0，
+未另行审核 provision 前所有 runner、signer 与 certificate 路径均 fail closed。
+
+校验 PASS 只证明模板渲染及静态隔离约束；它不证明 volume 容量、证书/密钥、数据库 grant、网络可达性、
+运行证据或 Task 7.2 完成，也不证明 endpoint/host 物理独立。实际 `docker compose up` 或 Portainer stack
+deploy 仍须保持在已批准 Develop 范围，禁止 main、publish、Production 或 tmrpp。
 
 ## Phase 3：单次 Develop legacy-proxy 窗口
 

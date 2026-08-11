@@ -7,10 +7,14 @@ import {
   type OrganizationReconciliationTrustedProvenanceContext
 } from "./iam-organization-reconciliation-provenance.js";
 import {
+  ORGANIZATION_RECONCILIATION_PLATFORM_GLOBAL_CONTEXT_REF,
   ORGANIZATION_RECONCILIATION_PUBLIC_CONTEXT_REF,
   ORGANIZATION_RECONCILIATION_PROJECTION_CATALOGS_READY,
+  type AuthorizationContextKind,
+  authorizationContextForLegacyOrganizationId,
   canonicalLegacyOrganizationId,
   canonicalReconciliationToken,
+  isCanonicalAuthorizationContext,
   isCanonicalLegacyOrganizationId,
   isCanonicalLegacyUserSubjectRef,
   isCanonicalOrganizationRef,
@@ -20,13 +24,19 @@ import {
 } from "./iam-organization-reconciliation-refs.js";
 import {
   canonicalizeOrganizationReconciliationEvidenceValue,
-  validateOrganizationReconciliationCompositeManifest,
-  validateOrganizationReconciliationCompositeManifestEvidenceBinding,
-  type OrganizationReconciliationCompositeManifest
+  validateOrganizationReconciliationOperationCompositeManifest,
+  validateOrganizationReconciliationOperationCompositeManifestEvidenceBinding,
+  type OrganizationReconciliationOperationCompositeManifest
 } from "./iam-organization-reconciliation-component-manifest.js";
 import {
   ORGANIZATION_RECONCILIATION_OPERATION_EVIDENCE_PROJECTOR_READY
 } from "./iam-organization-reconciliation-coordinator.js";
+import {
+  IDENTITY_ORGANIZATION_SURFACE_PROJECTOR_CONTRACT,
+  LEGACY_ORGANIZATION_SURFACE_PROJECTOR_CONTRACT,
+  ORGANIZATION_SURFACE_PROJECTION_BINDING_CONTRACT,
+  type OrganizationSurfaceProjectionBinding
+} from "./iam-organization-reconciliation-projector-contract.js";
 import {
   ORGANIZATION_RECONCILIATION_DATASET_LINEAGE_PRODUCTION_READY
 } from "./iam-organization-reconciliation-dataset-lineage.js";
@@ -43,7 +53,7 @@ export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | { readonly [key: string]: JsonValue } | readonly JsonValue[];
 
 export const ORGANIZATION_RECONCILIATION_STRING_ARRAY_EVIDENCE_HASH_BUILDER_CONTRACT =
-  "iam-organization-reconciliation-string-array-evidence-hash-builder/v1" as const;
+  "iam-organization-reconciliation-string-array-evidence-hash-builder/v2" as const;
 
 /** Structural HMAC computation only; this opaque handle conveys no source trust. */
 export interface OrganizationReconciliationStringArrayEvidenceHashBuilder {
@@ -64,12 +74,12 @@ export type OrganizationReconciliationSurface =
   | "effective-decision";
 
 export const ORGANIZATION_RECONCILIATION_COLLECTOR_CONTRACT =
-  "iam-organization-reconciliation-collector/v3";
+  "iam-organization-reconciliation-collector/v4";
 export const ORGANIZATION_RECONCILIATION_COLLECTOR_CONTRACT_HASH = createHash("sha256")
   .update(ORGANIZATION_RECONCILIATION_COLLECTOR_CONTRACT)
   .digest("hex");
 export const ORGANIZATION_RECONCILIATION_DECISION_DERIVATION_CONTRACT =
-  "iam-organization-reconciliation-decision-universe/v3";
+  "iam-organization-reconciliation-decision-universe/v4";
 /**
  * Deliberate production blocker. A reviewed change may set this true only when
  * every authoritative Legacy/Identity/plugin/rule adapter is registered.
@@ -169,14 +179,15 @@ export interface PluginVisibilityRecord {
 
 export interface CampusContextRecord {
   readonly subjectRef: string;
-  readonly campusRef: string;
-  readonly organizationRef: string;
+  readonly contextKind: AuthorizationContextKind;
+  readonly contextRef: string;
   readonly decision: OrganizationDecision;
 }
 
 export interface EffectiveOrganizationDecisionRecord {
   readonly subjectRef: string;
-  readonly organizationRef: string;
+  readonly contextKind: AuthorizationContextKind;
+  readonly contextRef: string;
   readonly resourceRef: string;
   readonly capabilityRef: string;
   readonly decision: OrganizationDecision;
@@ -241,6 +252,8 @@ export interface OrganizationReconciliationCollectionEnvelope {
 }
 
 export interface OrganizationReconciliationOperationEvidence {
+  /** Canonical, unbranded evidence copy of the exact A/B projector/run binding. */
+  readonly projectionBinding?: OrganizationSurfaceProjectionBinding;
   readonly collectionEnvelope?: OrganizationReconciliationCollectionEnvelope;
   readonly organizationDirectory?: ReconciliationPair<OrganizationDirectoryRecord>;
   readonly organizationMappings?: ReconciliationPair<OrganizationMappingRecord>;
@@ -259,7 +272,7 @@ export interface OrganizationReconciliationInput extends OrganizationReconciliat
    * a circular self-reference; trusted provenance signs the complete input,
    * including this manifest.
    */
-  readonly componentManifest?: OrganizationReconciliationCompositeManifest;
+  readonly componentManifest?: OrganizationReconciliationOperationCompositeManifest;
 }
 
 export interface OrganizationReconciliationFinding {
@@ -280,6 +293,10 @@ export interface OrganizationReconciliationCoverageBlocker {
     | "component-manifest-invalid"
     | "component-manifest-evidence-mismatch"
     | "component-manifest-envelope-mismatch"
+    | "projection-binding-missing"
+    | "projection-binding-invalid"
+    | "projection-binding-component-mismatch"
+    | "projection-binding-lineage-mismatch"
     | "collector-contract-invalid"
     | "collector-build-revision-invalid"
     | "real-source-adapters-not-ready"
@@ -538,9 +555,9 @@ function validateOrganizationReconciliationUnsafe(
     input.campusContexts,
     {
       valid: isCampusContextRecord,
-      key: (record) => [record.subjectRef, record.campusRef],
+      key: (record) => [record.subjectRef, record.contextKind, record.contextRef],
       decision: (record) => record.decision,
-      context: (record) => ({ organizationRef: record.organizationRef })
+      context: () => null
     }
   );
   compareDecisions(
@@ -549,7 +566,13 @@ function validateOrganizationReconciliationUnsafe(
     input.effectiveDecisions,
     {
       valid: isEffectiveOrganizationDecisionRecord,
-      key: (record) => [record.subjectRef, record.organizationRef, record.resourceRef, record.capabilityRef],
+      key: (record) => [
+        record.subjectRef,
+        record.contextKind,
+        record.contextRef,
+        record.resourceRef,
+        record.capabilityRef
+      ],
       decision: (record) => record.decision,
       context: () => null
     }
@@ -661,11 +684,14 @@ function verifyTrustedProvenance(
   if (!envelope) return verifyOrganizationReconciliationProvenance(undefined, context);
   try {
     const { componentManifest: candidateManifest, ...evidenceBody } = input;
-    validateOrganizationReconciliationCompositeManifestEvidenceBinding(
+    validateOrganizationReconciliationOperationCompositeManifestEvidenceBinding(
       candidateManifest,
       evidenceBody
     );
-    const binding = createOrganizationReconciliationProvenanceBindingFromInput(input);
+    const binding = createOrganizationReconciliationProvenanceBindingFromInput(
+      input,
+      context.expectedDeploymentEvidenceSha256
+    );
     return verifyOrganizationReconciliationProvenance(binding, context);
   } catch {
     return verifyOrganizationReconciliationProvenance(undefined, context);
@@ -1047,8 +1073,8 @@ function validateCollectionEnvelope(
   }
   const dimensionsByUniverse = {
     pluginVisibility: ["organizations", "plugins", "subjects"],
-    campusContexts: ["campuses", "organizations", "subjects"],
-    effectiveDecisions: ["capabilities", "organizations", "resources", "rulePairs", "subjects"]
+    campusContexts: ["contexts", "subjects"],
+    effectiveDecisions: ["capabilities", "contexts", "resources", "rulePairs", "subjects"]
   } as const;
   for (const name of ["pluginVisibility", "campusContexts", "effectiveDecisions"] as const) {
     const requiredDimensions = [...dimensionsByUniverse[name]].sort();
@@ -1121,6 +1147,7 @@ function validateComponentManifest(
   };
   const allowedInputKeys = new Set([
     "componentManifest",
+    "projectionBinding",
     "collectionEnvelope",
     "organizationDirectory",
     "organizationMappings",
@@ -1145,9 +1172,9 @@ function validateComponentManifest(
     return;
   }
 
-  let manifest: OrganizationReconciliationCompositeManifest;
+  let manifest: OrganizationReconciliationOperationCompositeManifest;
   try {
-    manifest = validateOrganizationReconciliationCompositeManifest(input.componentManifest);
+    manifest = validateOrganizationReconciliationOperationCompositeManifest(input.componentManifest);
   } catch {
     block("component-manifest-invalid");
     return;
@@ -1156,7 +1183,7 @@ function validateComponentManifest(
 
   const { componentManifest: _componentManifest, ...evidenceBody } = input;
   try {
-    validateOrganizationReconciliationCompositeManifestEvidenceBinding(manifest, evidenceBody);
+    validateOrganizationReconciliationOperationCompositeManifestEvidenceBinding(manifest, evidenceBody);
   } catch {
     block("component-manifest-evidence-mismatch");
     return;
@@ -1169,6 +1196,7 @@ function validateComponentManifest(
   }
   const legacyComponent = manifest.components.find((component) => component.componentId === "legacy-main");
   const identityComponent = manifest.components.find((component) => component.componentId === "identity");
+  const pluginComponent = manifest.components.find((component) => component.componentId === "plugin");
   if (
     !legacyComponent ||
     !identityComponent ||
@@ -1195,6 +1223,99 @@ function validateComponentManifest(
   ) {
     block("component-manifest-envelope-mismatch");
   }
+
+  const projectionBinding = input.projectionBinding;
+  if (!projectionBinding) {
+    block("projection-binding-missing");
+    return;
+  }
+  if (!isOrganizationSurfaceProjectionBindingEvidence(projectionBinding)) {
+    block("projection-binding-invalid");
+    return;
+  }
+  if (
+    !legacyComponent ||
+    !identityComponent ||
+    !pluginComponent ||
+    projectionBinding.legacy.primarySource.sourceVersion !== legacyComponent.sourceVersion ||
+    projectionBinding.legacy.primarySource.snapshotId !== legacyComponent.snapshotId ||
+    projectionBinding.identity.primarySource.sourceVersion !== identityComponent.sourceVersion ||
+    projectionBinding.identity.primarySource.snapshotId !== identityComponent.snapshotId ||
+    projectionBinding.pluginSource.sourceVersion !== pluginComponent.sourceVersion ||
+    projectionBinding.pluginSource.snapshotId !== pluginComponent.snapshotId
+  ) {
+    block("projection-binding-component-mismatch");
+  }
+  if (projectionBinding.lineageManifestSha256 !== manifest.parentLineageManifestSha256) {
+    block("projection-binding-lineage-mismatch");
+  }
+}
+
+function isOrganizationSurfaceProjectionBindingEvidence(
+  value: unknown
+): value is OrganizationSurfaceProjectionBinding {
+  if (!hasExactKeys(value, [
+    "contract",
+    "semanticRegistrySha256",
+    "lineageManifestSha256",
+    "legacy",
+    "identity",
+    "pluginSource"
+  ])) return false;
+  if (
+    value.contract !== ORGANIZATION_SURFACE_PROJECTION_BINDING_CONTRACT ||
+    !isSha256(value.semanticRegistrySha256) ||
+    !isSha256(value.lineageManifestSha256) ||
+    !isProjectionBindingSide(
+      value.legacy,
+      LEGACY_ORGANIZATION_SURFACE_PROJECTOR_CONTRACT
+    ) ||
+    !isProjectionBindingSide(
+      value.identity,
+      IDENTITY_ORGANIZATION_SURFACE_PROJECTOR_CONTRACT
+    ) ||
+    !isProjectionBindingSource(value.pluginSource)
+  ) return false;
+  return value.legacy.evaluatorId !== value.identity.evaluatorId &&
+    value.legacy.evaluatorBuildSha256 !== value.identity.evaluatorBuildSha256;
+}
+
+function isProjectionBindingSide(
+  value: unknown,
+  projectorContract:
+    | typeof LEGACY_ORGANIZATION_SURFACE_PROJECTOR_CONTRACT
+    | typeof IDENTITY_ORGANIZATION_SURFACE_PROJECTOR_CONTRACT
+): value is OrganizationSurfaceProjectionBinding["legacy"] |
+  OrganizationSurfaceProjectionBinding["identity"] {
+  return hasExactKeys(value, [
+    "projectorContract",
+    "evaluatorId",
+    "evaluatorBuildSha256",
+    "primarySource"
+  ]) &&
+    value.projectorContract === projectorContract &&
+    typeof value.evaluatorId === "string" &&
+    /^[a-z0-9][a-z0-9./:-]{0,127}$/.test(value.evaluatorId) &&
+    !value.evaluatorId.includes("..") &&
+    isSha256(value.evaluatorBuildSha256) &&
+    isProjectionBindingSource(value.primarySource);
+}
+
+function isProjectionBindingSource(
+  value: unknown
+): value is OrganizationSurfaceProjectionBinding["pluginSource"] {
+  return hasExactKeys(value, ["sourceVersion", "snapshotId"]) &&
+    isProjectionBindingMetadata(value.sourceVersion) &&
+    isProjectionBindingMetadata(value.snapshotId);
+}
+
+function isSha256(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
+
+function isProjectionBindingMetadata(value: unknown): value is string {
+  return typeof value === "string" && value.length >= 1 && value.length <= 1_024 &&
+    value.trim() === value;
 }
 
 function validateDecisionUniverseCoverage(
@@ -1227,11 +1348,14 @@ function validateDecisionUniverseCoverage(
       input.campusContexts,
       (record) => {
         const value = record as CampusContextRecord;
-        return [value.subjectRef, value.campusRef];
+        return [value.subjectRef, value.contextKind, value.contextRef];
       },
       (record) => {
         const value = record as CampusContextRecord;
-        return { subjects: value.subjectRef, campuses: value.campusRef, organizations: value.organizationRef };
+        return {
+          subjects: value.subjectRef,
+          contexts: canonicalAuthorizationContextDimension(value.contextKind, value.contextRef)
+        };
       }
     ],
     [
@@ -1240,13 +1364,19 @@ function validateDecisionUniverseCoverage(
       input.effectiveDecisions,
       (record) => {
         const value = record as EffectiveOrganizationDecisionRecord;
-        return [value.subjectRef, value.organizationRef, value.resourceRef, value.capabilityRef];
+        return [
+          value.subjectRef,
+          value.contextKind,
+          value.contextRef,
+          value.resourceRef,
+          value.capabilityRef
+        ];
       },
       (record) => {
         const value = record as EffectiveOrganizationDecisionRecord;
         return {
           subjects: value.subjectRef,
-          organizations: value.organizationRef,
+          contexts: canonicalAuthorizationContextDimension(value.contextKind, value.contextRef),
           resources: value.resourceRef,
           capabilities: value.capabilityRef,
           rulePairs: stableSerialize([value.resourceRef, value.capabilityRef])
@@ -1295,12 +1425,14 @@ function validateDecisionUniverseCoverage(
           dimensionValues.set("plugins", new Set(bindings.map((binding) => binding.pluginRef)));
           dimensionValues.set("organizations", new Set(bindings.map((binding) => binding.organizationRef)));
         }
-      } else if (surface === "effective-decision") {
+      } else if (surface === "campus-context" || surface === "effective-decision") {
         const directories = input.organizationDirectory?.[side]?.records ?? [];
         if (Array.isArray(directories) && directories.every(isOrganizationDirectoryRecord)) {
           dimensionValues.set(
-            "organizations",
-            new Set(directories.map((record) => organizationRefForLegacyId(record.legacyOrganizationId)))
+            "contexts",
+            new Set(canonicalAuthorizationContexts(directories).map((context) =>
+              canonicalAuthorizationContextDimension(context.contextKind, context.contextRef)
+            ))
           );
         }
       }
@@ -1358,32 +1490,33 @@ function validateDerivedDecisionKeyCoverage(
       }
     }
   } else if (surface === "campus-context") {
-    const campusOrganizations = new Map<string, string>();
     for (const record of records as readonly CampusContextRecord[]) {
-      actualKeys.add(stableSerialize([record.subjectRef, record.campusRef]));
-      const existing = campusOrganizations.get(record.campusRef);
-      if (existing !== undefined && existing !== record.organizationRef) {
-        accumulator.blockers.push({ surface, code: "decision-universe-coverage-mismatch", side });
-        return;
-      }
-      campusOrganizations.set(record.campusRef, record.organizationRef);
+      actualKeys.add(stableSerialize([
+        record.subjectRef,
+        record.contextKind,
+        record.contextRef
+      ]));
     }
+    const contexts = canonicalAuthorizationContextsForSide(input, side);
+    if (contexts === null) return;
     for (const subjectRef of subjects) {
-      for (const campusRef of campusOrganizations.keys()) {
-        expectedKeys.add(stableSerialize([subjectRef, campusRef]));
+      for (const context of contexts) {
+        expectedKeys.add(stableSerialize([
+          subjectRef,
+          context.contextKind,
+          context.contextRef
+        ]));
       }
     }
   } else if (surface === "effective-decision") {
-    const organizationRefs = new Set(
-      (input.organizationDirectory?.[side]?.records ?? [])
-        .filter(isOrganizationDirectoryRecord)
-        .map((record) => organizationRefForLegacyId(record.legacyOrganizationId))
-    );
+    const contexts = canonicalAuthorizationContextsForSide(input, side);
+    if (contexts === null) return;
     const rulePairs = new Map<string, readonly [string, string]>();
     for (const record of records as readonly EffectiveOrganizationDecisionRecord[]) {
       actualKeys.add(stableSerialize([
         record.subjectRef,
-        record.organizationRef,
+        record.contextKind,
+        record.contextRef,
         record.resourceRef,
         record.capabilityRef
       ]));
@@ -1393,9 +1526,15 @@ function validateDerivedDecisionKeyCoverage(
       );
     }
     for (const subjectRef of subjects) {
-      for (const organizationRef of organizationRefs) {
+      for (const context of contexts) {
         for (const [resourceRef, capabilityRef] of rulePairs.values()) {
-          expectedKeys.add(stableSerialize([subjectRef, organizationRef, resourceRef, capabilityRef]));
+          expectedKeys.add(stableSerialize([
+            subjectRef,
+            context.contextKind,
+            context.contextRef,
+            resourceRef,
+            capabilityRef
+          ]));
         }
       }
     }
@@ -1409,6 +1548,43 @@ function validateDerivedDecisionKeyCoverage(
   ) {
     accumulator.blockers.push({ surface, code: "decision-universe-coverage-mismatch", side });
   }
+}
+
+function canonicalAuthorizationContextDimension(
+  contextKind: AuthorizationContextKind,
+  contextRef: string
+): string {
+  return stableSerialize([contextKind, contextRef]);
+}
+
+function canonicalAuthorizationContextsForSide(
+  input: OrganizationReconciliationInput,
+  side: "legacy" | "identity"
+): readonly Readonly<{ contextKind: AuthorizationContextKind; contextRef: string }>[] | null {
+  const directories = input.organizationDirectory?.[side]?.records;
+  if (!Array.isArray(directories) || !directories.every(isOrganizationDirectoryRecord)) return null;
+  return canonicalAuthorizationContexts(directories);
+}
+
+/** The campus/effective structural universe is always S x (O + 2). */
+function canonicalAuthorizationContexts(
+  directories: readonly OrganizationDirectoryRecord[]
+): readonly Readonly<{ contextKind: AuthorizationContextKind; contextRef: string }>[] {
+  const contexts = directories.map((directory) =>
+    authorizationContextForLegacyOrganizationId(directory.legacyOrganizationId)
+  );
+  contexts.sort((left, right) => left.contextRef.localeCompare(right.contextRef));
+  contexts.push(
+    Object.freeze({
+      contextKind: "platform-global" as const,
+      contextRef: ORGANIZATION_RECONCILIATION_PLATFORM_GLOBAL_CONTEXT_REF
+    }),
+    Object.freeze({
+      contextKind: "public" as const,
+      contextRef: ORGANIZATION_RECONCILIATION_PUBLIC_CONTEXT_REF
+    })
+  );
+  return Object.freeze(contexts);
 }
 
 function validateMappingUniqueness(
@@ -1533,17 +1709,16 @@ function isPluginVisibilityRecord(value: unknown): value is PluginVisibilityReco
 }
 
 function isCampusContextRecord(value: unknown): value is CampusContextRecord {
-  if (!hasExactKeys(value, ["subjectRef", "campusRef", "organizationRef", "decision"])) return false;
+  if (!hasExactKeys(value, ["subjectRef", "contextKind", "contextRef", "decision"])) return false;
   return isCanonicalLegacyUserSubjectRef(value.subjectRef) &&
-    validCanonicalString(value.campusRef) &&
-    validOrganizationRef(value.organizationRef, false) &&
+    isCanonicalAuthorizationContext(value.contextKind, value.contextRef) &&
     validDecision(value.decision);
 }
 
 function isEffectiveOrganizationDecisionRecord(value: unknown): value is EffectiveOrganizationDecisionRecord {
-  if (!hasExactKeys(value, ["subjectRef", "organizationRef", "resourceRef", "capabilityRef", "decision"])) return false;
+  if (!hasExactKeys(value, ["subjectRef", "contextKind", "contextRef", "resourceRef", "capabilityRef", "decision"])) return false;
   return isCanonicalLegacyUserSubjectRef(value.subjectRef) &&
-    validOrganizationRef(value.organizationRef, false) &&
+    isCanonicalAuthorizationContext(value.contextKind, value.contextRef) &&
     validCanonicalString(value.resourceRef) &&
     validCanonicalString(value.capabilityRef) &&
     validDecision(value.decision);
@@ -1694,10 +1869,11 @@ function validateCrossSurfaceReferences(
       }
     }
     for (const record of [...campuses, ...decisions]) {
-      if (!validOrganizationRefExists(record.organizationRef)) {
-        invalid("decision-without-organization", [record.subjectRef, record.organizationRef]);
-      } else if (record.decision === "allow" && !validActiveOrganizationRef(record.organizationRef)) {
-        invalid("allow-without-active-organization", [record.subjectRef, record.organizationRef]);
+      if (record.contextKind !== "organization") continue;
+      if (!validOrganizationRefExists(record.contextRef)) {
+        invalid("decision-without-organization", [record.subjectRef, record.contextKind, record.contextRef]);
+      } else if (record.decision === "allow" && !validActiveOrganizationRef(record.contextRef)) {
+        invalid("allow-without-active-organization", [record.subjectRef, record.contextKind, record.contextRef]);
       }
     }
   }
@@ -1801,7 +1977,7 @@ interface StringArrayEvidenceHashBuilderState {
 }
 
 const ORGANIZATION_RECONCILIATION_EVIDENCE_HASH_DOMAIN =
-  "iam-organization-reconciliation:v3\u001f" as const;
+  "iam-organization-reconciliation:v4\u001f" as const;
 const stringArrayEvidenceHashBuilderBrands = new WeakMap<object, StringArrayEvidenceHashBuilderState>();
 
 export function createOrganizationReconciliationStringArrayEvidenceHashBuilder(
