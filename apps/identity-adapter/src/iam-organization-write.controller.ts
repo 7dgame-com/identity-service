@@ -58,6 +58,20 @@ export class IamOrganizationWriteController {
     };
   }
 
+  @Get("subjects/:legacyUserId/candidate")
+  async subjectCandidate(
+    @Headers("x-identity-internal-token") token: string | undefined,
+    @Param("legacyUserId") legacyUserId: string
+  ) {
+    this.assertInternalToken(token);
+    return {
+      status: "ok",
+      service: "identity-adapter",
+      capability: "iam-organization-write-subject-candidate",
+      data: await this.organizationWrite.subjectCandidate(parseLegacyUserId(legacyUserId))
+    };
+  }
+
   @Get("subjects/:legacyUserId/decision")
   async previewMembershipRollout(
     @Headers("x-identity-internal-token") token: string | undefined,

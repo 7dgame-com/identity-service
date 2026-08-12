@@ -19,6 +19,7 @@ Legacy 始终是本阶段唯一事实源。Legacy organization ID 是对外稳�
 IDENTITY_IAM_ORG_WRITE_MODE: "disabled"
 IDENTITY_IAM_ORG_WRITE_ROUTE_INTEGRATION_ENABLED: "false"
 IDENTITY_IAM_ORG_WRITE_DUAL_WRITE_EXECUTION_ENABLED: "false"
+IDENTITY_IAM_ORG_WRITE_IDENTITY_NATIVE_EXECUTION_ENABLED: "false"
 IDENTITY_IAM_ORG_WRITE_ROLLOUT_MODE: "off"
 IDENTITY_IAM_ORG_WRITE_ROLLOUT_ALLOWLIST: ""
 IDENTITY_IAM_ORG_WRITE_ROLLOUT_PERCENTAGE: "0"
@@ -860,6 +861,47 @@ IDENTITY_IAM_ORG_WRITE_RECOVERY_DRILL_TARGET_LEGACY_USER_ID: "581"
 演练后必须把两个 recovery-drill 变量恢复为 `false/0`，再执行 alignment、ledger 与 public default-off gate。
 
 ## 证据与回滚
+
+## Phase 5：Identity-native 独立窗口（Task 10.5）
+
+Identity-native 绝不能由 dual-write 自动升级；必须在 dual-write 已恢复默认关闭后，以独立批准的
+allowlist 或 percentage 窗口临时配置。代码和镜像仍默认关闭：
+
+```yaml
+IDENTITY_IAM_ORG_WRITE_MODE: "identity-native"
+IDENTITY_IAM_ORG_WRITE_ROUTE_INTEGRATION_ENABLED: "true"
+IDENTITY_IAM_ORG_WRITE_DUAL_WRITE_EXECUTION_ENABLED: "false"
+IDENTITY_IAM_ORG_WRITE_IDENTITY_NATIVE_EXECUTION_ENABLED: "true"
+IDENTITY_IAM_ORG_WRITE_ROLLOUT_MODE: "allowlist"
+IDENTITY_IAM_ORG_WRITE_ROLLOUT_ALLOWLIST: "legacy:<approved-dedicated-user-id>"
+IDENTITY_IAM_ORG_WRITE_ROLLOUT_PERCENTAGE: "0"
+```
+
+选择器现在表示 **Identity 拥有的目标用户**，不表示操作者；未选目标仍由既有 Legacy owner 处理。被选目标的
+`organization_ids` 采用 Identity candidate exact replacement，Legacy 写调用必须为 0。被选请求必须：
+
+- 只包含 `id` 与 `organization_ids`，混合 nickname/email/status 等资料更新明确失败，避免部分假成功；
+- 携带有效 Identity bearer token 与显式 `Idempotency-Key`；
+- 操作者同时满足 verified root 和 live Yii `user-management.update-user` permission；
+- 目标在 `identity_users` 为 active legacy-shadow，且 Identity role shadow 不含 root；
+- 目标已有 candidate snapshot，所有组织 ID 已在 Identity candidate catalog；
+- 写后从 Identity candidate 读回精确 ID 集合；若提交确认丢失或 postcheck 失败，恢复写前 candidate snapshot，
+  账本必须为 `legacyStatus=not-called` 且补偿终态明确。
+
+运行前后使用只读 gate；Identity-native 会额外读取 candidate 摘要，不输出用户名或组织名：
+
+```bash
+npm run iam:organization-write:window-gate -- \
+  --legacy-user-id=<approved-id> \
+  --expected-mode=identity-native \
+  --expected-allowlist-count=1
+```
+
+只有 `identityNativeGate.executable=true`、candidate digest 合法、账本无 pending/failed/required、管理员正向与
+普通用户负向、重复键、未知 ID、缺字段、add/remove/replace/restore、插件/campus/登录态回归全部通过，才可
+关闭该级窗口。关闭顺序固定为 execution=false、route=false、mode=disabled、rollout=off、allowlist 空、percentage=0。
+关闭配置不会删除 candidate；如需业务 restore，必须在窗口内先用新 idempotency key 把原 candidate 集合写回并读回，
+然后再关闭窗口。Production 每个比例仍需独立批准。
 
 日志、响应头和账本只保留 correlation ID、operation/idempotency 摘要、目标/操作者摘要、命中类型、
 组织数量和状态，不保存 Authorization、Cookie、密码、完整 token 或原始请求/响应 payload。

@@ -1,6 +1,6 @@
 import { pathToFileURL } from "node:url";
 
-export type OrganizationWriteWindowMode = "legacy-proxy" | "dual-write";
+export type OrganizationWriteWindowMode = "legacy-proxy" | "dual-write" | "identity-native";
 
 export interface OrganizationWriteWindowGateOptions {
   adapterUrl: string;
@@ -39,6 +39,9 @@ export async function runOrganizationWriteWindowGate(
   const alignmentResponse = options.requireAlignment
     ? await getJson(fetcher, `${base}/internal/iam/organization-write/subjects/${options.legacyUserId}/alignment`, headers)
     : null;
+  const candidateResponse = options.expectedMode === "identity-native"
+    ? await getJson(fetcher, `${base}/internal/iam/organization-write/subjects/${options.legacyUserId}/candidate`, headers)
+    : null;
 
   const failures: string[] = [];
   const healthBody = health.body;
@@ -48,6 +51,10 @@ export async function runOrganizationWriteWindowGate(
   const summary = summaryResponse.body.data;
   const recent = recentResponse.body.data;
   const alignment = alignmentResponse?.body.data ?? null;
+  const candidate = candidateResponse?.body.data ?? null;
+  const expectedSource = options.expectedMode === "identity-native"
+    ? "identity-candidate-selected-legacy-unselected"
+    : "legacy";
 
   compare(failures, "health.status", healthBody.status, "ok");
   compare(failures, "health.service", healthBody.service, "identity-adapter");
@@ -55,6 +62,7 @@ export async function runOrganizationWriteWindowGate(
   compare(failures, "health.organizationWrite.mode", posture?.mode, options.expectedMode);
   compare(failures, "health.organizationWrite.routeIntegrationEnabled", posture?.routeIntegrationEnabled, true);
   compare(failures, "health.organizationWrite.dualWriteExecutionEnabled", posture?.dualWriteExecutionEnabled, options.expectedMode === "dual-write");
+  compare(failures, "health.organizationWrite.identityNativeExecutionEnabled", posture?.identityNativeExecutionEnabled, options.expectedMode === "identity-native");
   compare(failures, "health.organizationWrite.candidateMaterializationEnabled", posture?.candidateMaterializationEnabled, false);
   compare(
     failures,
@@ -89,14 +97,14 @@ export async function runOrganizationWriteWindowGate(
   compare(failures, "health.organizationWrite.rolloutMode", posture?.rolloutMode, "allowlist");
   compare(failures, "health.organizationWrite.rolloutAllowlistCount", posture?.rolloutAllowlistCount, options.expectedAllowlistCount);
   compare(failures, "health.organizationWrite.rolloutPercentage", posture?.rolloutPercentage, 0);
-  compare(failures, "health.organizationWrite.sourceOfTruth", posture?.sourceOfTruth, "legacy");
-  compare(failures, "health.organizationWrite.identityNativeSupported", posture?.identityNativeSupported, false);
+  compare(failures, "health.organizationWrite.sourceOfTruth", posture?.sourceOfTruth, expectedSource);
+  compare(failures, "health.organizationWrite.identityNativeSupported", posture?.identityNativeSupported, options.expectedMode === "identity-native");
 
   compare(failures, "readiness.mode", readiness?.mode, options.expectedMode);
   compare(failures, "readiness.routeIntegrationEnabled", readiness?.routeIntegrationEnabled, true);
   compare(failures, "readiness.route", readiness?.route, "/v1/plugin-user/update-user");
   compare(failures, "readiness.scope", readiness?.scope, "membership-replace");
-  compare(failures, "readiness.sourceOfTruth", readiness?.sourceOfTruth, "legacy");
+  compare(failures, "readiness.sourceOfTruth", readiness?.sourceOfTruth, expectedSource);
   compare(failures, "readiness.recoveryDrill.enabled", readiness?.recoveryDrill?.enabled, options.expectedRecoveryDrill);
   compare(
     failures,
@@ -108,12 +116,12 @@ export async function runOrganizationWriteWindowGate(
   compare(failures, "readiness.rollout.allowlistCount", readiness?.rollout?.allowlistCount, options.expectedAllowlistCount);
   compare(failures, "readiness.rollout.percentage", readiness?.rollout?.percentage, 0);
   compare(failures, "readiness.rollout.selectionConfigured", readiness?.rollout?.selectionConfigured, true);
-  compare(
-    failures,
-    options.expectedMode === "legacy-proxy" ? "readiness.legacyProxyGate.executable" : "readiness.dualWriteGate.executable",
-    options.expectedMode === "legacy-proxy" ? readiness?.legacyProxyGate?.executable : readiness?.dualWriteGate?.executable,
-    true
-  );
+  const gateName = options.expectedMode === "legacy-proxy"
+    ? "legacyProxyGate"
+    : options.expectedMode === "dual-write"
+      ? "dualWriteGate"
+      : "identityNativeGate";
+  compare(failures, `readiness.${gateName}.executable`, readiness?.[gateName]?.executable, true);
 
   compare(failures, "decision.mutation", decision?.mutation, false);
   compare(failures, "decision.mode", decision?.mode, options.expectedMode);
@@ -122,7 +130,18 @@ export async function runOrganizationWriteWindowGate(
   compare(failures, "decision.selected", decision?.selected, true);
   compare(failures, "decision.executable", decision?.executable, true);
   compare(failures, "decision.decision", decision?.decision, "selected:allowlist");
-  compare(failures, "decision.sourceOfTruth", decision?.sourceOfTruth, "legacy");
+  compare(failures, "decision.sourceOfTruth", decision?.sourceOfTruth, expectedSource);
+
+  if (options.expectedMode === "identity-native") {
+    compare(failures, "candidate.mutation", candidate?.mutation, false);
+    compare(failures, "candidate.sourceOfTruth", candidate?.sourceOfTruth, "identity-candidate");
+    if (!Number.isSafeInteger(candidate?.organizationCount) || candidate.organizationCount < 0) {
+      failures.push("candidate.organizationCount is not a non-negative integer");
+    }
+    if (!/^[a-f0-9]{64}$/.test(String(candidate?.snapshotFingerprint ?? ""))) {
+      failures.push("candidate.snapshotFingerprint is not a full SHA-256 digest");
+    }
+  }
 
   if (Array.isArray(summary?.operations)) {
     for (const operation of summary.operations) {
@@ -161,6 +180,7 @@ export async function runOrganizationWriteWindowGate(
     decision,
     ledger: { summary, recent },
     alignment,
+    candidate,
     failures
   };
 }
@@ -198,7 +218,7 @@ export function parseOrganizationWriteWindowGateArgs(argv: string[], env: NodeJS
   if (!options.adapterUrl) throw new Error("--adapter-url must not be empty");
   if (!options.legacyUserId) throw new Error("--legacy-user-id is required");
   if (options.expectedMode === "legacy-proxy" && options.requireAlignment) {
-    throw new Error("--require-alignment is only valid for a dual-write gate.");
+    throw new Error("--require-alignment is only valid for a dual-write or identity-native gate.");
   }
   if (options.expectedRecoveryDrill && options.expectedMode !== "dual-write") {
     throw new Error("--expected-recovery-drill=true requires --expected-mode=dual-write");
@@ -224,7 +244,9 @@ function compare(failures: string[], field: string, actual: unknown, expected: u
 }
 
 function modeValue(value: string): OrganizationWriteWindowMode {
-  if (value !== "legacy-proxy" && value !== "dual-write") throw new Error("expected-mode must be legacy-proxy or dual-write");
+  if (value !== "legacy-proxy" && value !== "dual-write" && value !== "identity-native") {
+    throw new Error("expected-mode must be legacy-proxy, dual-write, or identity-native");
+  }
   return value;
 }
 

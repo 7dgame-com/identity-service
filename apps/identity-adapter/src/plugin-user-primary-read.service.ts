@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { Injectable, Logger, ServiceUnavailableException } from "@nestjs/common";
 import { loadConfig } from "./config.js";
 import { identityNativeRoleWriteTargetDecision } from "./iam-role-write-target-control.js";
+import { IamOrganizationWriteRepository } from "./iam-organization-write.repository.js";
+import { identityNativeOrganizationWriteTargetDecision } from "./iam-organization-write-target-control.js";
 import { IdentityOrganizationShadowRow, IdentityUserRow, IamRepository } from "./iam.repository.js";
 import { VerifiedAccessToken } from "./jwt-issuer.service.js";
 import {
@@ -28,7 +30,8 @@ export class PluginUserPrimaryReadService {
 
   constructor(
     private readonly repository: IamRepository,
-    private readonly legacyReader: LegacyIdentityReader
+    private readonly legacyReader: LegacyIdentityReader,
+    private readonly organizationRepository?: IamOrganizationWriteRepository
   ) {}
 
   async getUserById(id: number, claims: VerifiedAccessToken): Promise<PluginUserReadResult<LegacyUserReadModel | null>> {
@@ -92,6 +95,7 @@ export class PluginUserPrimaryReadService {
     if (
       this.config.iam.pluginUserWriteMode === "legacy-proxy"
       && this.config.iam.roleWriteMode !== "identity-native"
+      && this.config.iam.organizationWriteMode !== "identity-native"
     ) {
       return "legacy";
     }
@@ -171,10 +175,14 @@ export class PluginUserPrimaryReadService {
     }
 
     const metadata = recordMetadata(identity.metadata);
-    const [roleNames, organizations] = await Promise.all([
+    const [roleNames, shadowOrganizations] = await Promise.all([
       this.managedRoleNames(legacyUserId),
       this.repository.listOrganizationMembershipsShadow(legacyUserId)
     ]);
+    const organizations = await this.authoritativeOrganizations(
+      legacyUserId,
+      shadowOrganizations.map(toLegacyOrganization)
+    );
 
     return {
       id: legacyUserId,
@@ -187,7 +195,7 @@ export class PluginUserPrimaryReadService {
       updatedAt: numberOrNull(metadata.legacyUpdatedAt) ?? secondsFromIso(identity.updatedAt),
       userInfo: metadata.legacyUserInfo ?? null,
       roles: roleNames,
-      organizations: organizations.map(toLegacyOrganization),
+      organizations,
       source: "legacy"
     };
   }
@@ -196,8 +204,33 @@ export class PluginUserPrimaryReadService {
     if (!user) return null;
     return {
       ...user,
-      roles: await this.managedRoleNames(user.id, user.roles)
+      roles: await this.managedRoleNames(user.id, user.roles),
+      organizations: await this.authoritativeOrganizations(user.id, user.organizations)
     };
+  }
+
+  private async authoritativeOrganizations(
+    legacyUserId: number,
+    fallback: LegacyOrganization[]
+  ): Promise<LegacyOrganization[]> {
+    const iam = this.config.iam;
+    const decision = identityNativeOrganizationWriteTargetDecision(iam, legacyUserId);
+    if (
+      iam.organizationWriteMode !== "identity-native" ||
+      !iam.organizationWriteRouteIntegrationEnabled ||
+      !iam.organizationWriteIdentityNativeExecutionEnabled ||
+      !decision.owned
+    ) {
+      return fallback;
+    }
+    if (!this.organizationRepository?.isConfigured()) {
+      throw new Error("identity_native_organization_repository_not_configured");
+    }
+    const candidate = await this.organizationRepository.candidateForLegacyUser(legacyUserId);
+    if (!candidate) {
+      throw new Error("identity_native_organization_candidate_missing");
+    }
+    return candidate.organizations;
   }
 
   private async withAuthoritativeListRoles(result: LegacyManagedUserListResult): Promise<LegacyManagedUserListResult> {

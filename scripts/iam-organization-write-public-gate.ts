@@ -5,6 +5,7 @@ export interface OrganizationWritePublicGateOptions {
   expectedMode: "disabled" | "legacy-proxy" | "dual-write" | "identity-native";
   expectedRouteIntegration: boolean;
   expectedDualWriteExecution: boolean;
+  expectedIdentityNativeExecution: boolean;
   expectedCandidateMaterializationEnabled: boolean;
   expectedCandidateMaterializationTargetConfigured: boolean;
   expectedCandidateBatchMaterializationEnabled: boolean;
@@ -21,6 +22,7 @@ interface OrganizationWritePosture {
   mode: string;
   routeIntegrationEnabled: boolean;
   dualWriteExecutionEnabled: boolean;
+  identityNativeExecutionEnabled: boolean;
   candidateMaterializationEnabled: boolean;
   candidateMaterializationTargetConfigured: boolean;
   candidateBatchMaterializationEnabled: boolean;
@@ -64,6 +66,7 @@ async function inspect(fetcher: typeof fetch, url: string, options: Organization
     compare(failures, "mode", posture.mode, options.expectedMode);
     compare(failures, "routeIntegrationEnabled", posture.routeIntegrationEnabled, options.expectedRouteIntegration);
     compare(failures, "dualWriteExecutionEnabled", posture.dualWriteExecutionEnabled, options.expectedDualWriteExecution);
+    compare(failures, "identityNativeExecutionEnabled", posture.identityNativeExecutionEnabled, options.expectedIdentityNativeExecution);
     compare(
       failures,
       "candidateMaterializationEnabled",
@@ -100,8 +103,9 @@ async function inspect(fetcher: typeof fetch, url: string, options: Organization
     if (options.expectedAllowlistCount !== undefined) {
       compare(failures, "rolloutAllowlistCount", posture.rolloutAllowlistCount, options.expectedAllowlistCount);
     }
-    compare(failures, "sourceOfTruth", posture.sourceOfTruth, "legacy");
-    compare(failures, "identityNativeSupported", posture.identityNativeSupported, false);
+    compare(failures, "sourceOfTruth", posture.sourceOfTruth,
+      options.expectedMode === "identity-native" ? "identity-candidate-selected-legacy-unselected" : "legacy");
+    compare(failures, "identityNativeSupported", posture.identityNativeSupported, options.expectedMode === "identity-native");
   }
 
   return { url, status: response.status, revision: body.revision ?? null, posture: posture ?? null, failures };
@@ -117,6 +121,7 @@ export function parseOrganizationWritePublicGateArgs(argv: string[]): Organizati
     expectedMode: "disabled",
     expectedRouteIntegration: false,
     expectedDualWriteExecution: false,
+    expectedIdentityNativeExecution: false,
     expectedCandidateMaterializationEnabled: false,
     expectedCandidateMaterializationTargetConfigured: false,
     expectedCandidateBatchMaterializationEnabled: false,
@@ -133,6 +138,7 @@ export function parseOrganizationWritePublicGateArgs(argv: string[]): Organizati
     else if (arg.startsWith("--expected-mode=")) options.expectedMode = enumValue(arg, "--expected-mode=", ["disabled", "legacy-proxy", "dual-write", "identity-native"]);
     else if (arg.startsWith("--expected-route-integration=")) options.expectedRouteIntegration = booleanValue(arg, "--expected-route-integration=");
     else if (arg.startsWith("--expected-dual-write-execution=")) options.expectedDualWriteExecution = booleanValue(arg, "--expected-dual-write-execution=");
+    else if (arg.startsWith("--expected-identity-native-execution=")) options.expectedIdentityNativeExecution = booleanValue(arg, "--expected-identity-native-execution=");
     else if (arg.startsWith("--expected-candidate-materialization-enabled=")) {
       options.expectedCandidateMaterializationEnabled = booleanValue(arg, "--expected-candidate-materialization-enabled=");
     } else if (arg.startsWith("--expected-candidate-materialization-target-configured=")) {

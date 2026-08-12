@@ -52,6 +52,8 @@ export class HealthController {
             mode: this.config.iam.organizationWriteMode,
             routeIntegrationEnabled: this.config.iam.organizationWriteRouteIntegrationEnabled,
             dualWriteExecutionEnabled: this.config.iam.organizationWriteDualWriteExecutionEnabled,
+            identityNativeExecutionEnabled:
+              this.config.iam.organizationWriteIdentityNativeExecutionEnabled,
             candidateMaterializationEnabled:
               this.config.iam.organizationWriteCandidateMaterializationEnabled,
             candidateMaterializationTargetConfigured:
@@ -70,8 +72,13 @@ export class HealthController {
               .map((item) => item.trim())
               .filter(Boolean).length,
             rolloutPercentage: this.config.iam.organizationWriteRolloutPercentage,
-            sourceOfTruth: "legacy",
-            identityNativeSupported: false
+            sourceOfTruth: this.config.iam.organizationWriteMode === "identity-native"
+              ? "identity-candidate-selected-legacy-unselected"
+              : "legacy",
+            identityNativeSupported:
+              this.config.iam.organizationWriteMode === "identity-native" &&
+              this.config.iam.organizationWriteRouteIntegrationEnabled &&
+              this.config.iam.organizationWriteIdentityNativeExecutionEnabled
           },
           pluginUserWrite: this.config.iam.pluginUserWriteMode
         }

@@ -1,11 +1,14 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { isProxy } from "node:util/types";
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   Logger,
   NotFoundException,
-  ServiceUnavailableException
+  ServiceUnavailableException,
+  UnauthorizedException
 } from "@nestjs/common";
 import { loadConfig } from "./config.js";
 import {
@@ -23,6 +26,11 @@ import {
   organizationWriteOperationKey,
   organizationWriteRequestFingerprint
 } from "./iam-organization-write.repository.js";
+import {
+  identityNativeOrganizationWriteTargetDecision,
+  identityNativeOrganizationWriteTargetScope
+} from "./iam-organization-write-target-control.js";
+import { IamRepository, type IdentityUserRow } from "./iam.repository.js";
 import { JwtIssuerService, VerifiedAccessToken } from "./jwt-issuer.service.js";
 import {
   LegacyIdentityReader,
@@ -37,7 +45,7 @@ import { ORGANIZATION_RECONCILIATION_DEVELOP_LEGACY_DATABASE } from
 export interface IamOrganizationWriteProxyResponse {
   status: number;
   body: unknown;
-  mode: "legacy-proxy" | "dual-write";
+  mode: "legacy-proxy" | "dual-write" | "identity-native";
   evidence: IamOrganizationWriteEvidence;
 }
 
@@ -78,7 +86,8 @@ export class IamOrganizationWriteService {
     private readonly pluginUserWrite: PluginUserWriteService,
     private readonly repository: IamOrganizationWriteRepository,
     private readonly legacy: LegacyIdentityReader,
-    private readonly jwtIssuer: JwtIssuerService
+    private readonly jwtIssuer: JwtIssuerService,
+    private readonly iamRepository?: IamRepository
   ) {}
 
   async readiness() {
@@ -117,6 +126,28 @@ export class IamOrganizationWriteService {
         ...(!rollout.selectionConfigured ? ["scoped-rollout-selector"] : [])
       ]
     };
+    const identityNativeTargetScope = identityNativeOrganizationWriteTargetScope(iam);
+    const livePermissionReaderConfigured = typeof this.legacy.isConfigured === "function" && this.legacy.isConfigured();
+    const identityNativeGate = {
+      executable:
+        iam.organizationWriteMode === "identity-native" &&
+        iam.organizationWriteRouteIntegrationEnabled &&
+        iam.organizationWriteIdentityNativeExecutionEnabled &&
+        this.repository.isConfigured() &&
+        this.iamRepository?.isConfigured() === true &&
+        livePermissionReaderConfigured &&
+        materializationSchema.ready &&
+        identityNativeTargetScope.configured,
+      missingCapabilities: uniqueStrings([
+        ...(!iam.organizationWriteRouteIntegrationEnabled ? ["route-integration"] : []),
+        ...(!iam.organizationWriteIdentityNativeExecutionEnabled ? ["identity-native-execution-flag"] : []),
+        ...(!this.repository.isConfigured() ? ["identity-organization-candidate-repository"] : []),
+        ...(this.iamRepository?.isConfigured() !== true ? ["identity-user-repository"] : []),
+        ...(!livePermissionReaderConfigured ? ["live-yii-permission-reader"] : []),
+        ...(materializationSchema.blocker ? [materializationSchema.blocker] : []),
+        ...identityNativeTargetScope.missingCapabilities
+      ])
+    };
     const candidateMaterializationPreviewBlockers = uniqueStrings([
       ...(iam.organizationWriteCandidateMaterializationTargetLegacyUserId <= 0 ? ["target-not-configured"] : []),
       ...(!this.repository.isConfigured() ? ["identity-organization-candidate-repository"] : []),
@@ -152,7 +183,9 @@ export class IamOrganizationWriteService {
       routeIntegrationEnabled: iam.organizationWriteRouteIntegrationEnabled,
       route: "/v1/plugin-user/update-user",
       scope: "membership-replace",
-      sourceOfTruth: "legacy",
+      sourceOfTruth: iam.organizationWriteMode === "identity-native"
+        ? "identity-candidate-selected-legacy-unselected"
+        : "legacy",
       legacyOrganizationIdContract: "stable-external-key",
       updateSemantics: { absent: "preserve", emptyArray: "replace-empty", values: "positive-integer-dedupe-sort" },
       repositoryConfigured: this.repository.isConfigured(),
@@ -164,6 +197,9 @@ export class IamOrganizationWriteService {
       legacyProxyGate,
       dualWriteExecutionEnabled: iam.organizationWriteDualWriteExecutionEnabled,
       dualWriteGate,
+      identityNativeExecutionEnabled: iam.organizationWriteIdentityNativeExecutionEnabled,
+      identityNativeGate,
+      identityNativeTargetScope,
       candidateMaterialization: {
         enabled: iam.organizationWriteCandidateMaterializationEnabled,
         targetConfigured: iam.organizationWriteCandidateMaterializationTargetLegacyUserId > 0,
@@ -210,12 +246,12 @@ export class IamOrganizationWriteService {
         mutatesLegacy: false,
         writeScope: "identity-candidate-and-ledger"
       },
-      identityNativeSupported: false,
+      identityNativeSupported: identityNativeGate.executable,
       rollout,
       redactionPolicy: "metadata-only-no-request-or-token-payloads",
       blockedReasons:
         iam.organizationWriteMode === "identity-native"
-          ? ["identity-native-not-authorized", "legacy-owner-retained"]
+          ? identityNativeGate.missingCapabilities
           : iam.organizationWriteMode === "legacy-proxy" && !legacyProxyGate.executable
             ? legacyProxyGate.missingCapabilities
           : iam.organizationWriteMode === "dual-write" && !dualWriteGate.executable
@@ -227,11 +263,26 @@ export class IamOrganizationWriteService {
   async proxyMembershipUpdate(request: PluginUserWriteRequest): Promise<IamOrganizationWriteProxyResponse | null> {
     const { iam } = this.config;
     if (!iam.organizationWriteRouteIntegrationEnabled || iam.organizationWriteMode === "disabled") return null;
+    if (iam.organizationWriteMode === "identity-native" && identityNativeOrganizationFieldMalformed(request.body)) {
+      throw new BadRequestException({
+        code: "IAM_ORGANIZATION_WRITE_INPUT_INVALID",
+        message: "organization_ids must be an own data property containing positive integer identifiers."
+      });
+    }
     const parsed = parseMembershipReplace(request.body);
     if (!parsed.selected) return null;
 
     const claims = this.claims(request.headers.authorization);
-    const decision = organizationRolloutDecision(iam, parsed.legacyUserId, claims);
+    const nativeTargetDecision = identityNativeOrganizationWriteTargetDecision(iam, parsed.legacyUserId);
+    const decision = iam.organizationWriteMode === "identity-native"
+      ? {
+          selected: nativeTargetDecision.owned,
+          decision: nativeTargetDecision.owned
+            ? `selected:${nativeTargetDecision.selectorKind}`
+            : `not-selected:${nativeTargetDecision.reason}`,
+          selectorKind: nativeTargetDecision.selectorKind
+        }
+      : organizationRolloutDecision(iam, parsed.legacyUserId, claims);
     const evidence: IamOrganizationWriteEvidence = {
       correlationId: organizationWriteCorrelationId(request.headers),
       decision: decision.decision,
@@ -246,6 +297,24 @@ export class IamOrganizationWriteService {
       const readbackEvidence = await this.legacyProxyReadbackEvidence(upstream.status, parsed, evidence);
       this.logDecision(readbackEvidence, parsed.legacyUserId, parsed.organizationIds.length);
       return { ...upstream, mode: "legacy-proxy", evidence: readbackEvidence };
+    }
+    if (iam.organizationWriteMode === "identity-native") {
+      const readiness = await this.readiness();
+      if (!readiness.identityNativeGate.executable) {
+        throw new ServiceUnavailableException({
+          code: "IAM_ORGANIZATION_WRITE_IDENTITY_NATIVE_NOT_READY",
+          message: "Organization identity-native execution gates are not satisfied.",
+          missingCapabilities: readiness.identityNativeGate.missingCapabilities
+        });
+      }
+      const idempotencyKey = clientIdempotencyKey(request.headers);
+      if (!idempotencyKey) {
+        throw new BadRequestException({
+          code: "IAM_ORGANIZATION_WRITE_IDEMPOTENCY_KEY_REQUIRED",
+          message: "A client Idempotency-Key is required for selected organization identity-native write."
+        });
+      }
+      return this.identityNativeWrite(request, parsed, idempotencyKey, evidence);
     }
     if (iam.organizationWriteMode !== "dual-write") {
       throw new NotFoundException({
@@ -290,8 +359,10 @@ export class IamOrganizationWriteService {
       executable: decision.selected && modeGateExecutable,
       decision: decision.decision,
       matchedSelectorKind: decision.selectorKind,
-      sourceOfTruth: "legacy",
-      identityNativeSupported: false,
+      sourceOfTruth: iam.organizationWriteMode === "identity-native"
+        ? "identity-candidate-selected-legacy-unselected"
+        : "legacy",
+      identityNativeSupported: readiness.identityNativeGate.executable,
       blockedReasons: decision.selected ? readiness.blockedReasons : ["target-not-selected"]
     };
   }
@@ -323,6 +394,27 @@ export class IamOrganizationWriteService {
       this.repository.candidateForLegacyUser(legacyUserId)
     ]);
     return organizationAlignment(legacyUserId, legacyUser, candidate);
+  }
+
+  async subjectCandidate(legacyUserId: number) {
+    this.requireRepository();
+    await this.assertCandidateMaterializationSchemaReady();
+    const candidate = await this.repository.candidateForLegacyUser(legacyUserId);
+    if (!candidate) {
+      throw new NotFoundException({
+        code: "IAM_ORGANIZATION_WRITE_IDENTITY_CANDIDATE_MISSING",
+        message: "The Identity organization candidate snapshot is missing."
+      });
+    }
+    const organizations = normalizeOrganizations(candidate.organizations);
+    return {
+      mutation: false,
+      sourceOfTruth: "identity-candidate" as const,
+      targetFingerprint: organizationWriteFingerprint(`legacy:${legacyUserId}`),
+      organizationIds: organizations.map(({ id }) => id),
+      organizationCount: organizations.length,
+      snapshotFingerprint: organizationCandidateSnapshotFingerprint(legacyUserId, organizations)
+    };
   }
 
   async previewCandidateMaterialization(legacyUserId: number) {
@@ -1214,6 +1306,218 @@ export class IamOrganizationWriteService {
     }
   }
 
+  private async identityNativeWrite(
+    request: PluginUserWriteRequest,
+    parsed: SelectedMembershipReplace,
+    idempotencyKey: string,
+    evidence: IamOrganizationWriteEvidence
+  ): Promise<IamOrganizationWriteProxyResponse> {
+    assertIdentityNativeMembershipOnlyBody(request.body);
+    const claims = this.requireIdentityNativeClaims(request.headers.authorization);
+    await this.assertIdentityNativeOperator(claims);
+    const iamRepository = this.iamRepository;
+    if (!iamRepository?.isConfigured() || !this.repository.isConfigured()) {
+      throw new ServiceUnavailableException({
+        code: "IAM_ORGANIZATION_WRITE_IDENTITY_NATIVE_NOT_READY",
+        message: "Identity-native organization repositories are unavailable."
+      });
+    }
+
+    const operationKey = organizationWriteOperationKey(parsed.legacyUserId, idempotencyKey);
+    const requestFingerprint = organizationWriteRequestFingerprint(parsed.legacyUserId, parsed.organizationIds);
+    const metadata = {
+      correlationId: evidence.correlationId,
+      decision: evidence.decision,
+      actorFingerprint: evidence.actorFingerprint,
+      targetFingerprint: evidence.targetFingerprint,
+      selectorKind: evidence.matchedSelectorKind,
+      organizationCount: parsed.organizationIds.length,
+      owner: "identity",
+      legacyWritePerformed: false
+    };
+    const lock = await this.repository.withCandidateMaterializationSubjectLock(parsed.legacyUserId, async () => {
+      const [target, roleShadow, before, requestedOrganizations] = await Promise.all([
+        iamRepository.getIdentityUserByLegacyId(parsed.legacyUserId),
+        iamRepository.listRoleAssignmentsShadow(parsed.legacyUserId),
+        this.repository.candidateForLegacyUser(parsed.legacyUserId),
+        this.repository.candidateOrganizationsByLegacyIds(parsed.organizationIds)
+      ]);
+      if (!target || target.legacyUserId !== parsed.legacyUserId || target.source !== "legacy-shadow") {
+        throw new NotFoundException({
+          code: "IAM_ORGANIZATION_WRITE_IDENTITY_TARGET_NOT_FOUND",
+          message: "The selected target is not present in the Identity user model."
+        });
+      }
+      if (target.status !== "active") {
+        throw new ConflictException({
+          code: "IAM_ORGANIZATION_WRITE_INACTIVE_SUBJECT",
+          message: "Organization membership can only be changed for an active Identity subject."
+        });
+      }
+      if (
+        target.username?.trim().toLowerCase() === "root" ||
+        roleShadow.some((role) => role.roleName.trim().toLowerCase() === "root")
+      ) {
+        throw new ConflictException({
+          code: "IAM_ORGANIZATION_WRITE_PROTECTED_SUBJECT",
+          message: "Organization membership writes are not allowed for a protected root subject."
+        });
+      }
+      if (!before) {
+        throw new ConflictException({
+          code: "IAM_ORGANIZATION_WRITE_IDENTITY_CANDIDATE_MISSING",
+          message: "Identity-native organization write requires an existing candidate snapshot."
+        });
+      }
+      if (!sameIds(requestedOrganizations.map(({ id }) => id), parsed.organizationIds)) {
+        throw new BadRequestException({
+          code: "IAM_ORGANIZATION_WRITE_UNKNOWN_ORGANIZATION",
+          message: "One or more organization identifiers are not present in the Identity organization catalog."
+        });
+      }
+      const begin = await this.repository.begin({
+        operationKey,
+        idempotencyKeyDigest: createHash("sha256").update(idempotencyKey).digest("hex"),
+        requestFingerprint,
+        legacyUserId: parsed.legacyUserId,
+        mode: "identity-native",
+        metadata
+      });
+      if (begin.duplicate) {
+        const existing = await this.repository.find(operationKey);
+        if (
+          !existing ||
+          existing.mode !== "identity-native" ||
+          existing.requestFingerprint !== requestFingerprint
+        ) {
+          throw new ConflictException({
+            code: "IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_REQUEST",
+            message: "The idempotency key was already used for a different organization membership request."
+          });
+        }
+        if (existing.status !== "completed" || existing.compensationStatus !== "none") {
+          throw new ConflictException({
+            code: "IAM_ORGANIZATION_WRITE_REPLAY_UNAVAILABLE",
+            message: "The recorded Identity-native operation is not safely replayable."
+          });
+        }
+        const current = await this.repository.candidateForLegacyUser(parsed.legacyUserId);
+        if (!current || !sameIds(current.organizations.map(({ id }) => id), parsed.organizationIds)) {
+          throw new ConflictException({
+            code: "IAM_ORGANIZATION_WRITE_REPLAY_STATE_CHANGED",
+            message: "The target membership changed after the completed idempotent operation."
+          });
+        }
+        return identityNativeOrganizationResponse(target, current.organizations, evidence);
+      }
+
+      let candidateWriteAttempted = false;
+      let candidateWriteCompleted = false;
+      try {
+        candidateWriteAttempted = true;
+        await this.repository.replaceCandidate({
+          operationKey,
+          legacyUserId: parsed.legacyUserId,
+          organizations: normalizeOrganizations(requestedOrganizations)
+        });
+        candidateWriteCompleted = true;
+        const after = await this.repository.candidateForLegacyUser(parsed.legacyUserId);
+        if (!after || !sameIds(after.organizations.map(({ id }) => id), parsed.organizationIds)) {
+          throw new Error("IdentityOrganizationPostcheckMismatch");
+        }
+        await this.repository.update({
+          operationKey,
+          status: "completed",
+          legacyStatus: "not-called",
+          identityStatus: "completed",
+          compensationStatus: "none",
+          metadata
+        });
+        return identityNativeOrganizationResponse(target, after.organizations, evidence);
+      } catch (error) {
+        let compensationStatus: "none" | "completed" | "required" = "none";
+        let identityStatus = "failed";
+        let restoreRequired = candidateWriteCompleted;
+        if (candidateWriteAttempted && !candidateWriteCompleted) {
+          try {
+            const observed = await this.repository.candidateForLegacyUser(parsed.legacyUserId);
+            restoreRequired = Boolean(
+              observed && sameIds(observed.organizations.map(({ id }) => id), parsed.organizationIds)
+            );
+          } catch {
+            restoreRequired = true;
+          }
+        }
+        if (restoreRequired) {
+          try {
+            await this.repository.replaceCandidate({
+              operationKey,
+              legacyUserId: parsed.legacyUserId,
+              organizations: normalizeOrganizations(before.organizations)
+            });
+            compensationStatus = "completed";
+            identityStatus = "failed-restored-before-snapshot";
+          } catch {
+            compensationStatus = "required";
+            identityStatus = "failed-restore-required";
+          }
+        }
+        await this.repository.update({
+          operationKey,
+          status: "failed",
+          legacyStatus: "not-called",
+          identityStatus,
+          compensationStatus,
+          errorCode: errorName(error),
+          metadata
+        });
+        throw error;
+      }
+    });
+    if (!lock.acquired) {
+      throw new ConflictException({
+        code: "IAM_ORGANIZATION_WRITE_SUBJECT_BUSY",
+        message: "Another organization membership operation is active for the selected subject."
+      });
+    }
+    const completedEvidence = { ...evidence, identityStatus: "completed" };
+    this.logDecision(completedEvidence, parsed.legacyUserId, parsed.organizationIds.length);
+    return { ...lock.value, evidence: completedEvidence };
+  }
+
+  private requireIdentityNativeClaims(
+    authorization: string | string[] | undefined
+  ): VerifiedAccessToken {
+    const claims = this.claims(authorization);
+    if (!claims) {
+      throw new UnauthorizedException({
+        code: "IAM_ORGANIZATION_WRITE_OPERATOR_TOKEN_INVALID",
+        message: "A valid Identity operator token is required."
+      });
+    }
+    return claims;
+  }
+
+  private async assertIdentityNativeOperator(claims: VerifiedAccessToken): Promise<void> {
+    let permissions;
+    try {
+      permissions = await this.legacy.listUserPermissions(claims.uid);
+    } catch {
+      throw new ServiceUnavailableException({
+        code: "IAM_ORGANIZATION_WRITE_OPERATOR_AUTHORIZATION_UNAVAILABLE",
+        message: "The reviewed live Yii permission decision is unavailable."
+      });
+    }
+    const verifiedRoot = claims.roles.some((role) => role.trim().toLowerCase() === "root");
+    const livePermission = permissions.some((permission) => permission.name === "user-management.update-user");
+    if (!verifiedRoot || !livePermission) {
+      throw new ForbiddenException({
+        code: "IAM_ORGANIZATION_WRITE_OPERATOR_FORBIDDEN",
+        message: "The operator does not satisfy the reviewed root and live-permission decision."
+      });
+    }
+  }
+
   private claims(authorization: string | string[] | undefined): VerifiedAccessToken | null {
     const raw = firstHeader(authorization);
     const match = raw?.match(/^Bearer\s+(.+)$/i);
@@ -1314,6 +1618,7 @@ export class IamOrganizationWriteService {
       ...(iam.organizationWriteMode !== "disabled" ? ["organization-write-disabled-required"] : []),
       ...(iam.organizationWriteRouteIntegrationEnabled ? ["organization-route-integration-must-be-disabled"] : []),
       ...(iam.organizationWriteDualWriteExecutionEnabled ? ["organization-dual-write-must-be-disabled"] : []),
+      ...(iam.organizationWriteIdentityNativeExecutionEnabled ? ["organization-identity-native-must-be-disabled"] : []),
       ...(iam.organizationWriteRolloutMode !== "off" ? ["organization-rollout-must-be-off"] : []),
       ...(iam.organizationWriteRolloutAllowlist.trim() !== "" ? ["organization-rollout-allowlist-must-be-empty"] : []),
       ...(iam.organizationWriteRolloutPercentage !== 0 ? ["organization-rollout-percentage-must-be-zero"] : []),
@@ -1603,14 +1908,78 @@ function candidateBatchSubjectIdempotencyKey(input: {
 }
 
 function parseMembershipReplace(body: unknown): SelectedMembershipReplace | { selected: false } {
-  if (!body || typeof body !== "object" || Array.isArray(body)) return { selected: false };
-  const record = body as Record<string, unknown>;
-  if (!Object.prototype.hasOwnProperty.call(record, "organization_ids")) return { selected: false };
-  const legacyUserId = Number(record.id);
-  if (!Number.isSafeInteger(legacyUserId) || legacyUserId <= 0 || !Array.isArray(record.organization_ids)) return { selected: false };
-  const ids = record.organization_ids.map(Number);
+  if (!body || typeof body !== "object" || Array.isArray(body) || isProxy(body)) return { selected: false };
+  const descriptors = Object.getOwnPropertyDescriptors(body);
+  const idDescriptor = descriptors.id;
+  const organizationDescriptor = descriptors.organization_ids;
+  if (!organizationDescriptor || !("value" in organizationDescriptor) || !idDescriptor || !("value" in idDescriptor)) {
+    return { selected: false };
+  }
+  const legacyUserId = Number(idDescriptor.value);
+  if (!Number.isSafeInteger(legacyUserId) || legacyUserId <= 0 || !Array.isArray(organizationDescriptor.value)) return { selected: false };
+  const ids = organizationDescriptor.value.map(Number);
   if (ids.some((id) => !Number.isSafeInteger(id) || id <= 0)) return { selected: false };
   return { selected: true, legacyUserId, organizationIds: [...new Set(ids)].sort((a, b) => a - b) };
+}
+
+function identityNativeOrganizationFieldMalformed(body: unknown): boolean {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return false;
+  if (isProxy(body)) return true;
+  const descriptors = Object.getOwnPropertyDescriptors(body);
+  const descriptor = descriptors.organization_ids;
+  if (!descriptor) return false;
+  if (!("value" in descriptor) || !Array.isArray(descriptor.value)) return true;
+  return descriptor.value.some((value) => typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0);
+}
+
+function assertIdentityNativeMembershipOnlyBody(body: unknown): void {
+  if (!body || typeof body !== "object" || Array.isArray(body) || isProxy(body)) {
+    throw new BadRequestException({ code: "IAM_ORGANIZATION_WRITE_INPUT_INVALID" });
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(body);
+  if (Object.values(descriptors).some((descriptor) => !("value" in descriptor))) {
+    throw new BadRequestException({ code: "IAM_ORGANIZATION_WRITE_INPUT_INVALID" });
+  }
+  const unsupportedFields = Object.keys(descriptors).filter((key) => key !== "id" && key !== "organization_ids");
+  if (unsupportedFields.length > 0) {
+    throw new ConflictException({
+      code: "IAM_ORGANIZATION_WRITE_MIXED_UPDATE_UNSUPPORTED",
+      message: "The first Identity-native window accepts an organization-only membership replacement.",
+      unsupportedFields: unsupportedFields.sort()
+    });
+  }
+}
+
+function identityNativeOrganizationResponse(
+  target: IdentityUserRow,
+  organizations: LegacyOrganization[],
+  evidence: IamOrganizationWriteEvidence
+): IamOrganizationWriteProxyResponse {
+  const metadata = target.metadata && typeof target.metadata === "object" && !Array.isArray(target.metadata)
+    ? target.metadata as Record<string, unknown>
+    : {};
+  return {
+    status: 200,
+    mode: "identity-native",
+    evidence,
+    body: {
+      code: 0,
+      data: {
+        id: target.legacyUserId,
+        username: target.username,
+        email: target.email,
+        status: target.status === "active" ? 10 : 0,
+        nickname: typeof metadata.legacyNickname === "string" ? metadata.legacyNickname : null,
+        created_at: finiteNumber(metadata.legacyCreatedAt),
+        updated_at: finiteNumber(metadata.legacyUpdatedAt),
+        organizations: normalizeOrganizations(organizations)
+      }
+    }
+  };
+}
+
+function finiteNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 function organizationRolloutReadiness(iam: ReturnType<typeof loadConfig>["iam"]) {
