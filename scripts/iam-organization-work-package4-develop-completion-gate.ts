@@ -106,6 +106,7 @@ export async function validateOrganizationWorkPackage4DevelopCompletion(
   const apply = validateNativeWindow(loaded.nativeApply, "nativeApply", manifest.buildRevision, failures);
   const restore = validateNativeWindow(loaded.nativeRestore, "nativeRestore", manifest.buildRevision, failures);
   validateRestorePair(apply, restore, failures);
+  validateFinalReconciliationChronology(task72, restore, failures);
   validateDefaultOff(loaded.defaultOff, manifest.buildRevision, failures);
   const regression = validateRegression(loaded.regression, manifest.buildRevision, failures);
 
@@ -184,7 +185,17 @@ function validateTask72(
   } catch {
     failures.push("task72-certificate-closeout-invalid");
   }
-  return { datasets: "21/21", surfaces: "8/8", attestations: "1/1", physicalProbePasses: "6/6", revision };
+  pattern(failures, "task72Certificate.collection.windowStartedAt", certificate.collection?.windowStartedAt, INSTANT);
+  pattern(failures, "task72Certificate.provenance.attestedAt", certificate.provenance?.attestedAt, INSTANT);
+  return {
+    datasets: "21/21",
+    surfaces: "8/8",
+    attestations: "1/1",
+    physicalProbePasses: "6/6",
+    revision,
+    windowStartedAt: certificate.collection?.windowStartedAt,
+    attestedAt: certificate.provenance?.attestedAt
+  };
 }
 
 function validateNativeWindow(value: Record<string, any> | null, label: string, revision: unknown, failures: string[]) {
@@ -228,6 +239,23 @@ function validateRestorePair(apply: Record<string, any> | null, restore: Record<
   }
   if (restore.operation?.operationKeyDigest === apply.operation?.operationKeyDigest) failures.push("restore-operation-key-reused");
   if (restore.operation?.idempotencyKeyDigest === apply.operation?.idempotencyKeyDigest) failures.push("restore-idempotency-key-reused");
+}
+
+function validateFinalReconciliationChronology(
+  reconciliation: Record<string, any> | null,
+  restore: Record<string, any> | null,
+  failures: string[]
+) {
+  if (!reconciliation || !restore) return;
+  if (
+    typeof restore.checkedAt === "string" &&
+    INSTANT.test(restore.checkedAt) &&
+    typeof reconciliation.windowStartedAt === "string" &&
+    INSTANT.test(reconciliation.windowStartedAt) &&
+    reconciliation.windowStartedAt < restore.checkedAt
+  ) {
+    failures.push("reconciliation-window-started-before-native-restore");
+  }
 }
 
 function validateDefaultOff(value: Record<string, any> | null, revision: unknown, failures: string[]) {

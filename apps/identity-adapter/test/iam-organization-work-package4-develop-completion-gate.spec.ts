@@ -89,6 +89,13 @@ describe("Work Package 4 Develop completion gate", () => {
     expect(report.failures).toContain("restore.afterFingerprint-mismatch");
   });
 
+  it("rejects reconciliation collected before the final Identity-native restore", async () => {
+    const fixture = await createFixture({ restoreCheckedAt: "2026-08-09T00:02:00.000Z" });
+    const report = await validateOrganizationWorkPackage4DevelopCompletion(fixture.manifestPath, fixture.now);
+    expect(report.passed).toBe(false);
+    expect(report.failures).toContain("reconciliation-window-started-before-native-restore");
+  });
+
   it("rejects Production promotion, Legacy cleanup, missing required regression, and stale review date", async () => {
     const fixture = await createFixture({
       safety: { productionPromotionAllowed: true, legacyCleanupAuthorized: true },
@@ -137,6 +144,7 @@ async function createFixture(input: {
   requiredTests?: readonly string[];
   reviewDate?: string;
   reuseRestorePath?: boolean;
+  restoreCheckedAt?: string;
 } = {}) {
   const root = await realpath(await mkdtemp(join(tmpdir(), "iam-wp4-completion-")));
   roots.push(root);
@@ -148,7 +156,7 @@ async function createFixture(input: {
   const task72 = JSON.parse(serializeOrganizationReconciliationDevelopRuntimeCloseout(artifacts.closeout, artifacts.certificate));
   const nativeApply = windowOutput(revision, "1".repeat(64), "2".repeat(64), "a");
   const nativeRestore = { ...windowOutput(revision, "2".repeat(64), input.restoreAfter ?? "1".repeat(64), "b"),
-    checkedAt: "2026-08-12T11:05:00.000Z" };
+    checkedAt: input.restoreCheckedAt ?? "2026-08-09T00:00:20.000Z" };
   const defaultOff = {
     contract: ORGANIZATION_WRITE_PUBLIC_GATE_CONTRACT,
     passed: true,
@@ -239,7 +247,7 @@ function windowOutput(revision: string, before: string, after: string, key: stri
     environment: "xrteeth-develop",
     scope: "membership-replace",
     mode: "apply",
-    checkedAt: "2026-08-12T11:00:00.000Z",
+    checkedAt: "2026-08-09T00:00:10.000Z",
     revision,
     targetFingerprint: "1".repeat(16),
     organizationCount: 1,

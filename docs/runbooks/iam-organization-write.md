@@ -952,13 +952,17 @@ tmrpp；tmrpp 仅由用户按既定弹性服务器镜像同步流程处理，本
 “Develop 全部完成、Production 待批”只能由离线 completion gate 生成，不能手工写结论。候选 revision
 必须依次具备以下六份 canonical JSON 证据：
 
-1. Task 7.2 runtime certificate 与 closeout，固定 21/21 datasets、8/8 surfaces、1/1 Develop signer、
-   6/6 physical probe，P0/P1/P2/mismatch 全为 0；
+1. 在 Identity-native restore 成功之后重新采集的 Task 7.2 runtime certificate 与 closeout，固定
+   21/21 datasets、8/8 surfaces、1/1 Develop signer、6/6 physical probe，P0/P1/P2/mismatch 全为 0；
 2. Identity-native membership-replace 正向 one-shot 输出；
 3. 使用新 idempotency key 恢复 reviewed before snapshot 的反向 one-shot 输出；
 4. 公网 `https://identity.d.xrteeth.com/health` 默认关闭结果，且 revision 与候选提交完全一致；
 5. 候选提交的完整回归摘要；
 6. 兼容路由、监控项、1–168 小时回滚窗口和下次 review date。
+
+completion gate 会把 certificate 的 `collection.windowStartedAt` 与 restore one-shot 的 `checkedAt` 做精确
+顺序校验；reconciliation 早于 restore 时固定拒绝。因此窗口前或 apply/restore 之间生成的 Task 7.2 证书
+不能替代 Task 11.1 的最终全范围复跑。
 
 默认关闭证据必须显式只检查 Develop，禁止沿用 public gate 默认包含 tmrpp 的 URL 列表：
 
