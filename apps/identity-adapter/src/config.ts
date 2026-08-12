@@ -154,6 +154,10 @@ export const configSchema = z.object({
     organizationWriteCandidateBatchExpectedProtectedSubjectCount: numberFromEnv
       .transform((value) => value ?? 0)
       .pipe(z.number().int().min(0).max(5000)),
+    organizationWriteRecoveryDrillEnabled: boolFromEnv.default(false),
+    organizationWriteRecoveryDrillTargetLegacyUserId: numberFromEnv
+      .transform((value) => value ?? 0)
+      .pipe(z.number().int().min(0)),
     pluginUserWriteMode: z.enum(["disabled", "legacy-proxy", "dual-write", "identity-native"]).default("disabled"),
     pluginUserWriteShadowMode: z.enum(["off", "plan", "ledger-only"]).default("off"),
     pluginUserWriteDualWriteExecutionEnabled: boolFromEnv.default(false),
@@ -396,6 +400,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
         env.IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_EXPECTED_LEGACY_SUBJECT_COUNT,
       organizationWriteCandidateBatchExpectedProtectedSubjectCount:
         env.IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_EXPECTED_PROTECTED_SUBJECT_COUNT,
+      organizationWriteRecoveryDrillEnabled:
+        env.IDENTITY_IAM_ORG_WRITE_RECOVERY_DRILL_ENABLED,
+      organizationWriteRecoveryDrillTargetLegacyUserId:
+        env.IDENTITY_IAM_ORG_WRITE_RECOVERY_DRILL_TARGET_LEGACY_USER_ID,
       pluginUserWriteMode: env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE,
       pluginUserWriteShadowMode: env.IDENTITY_IAM_PLUGIN_USER_WRITE_SHADOW_MODE,
       pluginUserWriteDualWriteExecutionEnabled: env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED,

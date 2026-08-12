@@ -11,6 +11,7 @@ export interface OrganizationWriteWindowGateOptions {
   expectedAllowlistCount: number;
   sinceMinutes: number;
   requireAlignment: boolean;
+  expectedRecoveryDrill: boolean;
 }
 
 interface JsonResponse {
@@ -73,6 +74,18 @@ export async function runOrganizationWriteWindowGate(
     posture?.candidateBatchMaterializationEnvironment,
     "disabled"
   );
+  compare(
+    failures,
+    "health.organizationWrite.recoveryDrillEnabled",
+    posture?.recoveryDrillEnabled,
+    options.expectedRecoveryDrill
+  );
+  compare(
+    failures,
+    "health.organizationWrite.recoveryDrillTargetConfigured",
+    posture?.recoveryDrillTargetConfigured,
+    options.expectedRecoveryDrill
+  );
   compare(failures, "health.organizationWrite.rolloutMode", posture?.rolloutMode, "allowlist");
   compare(failures, "health.organizationWrite.rolloutAllowlistCount", posture?.rolloutAllowlistCount, options.expectedAllowlistCount);
   compare(failures, "health.organizationWrite.rolloutPercentage", posture?.rolloutPercentage, 0);
@@ -84,6 +97,13 @@ export async function runOrganizationWriteWindowGate(
   compare(failures, "readiness.route", readiness?.route, "/v1/plugin-user/update-user");
   compare(failures, "readiness.scope", readiness?.scope, "membership-replace");
   compare(failures, "readiness.sourceOfTruth", readiness?.sourceOfTruth, "legacy");
+  compare(failures, "readiness.recoveryDrill.enabled", readiness?.recoveryDrill?.enabled, options.expectedRecoveryDrill);
+  compare(
+    failures,
+    "readiness.recoveryDrill.targetConfigured",
+    readiness?.recoveryDrill?.targetConfigured,
+    options.expectedRecoveryDrill
+  );
   compare(failures, "readiness.rollout.mode", readiness?.rollout?.mode, "allowlist");
   compare(failures, "readiness.rollout.allowlistCount", readiness?.rollout?.allowlistCount, options.expectedAllowlistCount);
   compare(failures, "readiness.rollout.percentage", readiness?.rollout?.percentage, 0);
@@ -153,7 +173,8 @@ export function parseOrganizationWriteWindowGateArgs(argv: string[], env: NodeJS
     expectedMode: "legacy-proxy",
     expectedAllowlistCount: 1,
     sinceMinutes: 60,
-    requireAlignment: false
+    requireAlignment: false,
+    expectedRecoveryDrill: false
   };
 
   for (const arg of argv) {
@@ -164,6 +185,12 @@ export function parseOrganizationWriteWindowGateArgs(argv: string[], env: NodeJS
     else if (arg.startsWith("--expected-allowlist-count=")) options.expectedAllowlistCount = nonNegativeInteger(arg.slice("--expected-allowlist-count=".length), "expected-allowlist-count");
     else if (arg.startsWith("--since-minutes=")) options.sinceMinutes = boundedInteger(arg.slice("--since-minutes=".length), "since-minutes", 1, 1440);
     else if (arg === "--require-alignment") options.requireAlignment = true;
+    else if (arg.startsWith("--expected-recovery-drill=")) {
+      options.expectedRecoveryDrill = booleanValue(
+        arg.slice("--expected-recovery-drill=".length),
+        "expected-recovery-drill"
+      );
+    }
     else if (arg.startsWith("--token=")) throw new Error("Do not pass tokens on the command line; use IDENTITY_IAM_INTERNAL_API_TOKEN.");
     else throw new Error(`Unknown argument: ${arg}`);
   }
@@ -172,6 +199,9 @@ export function parseOrganizationWriteWindowGateArgs(argv: string[], env: NodeJS
   if (!options.legacyUserId) throw new Error("--legacy-user-id is required");
   if (options.expectedMode === "legacy-proxy" && options.requireAlignment) {
     throw new Error("--require-alignment is only valid for a dual-write gate.");
+  }
+  if (options.expectedRecoveryDrill && options.expectedMode !== "dual-write") {
+    throw new Error("--expected-recovery-drill=true requires --expected-mode=dual-write");
   }
   return options;
 }
@@ -216,6 +246,11 @@ function boundedInteger(value: string, name: string, min: number, max: number): 
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed < min || parsed > max) throw new Error(`${name} must be an integer from ${min} to ${max}`);
   return parsed;
+}
+
+function booleanValue(value: string, name: string): boolean {
+  if (value !== "true" && value !== "false") throw new Error(`${name} must be true or false`);
+  return value === "true";
 }
 
 async function main(): Promise<void> {

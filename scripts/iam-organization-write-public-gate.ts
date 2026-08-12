@@ -9,6 +9,8 @@ export interface OrganizationWritePublicGateOptions {
   expectedCandidateMaterializationTargetConfigured: boolean;
   expectedCandidateBatchMaterializationEnabled: boolean;
   expectedCandidateBatchMaterializationEnvironment: "disabled" | "xrteeth-develop";
+  expectedRecoveryDrillEnabled: boolean;
+  expectedRecoveryDrillTargetConfigured: boolean;
   expectedRolloutMode: "off" | "allowlist" | "percentage" | "full";
   expectedRolloutPercentage: number;
   expectedAllowlistCount?: number;
@@ -23,6 +25,8 @@ interface OrganizationWritePosture {
   candidateMaterializationTargetConfigured: boolean;
   candidateBatchMaterializationEnabled: boolean;
   candidateBatchMaterializationEnvironment: string;
+  recoveryDrillEnabled: boolean;
+  recoveryDrillTargetConfigured: boolean;
   rolloutMode: string;
   rolloutAllowlistCount: number;
   rolloutPercentage: number;
@@ -84,6 +88,13 @@ async function inspect(fetcher: typeof fetch, url: string, options: Organization
       posture.candidateBatchMaterializationEnvironment,
       options.expectedCandidateBatchMaterializationEnvironment
     );
+    compare(failures, "recoveryDrillEnabled", posture.recoveryDrillEnabled, options.expectedRecoveryDrillEnabled);
+    compare(
+      failures,
+      "recoveryDrillTargetConfigured",
+      posture.recoveryDrillTargetConfigured,
+      options.expectedRecoveryDrillTargetConfigured
+    );
     compare(failures, "rolloutMode", posture.rolloutMode, options.expectedRolloutMode);
     compare(failures, "rolloutPercentage", posture.rolloutPercentage, options.expectedRolloutPercentage);
     if (options.expectedAllowlistCount !== undefined) {
@@ -110,6 +121,8 @@ export function parseOrganizationWritePublicGateArgs(argv: string[]): Organizati
     expectedCandidateMaterializationTargetConfigured: false,
     expectedCandidateBatchMaterializationEnabled: false,
     expectedCandidateBatchMaterializationEnvironment: "disabled",
+    expectedRecoveryDrillEnabled: false,
+    expectedRecoveryDrillTargetConfigured: false,
     expectedRolloutMode: "off",
     expectedRolloutPercentage: 0,
     expectedAllowlistCount: 0
@@ -137,6 +150,13 @@ export function parseOrganizationWritePublicGateArgs(argv: string[]): Organizati
         arg,
         "--expected-candidate-batch-materialization-environment=",
         ["disabled", "xrteeth-develop"]
+      );
+    } else if (arg.startsWith("--expected-recovery-drill-enabled=")) {
+      options.expectedRecoveryDrillEnabled = booleanValue(arg, "--expected-recovery-drill-enabled=");
+    } else if (arg.startsWith("--expected-recovery-drill-target-configured=")) {
+      options.expectedRecoveryDrillTargetConfigured = booleanValue(
+        arg,
+        "--expected-recovery-drill-target-configured="
       );
     } else if (arg.startsWith("--expected-rollout-mode=")) options.expectedRolloutMode = enumValue(arg, "--expected-rollout-mode=", ["off", "allowlist", "percentage", "full"]);
     else if (arg.startsWith("--expected-rollout-percentage=")) options.expectedRolloutPercentage = integerValue(arg, "--expected-rollout-percentage=", 0, 100);
