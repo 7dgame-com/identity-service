@@ -27,6 +27,8 @@ const INTERNAL_TOKEN_ENV = "IDENTITY_IAM_INTERNAL_API_TOKEN";
 const OPERATOR_TOKEN_ENV = "IDENTITY_IAM_ORG_NATIVE_WINDOW_OPERATOR_BEARER_TOKEN";
 const IDEMPOTENCY_KEY_ENV = "IDENTITY_IAM_ORG_NATIVE_WINDOW_IDEMPOTENCY_KEY";
 const ORGANIZATION_IDS_ENV = "IDENTITY_IAM_ORG_NATIVE_WINDOW_ORGANIZATION_IDS";
+export const ORGANIZATION_IDENTITY_NATIVE_WINDOW_GATE_CONTRACT =
+  "iam-organization-identity-native-window-gate/v1" as const;
 
 export async function runOrganizationIdentityNativeWindowGate(
   options: OrganizationIdentityNativeWindowGateOptions,
@@ -281,6 +283,9 @@ function validateOptions(options: OrganizationIdentityNativeWindowGateOptions): 
 
 function result<T extends { passed: boolean }>(options: OrganizationIdentityNativeWindowGateOptions, value: T) {
   return {
+    contract: ORGANIZATION_IDENTITY_NATIVE_WINDOW_GATE_CONTRACT,
+    environment: "xrteeth-develop" as const,
+    scope: "membership-replace" as const,
     mode: options.apply ? "apply" : "preview",
     checkedAt: new Date().toISOString(),
     revision: options.expectedRevision,
@@ -363,7 +368,7 @@ async function main(): Promise<void> {
   const output = await runOrganizationIdentityNativeWindowGate(
     parseOrganizationIdentityNativeWindowGateArgs(process.argv.slice(2))
   );
-  console.log(JSON.stringify(output, null, 2));
+  process.stdout.write(`${JSON.stringify(output)}\n`);
   if (!output.passed) process.exitCode = 1;
 }
 

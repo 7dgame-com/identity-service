@@ -36,9 +36,11 @@ interface OrganizationWritePosture {
   identityNativeSupported: boolean;
 }
 
+export const ORGANIZATION_WRITE_PUBLIC_GATE_CONTRACT = "iam-organization-write-public-gate/v1" as const;
+
 async function main(): Promise<void> {
   const result = await runOrganizationWritePublicGate(parseOrganizationWritePublicGateArgs(process.argv.slice(2)));
-  console.log(JSON.stringify(result, null, 2));
+  process.stdout.write(`${JSON.stringify(result)}\n`);
   if (!result.passed) process.exitCode = 1;
 }
 
@@ -48,7 +50,7 @@ export async function runOrganizationWritePublicGate(
 ) {
   const results = await Promise.all(options.urls.map((url) => inspect(fetcher, url, options)));
   const failures = results.flatMap((result) => result.failures.map((failure) => `${result.url}: ${failure}`));
-  return { passed: failures.length === 0, results, failures };
+  return { contract: ORGANIZATION_WRITE_PUBLIC_GATE_CONTRACT, passed: failures.length === 0, results, failures };
 }
 
 async function inspect(fetcher: typeof fetch, url: string, options: OrganizationWritePublicGateOptions) {

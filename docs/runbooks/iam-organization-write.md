@@ -942,3 +942,48 @@ ID 集只从环境读取。它最多发送一次业务 POST；POST outcome unkno
 任何异常立即恢复全部默认值。回滚只关闭配置，不删除 Legacy 数据、不清理 candidate、不切换
 AuthZ owner。工作包 4 的未授权部署、运行、API、数据库、Docker 或 Portainer 操作一律不得进入
 tmrpp；tmrpp 仅由用户按既定弹性服务器镜像同步流程处理，本手册不授权代理操作。
+
+## Develop 完成门禁（Tasks 11.1–11.5）
+
+“Develop 全部完成、Production 待批”只能由离线 completion gate 生成，不能手工写结论。候选 revision
+必须依次具备以下六份 canonical JSON 证据：
+
+1. Task 7.2 runtime certificate 与 closeout，固定 21/21 datasets、8/8 surfaces、1/1 Develop signer、
+   6/6 physical probe，P0/P1/P2/mismatch 全为 0；
+2. Identity-native membership-replace 正向 one-shot 输出；
+3. 使用新 idempotency key 恢复 reviewed before snapshot 的反向 one-shot 输出；
+4. 公网 `https://identity.d.xrteeth.com/health` 默认关闭结果，且 revision 与候选提交完全一致；
+5. 候选提交的完整回归摘要；
+6. 兼容路由、监控项、1–168 小时回滚窗口和下次 review date。
+
+默认关闭证据必须显式只检查 Develop，禁止沿用 public gate 默认包含 tmrpp 的 URL 列表：
+
+```bash
+npm run iam:organization-write:public-gate -- \
+  --urls=https://identity.d.xrteeth.com/health \
+  --expected-revision=<exact-candidate-full40>
+```
+
+回归摘要不能人工构造。必须在 tracked worktree 干净、`HEAD` 等于待核 revision 时执行完整 Vitest；工具要求
+至少 900 个通过测试、0 个失败，并确认 Identity-native、one-shot gate、primary-read、full pipeline、
+plugin/campus 与 adapter 六个关键测试文件均实际通过：
+
+```bash
+npm run iam:organization-write:develop-regression -- \
+  --expected-revision=<exact-candidate-full40> \
+  --output=/absolute/private-evidence/develop-regression.json
+```
+
+将模板复制到与六份证据相同的 owner-only `0700` 目录，填写相对路径、exact file SHA-256、候选 revision、
+review date。manifest 和每份证据必须是 ordinary、owner-only `0600`、单链接、canonical 单行 JSON 加换行；
+证据路径和 digest 均不得复用。最后运行：
+
+```bash
+npm run iam:organization-write:develop-completion-gate -- \
+  --manifest=/absolute/private-evidence/develop-completion-manifest.json
+```
+
+唯一成功状态固定为 `develop-complete-production-pending-approval`。它同时固定
+`productionReady=false`、`productionPromotionAllowed=false`、main/publish/Production/tmrpp untouched、
+Legacy cleanup 未授权且未删除。该结论只关闭 Tasks 11.1–11.5 的 Develop 证据工作，不授权任何 Production
+比例、promotion、Legacy 数据清理或 main/publish 变更。
