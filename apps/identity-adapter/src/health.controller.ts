@@ -60,6 +60,10 @@ export class HealthController {
               this.config.iam.organizationWriteCandidateBatchMaterializationEnabled,
             candidateBatchMaterializationEnvironment:
               this.config.iam.organizationWriteCandidateBatchMaterializationEnvironment,
+            recoveryDrillEnabled:
+              this.config.iam.organizationWriteRecoveryDrillEnabled,
+            recoveryDrillTargetConfigured:
+              this.config.iam.organizationWriteRecoveryDrillTargetLegacyUserId > 0,
             rolloutMode: this.config.iam.organizationWriteRolloutMode,
             rolloutAllowlistCount: this.config.iam.organizationWriteRolloutAllowlist
               .split(",")

@@ -92,6 +92,31 @@ describe("IAM organization-write read-only window gate", () => {
     ]));
   });
 
+  it("requires the exact recovery-drill posture when requested", async () => {
+    const blocked = await runOrganizationWriteWindowGate({
+      ...options(),
+      expectedMode: "dual-write",
+      expectedRecoveryDrill: true
+    }, fixtureFetch({ mode: "dual-write", dualWriteExecutionEnabled: true }));
+    expect(blocked.passed).toBe(false);
+    expect(blocked.failures).toEqual(expect.arrayContaining([
+      "health.organizationWrite.recoveryDrillEnabled expected true, got false",
+      "readiness.recoveryDrill.enabled expected true, got false"
+    ]));
+
+    const passed = await runOrganizationWriteWindowGate({
+      ...options(),
+      expectedMode: "dual-write",
+      expectedRecoveryDrill: true
+    }, fixtureFetch({
+      mode: "dual-write",
+      dualWriteExecutionEnabled: true,
+      recoveryDrillEnabled: true,
+      recoveryDrillTargetConfigured: true
+    }));
+    expect(passed.passed).toBe(true);
+  });
+
   it("accepts tokens only from the environment and validates explicit target input", () => {
     expect(() => parseOrganizationWriteWindowGateArgs(["--legacy-user-id=24", "--token=secret"], {})).toThrow(
       "Do not pass tokens on the command line"
@@ -100,9 +125,15 @@ describe("IAM organization-write read-only window gate", () => {
       "--legacy-user-id is required"
     );
     expect(parseOrganizationWriteWindowGateArgs(
-      ["--legacy-user-id=2401", `--expected-revision=${revision}`],
+      ["--legacy-user-id=2401", `--expected-revision=${revision}`, "--expected-mode=dual-write", "--expected-recovery-drill=true"],
       { IDENTITY_IAM_INTERNAL_API_TOKEN: "secret" }
-    )).toMatchObject({ legacyUserId: 2401, token: "secret", expectedRevision: revision });
+    )).toMatchObject({
+      legacyUserId: 2401,
+      token: "secret",
+      expectedRevision: revision,
+      expectedMode: "dual-write",
+      expectedRecoveryDrill: true
+    });
   });
 });
 
@@ -115,7 +146,8 @@ function options(): OrganizationWriteWindowGateOptions {
     expectedRevision: revision,
     expectedAllowlistCount: 1,
     sinceMinutes: 60,
-    requireAlignment: false
+    requireAlignment: false,
+    expectedRecoveryDrill: false
   };
 }
 
@@ -129,6 +161,8 @@ function fixtureFetch(overrides: {
   decision?: Record<string, unknown>;
   summaryOperations?: Record<string, unknown>[];
   alignment?: Record<string, unknown>;
+  recoveryDrillEnabled?: boolean;
+  recoveryDrillTargetConfigured?: boolean;
 } = {}) {
   const mode = overrides.mode ?? "legacy-proxy";
   const dualWriteExecutionEnabled = overrides.dualWriteExecutionEnabled ?? false;
@@ -140,6 +174,8 @@ function fixtureFetch(overrides: {
     candidateMaterializationTargetConfigured: overrides.candidateMaterializationTargetConfigured ?? false,
     candidateBatchMaterializationEnabled: overrides.candidateBatchMaterializationEnabled ?? false,
     candidateBatchMaterializationEnvironment: overrides.candidateBatchMaterializationEnvironment ?? "disabled",
+    recoveryDrillEnabled: overrides.recoveryDrillEnabled ?? false,
+    recoveryDrillTargetConfigured: overrides.recoveryDrillTargetConfigured ?? false,
     rolloutMode: "allowlist",
     rolloutAllowlistCount: 1,
     rolloutPercentage: 0,
@@ -152,6 +188,10 @@ function fixtureFetch(overrides: {
     route: "/v1/plugin-user/update-user",
     scope: "membership-replace",
     sourceOfTruth: "legacy",
+    recoveryDrill: {
+      enabled: overrides.recoveryDrillEnabled ?? false,
+      targetConfigured: overrides.recoveryDrillTargetConfigured ?? false
+    },
     rollout: { mode: "allowlist", allowlistCount: 1, percentage: 0, selectionConfigured: true },
     legacyProxyGate: { executable: mode === "legacy-proxy" },
     dualWriteGate: { executable: mode === "dual-write" }

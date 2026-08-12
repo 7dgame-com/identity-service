@@ -100,6 +100,19 @@ export class IamOrganizationWriteController {
     };
   }
 
+  @Post("recovery-drill/prepare")
+  async prepareRecoveryDrill(
+    @Headers("x-identity-internal-token") token: string | undefined
+  ) {
+    this.assertInternalToken(token);
+    return {
+      status: "ok",
+      service: "identity-adapter",
+      capability: "iam-organization-write-recovery-drill",
+      data: await this.organizationWrite.prepareRecoveryDrill()
+    };
+  }
+
   @Post("subjects/:legacyUserId/materialize-candidate")
   async materializeCandidate(
     @Headers("x-identity-internal-token") token: string | undefined,
