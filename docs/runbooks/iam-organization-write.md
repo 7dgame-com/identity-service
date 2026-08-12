@@ -920,7 +920,8 @@ npm run iam:organization-write:native-window-gate -- \
   --legacy-user-id=<approved-id> \
   --expected-revision=<exact-40-char-deployed-revision> \
   --expected-before-fingerprint=<reviewed-current-candidate-sha256> \
-  --expected-after-fingerprint=<approved-desired-candidate-sha256>
+  --expected-after-fingerprint=<approved-desired-candidate-sha256> \
+  --output=/absolute/private-evidence/identity-native-apply.json
 ```
 
 operator 只允许 HTTP loopback adapter origin，拒绝 redirect、URL 凭据、path/query/fragment，所有敏感值和组织
@@ -934,7 +935,10 @@ ID 集只从环境读取。它最多发送一次业务 POST；POST outcome unkno
 普通用户负向、重复键、未知 ID、缺字段、add/remove/replace/restore、插件/campus/登录态回归全部通过，才可
 关闭该级窗口。关闭顺序固定为 execution=false、route=false、mode=disabled、rollout=off、allowlist 空、percentage=0。
 关闭配置不会删除 candidate；如需业务 restore，必须在窗口内先用新 idempotency key 把原 candidate 集合写回并读回，
-然后再关闭窗口。Production 每个比例仍需独立批准。
+并把第二次 one-shot 输出写入独立的
+`/absolute/private-evidence/identity-native-restore.json`，然后再关闭窗口。`--output` 使用 O_EXCL 创建 canonical
+0600 JSON，拒绝 symlink、非 canonical/非 owner-controlled parent 和已有目标；stdout 只返回 status 与 file SHA-256。
+Production 每个比例仍需独立批准。
 
 日志、响应头和账本只保留 correlation ID、operation/idempotency 摘要、目标/操作者摘要、命中类型、
 组织数量和状态，不保存 Authorization、Cookie、密码、完整 token 或原始请求/响应 payload。
@@ -961,7 +965,8 @@ tmrpp；tmrpp 仅由用户按既定弹性服务器镜像同步流程处理，本
 ```bash
 npm run iam:organization-write:public-gate -- \
   --urls=https://identity.d.xrteeth.com/health \
-  --expected-revision=<exact-candidate-full40>
+  --expected-revision=<exact-candidate-full40> \
+  --output=/absolute/private-evidence/develop-default-off.json
 ```
 
 回归摘要不能人工构造。必须在 tracked worktree 干净、`HEAD` 等于待核 revision 时执行完整 Vitest；工具要求

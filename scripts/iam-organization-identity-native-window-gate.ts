@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
+import { isAbsolute, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   runOrganizationWriteWindowGate,
   type OrganizationWriteWindowGateOptions
 } from "./iam-organization-write-window-gate.js";
+import { writeOrganizationEvidenceExclusive0600 } from "./iam-organization-write-evidence-output.js";
 
 export interface OrganizationIdentityNativeWindowGateOptions {
   adapterUrl: string;
@@ -18,6 +20,7 @@ export interface OrganizationIdentityNativeWindowGateOptions {
   expectedAllowlistCount: number;
   sinceMinutes: number;
   apply: boolean;
+  outputPath?: string;
 }
 
 const FULL_REVISION = /^[a-f0-9]{40}$/;
@@ -206,6 +209,7 @@ export function parseOrganizationIdentityNativeWindowGateArgs(
     else if (arg.startsWith("--expected-after-fingerprint=")) options.expectedAfterFingerprint = normalizedSha(arg.slice("--expected-after-fingerprint=".length), "expected-after-fingerprint");
     else if (arg.startsWith("--expected-allowlist-count=")) options.expectedAllowlistCount = nonNegativeInteger(arg.slice("--expected-allowlist-count=".length), "expected-allowlist-count");
     else if (arg.startsWith("--since-minutes=")) options.sinceMinutes = boundedInteger(arg.slice("--since-minutes=".length), "since-minutes", 1, 1440);
+    else if (arg.startsWith("--output=")) options.outputPath = normalizedOutputPath(arg.slice("--output=".length));
     else if (/--(token|operator-token|idempotency-key|organization-ids)=/.test(arg)) {
       throw new Error("Tokens, idempotency keys, and organization IDs must be supplied through the reviewed environment variables.");
     } else throw new Error(`Unknown argument: ${arg}`);
@@ -355,6 +359,13 @@ function sha256(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
+function normalizedOutputPath(value: string): string {
+  if (!value || value.includes("\0") || !isAbsolute(value) || value !== resolve(value)) {
+    throw new Error("output must be a normalized absolute path");
+  }
+  return value;
+}
+
 function nativeOperationKeyDigest(legacyUserId: number, idempotencyKey: string): string {
   const key = `iam-organization-write:v1:membership-replace:${sha256(`${legacyUserId}\u001f${idempotencyKey}`).slice(0, 48)}`;
   return sha256(key);
@@ -365,10 +376,12 @@ function nativeRequestFingerprintDigest(legacyUserId: number, organizationIds: n
 }
 
 async function main(): Promise<void> {
-  const output = await runOrganizationIdentityNativeWindowGate(
-    parseOrganizationIdentityNativeWindowGateArgs(process.argv.slice(2))
-  );
-  process.stdout.write(`${JSON.stringify(output)}\n`);
+  const options = parseOrganizationIdentityNativeWindowGateArgs(process.argv.slice(2));
+  const output = await runOrganizationIdentityNativeWindowGate(options);
+  if (options.outputPath) {
+    const written = await writeOrganizationEvidenceExclusive0600(options.outputPath, output);
+    process.stdout.write(`${JSON.stringify({ status: output.passed ? "completed" : "blocked", sha256: written.sha256 })}\n`);
+  } else process.stdout.write(`${JSON.stringify(output)}\n`);
   if (!output.passed) process.exitCode = 1;
 }
 

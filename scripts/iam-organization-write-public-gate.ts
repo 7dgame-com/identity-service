@@ -1,4 +1,6 @@
 import { pathToFileURL } from "node:url";
+import { isAbsolute, resolve } from "node:path";
+import { writeOrganizationEvidenceExclusive0600 } from "./iam-organization-write-evidence-output.js";
 
 export interface OrganizationWritePublicGateOptions {
   urls: string[];
@@ -16,6 +18,7 @@ export interface OrganizationWritePublicGateOptions {
   expectedRolloutPercentage: number;
   expectedAllowlistCount?: number;
   expectedRevision?: string;
+  outputPath?: string;
 }
 
 interface OrganizationWritePosture {
@@ -39,8 +42,12 @@ interface OrganizationWritePosture {
 export const ORGANIZATION_WRITE_PUBLIC_GATE_CONTRACT = "iam-organization-write-public-gate/v1" as const;
 
 async function main(): Promise<void> {
-  const result = await runOrganizationWritePublicGate(parseOrganizationWritePublicGateArgs(process.argv.slice(2)));
-  process.stdout.write(`${JSON.stringify(result)}\n`);
+  const options = parseOrganizationWritePublicGateArgs(process.argv.slice(2));
+  const result = await runOrganizationWritePublicGate(options);
+  if (options.outputPath) {
+    const written = await writeOrganizationEvidenceExclusive0600(options.outputPath, result);
+    process.stdout.write(`${JSON.stringify({ status: result.passed ? "completed" : "blocked", sha256: written.sha256 })}\n`);
+  } else process.stdout.write(`${JSON.stringify(result)}\n`);
   if (!result.passed) process.exitCode = 1;
 }
 
@@ -171,6 +178,7 @@ export function parseOrganizationWritePublicGateArgs(argv: string[]): Organizati
     else if (arg.startsWith("--expected-allowlist-count=")) options.expectedAllowlistCount = integerValue(arg, "--expected-allowlist-count=", 0, 10_000);
     else if (arg === "--ignore-allowlist-count") options.expectedAllowlistCount = undefined;
     else if (arg.startsWith("--expected-revision=")) options.expectedRevision = revisionValue(arg.slice("--expected-revision=".length));
+    else if (arg.startsWith("--output=")) options.outputPath = outputPathValue(arg.slice("--output=".length));
     else throw new Error(`Unknown argument: ${arg}`);
   }
 
@@ -182,6 +190,13 @@ function revisionValue(value: string): string {
   const normalized = value.trim().toLowerCase();
   if (!/^[a-f0-9]{40}$/.test(normalized)) throw new Error("--expected-revision must be a full 40-character Git SHA");
   return normalized;
+}
+
+function outputPathValue(value: string): string {
+  if (!value || value.includes("\0") || !isAbsolute(value) || value !== resolve(value)) {
+    throw new Error("--output must be a normalized absolute path");
+  }
+  return value;
 }
 
 function csv(value: string): string[] {
