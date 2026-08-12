@@ -39,7 +39,7 @@ interface OrganizationWritePosture {
   identityNativeSupported: boolean;
 }
 
-export const ORGANIZATION_WRITE_PUBLIC_GATE_CONTRACT = "iam-organization-write-public-gate/v1" as const;
+export const ORGANIZATION_WRITE_PUBLIC_GATE_CONTRACT = "iam-organization-write-public-gate/v2" as const;
 
 async function main(): Promise<void> {
   const options = parseOrganizationWritePublicGateArgs(process.argv.slice(2));
@@ -53,11 +53,22 @@ async function main(): Promise<void> {
 
 export async function runOrganizationWritePublicGate(
   options: OrganizationWritePublicGateOptions,
-  fetcher: typeof fetch = fetch
+  fetcher: typeof fetch = fetch,
+  now: Date = new Date()
 ) {
+  const checkedAt = trustedInstant(now);
   const results = await Promise.all(options.urls.map((url) => inspect(fetcher, url, options)));
   const failures = results.flatMap((result) => result.failures.map((failure) => `${result.url}: ${failure}`));
-  return { contract: ORGANIZATION_WRITE_PUBLIC_GATE_CONTRACT, passed: failures.length === 0, results, failures };
+  return { contract: ORGANIZATION_WRITE_PUBLIC_GATE_CONTRACT, checkedAt, passed: failures.length === 0, results, failures };
+}
+
+function trustedInstant(value: Date): string {
+  if (Object.getPrototypeOf(value) !== Date.prototype || Object.getOwnPropertyNames(value).length !== 0) {
+    throw new Error("now must be an exact native Date");
+  }
+  const timestamp = Date.prototype.getTime.call(value);
+  if (!Number.isFinite(timestamp)) throw new Error("now must be a valid Date");
+  return new Date(timestamp).toISOString();
 }
 
 async function inspect(fetcher: typeof fetch, url: string, options: OrganizationWritePublicGateOptions) {

@@ -107,7 +107,7 @@ export async function validateOrganizationWorkPackage4DevelopCompletion(
   const restore = validateNativeWindow(loaded.nativeRestore, "nativeRestore", manifest.buildRevision, failures);
   validateRestorePair(apply, restore, failures);
   validateFinalReconciliationChronology(task72, restore, failures);
-  validateDefaultOff(loaded.defaultOff, manifest.buildRevision, failures);
+  validateDefaultOff(loaded.defaultOff, manifest.buildRevision, task72, failures);
   const regression = validateRegression(loaded.regression, manifest.buildRevision, failures);
 
   const summary = failures.length === 0 ? {
@@ -258,12 +258,28 @@ function validateFinalReconciliationChronology(
   }
 }
 
-function validateDefaultOff(value: Record<string, any> | null, revision: unknown, failures: string[]) {
+function validateDefaultOff(
+  value: Record<string, any> | null,
+  revision: unknown,
+  reconciliation: Record<string, any> | null,
+  failures: string[]
+) {
   if (!value) return;
-  exactKeys(value, ["contract", "failures", "passed", "results"], "defaultOff", failures);
+  exactKeys(value, ["checkedAt", "contract", "failures", "passed", "results"], "defaultOff", failures);
   equal(failures, "defaultOff.contract", value.contract, ORGANIZATION_WRITE_PUBLIC_GATE_CONTRACT);
+  pattern(failures, "defaultOff.checkedAt", value.checkedAt, INSTANT);
   equal(failures, "defaultOff.passed", value.passed, true);
   arrayEmpty(failures, "defaultOff.failures", value.failures);
+  if (
+    reconciliation &&
+    typeof reconciliation.attestedAt === "string" &&
+    INSTANT.test(reconciliation.attestedAt) &&
+    typeof value.checkedAt === "string" &&
+    INSTANT.test(value.checkedAt) &&
+    value.checkedAt < reconciliation.attestedAt
+  ) {
+    failures.push("default-off-checked-before-final-reconciliation");
+  }
   if (!Array.isArray(value.results) || value.results.length !== 1) {
     failures.push("defaultOff.results-must-contain-exactly-xrteeth-develop");
     return;

@@ -961,8 +961,8 @@ tmrpp；tmrpp 仅由用户按既定弹性服务器镜像同步流程处理，本
 6. 兼容路由、监控项、1–168 小时回滚窗口和下次 review date。
 
 completion gate 会把 certificate 的 `collection.windowStartedAt` 与 restore one-shot 的 `checkedAt` 做精确
-顺序校验；reconciliation 早于 restore 时固定拒绝。因此窗口前或 apply/restore 之间生成的 Task 7.2 证书
-不能替代 Task 11.1 的最终全范围复跑。
+顺序校验，并要求 default-off public gate v2 的 `checkedAt` 不早于最终 reconciliation attestation；因此窗口前、
+apply/restore 之间生成的 Task 7.2 证书或旧 default-off 结果都不能替代最终复跑与窗口回收证明。
 
 默认关闭证据必须显式只检查 Develop，禁止沿用 public gate 默认包含 tmrpp 的 URL 列表：
 

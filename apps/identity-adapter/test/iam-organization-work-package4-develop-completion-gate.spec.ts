@@ -96,6 +96,13 @@ describe("Work Package 4 Develop completion gate", () => {
     expect(report.failures).toContain("reconciliation-window-started-before-native-restore");
   });
 
+  it("rejects default-off evidence collected before the final reconciliation", async () => {
+    const fixture = await createFixture({ defaultOffCheckedAt: "2026-08-09T00:04:00.000Z" });
+    const report = await validateOrganizationWorkPackage4DevelopCompletion(fixture.manifestPath, fixture.now);
+    expect(report.passed).toBe(false);
+    expect(report.failures).toContain("default-off-checked-before-final-reconciliation");
+  });
+
   it("rejects Production promotion, Legacy cleanup, missing required regression, and stale review date", async () => {
     const fixture = await createFixture({
       safety: { productionPromotionAllowed: true, legacyCleanupAuthorized: true },
@@ -145,6 +152,7 @@ async function createFixture(input: {
   reviewDate?: string;
   reuseRestorePath?: boolean;
   restoreCheckedAt?: string;
+  defaultOffCheckedAt?: string;
 } = {}) {
   const root = await realpath(await mkdtemp(join(tmpdir(), "iam-wp4-completion-")));
   roots.push(root);
@@ -159,6 +167,7 @@ async function createFixture(input: {
     checkedAt: input.restoreCheckedAt ?? "2026-08-09T00:00:20.000Z" };
   const defaultOff = {
     contract: ORGANIZATION_WRITE_PUBLIC_GATE_CONTRACT,
+    checkedAt: input.defaultOffCheckedAt ?? "2026-08-09T00:08:00.000Z",
     passed: true,
     results: [{
       url: "https://identity.d.xrteeth.com/health",
