@@ -26,6 +26,14 @@ describe.skipIf(!enabled)("IAM organization write MySQL integration", () => {
     const legacyOrganizationId = 1_000_000 + randomBytes(3).readUIntBE(0, 3);
     const idempotencyKey = `mysql-org-${randomUUID()}`;
     const operationKey = organizationWriteOperationKey(legacyUserId, idempotencyKey);
+    const identityNativeApplyOperationKey = organizationWriteOperationKey(
+      legacyUserId,
+      `mysql-org-identity-native-apply-${randomUUID()}`
+    );
+    const identityNativeRestoreOperationKey = organizationWriteOperationKey(
+      legacyUserId,
+      `mysql-org-identity-native-restore-${randomUUID()}`
+    );
     const materializationIdempotencyKey = `mysql-org-materialization-${randomUUID()}`;
     const materializationOperationKey = organizationCandidateMaterializationOperationKey(
       legacyUserId,
@@ -188,6 +196,86 @@ describe.skipIf(!enabled)("IAM organization write MySQL integration", () => {
         organizations: []
       });
 
+      const identityNativeOrganization = {
+        id: legacyOrganizationId,
+        name: `mysql-org-${legacyOrganizationId}`,
+        title: "MySQL integration organization",
+        createdAt: 1,
+        updatedAt: 2
+      };
+      const identityNativeApplyFingerprint = organizationWriteRequestFingerprint(
+        legacyUserId,
+        [legacyOrganizationId]
+      );
+      await expect(first.begin({
+        operationKey: identityNativeApplyOperationKey,
+        idempotencyKeyDigest: "c".repeat(64),
+        requestFingerprint: identityNativeApplyFingerprint,
+        legacyUserId,
+        mode: "identity-native",
+        metadata: { source: "mysql-identity-native-apply", legacyWritePerformed: false }
+      })).resolves.toEqual({ duplicate: false });
+      await first.replaceCandidate({
+        operationKey: identityNativeApplyOperationKey,
+        legacyUserId,
+        organizations: [identityNativeOrganization]
+      });
+      await first.update({
+        operationKey: identityNativeApplyOperationKey,
+        status: "completed",
+        legacyStatus: "not-called",
+        identityStatus: "completed",
+        compensationStatus: "none",
+        metadata: { source: "mysql-identity-native-apply", legacyWritePerformed: false }
+      });
+      await expect(second.find(identityNativeApplyOperationKey)).resolves.toMatchObject({
+        mode: "identity-native",
+        status: "completed",
+        legacyStatus: "not-called",
+        identityStatus: "completed",
+        compensationStatus: "none",
+        metadata: { source: "mysql-identity-native-apply", legacyWritePerformed: false }
+      });
+      await expect(second.candidateForLegacyUser(legacyUserId)).resolves.toMatchObject({
+        legacyUserId,
+        organizations: [{ id: legacyOrganizationId }]
+      });
+
+      const identityNativeRestoreFingerprint = organizationWriteRequestFingerprint(legacyUserId, []);
+      await expect(second.begin({
+        operationKey: identityNativeRestoreOperationKey,
+        idempotencyKeyDigest: "d".repeat(64),
+        requestFingerprint: identityNativeRestoreFingerprint,
+        legacyUserId,
+        mode: "identity-native",
+        metadata: { source: "mysql-identity-native-restore", legacyWritePerformed: false }
+      })).resolves.toEqual({ duplicate: false });
+      await second.replaceCandidate({
+        operationKey: identityNativeRestoreOperationKey,
+        legacyUserId,
+        organizations: []
+      });
+      await second.update({
+        operationKey: identityNativeRestoreOperationKey,
+        status: "completed",
+        legacyStatus: "not-called",
+        identityStatus: "completed",
+        compensationStatus: "none",
+        metadata: { source: "mysql-identity-native-restore", legacyWritePerformed: false }
+      });
+      await expect(first.find(identityNativeRestoreOperationKey)).resolves.toMatchObject({
+        mode: "identity-native",
+        status: "completed",
+        legacyStatus: "not-called",
+        identityStatus: "completed",
+        compensationStatus: "none",
+        metadata: { source: "mysql-identity-native-restore", legacyWritePerformed: false }
+      });
+      await expect(first.candidateForLegacyUser(legacyUserId)).resolves.toEqual({
+        legacyUserId,
+        organizations: []
+      });
+
       const staleInitialToken = "1".repeat(64);
       const changedMaterializationFingerprint = organizationCandidateSnapshotFingerprint(legacyUserId, [{
         id: legacyOrganizationId,
@@ -334,6 +422,8 @@ describe.skipIf(!enabled)("IAM organization write MySQL integration", () => {
       await cleanup(target, {
         operationKeys: [
           operationKey,
+          identityNativeApplyOperationKey,
+          identityNativeRestoreOperationKey,
           materializationOperationKey,
           staleOperationKey,
           failedNoneOperationKey,
