@@ -24,6 +24,8 @@ IDENTITY_IAM_ORG_WRITE_ROLLOUT_ALLOWLIST: ""
 IDENTITY_IAM_ORG_WRITE_ROLLOUT_PERCENTAGE: "0"
 IDENTITY_IAM_ORG_WRITE_CANDIDATE_MATERIALIZATION_ENABLED: "false"
 IDENTITY_IAM_ORG_WRITE_CANDIDATE_MATERIALIZATION_TARGET_LEGACY_USER_ID: "0"
+IDENTITY_IAM_ORG_WRITE_RECOVERY_DRILL_ENABLED: "false"
+IDENTITY_IAM_ORG_WRITE_RECOVERY_DRILL_TARGET_LEGACY_USER_ID: "0"
 ```
 
 代码与镜像发布不等于运行窗口获批。只要 route integration 为 false，现有 plugin-user update
@@ -813,6 +815,8 @@ IDENTITY_IAM_ORG_WRITE_DUAL_WRITE_EXECUTION_ENABLED: "true"
 IDENTITY_IAM_ORG_WRITE_ROLLOUT_MODE: "allowlist"
 IDENTITY_IAM_ORG_WRITE_ROLLOUT_ALLOWLIST: "legacy:<dedicated-test-user-id>"
 IDENTITY_IAM_ORG_WRITE_ROLLOUT_PERCENTAGE: "0"
+IDENTITY_IAM_ORG_WRITE_RECOVERY_DRILL_ENABLED: "false"
+IDENTITY_IAM_ORG_WRITE_RECOVERY_DRILL_TARGET_LEGACY_USER_ID: "0"
 ```
 
 命中的请求必须携带客户端 `Idempotency-Key`。执行顺序固定为：既有 plugin-user owner 写 Legacy
@@ -829,6 +833,31 @@ POST /internal/iam/organization-write/operations/:operationKey/retry-identity-ca
 
 恢复接口会读取调用时的当前 Legacy 状态并重建 candidate，不重放历史 mutation。恢复后必须再次
 执行 alignment，要求 `P0=0、P1=0、P2=0、mismatch=0`。
+
+### 等价补偿演练
+
+不得为了制造 Identity 写失败而修改数据库 grant、执行 DDL、关闭共享数据库/网络或向未知用户发请求。
+organization-write 提供一个默认关闭的 exact-target 内部演练入口；它只准备一条确定性的
+`legacy_completed + compensation=required` ledger 状态，**不调用 Legacy 写接口**：
+
+```text
+POST /internal/iam/organization-write/recovery-drill/prepare
+```
+
+该入口仅在另行批准的 `xrteeth-develop` dual-write allowlist 窗口中临时启用：
+
+```yaml
+IDENTITY_IAM_ORG_WRITE_RECOVERY_DRILL_ENABLED: "true"
+IDENTITY_IAM_ORG_WRITE_RECOVERY_DRILL_TARGET_LEGACY_USER_ID: "581"
+```
+
+它还要求 target 被 exact allowlist 选中、repository/readiness 可执行、Legacy target active、仅有 `user`
+角色且 membership 精确为 `[1]`。准备操作使用确定性 operation key；重复调用不会创建第二条账本。
+随后使用返回的 operation key 调用既有 `retry-identity-candidate`，从当前 Legacy `[1]` 重建 candidate，
+并证明 Legacy 写调用为 0。该演练只证明真实 ledger/recovery/candidate 存储链，不能替代正常的
+`[1] -> [] -> [1]` dual-write 窗口。
+
+演练后必须把两个 recovery-drill 变量恢复为 `false/0`，再执行 alignment、ledger 与 public default-off gate。
 
 ## 证据与回滚
 

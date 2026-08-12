@@ -33,6 +33,8 @@ describe("IAM organization membership write compatibility layer", () => {
     delete process.env.IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_MATERIALIZATION_PLAN_HMAC_KEY;
     delete process.env.IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_EXPECTED_LEGACY_SUBJECT_COUNT;
     delete process.env.IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_EXPECTED_PROTECTED_SUBJECT_COUNT;
+    delete process.env.IDENTITY_IAM_ORG_WRITE_RECOVERY_DRILL_ENABLED;
+    delete process.env.IDENTITY_IAM_ORG_WRITE_RECOVERY_DRILL_TARGET_LEGACY_USER_ID;
   });
 
   afterEach(() => {
@@ -75,7 +77,9 @@ describe("IAM organization membership write compatibility layer", () => {
       organizationWriteCandidateBatchMaterializationEnvironment: "disabled",
       organizationWriteCandidateBatchMaterializationPlanHmacKey: undefined,
       organizationWriteCandidateBatchExpectedLegacySubjectCount: 0,
-      organizationWriteCandidateBatchExpectedProtectedSubjectCount: 0
+      organizationWriteCandidateBatchExpectedProtectedSubjectCount: 0,
+      organizationWriteRecoveryDrillEnabled: false,
+      organizationWriteRecoveryDrillTargetLegacyUserId: 0
     });
   });
 
@@ -86,7 +90,8 @@ describe("IAM organization membership write compatibility layer", () => {
       previewCandidateMaterialization: vi.fn(async () => ({ mutation: false, expectedSnapshotFingerprint: "a".repeat(64) })),
       materializeCandidate: vi.fn(async () => ({ materialized: true })),
       previewCandidateBatchMaterialization: vi.fn(async () => ({ mutation: false, planToken: "b".repeat(64) })),
-      materializeCandidateBatch: vi.fn(async () => ({ completed: true }))
+      materializeCandidateBatch: vi.fn(async () => ({ completed: true })),
+      prepareRecoveryDrill: vi.fn(async () => ({ noLegacyMutation: true }))
     };
     const controller = new IamOrganizationWriteController(organizationWrite as never);
 
@@ -139,6 +144,10 @@ describe("IAM organization membership write compatibility layer", () => {
     expect(organizationWrite.materializeCandidateBatch).toHaveBeenCalledWith({
       planToken: "b".repeat(64),
       idempotencyKey: "batch-key"
+    });
+    await expect(controller.prepareRecoveryDrill("organization-internal-test")).resolves.toMatchObject({
+      capability: "iam-organization-write-recovery-drill",
+      data: { noLegacyMutation: true }
     });
   });
 
@@ -1139,6 +1148,24 @@ describe("IAM organization membership write compatibility layer", () => {
     });
     process.env.IDENTITY_IAM_ROLE_WRITE_RECOVERY_DRILL_ENABLED = "false";
 
+    process.env.IDENTITY_IAM_ORG_WRITE_RECOVERY_DRILL_ENABLED = "true";
+    process.env.IDENTITY_IAM_ORG_WRITE_RECOVERY_DRILL_TARGET_LEGACY_USER_ID = "24";
+    await expect(createFixture({ organizations, candidateMissing: true }).service.materializeCandidate({
+      legacyUserId: 24,
+      expectedSnapshotFingerprint,
+      idempotencyKey: "candidate-organization-recovery-active"
+    })).rejects.toMatchObject({
+      response: {
+        code: "IAM_ORGANIZATION_CANDIDATE_MATERIALIZATION_UNSAFE_POSTURE",
+        blockedReasons: expect.arrayContaining([
+          "organization-recovery-drill-must-be-disabled",
+          "organization-recovery-drill-target-must-be-zero"
+        ])
+      }
+    });
+    process.env.IDENTITY_IAM_ORG_WRITE_RECOVERY_DRILL_ENABLED = "false";
+    process.env.IDENTITY_IAM_ORG_WRITE_RECOVERY_DRILL_TARGET_LEGACY_USER_ID = "0";
+
     await expect(createFixture({ organizations, candidateMissing: true, roles: ["root"] }).service.materializeCandidate({
       legacyUserId: 24,
       expectedSnapshotFingerprint,
@@ -1171,6 +1198,149 @@ describe("IAM organization membership write compatibility layer", () => {
       compensationStatus: "completed",
       identityStatus: "candidate-recovered-from-current-legacy"
     }));
+  });
+
+  it("prepares one exact no-Legacy-mutation recovery drill and recovers the current baseline candidate", async () => {
+    enableDualWrite();
+    process.env.IDENTITY_IAM_ORG_WRITE_ROLLOUT_ALLOWLIST = "legacy:24";
+    process.env.IDENTITY_IAM_ORG_WRITE_RECOVERY_DRILL_ENABLED = "true";
+    process.env.IDENTITY_IAM_ORG_WRITE_RECOVERY_DRILL_TARGET_LEGACY_USER_ID = "24";
+    const fixture = createFixture({
+      organizations: [organization(1, "baseline", "Baseline")],
+      roles: ["user"]
+    });
+    let operation: Record<string, any> | null = null;
+    fixture.repository.begin.mockImplementation(async (input: Record<string, any>) => {
+      if (operation) return { duplicate: true };
+      operation = {
+        ...input,
+        mode: "dual-write",
+        status: "pending",
+        compensationStatus: "none"
+      };
+      return { duplicate: false };
+    });
+    fixture.repository.find.mockImplementation(async (operationKey: string) =>
+      operation?.operationKey === operationKey ? operation : null
+    );
+    fixture.repository.update.mockImplementation(async (input: Record<string, any>) => {
+      if (operation?.operationKey === input.operationKey) operation = { ...operation, ...input };
+    });
+
+    const prepared = await fixture.service.prepareRecoveryDrill();
+    expect(prepared).toMatchObject({
+      operationKey: expect.stringMatching(/^iam-organization-write:v1:membership-replace:/),
+      operationKeyDigest: expect.stringMatching(/^[a-f0-9]{16}$/),
+      targetFingerprint: expect.stringMatching(/^[a-f0-9]{16}$/),
+      status: "legacy_completed",
+      compensationStatus: "required",
+      noLegacyMutation: true,
+      duplicate: false,
+      resumedPrepare: false,
+      nextAction: "retry-identity-candidate"
+    });
+    expect(operation).toMatchObject({
+      mode: "dual-write",
+      status: "legacy_completed",
+      legacyStatus: "drill:no-mutation",
+      identityStatus: "drill:recovery-required",
+      compensationStatus: "required",
+      errorCode: "IAM_ORGANIZATION_WRITE_RECOVERY_DRILL"
+    });
+    expect(fixture.plugin.proxy).not.toHaveBeenCalled();
+
+    await expect(fixture.service.prepareRecoveryDrill()).resolves.toMatchObject({
+      operationKey: prepared.operationKey,
+      duplicate: true,
+      resumedPrepare: false,
+      nextAction: "retry-identity-candidate"
+    });
+    expect(fixture.repository.begin).toHaveBeenCalledTimes(2);
+
+    await expect(fixture.service.retryIdentityCandidate(prepared.operationKey)).resolves.toMatchObject({
+      operationKeyDigest: prepared.operationKeyDigest,
+      recovered: true,
+      source: "current-legacy-read"
+    });
+    expect(fixture.repository.replaceCandidate).toHaveBeenCalledWith(expect.objectContaining({
+      operationKey: prepared.operationKey,
+      legacyUserId: 24,
+      organizations: [expect.objectContaining({ id: 1 })]
+    }));
+    expect(operation).toMatchObject({
+      status: "completed",
+      identityStatus: "candidate-recovered-from-current-legacy",
+      compensationStatus: "completed"
+    });
+    expect(fixture.plugin.proxy).not.toHaveBeenCalled();
+
+    await expect(fixture.service.prepareRecoveryDrill()).resolves.toMatchObject({
+      duplicate: true,
+      resumedPrepare: false,
+      nextAction: "none"
+    });
+  });
+
+  it("resumes an interrupted recovery-drill prepare only for the exact deterministic request", async () => {
+    enableDualWrite();
+    process.env.IDENTITY_IAM_ORG_WRITE_ROLLOUT_ALLOWLIST = "legacy:24";
+    process.env.IDENTITY_IAM_ORG_WRITE_RECOVERY_DRILL_ENABLED = "true";
+    process.env.IDENTITY_IAM_ORG_WRITE_RECOVERY_DRILL_TARGET_LEGACY_USER_ID = "24";
+    const fixture = createFixture({
+      organizations: [organization(1, "baseline", "Baseline")],
+      roles: ["user"]
+    });
+    let operation: Record<string, any> | null = null;
+    fixture.repository.begin.mockImplementation(async (input: Record<string, any>) => {
+      operation ??= {
+        ...input,
+        mode: "dual-write",
+        status: "pending",
+        compensationStatus: "none"
+      };
+      return { duplicate: true };
+    });
+    fixture.repository.find.mockImplementation(async () => operation);
+    fixture.repository.update.mockImplementation(async (input: Record<string, any>) => {
+      operation = { ...operation, ...input };
+    });
+
+    await expect(fixture.service.prepareRecoveryDrill()).resolves.toMatchObject({
+      duplicate: true,
+      resumedPrepare: true,
+      status: "legacy_completed",
+      compensationStatus: "required",
+      nextAction: "retry-identity-candidate"
+    });
+    expect(operation).toMatchObject({
+      status: "legacy_completed",
+      legacyStatus: "drill:no-mutation",
+      identityStatus: "drill:recovery-required",
+      compensationStatus: "required"
+    });
+
+    operation = { ...(operation ?? {}), requestFingerprint: "f".repeat(64), status: "pending", compensationStatus: "none" };
+    await expect(fixture.service.prepareRecoveryDrill()).rejects.toMatchObject({
+      response: { code: "IAM_ORGANIZATION_WRITE_RECOVERY_DRILL_CONFLICT" }
+    });
+  });
+
+  it("keeps the recovery drill default-off and rejects non-baseline or protected targets", async () => {
+    enableDualWrite();
+    process.env.IDENTITY_IAM_ORG_WRITE_ROLLOUT_ALLOWLIST = "legacy:24";
+    await expect(createFixture({ organizations: [organization(1, "baseline", "Baseline")], roles: ["user"] })
+      .service.prepareRecoveryDrill()).rejects.toMatchObject({
+        response: { code: "IAM_ORGANIZATION_WRITE_RECOVERY_DRILL_DISABLED" }
+      });
+
+    process.env.IDENTITY_IAM_ORG_WRITE_RECOVERY_DRILL_ENABLED = "true";
+    process.env.IDENTITY_IAM_ORG_WRITE_RECOVERY_DRILL_TARGET_LEGACY_USER_ID = "24";
+    await expect(createFixture({ organizations: [], roles: ["user"] }).service.prepareRecoveryDrill())
+      .rejects.toMatchObject({ response: { code: "IAM_ORGANIZATION_WRITE_RECOVERY_DRILL_TARGET_NOT_BASELINE" } });
+    await expect(createFixture({ organizations: [organization(1, "baseline", "Baseline")], roles: ["root"] })
+      .service.prepareRecoveryDrill()).rejects.toMatchObject({
+        response: { code: "IAM_ORGANIZATION_WRITE_RECOVERY_DRILL_TARGET_PROTECTED" }
+      });
   });
 
   it("redacts nested secrets at the organization operation repository boundary", () => {
@@ -1368,7 +1538,7 @@ function createFixture(input: {
         subjectLocked = false;
       }
     }),
-    begin: vi.fn(async () => ({ duplicate: input.duplicate ?? false })),
+    begin: vi.fn(async (_operation: Record<string, any>) => ({ duplicate: input.duplicate ?? false })),
     beginCandidateMaterialization: vi.fn(async (operation: Record<string, any>) => {
       if (materializationOperation) return { duplicate: true };
       materializationOperation = {

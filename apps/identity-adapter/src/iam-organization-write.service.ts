@@ -201,6 +201,15 @@ export class IamOrganizationWriteService {
         protectedSubjectsWritten: false,
         writeScope: "identity-candidate-only"
       },
+      recoveryDrill: {
+        enabled: iam.organizationWriteRecoveryDrillEnabled,
+        targetConfigured: iam.organizationWriteRecoveryDrillTargetLegacyUserId > 0,
+        endpoint: "/internal/iam/organization-write/recovery-drill/prepare",
+        recoveryEndpoint: "/internal/iam/organization-write/operations/:operationKey/retry-identity-candidate",
+        requiresInternalToken: true,
+        mutatesLegacy: false,
+        writeScope: "identity-candidate-and-ledger"
+      },
       identityNativeSupported: false,
       rollout,
       redactionPolicy: "metadata-only-no-request-or-token-payloads",
@@ -924,6 +933,161 @@ export class IamOrganizationWriteService {
     }
   }
 
+  async prepareRecoveryDrill() {
+    const { iam } = this.config;
+    if (!iam.organizationWriteRecoveryDrillEnabled) {
+      throw new NotFoundException({
+        code: "IAM_ORGANIZATION_WRITE_RECOVERY_DRILL_DISABLED",
+        message: "Organization-write recovery drill is disabled."
+      });
+    }
+    if (iam.organizationWriteMode !== "dual-write" || !iam.organizationWriteDualWriteExecutionEnabled) {
+      throw new ConflictException({
+        code: "IAM_ORGANIZATION_WRITE_RECOVERY_DRILL_REQUIRES_DUAL_WRITE",
+        message: "Organization-write recovery drill requires an explicitly enabled dual-write window."
+      });
+    }
+
+    const targetLegacyUserId = iam.organizationWriteRecoveryDrillTargetLegacyUserId;
+    if (!Number.isInteger(targetLegacyUserId) || targetLegacyUserId <= 0) {
+      throw new ConflictException({
+        code: "IAM_ORGANIZATION_WRITE_RECOVERY_DRILL_TARGET_REQUIRED",
+        message: "Organization-write recovery drill requires one configured dedicated target."
+      });
+    }
+    const readiness = await this.readiness();
+    const decision = organizationRolloutDecision(iam, targetLegacyUserId, null);
+    if (!readiness.dualWriteGate.executable || !decision.selected) {
+      throw new ConflictException({
+        code: "IAM_ORGANIZATION_WRITE_RECOVERY_DRILL_GATE_BLOCKED",
+        message: "Organization-write recovery drill is blocked by the exact-target dual-write gate.",
+        missingCapabilities: [
+          ...readiness.dualWriteGate.missingCapabilities,
+          ...(!decision.selected ? ["dedicated-target-not-selected"] : [])
+        ]
+      });
+    }
+
+    const legacyUser = await this.legacy.getUserById(targetLegacyUserId);
+    const organizations = legacyUser ? normalizeOrganizations(legacyUser.organizations) : [];
+    const exactUserRole = legacyUser?.roles.length === 1 && legacyUser.roles[0]?.trim().toLowerCase() === "user";
+    if (!legacyUser || legacyUser.status !== 10 || isProtectedOrganizationSubject(legacyUser)) {
+      throw new ConflictException({
+        code: "IAM_ORGANIZATION_WRITE_RECOVERY_DRILL_TARGET_PROTECTED",
+        message: "Missing, inactive, or protected targets cannot be used for an organization-write recovery drill."
+      });
+    }
+    if (!exactUserRole || !sameIds(organizations.map(({ id }) => id), [1])) {
+      throw new ConflictException({
+        code: "IAM_ORGANIZATION_WRITE_RECOVERY_DRILL_TARGET_NOT_BASELINE",
+        message: "Organization-write recovery drill target must have the exact user/[1] Legacy baseline."
+      });
+    }
+
+    const idempotencyKey = `organization-recovery-drill:v1:legacy:${targetLegacyUserId}:baseline:1`;
+    const operationKey = organizationWriteOperationKey(targetLegacyUserId, idempotencyKey);
+    const requestFingerprint = organizationWriteRequestFingerprint(targetLegacyUserId, [1]);
+    const metadata = {
+      decision: decision.decision,
+      targetFingerprint: organizationWriteFingerprint(`legacy:${targetLegacyUserId}`),
+      selectorKind: decision.selectorKind,
+      organizationCount: 1,
+      drill: {
+        kind: "identity-candidate-recovery",
+        noLegacyMutation: true,
+        exactLegacyBaseline: [1]
+      }
+    };
+    const begun = await this.repository.begin({
+      operationKey,
+      idempotencyKeyDigest: createHash("sha256").update(idempotencyKey).digest("hex"),
+      requestFingerprint,
+      legacyUserId: targetLegacyUserId,
+      metadata
+    });
+    if (begun.duplicate) {
+      const existing = await this.repository.find(operationKey);
+      if (!existing) {
+        throw new ConflictException({
+          code: "IAM_ORGANIZATION_WRITE_RECOVERY_DRILL_DUPLICATE",
+          message: "Organization-write recovery drill operation already exists but cannot be read."
+        });
+      }
+      if (
+        existing.mode !== "dual-write" ||
+        existing.legacyUserId !== targetLegacyUserId ||
+        existing.requestFingerprint !== requestFingerprint
+      ) {
+        throw new ConflictException({
+          code: "IAM_ORGANIZATION_WRITE_RECOVERY_DRILL_CONFLICT",
+          message: "Existing organization-write recovery drill does not match the exact reviewed request."
+        });
+      }
+      if (existing.status === "pending" && existing.compensationStatus === "none") {
+        await this.repository.update({
+          operationKey,
+          status: "legacy_completed",
+          legacyStatus: "drill:no-mutation",
+          identityStatus: "drill:recovery-required",
+          compensationStatus: "required",
+          errorCode: "IAM_ORGANIZATION_WRITE_RECOVERY_DRILL",
+          metadata
+        });
+        return {
+          operationKey,
+          operationKeyDigest: shortDigest(operationKey),
+          targetFingerprint: organizationWriteFingerprint(`legacy:${targetLegacyUserId}`),
+          status: "legacy_completed",
+          compensationStatus: "required",
+          noLegacyMutation: true,
+          duplicate: true,
+          resumedPrepare: true,
+          nextAction: "retry-identity-candidate"
+        };
+      }
+      const retryable = existing.status === "legacy_completed" && existing.compensationStatus === "required";
+      const completed = existing.status === "completed" && existing.compensationStatus === "completed";
+      if (!retryable && !completed) {
+        throw new ConflictException({
+          code: "IAM_ORGANIZATION_WRITE_RECOVERY_DRILL_STATE_INVALID",
+          message: "Existing organization-write recovery drill state is not retryable or complete."
+        });
+      }
+      return {
+        operationKey,
+        operationKeyDigest: shortDigest(operationKey),
+        targetFingerprint: organizationWriteFingerprint(`legacy:${targetLegacyUserId}`),
+        status: existing.status,
+        compensationStatus: existing.compensationStatus,
+        noLegacyMutation: true,
+        duplicate: true,
+        resumedPrepare: false,
+        nextAction: completed ? "none" : "retry-identity-candidate"
+      };
+    }
+
+    await this.repository.update({
+      operationKey,
+      status: "legacy_completed",
+      legacyStatus: "drill:no-mutation",
+      identityStatus: "drill:recovery-required",
+      compensationStatus: "required",
+      errorCode: "IAM_ORGANIZATION_WRITE_RECOVERY_DRILL",
+      metadata
+    });
+    return {
+      operationKey,
+      operationKeyDigest: shortDigest(operationKey),
+      targetFingerprint: organizationWriteFingerprint(`legacy:${targetLegacyUserId}`),
+      status: "legacy_completed",
+      compensationStatus: "required",
+      noLegacyMutation: true,
+      duplicate: false,
+      resumedPrepare: false,
+      nextAction: "retry-identity-candidate"
+    };
+  }
+
   private async dualWrite(
     request: PluginUserWriteRequest,
     parsed: SelectedMembershipReplace,
@@ -1153,6 +1317,8 @@ export class IamOrganizationWriteService {
       ...(iam.organizationWriteRolloutMode !== "off" ? ["organization-rollout-must-be-off"] : []),
       ...(iam.organizationWriteRolloutAllowlist.trim() !== "" ? ["organization-rollout-allowlist-must-be-empty"] : []),
       ...(iam.organizationWriteRolloutPercentage !== 0 ? ["organization-rollout-percentage-must-be-zero"] : []),
+      ...(iam.organizationWriteRecoveryDrillEnabled ? ["organization-recovery-drill-must-be-disabled"] : []),
+      ...(iam.organizationWriteRecoveryDrillTargetLegacyUserId !== 0 ? ["organization-recovery-drill-target-must-be-zero"] : []),
       ...(iam.roleWriteMode !== "disabled" ? ["role-write-disabled-required"] : []),
       ...(iam.roleWriteDualWriteExecutionEnabled ? ["role-dual-write-must-be-disabled"] : []),
       ...(iam.roleWriteIdentityNativeExecutionEnabled ? ["role-identity-native-must-be-disabled"] : []),

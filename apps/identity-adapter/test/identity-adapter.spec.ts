@@ -2332,6 +2332,8 @@ describe("identity-adapter readonly API", () => {
       candidateMaterializationTargetConfigured: false,
       candidateBatchMaterializationEnabled: false,
       candidateBatchMaterializationEnvironment: "disabled",
+      recoveryDrillEnabled: false,
+      recoveryDrillTargetConfigured: false,
       rolloutMode: "off",
       rolloutAllowlistCount: 0,
       rolloutPercentage: 0,

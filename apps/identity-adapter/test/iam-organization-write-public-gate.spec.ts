@@ -11,7 +11,9 @@ describe("IAM organization-write public posture gate", () => {
       expectedCandidateMaterializationEnabled: false,
       expectedCandidateMaterializationTargetConfigured: false,
       expectedCandidateBatchMaterializationEnabled: false,
-      expectedCandidateBatchMaterializationEnvironment: "disabled"
+      expectedCandidateBatchMaterializationEnvironment: "disabled",
+      expectedRecoveryDrillEnabled: false,
+      expectedRecoveryDrillTargetConfigured: false
     });
   });
 
@@ -77,6 +79,19 @@ describe("IAM organization-write public posture gate", () => {
       expect.stringContaining("candidateBatchMaterializationEnvironment expected disabled, got undefined")
     ]));
   });
+
+  it("fails closed when an organization recovery drill remains configured", async () => {
+    const result = await runOrganizationWritePublicGate(options(), fixtureFetch({
+      recoveryDrillEnabled: true,
+      recoveryDrillTargetConfigured: true
+    }));
+
+    expect(result.passed).toBe(false);
+    expect(result.failures).toEqual(expect.arrayContaining([
+      expect.stringContaining("recoveryDrillEnabled expected false, got true"),
+      expect.stringContaining("recoveryDrillTargetConfigured expected false, got true")
+    ]));
+  });
 });
 
 function options(): OrganizationWritePublicGateOptions {
@@ -89,6 +104,8 @@ function options(): OrganizationWritePublicGateOptions {
     expectedCandidateMaterializationTargetConfigured: false,
     expectedCandidateBatchMaterializationEnabled: false,
     expectedCandidateBatchMaterializationEnvironment: "disabled",
+    expectedRecoveryDrillEnabled: false,
+    expectedRecoveryDrillTargetConfigured: false,
     expectedRolloutMode: "off",
     expectedRolloutPercentage: 0,
     expectedAllowlistCount: 0
@@ -101,6 +118,8 @@ function fixtureFetch(overrides: {
   candidateBatchMaterializationEnabled?: boolean;
   candidateBatchMaterializationEnvironment?: "disabled" | "xrteeth-develop";
   omitMaterializationPosture?: boolean;
+  recoveryDrillEnabled?: boolean;
+  recoveryDrillTargetConfigured?: boolean;
 } = {}) {
   const organizationWrite: Record<string, unknown> = {
     mode: "disabled",
@@ -110,6 +129,8 @@ function fixtureFetch(overrides: {
     candidateMaterializationTargetConfigured: overrides.candidateMaterializationTargetConfigured ?? false,
     candidateBatchMaterializationEnabled: overrides.candidateBatchMaterializationEnabled ?? false,
     candidateBatchMaterializationEnvironment: overrides.candidateBatchMaterializationEnvironment ?? "disabled",
+    recoveryDrillEnabled: overrides.recoveryDrillEnabled ?? false,
+    recoveryDrillTargetConfigured: overrides.recoveryDrillTargetConfigured ?? false,
     rolloutMode: "off",
     rolloutAllowlistCount: 0,
     rolloutPercentage: 0,
