@@ -11,6 +11,7 @@ import {
   UnauthorizedException
 } from "@nestjs/common";
 import { loadConfig } from "./config.js";
+import { currentBuildRevision, normalizeBuildRevision } from "./build-revision.js";
 import {
   IamOrganizationWriteEvidence,
   organizationWriteCorrelationId,
@@ -299,6 +300,7 @@ export class IamOrganizationWriteService {
       return { ...upstream, mode: "legacy-proxy", evidence: readbackEvidence };
     }
     if (iam.organizationWriteMode === "identity-native") {
+      assertIdentityNativeExpectedRevision(request.headers["x-identity-expected-revision"]);
       const readiness = await this.readiness();
       if (!readiness.identityNativeGate.executable) {
         throw new ServiceUnavailableException({
@@ -343,12 +345,23 @@ export class IamOrganizationWriteService {
   async previewMembershipRollout(legacyUserId: number) {
     const { iam } = this.config;
     const readiness = await this.readiness();
-    const decision = organizationRolloutDecision(iam, legacyUserId, null);
+    const nativeDecision = identityNativeOrganizationWriteTargetDecision(iam, legacyUserId);
+    const decision = iam.organizationWriteMode === "identity-native"
+      ? {
+          selected: nativeDecision.owned,
+          decision: nativeDecision.owned
+            ? `selected:${nativeDecision.selectorKind}`
+            : `not-selected:${nativeDecision.reason}`,
+          selectorKind: nativeDecision.selectorKind
+        }
+      : organizationRolloutDecision(iam, legacyUserId, null);
     const modeGateExecutable = iam.organizationWriteMode === "legacy-proxy"
       ? readiness.legacyProxyGate.executable
       : iam.organizationWriteMode === "dual-write"
         ? readiness.dualWriteGate.executable
-        : false;
+        : iam.organizationWriteMode === "identity-native"
+          ? readiness.identityNativeGate.executable
+          : false;
     return {
       mutation: false,
       mode: iam.organizationWriteMode,
@@ -411,7 +424,30 @@ export class IamOrganizationWriteService {
       mutation: false,
       sourceOfTruth: "identity-candidate" as const,
       targetFingerprint: organizationWriteFingerprint(`legacy:${legacyUserId}`),
-      organizationIds: organizations.map(({ id }) => id),
+      organizationCount: organizations.length,
+      snapshotFingerprint: organizationCandidateSnapshotFingerprint(legacyUserId, organizations)
+    };
+  }
+
+  async previewIdentityNativeDesiredSnapshot(legacyUserId: number, organizationIds: number[]) {
+    this.requireRepository();
+    await this.assertCandidateMaterializationSchemaReady();
+    if (!Number.isSafeInteger(legacyUserId) || legacyUserId <= 0 ||
+      organizationIds.some((id) => !Number.isSafeInteger(id) || id <= 0)) {
+      throw new BadRequestException({ code: "IAM_ORGANIZATION_WRITE_INPUT_INVALID" });
+    }
+    const normalizedIds = [...new Set(organizationIds)].sort((left, right) => left - right);
+    const organizations = await this.repository.candidateOrganizationsByLegacyIds(normalizedIds);
+    if (!sameIds(organizations.map(({ id }) => id), normalizedIds)) {
+      throw new BadRequestException({
+        code: "IAM_ORGANIZATION_WRITE_UNKNOWN_ORGANIZATION",
+        message: "One or more organization identifiers are not present in the Identity organization catalog."
+      });
+    }
+    return {
+      mutation: false,
+      sourceOfTruth: "identity-candidate-catalog",
+      legacyUserIdFingerprint: organizationWriteFingerprint(`legacy:${legacyUserId}`),
       organizationCount: organizations.length,
       snapshotFingerprint: organizationCandidateSnapshotFingerprint(legacyUserId, organizations)
     };
@@ -1930,6 +1966,24 @@ function identityNativeOrganizationFieldMalformed(body: unknown): boolean {
   if (!descriptor) return false;
   if (!("value" in descriptor) || !Array.isArray(descriptor.value)) return true;
   return descriptor.value.some((value) => typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0);
+}
+
+function assertIdentityNativeExpectedRevision(value: string | string[] | undefined): void {
+  if (Array.isArray(value) && value.length !== 1) {
+    throw new BadRequestException({ code: "IDENTITY_EXPECTED_BUILD_REVISION_INVALID" });
+  }
+  const raw = Array.isArray(value) ? value[0] : value;
+  const expected = normalizeBuildRevision(raw);
+  if (!expected || raw !== expected) {
+    throw new BadRequestException({ code: "IDENTITY_EXPECTED_BUILD_REVISION_INVALID" });
+  }
+  const actual = currentBuildRevision();
+  if (!actual) {
+    throw new ServiceUnavailableException({ code: "IDENTITY_BUILD_REVISION_UNAVAILABLE" });
+  }
+  if (actual !== expected) {
+    throw new ConflictException({ code: "IDENTITY_BUILD_REVISION_MISMATCH" });
+  }
 }
 
 function assertIdentityNativeMembershipOnlyBody(body: unknown): void {

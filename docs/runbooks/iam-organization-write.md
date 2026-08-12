@@ -897,6 +897,39 @@ npm run iam:organization-write:window-gate -- \
   --expected-allowlist-count=1
 ```
 
+真正的单窗写不得手工拼接 curl。使用 native one-shot gate；它默认仅执行只读 window gate 与 desired-snapshot
+preview，后者从当前 Identity organization candidate catalog 计算目标快照，只输出 count/SHA：
+
+```bash
+export IDENTITY_IAM_INTERNAL_API_TOKEN='<runtime secret; never argv/log>'
+export IDENTITY_IAM_ORG_NATIVE_WINDOW_ORGANIZATION_IDS='2,7'
+npm run iam:organization-write:native-window-gate -- \
+  --legacy-user-id=<approved-id> \
+  --expected-revision=<exact-40-char-deployed-revision> \
+  --expected-before-fingerprint=<reviewed-current-candidate-sha256>
+```
+
+审批记录必须绑定预览输出中的 `revision`、target fingerprint、organization count/set digest、before fingerprint
+与 desired fingerprint。获批后才临时注入管理员 token 与新的幂等键，并把已批准 desired SHA 原样作为 after：
+
+```bash
+export IDENTITY_IAM_ORG_NATIVE_WINDOW_OPERATOR_BEARER_TOKEN='<verified-root bearer; never argv/log>'
+export IDENTITY_IAM_ORG_NATIVE_WINDOW_IDEMPOTENCY_KEY='<unique 16..200 char secret; never argv/log>'
+npm run iam:organization-write:native-window-gate -- \
+  --apply \
+  --legacy-user-id=<approved-id> \
+  --expected-revision=<exact-40-char-deployed-revision> \
+  --expected-before-fingerprint=<reviewed-current-candidate-sha256> \
+  --expected-after-fingerprint=<approved-desired-candidate-sha256>
+```
+
+operator 只允许 HTTP loopback adapter origin，拒绝 redirect、URL 凭据、path/query/fragment，所有敏感值和组织
+ID 集只从环境读取。它最多发送一次业务 POST；POST outcome unknown 时固定停止且不得自动重试。业务 POST 自身携带并
+强制校验 `X-Identity-Expected-Revision`，因此 preflight 后若发生部署切换会在读取/写入 candidate 前失败。写后 gate
+重新读取 candidate 与 ledger，要求 exact after SHA/count、operation key/request fingerprint、`mode=identity-native`、
+`legacyStatus=not-called`、`identityStatus=completed`、`compensationStatus=none`、`owner=identity`、
+`legacyWritePerformed=false`，并精确核对 Identity response headers。
+
 只有 `identityNativeGate.executable=true`、candidate digest 合法、账本无 pending/failed/required、管理员正向与
 普通用户负向、重复键、未知 ID、缺字段、add/remove/replace/restore、插件/campus/登录态回归全部通过，才可
 关闭该级窗口。关闭顺序固定为 execution=false、route=false、mode=disabled、rollout=off、allowlist 空、percentage=0。

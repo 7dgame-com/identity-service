@@ -227,7 +227,7 @@ export function parseOrganizationWriteWindowGateArgs(argv: string[], env: NodeJS
 }
 
 async function getJson(fetcher: typeof fetch, url: string, headers?: Record<string, string>): Promise<JsonResponse> {
-  const response = await fetcher(url, { headers, signal: AbortSignal.timeout(10_000) });
+  const response = await fetcher(url, { headers, redirect: "error", signal: AbortSignal.timeout(10_000) });
   const text = await response.text();
   let body: Record<string, any>;
   try {

@@ -22,6 +22,7 @@ describe("IAM organization identity-native membership replacement", () => {
     process.env.IDENTITY_IAM_ORG_WRITE_ROLLOUT_MODE = "allowlist";
     process.env.IDENTITY_IAM_ORG_WRITE_ROLLOUT_ALLOWLIST = "legacy:24";
     process.env.IDENTITY_IAM_ORG_WRITE_ROLLOUT_PERCENTAGE = "0";
+    process.env.IDENTITY_BUILD_REVISION = "a".repeat(40);
   });
 
   afterEach(() => {
@@ -45,6 +46,26 @@ describe("IAM organization identity-native membership replacement", () => {
       .rejects.toMatchObject({ response: { code: "IAM_ORGANIZATION_WRITE_IDENTITY_NATIVE_NOT_READY" } });
     expect(fixture.repository.begin).not.toHaveBeenCalled();
     expect(fixture.plugin.proxy).not.toHaveBeenCalled();
+  });
+
+  it("requires the reviewed full build revision before any Identity-native repository read", async () => {
+    const missing = createFixture();
+    const missingRequest = request([2], "native-revision-missing");
+    missingRequest.headers["x-identity-expected-revision"] = undefined;
+    await expect(missing.service.proxyMembershipUpdate(missingRequest))
+      .rejects.toMatchObject({ response: { code: "IDENTITY_EXPECTED_BUILD_REVISION_INVALID" } });
+    expect(missing.repository.materializationSchemaReadiness).not.toHaveBeenCalled();
+    expect(missing.repository.begin).not.toHaveBeenCalled();
+    expect(missing.repository.candidateForLegacyUser).not.toHaveBeenCalled();
+
+    const mismatch = createFixture();
+    const mismatchRequest = request([2], "native-revision-mismatch");
+    mismatchRequest.headers["x-identity-expected-revision"] = "b".repeat(40);
+    await expect(mismatch.service.proxyMembershipUpdate(mismatchRequest))
+      .rejects.toMatchObject({ response: { code: "IDENTITY_BUILD_REVISION_MISMATCH" } });
+    expect(mismatch.repository.materializationSchemaReadiness).not.toHaveBeenCalled();
+    expect(mismatch.repository.begin).not.toHaveBeenCalled();
+    expect(mismatch.repository.candidateForLegacyUser).not.toHaveBeenCalled();
   });
 
   it("writes only the selected Identity candidate, preserves Legacy, and returns the compatible legacy-id response", async () => {
@@ -76,6 +97,22 @@ describe("IAM organization identity-native membership replacement", () => {
       identityStatus: "completed",
       compensationStatus: "none"
     }));
+  });
+
+  it("supports exact add and remove-all replacement semantics in Identity without Legacy writes", async () => {
+    const add = createFixture();
+    await expect(add.service.proxyMembershipUpdate(request([1, 2], "native-add"))).resolves.toMatchObject({
+      body: { data: { organizations: [{ id: 1 }, { id: 2 }] } }
+    });
+    expect(add.candidate()?.map(({ id }) => id)).toEqual([1, 2]);
+    expect(add.plugin.proxy).not.toHaveBeenCalled();
+
+    const removeAll = createFixture();
+    await expect(removeAll.service.proxyMembershipUpdate(request([], "native-remove-all"))).resolves.toMatchObject({
+      body: { data: { organizations: [] } }
+    });
+    expect(removeAll.candidate()).toEqual([]);
+    expect(removeAll.plugin.proxy).not.toHaveBeenCalled();
   });
 
   it("leaves an unowned target on the existing Legacy owner path", async () => {
@@ -240,6 +277,43 @@ describe("IAM organization identity-native membership replacement", () => {
     const expectedBucket = Number.parseInt(createHash("sha256").update("legacy:24").digest("hex").slice(0, 8), 16) % 100;
     expect(decision).toMatchObject({ bucket: expectedBucket, owned: expectedBucket < 25, selectorKind: "percentage" });
   });
+
+  it("uses the same target-owned selector and native readiness gate for the runtime preview", async () => {
+    const fixture = createFixture();
+    await expect(fixture.service.previewMembershipRollout(24)).resolves.toMatchObject({
+      mutation: false,
+      mode: "identity-native",
+      selected: true,
+      executable: true,
+      decision: "selected:allowlist",
+      matchedSelectorKind: "allowlist",
+      sourceOfTruth: "identity-candidate-selected-legacy-unselected",
+      identityNativeSupported: true,
+      blockedReasons: []
+    });
+    await expect(fixture.service.previewMembershipRollout(25)).resolves.toMatchObject({
+      selected: false,
+      executable: false,
+      decision: "not-selected:target_not_owned",
+      matchedSelectorKind: null,
+      blockedReasons: ["target-not-selected"]
+    });
+  });
+
+  it("previews the exact desired snapshot from the Identity organization catalog without exposing catalog rows", async () => {
+    const fixture = createFixture();
+    const preview = await fixture.service.previewIdentityNativeDesiredSnapshot(24, [2, 2]);
+    expect(preview).toEqual({
+      mutation: false,
+      sourceOfTruth: "identity-candidate-catalog",
+      legacyUserIdFingerprint: expect.stringMatching(/^[a-f0-9]{16}$/),
+      organizationCount: 1,
+      snapshotFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/)
+    });
+    expect(preview).not.toHaveProperty("organizationIds");
+    await expect(fixture.service.previewIdentityNativeDesiredSnapshot(24, [999]))
+      .rejects.toMatchObject({ response: { code: "IAM_ORGANIZATION_WRITE_UNKNOWN_ORGANIZATION" } });
+  });
 });
 
 function createFixture(input: {
@@ -360,7 +434,11 @@ function createFixture(input: {
 function request(organizationIds: number[], idempotencyKey: string, legacyUserId = 24) {
   return {
     method: "POST",
-    headers: { authorization: "Bearer verified", "idempotency-key": idempotencyKey },
+    headers: {
+      authorization: "Bearer verified",
+      "idempotency-key": idempotencyKey,
+      "x-identity-expected-revision": "a".repeat(40)
+    } as Record<string, string | undefined>,
     body: { id: legacyUserId, organization_ids: organizationIds }
   };
 }
