@@ -179,6 +179,19 @@ describe("organization candidate batch materialization operator gate", () => {
     expect(result.failures).toContain("readiness plan key expected false, got true");
   });
 
+  it("verifies the default disabled contract after restoring the Production gate", async () => {
+    const restored = batchFetcher({ restored: true, environment: "xrteeth-production" });
+
+    await expect(runOrganizationCandidateBatchGate(options({
+      environment: "xrteeth-production",
+      expectRestored: true
+    }), restored)).resolves.toMatchObject({
+      passed: true,
+      mode: "expect-restored",
+      failures: []
+    });
+  });
+
   it("rejects remote URLs, duplicate flags and command-line secrets before I/O", () => {
     const env = {
       IDENTITY_IAM_INTERNAL_API_TOKEN: TOKEN,
@@ -325,7 +338,7 @@ function readiness(input: Parameters<typeof batchFetcher>[0]) {
     capability: "iam-organization-write",
     data: {
       candidateBatchMaterialization: {
-        contract: `iam-organization-candidate-batch-materialization/${environment}/v1`,
+        contract: `iam-organization-candidate-batch-materialization/${restored ? "xrteeth-develop" : environment}/v1`,
         enabled: applyEnabled,
         environment: restored ? "disabled" : environment,
         planHmacKeyConfigured: restored ? input.restoredPlanKeyConfigured === true : true,

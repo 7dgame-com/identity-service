@@ -334,7 +334,12 @@ function assertReadiness(
 ): void {
   assertEnvelope(failures, "readiness", response, "iam-organization-write");
   const batch = response.body.data?.candidateBatchMaterialization;
-  equal(failures, "readiness contract", batch?.contract, contract(options.environment));
+  equal(
+    failures,
+    "readiness contract",
+    batch?.contract,
+    contract(restored ? "xrteeth-develop" : options.environment)
+  );
   equal(failures, "readiness enabled", batch?.enabled, applyEnabled);
   equal(failures, "readiness environment", batch?.environment, restored ? "disabled" : options.environment);
   equal(failures, "readiness plan key", batch?.planHmacKeyConfigured, !restored);
