@@ -1,4 +1,5 @@
 import { Body, Controller, Get, Headers, HttpException, HttpStatus, Param, Post, Query } from "@nestjs/common";
+import { isProxy } from "node:util/types";
 import { loadConfig } from "./config.js";
 import { currentBuildRevision, normalizeBuildRevision } from "./build-revision.js";
 import { IamOrganizationWriteService } from "./iam-organization-write.service.js";
@@ -55,6 +56,38 @@ export class IamOrganizationWriteController {
       service: "identity-adapter",
       capability: "iam-organization-write-subject-alignment",
       data: await this.organizationWrite.subjectAlignment(parseLegacyUserId(legacyUserId))
+    };
+  }
+
+  @Get("subjects/:legacyUserId/candidate")
+  async subjectCandidate(
+    @Headers("x-identity-internal-token") token: string | undefined,
+    @Param("legacyUserId") legacyUserId: string
+  ) {
+    this.assertInternalToken(token);
+    return {
+      status: "ok",
+      service: "identity-adapter",
+      capability: "iam-organization-write-subject-candidate",
+      data: await this.organizationWrite.subjectCandidate(parseLegacyUserId(legacyUserId))
+    };
+  }
+
+  @Post("subjects/:legacyUserId/identity-native-snapshot-preview")
+  async previewIdentityNativeSnapshot(
+    @Headers("x-identity-internal-token") token: string | undefined,
+    @Param("legacyUserId") legacyUserId: string,
+    @Body() body: unknown
+  ) {
+    this.assertInternalToken(token);
+    return {
+      status: "ok",
+      service: "identity-adapter",
+      capability: "iam-organization-write-identity-native-snapshot-preview",
+      data: await this.organizationWrite.previewIdentityNativeDesiredSnapshot(
+        parseLegacyUserId(legacyUserId),
+        identityNativeOrganizationIds(body)
+      )
     };
   }
 
@@ -222,6 +255,22 @@ function parseLegacyUserId(value: string): number {
     throw new HttpException({ code: "INVALID_LEGACY_USER_ID", message: "Legacy user id must be a positive integer." }, HttpStatus.BAD_REQUEST);
   }
   return parsed;
+}
+
+function identityNativeOrganizationIds(body: unknown): number[] {
+  if (!body || typeof body !== "object" || Array.isArray(body) || isProxy(body)) {
+    throw new HttpException({ code: "IAM_ORGANIZATION_WRITE_INPUT_INVALID" }, HttpStatus.BAD_REQUEST);
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(body);
+  if (Object.keys(descriptors).length !== 1 || !descriptors.organization_ids ||
+    !("value" in descriptors.organization_ids) || !Array.isArray(descriptors.organization_ids.value)) {
+    throw new HttpException({ code: "IAM_ORGANIZATION_WRITE_INPUT_INVALID" }, HttpStatus.BAD_REQUEST);
+  }
+  const values = descriptors.organization_ids.value;
+  if (values.some((value: unknown) => typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0)) {
+    throw new HttpException({ code: "IAM_ORGANIZATION_WRITE_INPUT_INVALID" }, HttpStatus.BAD_REQUEST);
+  }
+  return [...new Set(values as number[])].sort((left, right) => left - right);
 }
 
 function materializationFingerprint(body: unknown): string | undefined {

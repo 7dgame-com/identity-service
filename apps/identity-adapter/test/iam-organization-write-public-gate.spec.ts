@@ -18,9 +18,23 @@ describe("IAM organization-write public posture gate", () => {
   });
 
   it("passes a compatible default-off public posture", async () => {
-    const result = await runOrganizationWritePublicGate(options(), fixtureFetch());
+    const result = await runOrganizationWritePublicGate(
+      options(),
+      fixtureFetch(),
+      new Date("2026-08-12T12:00:00.000Z")
+    );
 
-    expect(result).toMatchObject({ passed: true, failures: [] });
+    expect(result).toMatchObject({ checkedAt: "2026-08-12T12:00:00.000Z", passed: true, failures: [] });
+  });
+
+  it("rejects an untrusted Date without reading user-defined properties", async () => {
+    let getterReads = 0;
+    const untrusted = new Date("2026-08-12T12:00:00.000Z");
+    Object.defineProperty(untrusted, "getTime", { get() { getterReads += 1; return Date.prototype.getTime; } });
+
+    await expect(runOrganizationWritePublicGate(options(), fixtureFetch(), untrusted))
+      .rejects.toThrow("now must be an exact native Date");
+    expect(getterReads).toBe(0);
   });
 
   it("fails closed when materialization is enabled or a target remains configured", async () => {
@@ -100,6 +114,7 @@ function options(): OrganizationWritePublicGateOptions {
     expectedMode: "disabled",
     expectedRouteIntegration: false,
     expectedDualWriteExecution: false,
+    expectedIdentityNativeExecution: false,
     expectedCandidateMaterializationEnabled: false,
     expectedCandidateMaterializationTargetConfigured: false,
     expectedCandidateBatchMaterializationEnabled: false,
@@ -125,6 +140,7 @@ function fixtureFetch(overrides: {
     mode: "disabled",
     routeIntegrationEnabled: false,
     dualWriteExecutionEnabled: false,
+    identityNativeExecutionEnabled: false,
     candidateMaterializationEnabled: overrides.candidateMaterializationEnabled ?? false,
     candidateMaterializationTargetConfigured: overrides.candidateMaterializationTargetConfigured ?? false,
     candidateBatchMaterializationEnabled: overrides.candidateBatchMaterializationEnabled ?? false,

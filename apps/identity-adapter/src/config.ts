@@ -134,6 +134,7 @@ export const configSchema = z.object({
     organizationWriteMode: z.enum(["disabled", "legacy-proxy", "dual-write", "identity-native"]).default("disabled"),
     organizationWriteRouteIntegrationEnabled: boolFromEnv.default(false),
     organizationWriteDualWriteExecutionEnabled: boolFromEnv.default(false),
+    organizationWriteIdentityNativeExecutionEnabled: boolFromEnv.default(false),
     organizationWriteRolloutMode: z.enum(["off", "allowlist", "percentage", "full"]).default("off"),
     organizationWriteRolloutAllowlist: z.string().default(""),
     organizationWriteRolloutPercentage: numberFromEnv
@@ -383,6 +384,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
       organizationWriteMode: env.IDENTITY_IAM_ORG_WRITE_MODE,
       organizationWriteRouteIntegrationEnabled: env.IDENTITY_IAM_ORG_WRITE_ROUTE_INTEGRATION_ENABLED,
       organizationWriteDualWriteExecutionEnabled: env.IDENTITY_IAM_ORG_WRITE_DUAL_WRITE_EXECUTION_ENABLED,
+      organizationWriteIdentityNativeExecutionEnabled:
+        env.IDENTITY_IAM_ORG_WRITE_IDENTITY_NATIVE_EXECUTION_ENABLED,
       organizationWriteRolloutMode: env.IDENTITY_IAM_ORG_WRITE_ROLLOUT_MODE,
       organizationWriteRolloutAllowlist: env.IDENTITY_IAM_ORG_WRITE_ROLLOUT_ALLOWLIST,
       organizationWriteRolloutPercentage: env.IDENTITY_IAM_ORG_WRITE_ROLLOUT_PERCENTAGE,

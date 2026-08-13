@@ -1,10 +1,13 @@
 import { pathToFileURL } from "node:url";
+import { isAbsolute, resolve } from "node:path";
+import { writeOrganizationEvidenceExclusive0600 } from "./iam-organization-write-evidence-output.js";
 
 export interface OrganizationWritePublicGateOptions {
   urls: string[];
   expectedMode: "disabled" | "legacy-proxy" | "dual-write" | "identity-native";
   expectedRouteIntegration: boolean;
   expectedDualWriteExecution: boolean;
+  expectedIdentityNativeExecution: boolean;
   expectedCandidateMaterializationEnabled: boolean;
   expectedCandidateMaterializationTargetConfigured: boolean;
   expectedCandidateBatchMaterializationEnabled: boolean;
@@ -15,12 +18,14 @@ export interface OrganizationWritePublicGateOptions {
   expectedRolloutPercentage: number;
   expectedAllowlistCount?: number;
   expectedRevision?: string;
+  outputPath?: string;
 }
 
 interface OrganizationWritePosture {
   mode: string;
   routeIntegrationEnabled: boolean;
   dualWriteExecutionEnabled: boolean;
+  identityNativeExecutionEnabled: boolean;
   candidateMaterializationEnabled: boolean;
   candidateMaterializationTargetConfigured: boolean;
   candidateBatchMaterializationEnabled: boolean;
@@ -34,19 +39,36 @@ interface OrganizationWritePosture {
   identityNativeSupported: boolean;
 }
 
+export const ORGANIZATION_WRITE_PUBLIC_GATE_CONTRACT = "iam-organization-write-public-gate/v2" as const;
+
 async function main(): Promise<void> {
-  const result = await runOrganizationWritePublicGate(parseOrganizationWritePublicGateArgs(process.argv.slice(2)));
-  console.log(JSON.stringify(result, null, 2));
+  const options = parseOrganizationWritePublicGateArgs(process.argv.slice(2));
+  const result = await runOrganizationWritePublicGate(options);
+  if (options.outputPath) {
+    const written = await writeOrganizationEvidenceExclusive0600(options.outputPath, result);
+    process.stdout.write(`${JSON.stringify({ status: result.passed ? "completed" : "blocked", sha256: written.sha256 })}\n`);
+  } else process.stdout.write(`${JSON.stringify(result)}\n`);
   if (!result.passed) process.exitCode = 1;
 }
 
 export async function runOrganizationWritePublicGate(
   options: OrganizationWritePublicGateOptions,
-  fetcher: typeof fetch = fetch
+  fetcher: typeof fetch = fetch,
+  now: Date = new Date()
 ) {
+  const checkedAt = trustedInstant(now);
   const results = await Promise.all(options.urls.map((url) => inspect(fetcher, url, options)));
   const failures = results.flatMap((result) => result.failures.map((failure) => `${result.url}: ${failure}`));
-  return { passed: failures.length === 0, results, failures };
+  return { contract: ORGANIZATION_WRITE_PUBLIC_GATE_CONTRACT, checkedAt, passed: failures.length === 0, results, failures };
+}
+
+function trustedInstant(value: Date): string {
+  if (Object.getPrototypeOf(value) !== Date.prototype || Object.getOwnPropertyNames(value).length !== 0) {
+    throw new Error("now must be an exact native Date");
+  }
+  const timestamp = Date.prototype.getTime.call(value);
+  if (!Number.isFinite(timestamp)) throw new Error("now must be a valid Date");
+  return new Date(timestamp).toISOString();
 }
 
 async function inspect(fetcher: typeof fetch, url: string, options: OrganizationWritePublicGateOptions) {
@@ -64,6 +86,7 @@ async function inspect(fetcher: typeof fetch, url: string, options: Organization
     compare(failures, "mode", posture.mode, options.expectedMode);
     compare(failures, "routeIntegrationEnabled", posture.routeIntegrationEnabled, options.expectedRouteIntegration);
     compare(failures, "dualWriteExecutionEnabled", posture.dualWriteExecutionEnabled, options.expectedDualWriteExecution);
+    compare(failures, "identityNativeExecutionEnabled", posture.identityNativeExecutionEnabled, options.expectedIdentityNativeExecution);
     compare(
       failures,
       "candidateMaterializationEnabled",
@@ -100,8 +123,9 @@ async function inspect(fetcher: typeof fetch, url: string, options: Organization
     if (options.expectedAllowlistCount !== undefined) {
       compare(failures, "rolloutAllowlistCount", posture.rolloutAllowlistCount, options.expectedAllowlistCount);
     }
-    compare(failures, "sourceOfTruth", posture.sourceOfTruth, "legacy");
-    compare(failures, "identityNativeSupported", posture.identityNativeSupported, false);
+    compare(failures, "sourceOfTruth", posture.sourceOfTruth,
+      options.expectedMode === "identity-native" ? "identity-candidate-selected-legacy-unselected" : "legacy");
+    compare(failures, "identityNativeSupported", posture.identityNativeSupported, options.expectedMode === "identity-native");
   }
 
   return { url, status: response.status, revision: body.revision ?? null, posture: posture ?? null, failures };
@@ -117,6 +141,7 @@ export function parseOrganizationWritePublicGateArgs(argv: string[]): Organizati
     expectedMode: "disabled",
     expectedRouteIntegration: false,
     expectedDualWriteExecution: false,
+    expectedIdentityNativeExecution: false,
     expectedCandidateMaterializationEnabled: false,
     expectedCandidateMaterializationTargetConfigured: false,
     expectedCandidateBatchMaterializationEnabled: false,
@@ -133,6 +158,7 @@ export function parseOrganizationWritePublicGateArgs(argv: string[]): Organizati
     else if (arg.startsWith("--expected-mode=")) options.expectedMode = enumValue(arg, "--expected-mode=", ["disabled", "legacy-proxy", "dual-write", "identity-native"]);
     else if (arg.startsWith("--expected-route-integration=")) options.expectedRouteIntegration = booleanValue(arg, "--expected-route-integration=");
     else if (arg.startsWith("--expected-dual-write-execution=")) options.expectedDualWriteExecution = booleanValue(arg, "--expected-dual-write-execution=");
+    else if (arg.startsWith("--expected-identity-native-execution=")) options.expectedIdentityNativeExecution = booleanValue(arg, "--expected-identity-native-execution=");
     else if (arg.startsWith("--expected-candidate-materialization-enabled=")) {
       options.expectedCandidateMaterializationEnabled = booleanValue(arg, "--expected-candidate-materialization-enabled=");
     } else if (arg.startsWith("--expected-candidate-materialization-target-configured=")) {
@@ -163,6 +189,7 @@ export function parseOrganizationWritePublicGateArgs(argv: string[]): Organizati
     else if (arg.startsWith("--expected-allowlist-count=")) options.expectedAllowlistCount = integerValue(arg, "--expected-allowlist-count=", 0, 10_000);
     else if (arg === "--ignore-allowlist-count") options.expectedAllowlistCount = undefined;
     else if (arg.startsWith("--expected-revision=")) options.expectedRevision = revisionValue(arg.slice("--expected-revision=".length));
+    else if (arg.startsWith("--output=")) options.outputPath = outputPathValue(arg.slice("--output=".length));
     else throw new Error(`Unknown argument: ${arg}`);
   }
 
@@ -174,6 +201,13 @@ function revisionValue(value: string): string {
   const normalized = value.trim().toLowerCase();
   if (!/^[a-f0-9]{40}$/.test(normalized)) throw new Error("--expected-revision must be a full 40-character Git SHA");
   return normalized;
+}
+
+function outputPathValue(value: string): string {
+  if (!value || value.includes("\0") || !isAbsolute(value) || value !== resolve(value)) {
+    throw new Error("--output must be a normalized absolute path");
+  }
+  return value;
 }
 
 function csv(value: string): string[] {

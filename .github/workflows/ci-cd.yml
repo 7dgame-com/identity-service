@@ -36,6 +36,22 @@ jobs:
       - name: Run tests
         run: npm test
 
+      - name: Generate Develop completion regression evidence
+        if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+        run: >-
+          npm run iam:organization-write:develop-regression --
+          --expected-revision=${{ github.sha }}
+          --output=${{ github.workspace }}/identity-develop-regression.json
+
+      - name: Retain Develop completion regression evidence
+        if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+        uses: actions/upload-artifact@v4
+        with:
+          name: identity-develop-regression-evidence
+          path: identity-develop-regression.json
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Build TypeScript
         run: npm run build
 

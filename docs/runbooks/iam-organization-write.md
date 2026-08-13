@@ -19,6 +19,7 @@ Legacy 始终是本阶段唯一事实源。Legacy organization ID 是对外稳�
 IDENTITY_IAM_ORG_WRITE_MODE: "disabled"
 IDENTITY_IAM_ORG_WRITE_ROUTE_INTEGRATION_ENABLED: "false"
 IDENTITY_IAM_ORG_WRITE_DUAL_WRITE_EXECUTION_ENABLED: "false"
+IDENTITY_IAM_ORG_WRITE_IDENTITY_NATIVE_EXECUTION_ENABLED: "false"
 IDENTITY_IAM_ORG_WRITE_ROLLOUT_MODE: "off"
 IDENTITY_IAM_ORG_WRITE_ROLLOUT_ALLOWLIST: ""
 IDENTITY_IAM_ORG_WRITE_ROLLOUT_PERCENTAGE: "0"
@@ -861,9 +862,137 @@ IDENTITY_IAM_ORG_WRITE_RECOVERY_DRILL_TARGET_LEGACY_USER_ID: "581"
 
 ## 证据与回滚
 
+## Phase 5：Identity-native 独立窗口（Task 10.5）
+
+Identity-native 绝不能由 dual-write 自动升级；必须在 dual-write 已恢复默认关闭后，以独立批准的
+allowlist 或 percentage 窗口临时配置。代码和镜像仍默认关闭：
+
+```yaml
+IDENTITY_IAM_ORG_WRITE_MODE: "identity-native"
+IDENTITY_IAM_ORG_WRITE_ROUTE_INTEGRATION_ENABLED: "true"
+IDENTITY_IAM_ORG_WRITE_DUAL_WRITE_EXECUTION_ENABLED: "false"
+IDENTITY_IAM_ORG_WRITE_IDENTITY_NATIVE_EXECUTION_ENABLED: "true"
+IDENTITY_IAM_ORG_WRITE_ROLLOUT_MODE: "allowlist"
+IDENTITY_IAM_ORG_WRITE_ROLLOUT_ALLOWLIST: "legacy:<approved-dedicated-user-id>"
+IDENTITY_IAM_ORG_WRITE_ROLLOUT_PERCENTAGE: "0"
+```
+
+选择器现在表示 **Identity 拥有的目标用户**，不表示操作者；未选目标仍由既有 Legacy owner 处理。被选目标的
+`organization_ids` 采用 Identity candidate exact replacement，Legacy 写调用必须为 0。被选请求必须：
+
+- 只包含 `id` 与 `organization_ids`，混合 nickname/email/status 等资料更新明确失败，避免部分假成功；
+- 携带有效 Identity bearer token 与显式 `Idempotency-Key`；
+- 操作者同时满足 verified root 和 live Yii `user-management.update-user` permission；
+- 目标在 `identity_users` 为 active legacy-shadow，且 Identity role shadow 不含 root；
+- 目标已有 candidate snapshot，所有组织 ID 已在 Identity candidate catalog；
+- 写后从 Identity candidate 读回精确 ID 集合；若提交确认丢失或 postcheck 失败，恢复写前 candidate snapshot，
+  账本必须为 `legacyStatus=not-called` 且补偿终态明确。
+
+运行前后使用只读 gate；Identity-native 会额外读取 candidate 摘要，不输出用户名或组织名：
+
+```bash
+npm run iam:organization-write:window-gate -- \
+  --legacy-user-id=<approved-id> \
+  --expected-mode=identity-native \
+  --expected-allowlist-count=1
+```
+
+真正的单窗写不得手工拼接 curl。使用 native one-shot gate；它默认仅执行只读 window gate 与 desired-snapshot
+preview，后者从当前 Identity organization candidate catalog 计算目标快照，只输出 count/SHA：
+
+```bash
+export IDENTITY_IAM_INTERNAL_API_TOKEN='<runtime secret; never argv/log>'
+export IDENTITY_IAM_ORG_NATIVE_WINDOW_ORGANIZATION_IDS='2,7'
+npm run iam:organization-write:native-window-gate -- \
+  --legacy-user-id=<approved-id> \
+  --expected-revision=<exact-40-char-deployed-revision> \
+  --expected-before-fingerprint=<reviewed-current-candidate-sha256>
+```
+
+审批记录必须绑定预览输出中的 `revision`、target fingerprint、organization count/set digest、before fingerprint
+与 desired fingerprint。获批后才临时注入管理员 token 与新的幂等键，并把已批准 desired SHA 原样作为 after：
+
+```bash
+export IDENTITY_IAM_ORG_NATIVE_WINDOW_OPERATOR_BEARER_TOKEN='<verified-root bearer; never argv/log>'
+export IDENTITY_IAM_ORG_NATIVE_WINDOW_IDEMPOTENCY_KEY='<unique 16..200 char secret; never argv/log>'
+npm run iam:organization-write:native-window-gate -- \
+  --apply \
+  --legacy-user-id=<approved-id> \
+  --expected-revision=<exact-40-char-deployed-revision> \
+  --expected-before-fingerprint=<reviewed-current-candidate-sha256> \
+  --expected-after-fingerprint=<approved-desired-candidate-sha256> \
+  --output=/absolute/private-evidence/identity-native-apply.json
+```
+
+operator 只允许 HTTP loopback adapter origin，拒绝 redirect、URL 凭据、path/query/fragment，所有敏感值和组织
+ID 集只从环境读取。它最多发送一次业务 POST；POST outcome unknown 时固定停止且不得自动重试。业务 POST 自身携带并
+强制校验 `X-Identity-Expected-Revision`，因此 preflight 后若发生部署切换会在读取/写入 candidate 前失败。写后 gate
+重新读取 candidate 与 ledger，要求 exact after SHA/count、operation key/request fingerprint、`mode=identity-native`、
+`legacyStatus=not-called`、`identityStatus=completed`、`compensationStatus=none`、`owner=identity`、
+`legacyWritePerformed=false`，并精确核对 Identity response headers。
+
+只有 `identityNativeGate.executable=true`、candidate digest 合法、账本无 pending/failed/required、管理员正向与
+普通用户负向、重复键、未知 ID、缺字段、add/remove/replace/restore、插件/campus/登录态回归全部通过，才可
+关闭该级窗口。关闭顺序固定为 execution=false、route=false、mode=disabled、rollout=off、allowlist 空、percentage=0。
+关闭配置不会删除 candidate；如需业务 restore，必须在窗口内先用新 idempotency key 把原 candidate 集合写回并读回，
+并把第二次 one-shot 输出写入独立的
+`/absolute/private-evidence/identity-native-restore.json`，然后再关闭窗口。`--output` 使用 O_EXCL 创建 canonical
+0600 JSON，拒绝 symlink、非 canonical/非 owner-controlled parent 和已有目标；stdout 只返回 status 与 file SHA-256。
+Production 每个比例仍需独立批准。
+
 日志、响应头和账本只保留 correlation ID、operation/idempotency 摘要、目标/操作者摘要、命中类型、
 组织数量和状态，不保存 Authorization、Cookie、密码、完整 token 或原始请求/响应 payload。
 
 任何异常立即恢复全部默认值。回滚只关闭配置，不删除 Legacy 数据、不清理 candidate、不切换
 AuthZ owner。工作包 4 的未授权部署、运行、API、数据库、Docker 或 Portainer 操作一律不得进入
 tmrpp；tmrpp 仅由用户按既定弹性服务器镜像同步流程处理，本手册不授权代理操作。
+
+## Develop 完成门禁（Tasks 11.1–11.5）
+
+“Develop 全部完成、Production 待批”只能由离线 completion gate 生成，不能手工写结论。候选 revision
+必须依次具备以下六份 canonical JSON 证据：
+
+1. 在 Identity-native restore 成功之后重新采集的 Task 7.2 runtime certificate 与 closeout，固定
+   21/21 datasets、8/8 surfaces、1/1 Develop signer、6/6 physical probe，P0/P1/P2/mismatch 全为 0；
+2. Identity-native membership-replace 正向 one-shot 输出；
+3. 使用新 idempotency key 恢复 reviewed before snapshot 的反向 one-shot 输出；
+4. 公网 `https://identity.d.xrteeth.com/health` 默认关闭结果，且 revision 与候选提交完全一致；
+5. 候选提交的完整回归摘要；
+6. 兼容路由、监控项、1–168 小时回滚窗口和下次 review date。
+
+completion gate 会把 certificate 的 `collection.windowStartedAt` 与 restore one-shot 的 `checkedAt` 做精确
+顺序校验，并要求 default-off public gate v2 的 `checkedAt` 不早于最终 reconciliation attestation；因此窗口前、
+apply/restore 之间生成的 Task 7.2 证书或旧 default-off 结果都不能替代最终复跑与窗口回收证明。
+
+默认关闭证据必须显式只检查 Develop，禁止沿用 public gate 默认包含 tmrpp 的 URL 列表：
+
+```bash
+npm run iam:organization-write:public-gate -- \
+  --urls=https://identity.d.xrteeth.com/health \
+  --expected-revision=<exact-candidate-full40> \
+  --output=/absolute/private-evidence/develop-default-off.json
+```
+
+回归摘要不能人工构造。必须在 tracked worktree 干净、`HEAD` 等于待核 revision 时执行完整 Vitest；工具要求
+至少 900 个通过测试、0 个失败，并确认 Identity-native、one-shot gate、primary-read、full pipeline、
+plugin/campus 与 adapter 六个关键测试文件均实际通过：
+
+```bash
+npm run iam:organization-write:develop-regression -- \
+  --expected-revision=<exact-candidate-full40> \
+  --output=/absolute/private-evidence/develop-regression.json
+```
+
+将模板复制到与六份证据相同的 owner-only `0700` 目录，填写相对路径、exact file SHA-256、候选 revision、
+review date。manifest 和每份证据必须是 ordinary、owner-only `0600`、单链接、canonical 单行 JSON 加换行；
+证据路径和 digest 均不得复用。最后运行：
+
+```bash
+npm run iam:organization-write:develop-completion-gate -- \
+  --manifest=/absolute/private-evidence/develop-completion-manifest.json
+```
+
+唯一成功状态固定为 `develop-complete-production-pending-approval`。它同时固定
+`productionReady=false`、`productionPromotionAllowed=false`、main/publish/Production/tmrpp untouched、
+Legacy cleanup 未授权且未删除。该结论只关闭 Tasks 11.1–11.5 的 Develop 证据工作，不授权任何 Production
+比例、promotion、Legacy 数据清理或 main/publish 变更。

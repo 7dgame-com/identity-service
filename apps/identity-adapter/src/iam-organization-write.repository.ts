@@ -6,7 +6,7 @@ import type { LegacyOrganization } from "./legacy-identity.reader.js";
 
 export type OrganizationWriteOperationStatus = "pending" | "legacy_completed" | "completed" | "failed";
 export type OrganizationWriteCompensationStatus = "none" | "required" | "completed" | "failed";
-export type OrganizationWriteOperationMode = "dual-write" | "candidate-materialization";
+export type OrganizationWriteOperationMode = "dual-write" | "identity-native" | "candidate-materialization";
 
 export const ORGANIZATION_CANDIDATE_MATERIALIZATION_PENDING_LEASE_MS = 5 * 60_000;
 
@@ -81,20 +81,23 @@ export class IamOrganizationWriteRepository implements OnModuleDestroy {
     idempotencyKeyDigest: string;
     requestFingerprint: string;
     legacyUserId: number;
+    mode?: "dual-write" | "identity-native";
     metadata: Record<string, unknown>;
   }): Promise<{ duplicate: boolean }> {
     const pool = this.requirePool();
-    await this.ensureSchema();
+    const mode = input.mode ?? "dual-write";
+    if (mode === "dual-write") await this.ensureSchema();
     const [result] = await pool.execute<ResultSetHeader>(
       `INSERT IGNORE INTO identity_organization_write_operations
         (operation_key, idempotency_key_digest, request_fingerprint, legacy_user_id, mode,
          status, compensation_status, requested_at, metadata)
-       VALUES (?, ?, ?, ?, 'dual-write', 'pending', 'none', ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, 'pending', 'none', ?, ?)`,
       [
         input.operationKey,
         input.idempotencyKeyDigest,
         input.requestFingerprint,
         input.legacyUserId,
+        mode,
         new Date(),
         JSON.stringify(redactOrganizationWriteMetadata(input.metadata))
       ]
@@ -416,6 +419,31 @@ export class IamOrganizationWriteRepository implements OnModuleDestroy {
     };
   }
 
+  async candidateOrganizationsByLegacyIds(legacyOrganizationIds: number[]): Promise<LegacyOrganization[]> {
+    const pool = this.requirePool();
+    const ids = [...new Set(legacyOrganizationIds)].sort((left, right) => left - right);
+    if (ids.length === 0) return [];
+    const placeholders = ids.map(() => "?").join(", ");
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT legacy_organization_id AS id, name, title,
+              JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.legacyCreatedAt')) AS createdAt,
+              JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.legacyUpdatedAt')) AS updatedAt
+         FROM identity_organizations_candidate
+        WHERE source = 'legacy'
+          AND candidate_status = 'candidate'
+          AND legacy_organization_id IN (${placeholders})
+        ORDER BY legacy_organization_id ASC`,
+      ids
+    );
+    return rows.map((row) => ({
+      id: Number(row.id),
+      name: String(row.name),
+      title: String(row.title),
+      createdAt: nullableNumber(row.createdAt),
+      updatedAt: nullableNumber(row.updatedAt)
+    }));
+  }
+
   async countUnresolvedForLegacyUser(legacyUserId: number, excludeOperationKey?: string): Promise<number> {
     const pool = this.requirePool();
     const exclusion = excludeOperationKey ? " AND operation_key <> ?" : "";
@@ -427,7 +455,7 @@ export class IamOrganizationWriteRepository implements OnModuleDestroy {
          FROM identity_organization_write_operations
         WHERE legacy_user_id = ?
           AND NOT (
-            mode IN ('dual-write', 'candidate-materialization')
+            mode IN ('dual-write', 'identity-native', 'candidate-materialization')
             AND (
               (status = 'completed' AND compensation_status IN ('none', 'completed'))
               OR (status = 'failed' AND compensation_status = 'none')
@@ -709,7 +737,7 @@ function operationRecord(row: RowDataPacket): OrganizationWriteOperationRecord {
 }
 
 export function organizationWriteOperationMode(value: unknown): OrganizationWriteOperationMode {
-  if (value === "dual-write" || value === "candidate-materialization") return value;
+  if (value === "dual-write" || value === "identity-native" || value === "candidate-materialization") return value;
   throw new Error(`Unknown organization write operation mode: ${String(value)}`);
 }
 

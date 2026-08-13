@@ -2328,6 +2328,7 @@ describe("identity-adapter readonly API", () => {
       mode: "disabled",
       routeIntegrationEnabled: false,
       dualWriteExecutionEnabled: false,
+      identityNativeExecutionEnabled: false,
       candidateMaterializationEnabled: false,
       candidateMaterializationTargetConfigured: false,
       candidateBatchMaterializationEnabled: false,

@@ -23,6 +23,7 @@ describe("IAM organization membership write compatibility layer", () => {
     delete process.env.IDENTITY_IAM_ORG_WRITE_MODE;
     delete process.env.IDENTITY_IAM_ORG_WRITE_ROUTE_INTEGRATION_ENABLED;
     delete process.env.IDENTITY_IAM_ORG_WRITE_DUAL_WRITE_EXECUTION_ENABLED;
+    delete process.env.IDENTITY_IAM_ORG_WRITE_IDENTITY_NATIVE_EXECUTION_ENABLED;
     delete process.env.IDENTITY_IAM_ORG_WRITE_ROLLOUT_MODE;
     delete process.env.IDENTITY_IAM_ORG_WRITE_ROLLOUT_ALLOWLIST;
     delete process.env.IDENTITY_IAM_ORG_WRITE_ROLLOUT_PERCENTAGE;
@@ -68,6 +69,7 @@ describe("IAM organization membership write compatibility layer", () => {
       organizationWriteMode: "disabled",
       organizationWriteRouteIntegrationEnabled: false,
       organizationWriteDualWriteExecutionEnabled: false,
+      organizationWriteIdentityNativeExecutionEnabled: false,
       organizationWriteRolloutMode: "off",
       organizationWriteRolloutAllowlist: "",
       organizationWriteRolloutPercentage: 0,
@@ -1456,6 +1458,59 @@ describe("IAM organization membership write compatibility layer", () => {
       .rejects.toThrow(`Invalid organization write operation ${field}: expected string or null`);
   });
 
+  it("opens an Identity-native ledger entry without schema mutation and binds the mode explicitly", async () => {
+    const execute = vi.fn(async (_sql: string, _params: unknown[]) => [{ affectedRows: 1 }]);
+    const repository = repositoryWithPool({ execute });
+
+    await expect(repository.begin({
+      operationKey: "native-ledger-operation",
+      idempotencyKeyDigest: "a".repeat(64),
+      requestFingerprint: "b".repeat(64),
+      legacyUserId: 24,
+      mode: "identity-native",
+      metadata: { source: "identity-native-test" }
+    })).resolves.toEqual({ duplicate: false });
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(execute.mock.calls[0]?.[0]).toContain("INSERT IGNORE INTO identity_organization_write_operations");
+    expect(execute.mock.calls[0]?.[1]).toEqual([
+      "native-ledger-operation",
+      "a".repeat(64),
+      "b".repeat(64),
+      24,
+      "identity-native",
+      expect.any(Date),
+      JSON.stringify({ source: "identity-native-test" })
+    ]);
+  });
+
+  it("resolves the reviewed Identity organization catalog by exact positive legacy IDs", async () => {
+    const query = vi.fn(async (_sql: string, _params: unknown[]) => [[{
+      id: "2",
+      name: "two",
+      title: "Two",
+      createdAt: "101",
+      updatedAt: null
+    }]]);
+    const repository = repositoryWithPool({ query });
+
+    await expect(repository.candidateOrganizationsByLegacyIds([2, 1, 2])).resolves.toEqual([{
+      id: 2,
+      name: "two",
+      title: "Two",
+      createdAt: 101,
+      updatedAt: null
+    }]);
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(query.mock.calls[0]?.[0]).toContain("candidate_status = 'candidate'");
+    expect(query.mock.calls[0]?.[1]).toEqual([1, 2]);
+
+    query.mockClear();
+    await expect(repository.candidateOrganizationsByLegacyIds([])).resolves.toEqual([]);
+    expect(query).not.toHaveBeenCalled();
+    expect(organizationWriteOperationMode("identity-native")).toBe("identity-native");
+  });
+
   it("fails closed for unknown ledger mode, status, or compensation values", () => {
     expect(() => organizationWriteOperationMode("future-mode")).toThrow("Unknown organization write operation mode");
     expect(() => organizationWriteOperationStatus("future-status")).toThrow("Unknown organization write operation status");
@@ -1670,6 +1725,12 @@ function createFixture(input: {
 function repositoryWithQuery(query: ReturnType<typeof vi.fn>): IamOrganizationWriteRepository {
   const repository = Object.create(IamOrganizationWriteRepository.prototype) as IamOrganizationWriteRepository;
   Object.defineProperty(repository, "pool", { value: { query } });
+  return repository;
+}
+
+function repositoryWithPool(pool: Record<string, unknown>): IamOrganizationWriteRepository {
+  const repository = Object.create(IamOrganizationWriteRepository.prototype) as IamOrganizationWriteRepository;
+  Object.defineProperty(repository, "pool", { value: pool });
   return repository;
 }
 
