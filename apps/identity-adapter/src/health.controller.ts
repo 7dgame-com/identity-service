@@ -1,5 +1,6 @@
 import { Controller, Get, Inject } from "@nestjs/common";
 import { trace } from "@opentelemetry/api";
+import { publicBuildRevision } from "./build-revision.js";
 import { loadConfig } from "./config.js";
 import { LegacyIdentityReader } from "./legacy-identity.reader.js";
 
@@ -19,7 +20,7 @@ export class HealthController {
         service: "identity-adapter",
         mode: this.config.readonlyMode ? "readonly" : "unsafe",
         version: process.env.npm_package_version ?? "0.1.0",
-        revision: buildRevision(),
+        revision: publicBuildRevision(),
         dependencies: {
           legacyDatabase,
           keycloak: this.config.keycloak.baseUrl ? "configured" : "not_configured"
@@ -51,14 +52,33 @@ export class HealthController {
             mode: this.config.iam.organizationWriteMode,
             routeIntegrationEnabled: this.config.iam.organizationWriteRouteIntegrationEnabled,
             dualWriteExecutionEnabled: this.config.iam.organizationWriteDualWriteExecutionEnabled,
+            identityNativeExecutionEnabled:
+              this.config.iam.organizationWriteIdentityNativeExecutionEnabled,
+            candidateMaterializationEnabled:
+              this.config.iam.organizationWriteCandidateMaterializationEnabled,
+            candidateMaterializationTargetConfigured:
+              this.config.iam.organizationWriteCandidateMaterializationTargetLegacyUserId > 0,
+            candidateBatchMaterializationEnabled:
+              this.config.iam.organizationWriteCandidateBatchMaterializationEnabled,
+            candidateBatchMaterializationEnvironment:
+              this.config.iam.organizationWriteCandidateBatchMaterializationEnvironment,
+            recoveryDrillEnabled:
+              this.config.iam.organizationWriteRecoveryDrillEnabled,
+            recoveryDrillTargetConfigured:
+              this.config.iam.organizationWriteRecoveryDrillTargetLegacyUserId > 0,
             rolloutMode: this.config.iam.organizationWriteRolloutMode,
             rolloutAllowlistCount: this.config.iam.organizationWriteRolloutAllowlist
               .split(",")
               .map((item) => item.trim())
               .filter(Boolean).length,
             rolloutPercentage: this.config.iam.organizationWriteRolloutPercentage,
-            sourceOfTruth: "legacy",
-            identityNativeSupported: false
+            sourceOfTruth: this.config.iam.organizationWriteMode === "identity-native"
+              ? "identity-candidate-selected-legacy-unselected"
+              : "legacy",
+            identityNativeSupported:
+              this.config.iam.organizationWriteMode === "identity-native" &&
+              this.config.iam.organizationWriteRouteIntegrationEnabled &&
+              this.config.iam.organizationWriteIdentityNativeExecutionEnabled
           },
           pluginUserWrite: this.config.iam.pluginUserWriteMode
         }
@@ -67,9 +87,4 @@ export class HealthController {
       span.end();
     }
   }
-}
-
-function buildRevision(): string {
-  const value = process.env.IDENTITY_BUILD_REVISION?.trim().toLowerCase() ?? "";
-  return /^[a-f0-9]{40}$/.test(value) ? value : "unknown";
 }
