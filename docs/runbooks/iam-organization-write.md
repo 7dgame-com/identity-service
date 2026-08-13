@@ -309,8 +309,9 @@ IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_EXPECTED_LEGACY_SUBJECT_COUNT: "0"
 IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_EXPECTED_PROTECTED_SUBJECT_COUNT: "0"
 ```
 
-受控 preview/apply 要求 Identity DB 精确为 `xrugc_identity_dev`、Legacy DB 精确为
-`bujiaban_development`，并要求
+受控 preview/apply 的环境与数据库必须精确匹配：`xrteeth-develop` 只接受 Identity
+`xrugc_identity_dev` / Legacy `bujiaban_development`；`xrteeth-production` 只接受 Identity
+`xrugc_identity` / Legacy `bujiaban`，并额外将总主体数固定为 `807`、受保护主体数固定为 `2`。两种环境都要求
 现有单主体 materialization 已恢复为 disabled/target `0`。preview 只返回聚合计数和 HMAC plan token，
 不返回 Legacy user ID、用户名、角色或组织；plan token 绑定完整 Legacy source snapshot、状态、受保护分类
 和组织 fingerprint。Preview 阶段必须保持 batch `ENABLED=false`；审核 token/计数并取得独立写批准后，
@@ -335,6 +336,7 @@ Preview 阶段 batch `ENABLED=false`，但 environment/key/精确 expected count
 ```sh
 IDENTITY_IAM_INTERNAL_API_TOKEN='<runtime-secret>' \
 npm run iam:organization-write:batch-materialization-gate:dist -- \
+  --environment=xrteeth-develop \
   --adapter-url=http://127.0.0.1:8086 \
   --expected-revision=<full-40-character-develop-git-sha> \
   --expected-legacy-subject-count=<reviewed-full-count> \
@@ -352,6 +354,7 @@ IDENTITY_IAM_ORG_CANDIDATE_BATCH_PLAN_TOKEN='<reviewed-64-hex-plan>' \
 IDENTITY_IAM_ORG_CANDIDATE_BATCH_IDEMPOTENCY_KEY='<approved-window-key>' \
 npm run iam:organization-write:batch-materialization-gate:dist -- \
   --apply \
+  --environment=xrteeth-develop \
   --adapter-url=http://127.0.0.1:8086 \
   --expected-revision=<full-40-character-develop-git-sha> \
   --expected-legacy-subject-count=<reviewed-full-count> \
@@ -385,6 +388,7 @@ IDENTITY_IAM_ORG_CANDIDATE_BATCH_PLAN_TOKEN='<same-reviewed-plan>' \
 IDENTITY_IAM_ORG_CANDIDATE_BATCH_IDEMPOTENCY_KEY='<same-window-key>' \
 npm run iam:organization-write:batch-materialization-gate:dist -- \
   --verify-outcome \
+  --environment=xrteeth-develop \
   --adapter-url=http://127.0.0.1:8086 \
   --expected-revision=<full-40-character-develop-git-sha> \
   --expected-legacy-subject-count=<reviewed-full-count> \
@@ -398,6 +402,7 @@ npm run iam:organization-write:batch-materialization-gate:dist -- \
 IDENTITY_IAM_INTERNAL_API_TOKEN='<runtime-secret>' \
 npm run iam:organization-write:batch-materialization-gate:dist -- \
   --expect-restored \
+  --environment=xrteeth-develop \
   --adapter-url=http://127.0.0.1:8086 \
   --expected-revision=<full-40-character-develop-git-sha>
 ```

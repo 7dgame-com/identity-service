@@ -175,7 +175,7 @@ function fixtureFetch(overrides: {
   candidateMaterializationEnabled?: boolean;
   candidateMaterializationTargetConfigured?: boolean;
   candidateBatchMaterializationEnabled?: boolean;
-  candidateBatchMaterializationEnvironment?: "disabled" | "xrteeth-develop";
+  candidateBatchMaterializationEnvironment?: "disabled" | "xrteeth-develop" | "xrteeth-production";
   decision?: Record<string, unknown>;
   summaryOperations?: Record<string, unknown>[];
   alignment?: Record<string, unknown>;
