@@ -79,6 +79,22 @@ export interface LegacyUserListInput {
   limit: number;
 }
 
+export const LEGACY_ORGANIZATION_CANDIDATE_SOURCE_SNAPSHOT_CONTRACT =
+  "legacy-organization-candidate-source-snapshot/v1" as const;
+
+export interface LegacyOrganizationCandidateSourceSnapshot {
+  readonly contract: typeof LEGACY_ORGANIZATION_CANDIDATE_SOURCE_SNAPSHOT_CONTRACT;
+  readonly users: readonly LegacyOrganizationCandidateSourceUser[];
+}
+
+export interface LegacyOrganizationCandidateSourceUser {
+  readonly id: number;
+  readonly username: string | null;
+  readonly status: number;
+  readonly roles: readonly string[];
+  readonly organizations: readonly Readonly<LegacyOrganization>[];
+}
+
 export interface LegacyManagedUserListInput {
   page: number;
   pageSize: number;
@@ -215,6 +231,110 @@ export class LegacyIdentityReader implements OnModuleDestroy {
 
     const users = await Promise.all(rows.map((row) => this.getUserById(Number(row.id))));
     return users.filter((user): user is LegacyUserReadModel => user !== null);
+  }
+
+  async readOrganizationCandidateSourceSnapshot(): Promise<LegacyOrganizationCandidateSourceSnapshot> {
+    if (!this.pool) {
+      return Object.freeze({
+        contract: LEGACY_ORGANIZATION_CANDIDATE_SOURCE_SNAPSHOT_CONTRACT,
+        users: Object.freeze([])
+      });
+    }
+
+    const connection = await this.pool.getConnection();
+    let transactionStarted = false;
+    try {
+      await connection.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+      await connection.query("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY");
+      transactionStarted = true;
+      const [userRows] = await connection.query<RowDataPacket[]>(
+        "SELECT id, username, status FROM user ORDER BY id ASC LIMIT 5001"
+      );
+      if (userRows.length === 0 || userRows.length > 5000) {
+        throw new Error("Legacy organization source subject count is outside the reviewed bound.");
+      }
+      const [roleRows] = await connection.query<RowDataPacket[]>(
+        `SELECT u.id AS legacyUserId, aa.item_name AS role
+           FROM user u
+           JOIN auth_assignment aa ON aa.user_id = CAST(u.id AS CHAR)
+           JOIN auth_item ai ON ai.name = aa.item_name AND ai.type = 1
+          ORDER BY u.id ASC, CAST(aa.item_name AS BINARY) ASC
+          LIMIT 100001`
+      );
+      if (roleRows.length > 100000) throw new Error("Legacy role assignment count exceeds the reviewed bound.");
+      const [organizationRows] = await connection.query<RowDataPacket[]>(
+        `SELECT u.id AS legacyUserId, o.id, o.name, o.title,
+                o.created_at AS createdAt, o.updated_at AS updatedAt
+           FROM user u
+           JOIN user_organization uo ON uo.user_id = u.id
+           JOIN organization o ON o.id = uo.organization_id
+          ORDER BY u.id ASC, o.id ASC
+          LIMIT 100001`
+      );
+      if (organizationRows.length > 100000) throw new Error("Legacy membership count exceeds the reviewed bound.");
+
+      const byId = new Map<number, LegacyUserReadModel>();
+      for (const row of userRows) {
+        const id = positiveSafeInteger(row.id, "Legacy user id");
+        const status = Number(row.status);
+        if (!Number.isSafeInteger(status)) throw new Error("Legacy user status is invalid.");
+        if (byId.has(id)) throw new Error("Legacy subject snapshot contains a duplicate user id.");
+        byId.set(id, {
+          id,
+          username: row.username === null || row.username === undefined ? null : String(row.username),
+          email: null,
+          status,
+          nickname: null,
+          emailVerifiedAt: null,
+          createdAt: null,
+          updatedAt: null,
+          userInfo: {},
+          roles: [],
+          organizations: [],
+          source: "legacy"
+        });
+      }
+      for (const row of roleRows) {
+        const user = byId.get(positiveSafeInteger(row.legacyUserId, "Legacy role subject id"));
+        if (!user) throw new Error("Legacy role assignment references an unknown subject.");
+        const role = String(row.role ?? "").trim();
+        if (!role) throw new Error("Legacy role assignment contains an empty role.");
+        if (user.roles.includes(role)) throw new Error("Legacy role assignment snapshot contains a duplicate role.");
+        user.roles.push(role);
+      }
+      for (const row of organizationRows) {
+        const user = byId.get(positiveSafeInteger(row.legacyUserId, "Legacy membership subject id"));
+        if (!user) throw new Error("Legacy membership references an unknown subject.");
+        const organization = normalizeOrganization(row);
+        if (user.organizations.some((candidate) => candidate.id === organization.id)) {
+          throw new Error("Legacy membership snapshot contains a duplicate organization.");
+        }
+        user.organizations.push(organization);
+      }
+      const users: LegacyOrganizationCandidateSourceUser[] = [...byId.values()].map((user) => Object.freeze({
+        id: user.id,
+        username: user.username,
+        status: user.status,
+        roles: Object.freeze([...user.roles]),
+        organizations: Object.freeze(user.organizations.map((organization) => Object.freeze({ ...organization })))
+      }));
+      return Object.freeze({
+        contract: LEGACY_ORGANIZATION_CANDIDATE_SOURCE_SNAPSHOT_CONTRACT,
+        users: Object.freeze(users)
+      });
+    } finally {
+      let rollbackError: Error | null = null;
+      if (transactionStarted) {
+        try {
+          await connection.query("ROLLBACK");
+        } catch {
+          connection.destroy();
+          rollbackError = new Error("Legacy organization source snapshot rollback failed.");
+        }
+      }
+      if (!rollbackError) connection.release();
+      if (rollbackError) throw rollbackError;
+    }
   }
 
   async listManagedUsers(input: LegacyManagedUserListInput): Promise<LegacyManagedUserListResult> {
@@ -543,6 +663,12 @@ function normalizeOrganization(row: RowDataPacket): LegacyOrganization {
     createdAt: numberOrNull(row.createdAt),
     updatedAt: numberOrNull(row.updatedAt)
   };
+}
+
+function positiveSafeInteger(value: unknown, label: string): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new Error(`${label} is invalid.`);
+  return parsed;
 }
 
 function numberOrNull(value: unknown): number | null {

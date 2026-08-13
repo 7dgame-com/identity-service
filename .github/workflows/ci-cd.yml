@@ -36,8 +36,27 @@ jobs:
       - name: Run tests
         run: npm test
 
+      - name: Generate Develop completion regression evidence
+        if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+        run: >-
+          npm run iam:organization-write:develop-regression --
+          --expected-revision=${{ github.sha }}
+          --output=${{ github.workspace }}/identity-develop-regression.json
+
+      - name: Retain Develop completion regression evidence
+        if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+        uses: actions/upload-artifact@v4
+        with:
+          name: identity-develop-regression-evidence
+          path: identity-develop-regression.json
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Build TypeScript
         run: npm run build
+
+      - name: Validate immutable build revision input
+        run: npm run build:compiled-revision -- --check "${{ github.sha }}"
 
       - name: Validate Docker Compose
         run: docker compose --profile identity config --quiet
@@ -120,6 +139,7 @@ jobs:
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/publish' }}
 
       - name: Build and push Docker image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -131,3 +151,31 @@ jobs:
             BUILD_REVISION=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Record immutable Develop image provenance
+        if: github.ref == 'refs/heads/develop'
+        env:
+          GIT_SHA: ${{ github.sha }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        run: >-
+          node -e '
+          const fs = require("node:fs");
+          const sha = process.env.GIT_SHA;
+          const digest = process.env.IMAGE_DIGEST;
+          const repository = process.env.IMAGE_REPOSITORY;
+          if (!/^[a-f0-9]{40}$/.test(sha ?? "") || !/^sha256:[a-f0-9]{64}$/.test(digest ?? "") ||
+              !/^[A-Za-z0-9._:/-]+$/.test(repository ?? "")) process.exit(2);
+          const artifact = {contract:"identity-service/develop-image-provenance/v1",gitSha:sha,
+            image:`${repository}@${digest}`,imageDigest:digest};
+          fs.writeFileSync("identity-develop-image-provenance.json", `${JSON.stringify(artifact)}\n`, {encoding:"utf8",flag:"wx",mode:0o600});
+          '
+
+      - name: Retain immutable Develop image provenance
+        if: github.ref == 'refs/heads/develop'
+        uses: actions/upload-artifact@v4
+        with:
+          name: identity-develop-image-provenance-${{ github.sha }}
+          path: identity-develop-image-provenance.json
+          if-no-files-found: error
+          retention-days: 30

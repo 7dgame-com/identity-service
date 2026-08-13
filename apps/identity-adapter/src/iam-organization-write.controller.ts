@@ -1,5 +1,7 @@
-import { Controller, Get, Headers, HttpException, HttpStatus, Param, Post, Query } from "@nestjs/common";
+import { Body, Controller, Get, Headers, HttpException, HttpStatus, Param, Post, Query } from "@nestjs/common";
+import { isProxy } from "node:util/types";
 import { loadConfig } from "./config.js";
+import { currentBuildRevision, normalizeBuildRevision } from "./build-revision.js";
 import { IamOrganizationWriteService } from "./iam-organization-write.service.js";
 
 @Controller("internal/iam/organization-write")
@@ -9,9 +11,9 @@ export class IamOrganizationWriteController {
   constructor(private readonly organizationWrite: IamOrganizationWriteService) {}
 
   @Get("readiness")
-  readiness(@Headers("x-identity-internal-token") token: string | undefined) {
+  async readiness(@Headers("x-identity-internal-token") token: string | undefined) {
     this.assertInternalToken(token);
-    return { status: "ok", service: "identity-adapter", capability: "iam-organization-write", data: this.organizationWrite.readiness() };
+    return { status: "ok", service: "identity-adapter", capability: "iam-organization-write", data: await this.organizationWrite.readiness() };
   }
 
   @Get("operations/summary")
@@ -57,8 +59,40 @@ export class IamOrganizationWriteController {
     };
   }
 
+  @Get("subjects/:legacyUserId/candidate")
+  async subjectCandidate(
+    @Headers("x-identity-internal-token") token: string | undefined,
+    @Param("legacyUserId") legacyUserId: string
+  ) {
+    this.assertInternalToken(token);
+    return {
+      status: "ok",
+      service: "identity-adapter",
+      capability: "iam-organization-write-subject-candidate",
+      data: await this.organizationWrite.subjectCandidate(parseLegacyUserId(legacyUserId))
+    };
+  }
+
+  @Post("subjects/:legacyUserId/identity-native-snapshot-preview")
+  async previewIdentityNativeSnapshot(
+    @Headers("x-identity-internal-token") token: string | undefined,
+    @Param("legacyUserId") legacyUserId: string,
+    @Body() body: unknown
+  ) {
+    this.assertInternalToken(token);
+    return {
+      status: "ok",
+      service: "identity-adapter",
+      capability: "iam-organization-write-identity-native-snapshot-preview",
+      data: await this.organizationWrite.previewIdentityNativeDesiredSnapshot(
+        parseLegacyUserId(legacyUserId),
+        identityNativeOrganizationIds(body)
+      )
+    };
+  }
+
   @Get("subjects/:legacyUserId/decision")
-  previewMembershipRollout(
+  async previewMembershipRollout(
     @Headers("x-identity-internal-token") token: string | undefined,
     @Param("legacyUserId") legacyUserId: string
   ) {
@@ -67,7 +101,21 @@ export class IamOrganizationWriteController {
       status: "ok",
       service: "identity-adapter",
       capability: "iam-organization-write-rollout-preview",
-      data: this.organizationWrite.previewMembershipRollout(parseLegacyUserId(legacyUserId))
+      data: await this.organizationWrite.previewMembershipRollout(parseLegacyUserId(legacyUserId))
+    };
+  }
+
+  @Get("subjects/:legacyUserId/materialization-preview")
+  async previewCandidateMaterialization(
+    @Headers("x-identity-internal-token") token: string | undefined,
+    @Param("legacyUserId") legacyUserId: string
+  ) {
+    this.assertInternalToken(token);
+    return {
+      status: "ok",
+      service: "identity-adapter",
+      capability: "iam-organization-candidate-materialization-preview",
+      data: await this.organizationWrite.previewCandidateMaterialization(parseLegacyUserId(legacyUserId))
     };
   }
 
@@ -85,6 +133,78 @@ export class IamOrganizationWriteController {
     };
   }
 
+  @Post("recovery-drill/prepare")
+  async prepareRecoveryDrill(
+    @Headers("x-identity-internal-token") token: string | undefined
+  ) {
+    this.assertInternalToken(token);
+    return {
+      status: "ok",
+      service: "identity-adapter",
+      capability: "iam-organization-write-recovery-drill",
+      data: await this.organizationWrite.prepareRecoveryDrill()
+    };
+  }
+
+  @Post("subjects/:legacyUserId/materialize-candidate")
+  async materializeCandidate(
+    @Headers("x-identity-internal-token") token: string | undefined,
+    @Headers("x-identity-expected-revision") expectedRevisionHeader: string | string[] | undefined,
+    @Headers("idempotency-key") idempotencyKey: string | string[] | undefined,
+    @Headers("x-idempotency-key") idempotencyKeyAlias: string | string[] | undefined,
+    @Param("legacyUserId") legacyUserId: string,
+    @Body() body: unknown
+  ) {
+    this.assertInternalToken(token);
+    this.assertExpectedBuildRevision(expectedRevisionHeader);
+    return {
+      status: "ok",
+      service: "identity-adapter",
+      capability: "iam-organization-candidate-materialization",
+      data: await this.organizationWrite.materializeCandidate({
+        legacyUserId: parseLegacyUserId(legacyUserId),
+        expectedSnapshotFingerprint: materializationFingerprint(body),
+        idempotencyKey: materializationIdempotencyKey(idempotencyKey, idempotencyKeyAlias)
+      })
+    };
+  }
+
+  @Get("candidate-batch-materialization/preview")
+  async previewCandidateBatchMaterialization(
+    @Headers("x-identity-internal-token") token: string | undefined,
+    @Headers("x-identity-expected-revision") expectedRevisionHeader: string | string[] | undefined
+  ) {
+    this.assertInternalToken(token);
+    this.assertExpectedBuildRevision(expectedRevisionHeader);
+    return {
+      status: "ok",
+      service: "identity-adapter",
+      capability: "iam-organization-candidate-batch-materialization-preview",
+      data: await this.organizationWrite.previewCandidateBatchMaterialization()
+    };
+  }
+
+  @Post("candidate-batch-materialization/apply")
+  async materializeCandidateBatch(
+    @Headers("x-identity-internal-token") token: string | undefined,
+    @Headers("x-identity-expected-revision") expectedRevisionHeader: string | string[] | undefined,
+    @Headers("idempotency-key") idempotencyKey: string | string[] | undefined,
+    @Headers("x-idempotency-key") idempotencyKeyAlias: string | string[] | undefined,
+    @Body() body: unknown
+  ) {
+    this.assertInternalToken(token);
+    this.assertExpectedBuildRevision(expectedRevisionHeader);
+    return {
+      status: "ok",
+      service: "identity-adapter",
+      capability: "iam-organization-candidate-batch-materialization",
+      data: await this.organizationWrite.materializeCandidateBatch({
+        planToken: batchMaterializationPlanToken(body),
+        idempotencyKey: materializationIdempotencyKey(idempotencyKey, idempotencyKeyAlias)
+      })
+    };
+  }
+
   private assertInternalToken(token: string | undefined): void {
     const configuredToken = this.config.iam.internalToken;
     if (!configuredToken) {
@@ -97,6 +217,36 @@ export class IamOrganizationWriteController {
       throw new HttpException({ code: "INTERNAL_TOKEN_INVALID", message: "Internal service token is invalid." }, HttpStatus.UNAUTHORIZED);
     }
   }
+
+  private assertExpectedBuildRevision(value: string | string[] | undefined): void {
+    if (Array.isArray(value) && value.length !== 1) {
+      throw new HttpException(
+        { code: "IDENTITY_EXPECTED_BUILD_REVISION_INVALID", message: "A single full expected build revision is required." },
+        HttpStatus.BAD_REQUEST
+      );
+    }
+    const rawExpected = firstHeader(value);
+    const expected = normalizeBuildRevision(rawExpected);
+    if (!expected || rawExpected?.trim() !== expected) {
+      throw new HttpException(
+        { code: "IDENTITY_EXPECTED_BUILD_REVISION_INVALID", message: "A full expected build revision is required." },
+        HttpStatus.BAD_REQUEST
+      );
+    }
+    const actual = currentBuildRevision();
+    if (!actual) {
+      throw new HttpException(
+        { code: "IDENTITY_BUILD_REVISION_UNAVAILABLE", message: "The running build revision is unavailable." },
+        HttpStatus.SERVICE_UNAVAILABLE
+      );
+    }
+    if (actual !== expected) {
+      throw new HttpException(
+        { code: "IDENTITY_BUILD_REVISION_MISMATCH", message: "The running build does not match the reviewed revision." },
+        HttpStatus.CONFLICT
+      );
+    }
+  }
 }
 
 function parseLegacyUserId(value: string): number {
@@ -105,4 +255,51 @@ function parseLegacyUserId(value: string): number {
     throw new HttpException({ code: "INVALID_LEGACY_USER_ID", message: "Legacy user id must be a positive integer." }, HttpStatus.BAD_REQUEST);
   }
   return parsed;
+}
+
+function identityNativeOrganizationIds(body: unknown): number[] {
+  if (!body || typeof body !== "object" || Array.isArray(body) || isProxy(body)) {
+    throw new HttpException({ code: "IAM_ORGANIZATION_WRITE_INPUT_INVALID" }, HttpStatus.BAD_REQUEST);
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(body);
+  if (Object.keys(descriptors).length !== 1 || !descriptors.organization_ids ||
+    !("value" in descriptors.organization_ids) || !Array.isArray(descriptors.organization_ids.value)) {
+    throw new HttpException({ code: "IAM_ORGANIZATION_WRITE_INPUT_INVALID" }, HttpStatus.BAD_REQUEST);
+  }
+  const values = descriptors.organization_ids.value;
+  if (values.some((value: unknown) => typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0)) {
+    throw new HttpException({ code: "IAM_ORGANIZATION_WRITE_INPUT_INVALID" }, HttpStatus.BAD_REQUEST);
+  }
+  return [...new Set(values as number[])].sort((left, right) => left - right);
+}
+
+function materializationFingerprint(body: unknown): string | undefined {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
+  const value = (body as Record<string, unknown>).expectedSnapshotFingerprint;
+  return typeof value === "string" ? value : undefined;
+}
+
+function batchMaterializationPlanToken(body: unknown): string | undefined {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
+  const value = (body as Record<string, unknown>).planToken;
+  return typeof value === "string" ? value : undefined;
+}
+
+function materializationIdempotencyKey(
+  primary: string | string[] | undefined,
+  alias: string | string[] | undefined
+): string | undefined {
+  const normalizedPrimary = firstHeader(primary)?.trim();
+  const normalizedAlias = firstHeader(alias)?.trim();
+  if (normalizedPrimary && normalizedAlias && normalizedPrimary !== normalizedAlias) {
+    throw new HttpException(
+      { code: "IDEMPOTENCY_KEY_CONFLICT", message: "Conflicting idempotency headers were provided." },
+      HttpStatus.BAD_REQUEST
+    );
+  }
+  return normalizedPrimary || normalizedAlias || undefined;
+}
+
+function firstHeader(value: string | string[] | undefined): string | undefined {
+  return Array.isArray(value) ? value[0] : value;
 }

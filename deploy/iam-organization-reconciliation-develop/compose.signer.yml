@@ -1,0 +1,52 @@
+name: identity-organization-reconciliation-develop-signer
+
+services:
+  develop-hash-signer:
+    image: "${IDENTITY_DEVELOP_IMAGE_REPOSITORY:?set the repository from the Develop provenance artifact}@${IDENTITY_DEVELOP_IMAGE_DIGEST:?set the sha256 digest from the Develop provenance artifact}"
+    pull_policy: always
+    user: "1000:1000"
+    command:
+      - node
+      - dist/scripts/iam-organization-reconciliation-develop-hash-signer-https.js
+      - --config=/run/identity-develop-signer/launcher.json
+    init: true
+    restart: "no"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16777216,uid=1000,gid=1000,mode=0700
+    volumes:
+      - type: volume
+        source: signer-local-secrets
+        target: /run/identity-develop-signer
+        read_only: true
+        volume:
+          nocopy: true
+    networks:
+      signer-private:
+        ipv4_address: "${DEVELOP_SIGNER_CONTAINER_IPV4:?set the private static container IPv4 address}"
+    ports:
+      - target: 8443
+        published: "8443"
+        host_ip: "${DEVELOP_SIGNER_BIND_IPV4:?set the private host bind IPv4 address}"
+        protocol: tcp
+        mode: host
+    stop_grace_period: 10s
+
+networks:
+  signer-private:
+    name: "${DEVELOP_SIGNER_PRIVATE_NETWORK:?set a node-local private bridge name}"
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: "${DEVELOP_SIGNER_PRIVATE_SUBNET:?set a private IPv4 CIDR containing the static address}"
+
+volumes:
+  signer-local-secrets:
+    external: true
+    name: "${DEVELOP_SIGNER_LOCAL_SECRET_VOLUME:?set a pre-created node-local external volume}"

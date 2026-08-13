@@ -134,11 +134,31 @@ export const configSchema = z.object({
     organizationWriteMode: z.enum(["disabled", "legacy-proxy", "dual-write", "identity-native"]).default("disabled"),
     organizationWriteRouteIntegrationEnabled: boolFromEnv.default(false),
     organizationWriteDualWriteExecutionEnabled: boolFromEnv.default(false),
+    organizationWriteIdentityNativeExecutionEnabled: boolFromEnv.default(false),
     organizationWriteRolloutMode: z.enum(["off", "allowlist", "percentage", "full"]).default("off"),
     organizationWriteRolloutAllowlist: z.string().default(""),
     organizationWriteRolloutPercentage: numberFromEnv
       .transform((value) => value ?? 0)
       .pipe(z.number().int().min(0).max(100)),
+    organizationWriteCandidateMaterializationEnabled: boolFromEnv.default(false),
+    organizationWriteCandidateMaterializationTargetLegacyUserId: numberFromEnv
+      .transform((value) => value ?? 0)
+      .pipe(z.number().int().min(0)),
+    organizationWriteCandidateBatchMaterializationEnabled: boolFromEnv.default(false),
+    organizationWriteCandidateBatchMaterializationEnvironment: z
+      .enum(["disabled", "xrteeth-develop"])
+      .default("disabled"),
+    organizationWriteCandidateBatchMaterializationPlanHmacKey: optionalStringFromEnv,
+    organizationWriteCandidateBatchExpectedLegacySubjectCount: numberFromEnv
+      .transform((value) => value ?? 0)
+      .pipe(z.number().int().min(0).max(5000)),
+    organizationWriteCandidateBatchExpectedProtectedSubjectCount: numberFromEnv
+      .transform((value) => value ?? 0)
+      .pipe(z.number().int().min(0).max(5000)),
+    organizationWriteRecoveryDrillEnabled: boolFromEnv.default(false),
+    organizationWriteRecoveryDrillTargetLegacyUserId: numberFromEnv
+      .transform((value) => value ?? 0)
+      .pipe(z.number().int().min(0)),
     pluginUserWriteMode: z.enum(["disabled", "legacy-proxy", "dual-write", "identity-native"]).default("disabled"),
     pluginUserWriteShadowMode: z.enum(["off", "plan", "ledger-only"]).default("off"),
     pluginUserWriteDualWriteExecutionEnabled: boolFromEnv.default(false),
@@ -364,9 +384,29 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
       organizationWriteMode: env.IDENTITY_IAM_ORG_WRITE_MODE,
       organizationWriteRouteIntegrationEnabled: env.IDENTITY_IAM_ORG_WRITE_ROUTE_INTEGRATION_ENABLED,
       organizationWriteDualWriteExecutionEnabled: env.IDENTITY_IAM_ORG_WRITE_DUAL_WRITE_EXECUTION_ENABLED,
+      organizationWriteIdentityNativeExecutionEnabled:
+        env.IDENTITY_IAM_ORG_WRITE_IDENTITY_NATIVE_EXECUTION_ENABLED,
       organizationWriteRolloutMode: env.IDENTITY_IAM_ORG_WRITE_ROLLOUT_MODE,
       organizationWriteRolloutAllowlist: env.IDENTITY_IAM_ORG_WRITE_ROLLOUT_ALLOWLIST,
       organizationWriteRolloutPercentage: env.IDENTITY_IAM_ORG_WRITE_ROLLOUT_PERCENTAGE,
+      organizationWriteCandidateMaterializationEnabled:
+        env.IDENTITY_IAM_ORG_WRITE_CANDIDATE_MATERIALIZATION_ENABLED,
+      organizationWriteCandidateMaterializationTargetLegacyUserId:
+        env.IDENTITY_IAM_ORG_WRITE_CANDIDATE_MATERIALIZATION_TARGET_LEGACY_USER_ID,
+      organizationWriteCandidateBatchMaterializationEnabled:
+        env.IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_MATERIALIZATION_ENABLED,
+      organizationWriteCandidateBatchMaterializationEnvironment:
+        env.IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_MATERIALIZATION_ENVIRONMENT,
+      organizationWriteCandidateBatchMaterializationPlanHmacKey:
+        env.IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_MATERIALIZATION_PLAN_HMAC_KEY,
+      organizationWriteCandidateBatchExpectedLegacySubjectCount:
+        env.IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_EXPECTED_LEGACY_SUBJECT_COUNT,
+      organizationWriteCandidateBatchExpectedProtectedSubjectCount:
+        env.IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_EXPECTED_PROTECTED_SUBJECT_COUNT,
+      organizationWriteRecoveryDrillEnabled:
+        env.IDENTITY_IAM_ORG_WRITE_RECOVERY_DRILL_ENABLED,
+      organizationWriteRecoveryDrillTargetLegacyUserId:
+        env.IDENTITY_IAM_ORG_WRITE_RECOVERY_DRILL_TARGET_LEGACY_USER_ID,
       pluginUserWriteMode: env.IDENTITY_IAM_PLUGIN_USER_WRITE_MODE,
       pluginUserWriteShadowMode: env.IDENTITY_IAM_PLUGIN_USER_WRITE_SHADOW_MODE,
       pluginUserWriteDualWriteExecutionEnabled: env.IDENTITY_IAM_PLUGIN_USER_WRITE_DUAL_WRITE_EXECUTION_ENABLED,

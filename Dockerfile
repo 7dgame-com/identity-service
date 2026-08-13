@@ -4,10 +4,12 @@ COPY package*.json ./
 RUN npm ci
 
 FROM deps AS build
+ARG BUILD_REVISION=unknown
 COPY tsconfig.json vitest.config.ts ./
 COPY apps ./apps
 COPY packages ./packages
 COPY scripts ./scripts
+RUN npm run build:compiled-revision -- "${BUILD_REVISION}"
 RUN npm run build
 
 FROM node:22-alpine AS runtime
