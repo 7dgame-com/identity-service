@@ -224,6 +224,60 @@ describe("xrteeth Develop organization candidate batch materialization", () => {
     })).rejects.toMatchObject({ response: { code: "IAM_ORGANIZATION_CANDIDATE_BATCH_MATERIALIZATION_DISABLED" } });
     expect(fixture.repository.replaceCandidate).not.toHaveBeenCalled();
   });
+
+  it("materializes the exact reviewed Production universe while skipping both protected roots", async () => {
+    const fixture = batchFixture({ environment: "xrteeth-production" });
+    const preview = await fixture.service.previewCandidateBatchMaterialization();
+
+    expect(preview).toMatchObject({
+      contract: "iam-organization-candidate-batch-materialization/xrteeth-production/v1",
+      executable: true,
+      legacySubjectCount: 807,
+      ordinarySubjectCount: 805,
+      protectedSubjectCount: 2,
+      ordinaryAlignedCount: 1,
+      ordinaryMissingCount: 804,
+      ordinaryBlockedCount: 0
+    });
+
+    const result = await fixture.service.materializeCandidateBatch({
+      planToken: preview.planToken,
+      idempotencyKey: "reviewed-production-batch-807-2"
+    });
+    expect(result).toMatchObject({
+      contract: "iam-organization-candidate-batch-materialization/xrteeth-production/v1",
+      completed: true,
+      appliedCount: 804,
+      skippedAlignedCount: 1,
+      protectedSkippedCount: 2,
+      legacyWritePerformed: false,
+      protectedSubjectWritePerformed: false,
+      writeScope: "identity-candidate-only"
+    });
+    expect(fixture.repository.replaceCandidate).toHaveBeenCalledTimes(804);
+    expect(fixture.repository.replaceCandidate).not.toHaveBeenCalledWith(expect.objectContaining({ legacyUserId: 806 }));
+    expect(fixture.repository.replaceCandidate).not.toHaveBeenCalledWith(expect.objectContaining({ legacyUserId: 807 }));
+  });
+
+  it("rejects Production database or 807/2 expectation drift before any candidate write", async () => {
+    const countDrift = batchFixture({ environment: "xrteeth-production", expectedLegacySubjectCount: 806 });
+    await expect(countDrift.service.previewCandidateBatchMaterialization()).rejects.toMatchObject({
+      response: {
+        code: "IAM_ORGANIZATION_CANDIDATE_BATCH_CONFIGURATION_NOT_READY",
+        blockedReasons: expect.arrayContaining(["candidate-batch-production-legacy-subject-count-not-reviewed"])
+      }
+    });
+    expect(countDrift.repository.replaceCandidate).not.toHaveBeenCalled();
+
+    const databaseDrift = batchFixture({ environment: "xrteeth-production", identityDatabaseName: "xrugc_identity_dev" });
+    await expect(databaseDrift.service.previewCandidateBatchMaterialization()).rejects.toMatchObject({
+      response: {
+        code: "IAM_ORGANIZATION_CANDIDATE_BATCH_CONFIGURATION_NOT_READY",
+        blockedReasons: expect.arrayContaining(["candidate-batch-identity-database-mismatch"])
+      }
+    });
+    expect(databaseDrift.repository.replaceCandidate).not.toHaveBeenCalled();
+  });
 });
 
 function batchFixture(input: {
@@ -235,14 +289,30 @@ function batchFixture(input: {
   driftLegacySourceDuringFinalPostcheck?: boolean;
   batchEnabled?: boolean;
   unresolvedSubjectId?: number;
+  environment?: "xrteeth-develop" | "xrteeth-production";
+  identityDatabaseName?: string;
 } = {}) {
   let busySubjectId = input.busySubjectId ?? null;
-  const sources = [
-    sourceUser(1, "ordinary-aligned", [], 10, [organization(1)]),
-    sourceUser(2, "ordinary-missing", [], input.secondStatus ?? 10, []),
-    ...(input.includeSecondMissing ? [sourceUser(3, "ordinary-missing-two", [], 10, [])] : []),
-    sourceUser(input.includeSecondMissing ? 4 : 3, "root", ["root"], 10, [])
-  ];
+  const production = input.environment === "xrteeth-production";
+  if (production) {
+    process.env.IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_MATERIALIZATION_ENVIRONMENT = "xrteeth-production";
+    process.env.IDENTITY_DB_NAME = input.identityDatabaseName ?? "xrugc_identity";
+    process.env.LEGACY_DB_NAME = "bujiaban";
+    process.env.IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_EXPECTED_PROTECTED_SUBJECT_COUNT = "2";
+  }
+  const sources = production
+    ? [
+        sourceUser(1, "ordinary-aligned", [], 10, [organization(1)]),
+        ...Array.from({ length: 804 }, (_, index) => sourceUser(index + 2, `ordinary-${index + 2}`, [], 10, [])),
+        sourceUser(806, "root", ["root"], 10, []),
+        sourceUser(807, "protected-root-two", ["root"], 10, [])
+      ]
+    : [
+        sourceUser(1, "ordinary-aligned", [], 10, [organization(1)]),
+        sourceUser(2, "ordinary-missing", [], input.secondStatus ?? 10, []),
+        ...(input.includeSecondMissing ? [sourceUser(3, "ordinary-missing-two", [], 10, [])] : []),
+        sourceUser(input.includeSecondMissing ? 4 : 3, "root", ["root"], 10, [])
+      ];
   process.env.IDENTITY_IAM_ORG_WRITE_CANDIDATE_BATCH_EXPECTED_LEGACY_SUBJECT_COUNT = String(
     input.expectedLegacySubjectCount ?? sources.length
   );
@@ -250,10 +320,7 @@ function batchFixture(input: {
     input.batchEnabled ?? true
   );
   const candidates = new Map<number, { legacyUserId: number; organizations: LegacyOrganization[] } | null>([
-    [1, { legacyUserId: 1, organizations: [organization(1)] }],
-    [2, null],
-    [3, null],
-    [4, null]
+    [1, { legacyUserId: 1, organizations: [organization(1)] }]
   ]);
   const operations = new Map<string, Record<string, any>>();
   const repository = {
@@ -335,6 +402,9 @@ function batchFixture(input: {
   const plugin = { readiness: vi.fn(() => ({ mode: "legacy-proxy", legacyProxyConfigured: true })) };
   const jwt = { verifyAccessToken: vi.fn(() => { throw new Error("not used"); }) };
   const service = new IamOrganizationWriteService(plugin as never, repository as never, legacy as never, jwt as never);
+  Object.assign(service as unknown as { logger: { log: ReturnType<typeof vi.fn> } }, {
+    logger: { log: vi.fn() }
+  });
   return {
     service,
     repository,

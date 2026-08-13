@@ -2,6 +2,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { pathToFileURL } from "node:url";
 
 export interface OrganizationCandidateBatchGateOptions {
+  environment: "xrteeth-develop" | "xrteeth-production";
   adapterUrl: string;
   token: string | null;
   expectedRevision: string;
@@ -26,7 +27,7 @@ const FULL_REVISION = /^[a-f0-9]{40}$/;
 const FULL_DIGEST = /^[a-f0-9]{64}$/;
 const SHORT_DIGEST = /^[a-f0-9]{16}$/;
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
-const CONTRACT = "iam-organization-candidate-batch-materialization/xrteeth-develop/v1";
+const CONTRACT_PREFIX = "iam-organization-candidate-batch-materialization";
 
 export async function runOrganizationCandidateBatchGate(
   options: OrganizationCandidateBatchGateOptions,
@@ -137,6 +138,7 @@ export function parseOrganizationCandidateBatchGateArgs(
   env: NodeJS.ProcessEnv = process.env
 ): OrganizationCandidateBatchGateOptions {
   const options: OrganizationCandidateBatchGateOptions = {
+    environment: "xrteeth-develop",
     adapterUrl: "",
     token: env[INTERNAL_TOKEN_ENV]?.trim() || null,
     expectedRevision: "",
@@ -166,6 +168,13 @@ export function parseOrganizationCandidateBatchGateArgs(
     } else if (arg.startsWith("--adapter-url=")) {
       claim("--adapter-url");
       options.adapterUrl = arg.slice("--adapter-url=".length);
+    } else if (arg.startsWith("--environment=")) {
+      claim("--environment");
+      const environment = arg.slice("--environment=".length);
+      if (environment !== "xrteeth-develop" && environment !== "xrteeth-production") {
+        throw new Error("Environment must be xrteeth-develop or xrteeth-production.");
+      }
+      options.environment = environment;
     } else if (arg.startsWith("--expected-revision=")) {
       claim("--expected-revision");
       options.expectedRevision = arg.slice("--expected-revision=".length);
@@ -309,7 +318,7 @@ function assertHealth(
     failures,
     "health batch environment",
     posture?.candidateBatchMaterializationEnvironment,
-    restored ? "disabled" : "xrteeth-develop"
+    restored ? "disabled" : options.environment
   );
   equal(failures, "health rollout mode", posture?.rolloutMode, "off");
   equal(failures, "health rollout allowlist count", posture?.rolloutAllowlistCount, 0);
@@ -325,9 +334,9 @@ function assertReadiness(
 ): void {
   assertEnvelope(failures, "readiness", response, "iam-organization-write");
   const batch = response.body.data?.candidateBatchMaterialization;
-  equal(failures, "readiness contract", batch?.contract, CONTRACT);
+  equal(failures, "readiness contract", batch?.contract, contract(options.environment));
   equal(failures, "readiness enabled", batch?.enabled, applyEnabled);
-  equal(failures, "readiness environment", batch?.environment, restored ? "disabled" : "xrteeth-develop");
+  equal(failures, "readiness environment", batch?.environment, restored ? "disabled" : options.environment);
   equal(failures, "readiness plan key", batch?.planHmacKeyConfigured, !restored);
   equal(
     failures,
@@ -358,7 +367,7 @@ function assertPreview(
 ): void {
   assertEnvelope(failures, "preview", response, "iam-organization-candidate-batch-materialization-preview");
   const data = response.body.data;
-  equal(failures, "preview contract", data?.contract, CONTRACT);
+  equal(failures, "preview contract", data?.contract, contract(options.environment));
   equal(failures, "preview mutation", data?.mutation, false);
   equal(failures, "preview executable", data?.executable, true);
   equal(failures, "preview apply enabled", data?.applyEnabled, applyEnabled);
@@ -407,7 +416,7 @@ function assertApply(
 ): void {
   assertEnvelope(failures, "apply", response, "iam-organization-candidate-batch-materialization", 201);
   const data = response.body.data;
-  equal(failures, "apply contract", data?.contract, CONTRACT);
+  equal(failures, "apply contract", data?.contract, contract(options.environment));
   equal(failures, "apply completed", data?.completed, true);
   equal(failures, "apply Legacy subjects", data?.legacySubjectCount, options.expectedLegacySubjectCount);
   equal(
@@ -441,6 +450,9 @@ function assertApply(
 }
 
 function validateOptions(options: OrganizationCandidateBatchGateOptions): string {
+  if (options.environment !== "xrteeth-develop" && options.environment !== "xrteeth-production") {
+    throw new Error("Environment must be xrteeth-develop or xrteeth-production.");
+  }
   if ([options.apply, options.verifyOutcome, options.expectRestored].filter(Boolean).length > 1) {
     throw new Error("Apply, outcome-verification and restored-posture modes are mutually exclusive.");
   }
@@ -456,6 +468,10 @@ function validateOptions(options: OrganizationCandidateBatchGateOptions): string
       options.expectedProtectedSubjectCount >= options.expectedLegacySubjectCount) {
       throw new Error("Expected protected subject count is invalid.");
     }
+    if (options.environment === "xrteeth-production" &&
+      (options.expectedLegacySubjectCount !== 807 || options.expectedProtectedSubjectCount !== 2)) {
+      throw new Error("xrteeth-production requires the reviewed 807/2 subject universe.");
+    }
   }
   if (options.apply || options.verifyOutcome) {
     if (!options.planToken || !FULL_DIGEST.test(options.planToken)) throw new Error(`${PLAN_TOKEN_ENV} is required.`);
@@ -464,6 +480,10 @@ function validateOptions(options: OrganizationCandidateBatchGateOptions): string
     }
   }
   return base;
+}
+
+function contract(environment: OrganizationCandidateBatchGateOptions["environment"]): string {
+  return `${CONTRACT_PREFIX}/${environment}/v1`;
 }
 
 function loopbackBase(value: string): string {

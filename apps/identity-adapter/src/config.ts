@@ -146,7 +146,7 @@ export const configSchema = z.object({
       .pipe(z.number().int().min(0)),
     organizationWriteCandidateBatchMaterializationEnabled: boolFromEnv.default(false),
     organizationWriteCandidateBatchMaterializationEnvironment: z
-      .enum(["disabled", "xrteeth-develop"])
+      .enum(["disabled", "xrteeth-develop", "xrteeth-production"])
       .default("disabled"),
     organizationWriteCandidateBatchMaterializationPlanHmacKey: optionalStringFromEnv,
     organizationWriteCandidateBatchExpectedLegacySubjectCount: numberFromEnv

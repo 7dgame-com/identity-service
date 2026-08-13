@@ -50,8 +50,15 @@ export interface IamOrganizationWriteProxyResponse {
   evidence: IamOrganizationWriteEvidence;
 }
 
-export const ORGANIZATION_CANDIDATE_BATCH_MATERIALIZATION_CONTRACT =
+export const ORGANIZATION_CANDIDATE_BATCH_MATERIALIZATION_DEVELOP_CONTRACT =
   "iam-organization-candidate-batch-materialization/xrteeth-develop/v1" as const;
+export const ORGANIZATION_CANDIDATE_BATCH_MATERIALIZATION_PRODUCTION_CONTRACT =
+  "iam-organization-candidate-batch-materialization/xrteeth-production/v1" as const;
+
+type OrganizationCandidateBatchEnvironment = "xrteeth-develop" | "xrteeth-production";
+type OrganizationCandidateBatchContract =
+  | typeof ORGANIZATION_CANDIDATE_BATCH_MATERIALIZATION_DEVELOP_CONTRACT
+  | typeof ORGANIZATION_CANDIDATE_BATCH_MATERIALIZATION_PRODUCTION_CONTRACT;
 
 interface OrganizationCandidateBatchSubjectPlan {
   readonly source: LegacyOrganizationCandidateSourceUser;
@@ -64,6 +71,7 @@ interface OrganizationCandidateBatchSubjectPlan {
 }
 
 interface OrganizationCandidateBatchPlan {
+  readonly contract: OrganizationCandidateBatchContract;
   readonly planToken: string;
   readonly subjects: readonly OrganizationCandidateBatchSubjectPlan[];
   readonly legacySubjectCount: number;
@@ -218,7 +226,7 @@ export class IamOrganizationWriteService {
         writeScope: "identity-candidate-only"
       },
       candidateBatchMaterialization: {
-        contract: ORGANIZATION_CANDIDATE_BATCH_MATERIALIZATION_CONTRACT,
+        contract: candidateBatchContract(iam.organizationWriteCandidateBatchMaterializationEnvironment),
         enabled: iam.organizationWriteCandidateBatchMaterializationEnabled,
         environment: iam.organizationWriteCandidateBatchMaterializationEnvironment,
         planHmacKeyConfigured: candidateBatchPlanHmacKeyConfigured(iam),
@@ -649,7 +657,7 @@ export class IamOrganizationWriteService {
         skippedAlignedCount
       }));
       return {
-        contract: ORGANIZATION_CANDIDATE_BATCH_MATERIALIZATION_CONTRACT,
+        contract: plan.contract,
         mutation: appliedCount > 0,
         completed: true,
         planTokenDigest: shortDigest(planToken),
@@ -675,6 +683,7 @@ export class IamOrganizationWriteService {
   }
 
   private async createCandidateBatchPlan(): Promise<OrganizationCandidateBatchPlan> {
+    const environment = this.requireCandidateBatchEnvironment();
     const snapshot = await this.legacy.readOrganizationCandidateSourceSnapshot();
     const users = [...snapshot.users];
     if (users.length === 0 || users.length > 5000) {
@@ -732,7 +741,7 @@ export class IamOrganizationWriteService {
     let planToken: string;
     try {
       planToken = createHmac("sha256", key)
-        .update("iam-organization-candidate-batch-plan:xrteeth-develop:v1\u001f", "utf8")
+        .update(`iam-organization-candidate-batch-plan:${environment}:v1\u001f`, "utf8")
         .update(JSON.stringify(subjects.map((subject) => ({
           legacyUserId: subject.source.id,
           status: subject.source.status,
@@ -758,6 +767,7 @@ export class IamOrganizationWriteService {
         : [])
     ]);
     return Object.freeze({
+      contract: candidateBatchContract(environment),
       planToken,
       subjects: Object.freeze(subjects),
       legacySubjectCount: subjects.length,
@@ -1600,12 +1610,18 @@ export class IamOrganizationWriteService {
 
   private candidateBatchConfigurationBlockedReasons(): string[] {
     const { iam, identityDb, legacyDb } = this.config;
+    const environment = iam.organizationWriteCandidateBatchMaterializationEnvironment;
+    const reviewedEnvironment = environment === "xrteeth-develop" || environment === "xrteeth-production";
+    const expectedIdentityDatabase = environment === "xrteeth-production" ? "xrugc_identity" : "xrugc_identity_dev";
+    const expectedLegacyDatabase = environment === "xrteeth-production"
+      ? "bujiaban"
+      : ORGANIZATION_RECONCILIATION_DEVELOP_LEGACY_DATABASE;
     return [
-      ...(iam.organizationWriteCandidateBatchMaterializationEnvironment !== "xrteeth-develop"
-        ? ["candidate-batch-environment-not-xrteeth-develop"]
+      ...(!reviewedEnvironment
+        ? ["candidate-batch-environment-not-reviewed"]
         : []),
-      ...(identityDb.name !== "xrugc_identity_dev" ? ["candidate-batch-identity-database-mismatch"] : []),
-      ...(legacyDb.name !== ORGANIZATION_RECONCILIATION_DEVELOP_LEGACY_DATABASE
+      ...(identityDb.name !== expectedIdentityDatabase ? ["candidate-batch-identity-database-mismatch"] : []),
+      ...(legacyDb.name !== expectedLegacyDatabase
         ? ["candidate-batch-legacy-database-mismatch"]
         : []),
       ...(!candidateBatchPlanHmacKeyConfigured(iam) ? ["candidate-batch-plan-hmac-key-not-configured"] : []),
@@ -1616,6 +1632,14 @@ export class IamOrganizationWriteService {
         iam.organizationWriteCandidateBatchExpectedProtectedSubjectCount >=
           iam.organizationWriteCandidateBatchExpectedLegacySubjectCount
         ? ["candidate-batch-expected-protected-subject-count-not-configured"]
+        : []),
+      ...(environment === "xrteeth-production" &&
+        iam.organizationWriteCandidateBatchExpectedLegacySubjectCount !== 807
+        ? ["candidate-batch-production-legacy-subject-count-not-reviewed"]
+        : []),
+      ...(environment === "xrteeth-production" &&
+        iam.organizationWriteCandidateBatchExpectedProtectedSubjectCount !== 2
+        ? ["candidate-batch-production-protected-subject-count-not-reviewed"]
         : [])
     ];
   }
@@ -1625,10 +1649,21 @@ export class IamOrganizationWriteService {
     if (blockedReasons.length > 0) {
       throw new ServiceUnavailableException({
         code: "IAM_ORGANIZATION_CANDIDATE_BATCH_CONFIGURATION_NOT_READY",
-        message: "The xrteeth Develop candidate batch configuration is not complete.",
+        message: "The reviewed xrteeth candidate batch configuration is not complete.",
         blockedReasons
       });
     }
+  }
+
+  private requireCandidateBatchEnvironment(): OrganizationCandidateBatchEnvironment {
+    const environment = this.config.iam.organizationWriteCandidateBatchMaterializationEnvironment;
+    if (environment !== "xrteeth-develop" && environment !== "xrteeth-production") {
+      throw new ServiceUnavailableException({
+        code: "IAM_ORGANIZATION_CANDIDATE_BATCH_CONFIGURATION_NOT_READY",
+        message: "The reviewed xrteeth candidate batch environment is not configured."
+      });
+    }
+    return environment;
   }
 
   private requireCandidateBatchPlanHmacKey(): Buffer {
@@ -1885,7 +1920,7 @@ function candidateBatchPublicPlan(
     ...input.postureBlockers
   ]);
   return {
-    contract: ORGANIZATION_CANDIDATE_BATCH_MATERIALIZATION_CONTRACT,
+    contract: plan.contract,
     mutation: false,
     executable: blockedReasons.length === 0,
     applyEnabled: input.applyEnabled,
@@ -1905,6 +1940,14 @@ function candidateBatchPublicPlan(
     protectedSubjectWritePerformed: false,
     blockedReasons
   };
+}
+
+function candidateBatchContract(
+  environment: "disabled" | OrganizationCandidateBatchEnvironment
+): OrganizationCandidateBatchContract {
+  return environment === "xrteeth-production"
+    ? ORGANIZATION_CANDIDATE_BATCH_MATERIALIZATION_PRODUCTION_CONTRACT
+    : ORGANIZATION_CANDIDATE_BATCH_MATERIALIZATION_DEVELOP_CONTRACT;
 }
 
 function candidateBatchPlanTokenInput(value: string | undefined): string {
