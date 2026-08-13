@@ -11,7 +11,7 @@ export interface OrganizationWritePublicGateOptions {
   expectedCandidateMaterializationEnabled: boolean;
   expectedCandidateMaterializationTargetConfigured: boolean;
   expectedCandidateBatchMaterializationEnabled: boolean;
-  expectedCandidateBatchMaterializationEnvironment: "disabled" | "xrteeth-develop";
+  expectedCandidateBatchMaterializationEnvironment: "disabled" | "xrteeth-develop" | "xrteeth-production";
   expectedRecoveryDrillEnabled: boolean;
   expectedRecoveryDrillTargetConfigured: boolean;
   expectedRolloutMode: "off" | "allowlist" | "percentage" | "full";
@@ -175,7 +175,7 @@ export function parseOrganizationWritePublicGateArgs(argv: string[]): Organizati
       options.expectedCandidateBatchMaterializationEnvironment = enumValue(
         arg,
         "--expected-candidate-batch-materialization-environment=",
-        ["disabled", "xrteeth-develop"]
+        ["disabled", "xrteeth-develop", "xrteeth-production"]
       );
     } else if (arg.startsWith("--expected-recovery-drill-enabled=")) {
       options.expectedRecoveryDrillEnabled = booleanValue(arg, "--expected-recovery-drill-enabled=");

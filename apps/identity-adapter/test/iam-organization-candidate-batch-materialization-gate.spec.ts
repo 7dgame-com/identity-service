@@ -40,6 +40,30 @@ describe("organization candidate batch materialization operator gate", () => {
     expect(JSON.stringify(result)).not.toContain("ordinary-user");
   });
 
+  it("binds the Production operator gate to the reviewed 807/2 universe and Production contract", async () => {
+    const fetcher = batchFetcher({ applyEnabled: false, environment: "xrteeth-production" });
+
+    const result = await runOrganizationCandidateBatchGate(options({
+      environment: "xrteeth-production",
+      expectedLegacySubjectCount: 807,
+      expectedProtectedSubjectCount: 2
+    }), fetcher);
+
+    expect(result).toMatchObject({
+      passed: true,
+      mode: "preview",
+      counts: {
+        legacySubjects: 807,
+        ordinarySubjects: 805,
+        protectedSubjects: 2,
+        ordinaryAligned: 1,
+        ordinaryMissing: 804
+      },
+      safety: { sourceOfTruth: "legacy", legacyWritePerformed: false, protectedSubjectWritePerformed: false }
+    });
+    expect(fetcher.mock.calls.some(([, init]) => init?.method === "POST")).toBe(false);
+  });
+
   it("sends one reviewed POST and requires a fresh full-range aligned preview", async () => {
     const fetcher = batchFetcher({ applyEnabled: true });
 
@@ -155,6 +179,19 @@ describe("organization candidate batch materialization operator gate", () => {
     expect(result.failures).toContain("readiness plan key expected false, got true");
   });
 
+  it("verifies the default disabled contract after restoring the Production gate", async () => {
+    const restored = batchFetcher({ restored: true, environment: "xrteeth-production" });
+
+    await expect(runOrganizationCandidateBatchGate(options({
+      environment: "xrteeth-production",
+      expectRestored: true
+    }), restored)).resolves.toMatchObject({
+      passed: true,
+      mode: "expect-restored",
+      failures: []
+    });
+  });
+
   it("rejects remote URLs, duplicate flags and command-line secrets before I/O", () => {
     const env = {
       IDENTITY_IAM_INTERNAL_API_TOKEN: TOKEN,
@@ -186,11 +223,19 @@ describe("organization candidate batch materialization operator gate", () => {
       ...required,
       `--token=${TOKEN}`
     ], env)).toThrow("Do not pass tokens");
+    expect(() => parseOrganizationCandidateBatchGateArgs([
+      "--environment=xrteeth-production",
+      "--adapter-url=http://127.0.0.1:8086",
+      `--expected-revision=${REVISION}`,
+      "--expected-legacy-subject-count=806",
+      "--expected-protected-subject-count=2"
+    ], env)).toThrow("reviewed 807/2");
   });
 });
 
 function options(overrides: Partial<OrganizationCandidateBatchGateOptions> = {}): OrganizationCandidateBatchGateOptions {
   return {
+    environment: "xrteeth-develop",
     adapterUrl: "http://127.0.0.1:8086",
     token: TOKEN,
     expectedRevision: REVISION,
@@ -213,8 +258,13 @@ function batchFetcher(input: {
   restoredPlanKeyConfigured?: boolean;
   initiallyApplied?: boolean;
   previewBlocked?: boolean;
+  environment?: "xrteeth-develop" | "xrteeth-production";
 }) {
   let applied = input.initiallyApplied === true;
+  const environment = input.environment ?? "xrteeth-develop";
+  const legacySubjectCount = environment === "xrteeth-production" ? 807 : 3;
+  const protectedSubjectCount = environment === "xrteeth-production" ? 2 : 1;
+  const ordinarySubjectCount = legacySubjectCount - protectedSubjectCount;
   const fetcher = vi.fn(async (urlValue: string | URL | Request, init?: RequestInit) => {
     const url = String(urlValue);
     if (url.endsWith("/health")) return json(health(input));
@@ -230,14 +280,14 @@ function batchFetcher(input: {
         service: "identity-adapter",
         capability: "iam-organization-candidate-batch-materialization",
         data: {
-          contract: "iam-organization-candidate-batch-materialization/xrteeth-develop/v1",
+          contract: `iam-organization-candidate-batch-materialization/${environment}/v1`,
           mutation: true,
           completed: true,
           planTokenDigest: createHash("sha256").update(PLAN, "utf8").digest("hex").slice(0, 16),
-          legacySubjectCount: 3,
-          ordinarySubjectCount: 2,
-          protectedSkippedCount: 1,
-          appliedCount: 1,
+          legacySubjectCount,
+          ordinarySubjectCount,
+          protectedSkippedCount: protectedSubjectCount,
+          appliedCount: ordinarySubjectCount - 1,
           replayedCount: 0,
           skippedAlignedCount: 1,
           sourceOfTruth: "legacy",
@@ -254,6 +304,7 @@ function batchFetcher(input: {
 
 function health(input: Parameters<typeof batchFetcher>[0]) {
   const restored = input.restored === true;
+  const environment = input.environment ?? "xrteeth-develop";
   return {
     status: "ok",
     service: "identity-adapter",
@@ -266,7 +317,7 @@ function health(input: Parameters<typeof batchFetcher>[0]) {
         candidateMaterializationEnabled: false,
         candidateMaterializationTargetConfigured: false,
         candidateBatchMaterializationEnabled: restored ? false : input.applyEnabled === true,
-        candidateBatchMaterializationEnvironment: restored ? "disabled" : "xrteeth-develop",
+        candidateBatchMaterializationEnvironment: restored ? "disabled" : environment,
         rolloutMode: "off",
         rolloutAllowlistCount: 0,
         rolloutPercentage: 0
@@ -278,18 +329,21 @@ function health(input: Parameters<typeof batchFetcher>[0]) {
 function readiness(input: Parameters<typeof batchFetcher>[0]) {
   const restored = input.restored === true;
   const applyEnabled = input.applyEnabled === true && !restored;
+  const environment = input.environment ?? "xrteeth-develop";
+  const legacySubjectCount = environment === "xrteeth-production" ? 807 : 3;
+  const protectedSubjectCount = environment === "xrteeth-production" ? 2 : 1;
   return {
     status: "ok",
     service: "identity-adapter",
     capability: "iam-organization-write",
     data: {
       candidateBatchMaterialization: {
-        contract: "iam-organization-candidate-batch-materialization/xrteeth-develop/v1",
+        contract: `iam-organization-candidate-batch-materialization/${restored ? "xrteeth-develop" : environment}/v1`,
         enabled: applyEnabled,
-        environment: restored ? "disabled" : "xrteeth-develop",
+        environment: restored ? "disabled" : environment,
         planHmacKeyConfigured: restored ? input.restoredPlanKeyConfigured === true : true,
-        expectedLegacySubjectCount: restored ? 0 : 3,
-        expectedProtectedSubjectCount: restored ? 0 : 1,
+        expectedLegacySubjectCount: restored ? 0 : legacySubjectCount,
+        expectedProtectedSubjectCount: restored ? 0 : protectedSubjectCount,
         canPreview: !restored,
         canApply: applyEnabled,
         sourceOfTruth: "legacy",
@@ -302,26 +356,30 @@ function readiness(input: Parameters<typeof batchFetcher>[0]) {
 }
 
 function preview(input: Parameters<typeof batchFetcher>[0], applied: boolean) {
-  const ordinaryMissing = applied ? 0 : 1;
+  const environment = input.environment ?? "xrteeth-develop";
+  const legacySubjectCount = environment === "xrteeth-production" ? 807 : 3;
+  const protectedSubjectCount = environment === "xrteeth-production" ? 2 : 1;
+  const ordinarySubjectCount = legacySubjectCount - protectedSubjectCount;
+  const ordinaryMissing = applied ? 0 : ordinarySubjectCount - 1;
   return {
     status: "ok",
     service: "identity-adapter",
     capability: "iam-organization-candidate-batch-materialization-preview",
     data: {
-      contract: "iam-organization-candidate-batch-materialization/xrteeth-develop/v1",
+      contract: `iam-organization-candidate-batch-materialization/${environment}/v1`,
       mutation: false,
       executable: true,
       applyEnabled: input.applyEnabled === true,
       planToken: input.planToken ?? PLAN,
-      legacySubjectCount: 3,
-      ordinarySubjectCount: 2,
-      protectedSubjectCount: 1,
-      ordinaryAlignedCount: 2 - ordinaryMissing,
+      legacySubjectCount,
+      ordinarySubjectCount,
+      protectedSubjectCount,
+      ordinaryAlignedCount: ordinarySubjectCount - ordinaryMissing,
       ordinaryMissingCount: ordinaryMissing,
       ordinaryBlockedCount: 0,
       inactiveOrdinaryCount: 0,
       protectedAlignedCount: 0,
-      protectedMissingCount: 1,
+      protectedMissingCount: protectedSubjectCount,
       sourceOfTruth: "legacy",
       legacyWritePerformed: false,
       identityCandidateWritePerformed: false,

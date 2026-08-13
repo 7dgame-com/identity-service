@@ -131,7 +131,7 @@ function fixtureFetch(overrides: {
   candidateMaterializationEnabled?: boolean;
   candidateMaterializationTargetConfigured?: boolean;
   candidateBatchMaterializationEnabled?: boolean;
-  candidateBatchMaterializationEnvironment?: "disabled" | "xrteeth-develop";
+  candidateBatchMaterializationEnvironment?: "disabled" | "xrteeth-develop" | "xrteeth-production";
   omitMaterializationPosture?: boolean;
   recoveryDrillEnabled?: boolean;
   recoveryDrillTargetConfigured?: boolean;
