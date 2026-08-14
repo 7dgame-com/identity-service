@@ -43,6 +43,38 @@ describe("plugin-user Identity-native organization read ownership", () => {
     expect(fixture.organizationRepository.candidateForLegacyUser).not.toHaveBeenCalled();
   });
 
+  it("keeps an owned protected root on its read-only Legacy organizations without requiring a candidate", async () => {
+    const fixture = createFixture({
+      candidateMissing: true,
+      username: "root",
+      roles: ["root"]
+    });
+
+    const result = await fixture.service.getUserById(24, claims());
+
+    expect(result.data?.organizations).toEqual([organization(1, "legacy", "Legacy")]);
+    expect(result.data?.roles).toEqual(["root"]);
+    expect(fixture.organizationRepository.candidateForLegacyUser).not.toHaveBeenCalled();
+  });
+
+  it("keeps the compatible user list available when it contains a protected root without a candidate", async () => {
+    const fixture = createFixture({
+      candidateMissing: true,
+      username: "root",
+      roles: ["root"]
+    });
+
+    const result = await fixture.service.listUsers({
+      page: 1,
+      pageSize: 20,
+      order: "desc"
+    }, claims());
+
+    expect(result.data.users).toHaveLength(1);
+    expect(result.data.users[0]?.organizations).toEqual([organization(1, "legacy", "Legacy")]);
+    expect(fixture.organizationRepository.candidateForLegacyUser).not.toHaveBeenCalled();
+  });
+
   it("fails closed for an owned target when its Identity candidate is missing", async () => {
     const fixture = createFixture({ candidateMissing: true });
 
@@ -51,25 +83,37 @@ describe("plugin-user Identity-native organization read ownership", () => {
   });
 });
 
-function createFixture(input: { candidateMissing?: boolean } = {}) {
+function createFixture(input: {
+  candidateMissing?: boolean;
+  username?: string;
+  roles?: string[];
+} = {}) {
+  const managedUser = (id: number): LegacyUserReadModel => ({
+    id,
+    username: input.username ?? `user-${id}`,
+    email: null,
+    status: 10,
+    nickname: null,
+    emailVerifiedAt: null,
+    createdAt: 1,
+    updatedAt: 2,
+    userInfo: {},
+    roles: input.roles ?? ["user"],
+    organizations: [organization(1, "legacy", "Legacy")],
+    source: "legacy"
+  });
   const legacyReader = {
-    getUserById: vi.fn(async (id: number): Promise<LegacyUserReadModel> => ({
-      id,
-      username: `user-${id}`,
-      email: null,
-      status: 10,
-      nickname: null,
-      emailVerifiedAt: null,
-      createdAt: 1,
-      updatedAt: 2,
-      userInfo: {},
-      roles: ["user"],
-      organizations: [organization(1, "legacy", "Legacy")],
-      source: "legacy"
+    getUserById: vi.fn(async (id: number): Promise<LegacyUserReadModel> => managedUser(id)),
+    listManagedUsers: vi.fn(async (request: { page: number; pageSize: number }) => ({
+      users: [managedUser(24)],
+      page: request.page,
+      pageSize: request.pageSize,
+      total: 1,
+      totalPages: 1
     }))
   };
   const iamRepository = {
-    listRoleAssignmentsShadow: vi.fn(async () => [{ roleName: "user" }])
+    listRoleAssignmentsShadow: vi.fn(async () => (input.roles ?? ["user"]).map((roleName) => ({ roleName })))
   };
   const organizationRepository = {
     isConfigured: vi.fn(() => true),
