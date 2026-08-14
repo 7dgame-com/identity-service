@@ -202,10 +202,16 @@ export class PluginUserPrimaryReadService {
 
   private async withAuthoritativeRoles(user: LegacyUserReadModel | null): Promise<LegacyUserReadModel | null> {
     if (!user) return null;
+    const roles = await this.managedRoleNames(user.id, user.roles);
     return {
       ...user,
-      roles: await this.managedRoleNames(user.id, user.roles),
-      organizations: await this.authoritativeOrganizations(user.id, user.organizations)
+      roles,
+      // Protected root subjects are intentionally excluded from organization
+      // candidate materialization. Their compatible read model therefore stays
+      // on the existing read-only Legacy organization projection.
+      organizations: isProtectedOrganizationReadSubject(user, roles)
+        ? user.organizations
+        : await this.authoritativeOrganizations(user.id, user.organizations)
     };
   }
 
@@ -537,6 +543,11 @@ function serializeComparableUser(user: LegacyUserReadModel | undefined) {
       title: organization.title
     }))
   };
+}
+
+function isProtectedOrganizationReadSubject(user: LegacyUserReadModel, roles: string[]): boolean {
+  return user.username?.trim().toLowerCase() === "root"
+    || roles.some((role) => role.trim().toLowerCase() === "root");
 }
 
 function toLegacyOrganization(organization: IdentityOrganizationShadowRow): LegacyOrganization {
