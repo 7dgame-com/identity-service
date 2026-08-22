@@ -212,9 +212,9 @@ export class IamRoleWriteService {
    * Explains why a configured role-write candidate is (or is not) executable without
    * disclosing a policy checksum or mutating Legacy, Identity, or the operation ledger.
    */
-  async policyDiagnostics() {
+  async policyDiagnostics(policyChecksumOverride?: string) {
     const { iam } = this.config;
-    const configuredChecksum = iam.roleWritePolicyChecksum;
+    const configuredChecksum = policyChecksumOverride ?? iam.roleWritePolicyChecksum;
     const sources = {
       legacyReaderConfigured: this.legacyReader.isConfigured(),
       identityRepositoryConfigured: this.iamRepository.isConfigured()

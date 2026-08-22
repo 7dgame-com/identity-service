@@ -5129,7 +5129,8 @@ describe("identity-adapter IAM role write API", () => {
     const currentPolicy = createIamPermissionPolicySnapshot(await legacyReader.readRbacPolicySnapshot());
     await iamRepository.upsertPermissionPolicyCandidate(currentPolicy, "public-prefix-preflight-test");
     iamRepository.subjectAssignments.set(25, [{ itemName: "user", itemType: "role" }]);
-    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = currentPolicy.checksum;
+    delete process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM;
+    process.env.IDENTITY_IAM_AUTHZ_POLICY_CHECKSUM = currentPolicy.checksum;
     app = await createLifecycleTestApp(operations, iamRepository, undefined, undefined, legacyReader);
     const beforeOperationCount = operations.inputs.length;
 

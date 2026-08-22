@@ -81,10 +81,12 @@ export class IamRoleWriteController {
   ) {
     this.assertInternalToken(token);
     const parsedLegacyUserId = parseLegacyUserId(legacyUserId ?? "");
-    const configuredChecksum = parsePolicyChecksum(this.config.iam.roleWritePolicyChecksum);
+    const configuredChecksum = parsePolicyChecksum(
+      this.config.iam.roleWritePolicyChecksum ?? this.config.iam.authzPolicyChecksum
+    );
     const [baseline, policy, alignment] = await Promise.all([
       this.roleWrite.operationLedgerBaseline(parsedLegacyUserId),
-      this.roleWrite.policyDiagnostics(),
+      this.roleWrite.policyDiagnostics(configuredChecksum),
       this.roleWrite.subjectAlignment({ legacyUserId: parsedLegacyUserId, policyChecksum: configuredChecksum })
     ]);
     const legacyRoles = alignment.assignments.legacy.filter((assignment) => assignment.startsWith("role:"));
