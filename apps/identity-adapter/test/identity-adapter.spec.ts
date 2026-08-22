@@ -5109,6 +5109,79 @@ describe("identity-adapter IAM role write API", () => {
     });
   });
 
+  it("exposes a token-protected public-prefix preflight without echoing sensitive inputs or writing state", async () => {
+    const operations = new FakePluginUserWriteOperationRepository();
+    for (const index of [0, 1]) {
+      const operationKey = `public-prefix-preflight-${index}`;
+      await operations.begin({
+        operationKey,
+        idempotencyKey: operationKey,
+        route: index === 0 ? "change-role" : "people-auth",
+        mode: "dual-write",
+        actorSubject: "legacy:1",
+        targetSubject: "legacy:25",
+        legacyUserId: 25
+      });
+      await operations.update({ operationKey, status: "completed", compensationStatus: "none" });
+    }
+    const iamRepository = new FakeIamRepository();
+    const legacyReader = new FakeLegacyIdentityReader();
+    const currentPolicy = createIamPermissionPolicySnapshot(await legacyReader.readRbacPolicySnapshot());
+    await iamRepository.upsertPermissionPolicyCandidate(currentPolicy, "public-prefix-preflight-test");
+    iamRepository.subjectAssignments.set(25, [{ itemName: "user", itemType: "role" }]);
+    process.env.IDENTITY_IAM_ROLE_WRITE_POLICY_CHECKSUM = currentPolicy.checksum;
+    app = await createLifecycleTestApp(operations, iamRepository, undefined, undefined, legacyReader);
+    const beforeOperationCount = operations.inputs.length;
+
+    await request(app.getHttpServer())
+      .get("/v1/plugin-user/internal/iam/role-write/preflight?legacyUserId=25")
+      .expect(401);
+    await request(app.getHttpServer())
+      .get("/v1/plugin-user/internal/iam/role-write/preflight?legacyUserId=invalid")
+      .set("x-identity-internal-token", "role-write-test-token")
+      .expect(400);
+
+    const response = await request(app.getHttpServer())
+      .get("/v1/plugin-user/internal/iam/role-write/preflight?legacyUserId=25")
+      .set("x-identity-internal-token", "role-write-test-token")
+      .expect(200);
+
+    expect(response.body.data).toEqual({
+      readOnly: true,
+      writePerformed: false,
+      baseline: {
+        configured: true,
+        readOnly: true,
+        writePerformed: false,
+        global: { total: 2, completed: 2, unresolved: 0 },
+        target: { total: 2, completed: 2, unresolved: 0 },
+        uniqueCompletedTargetCount: 1,
+        targetUnique: true
+      },
+      policy: {
+        configured: true,
+        current: true,
+        candidateAvailable: true,
+        blockedReasonCount: 0,
+        legacyRemainsAuthoritative: true
+      },
+      alignment: {
+        legacyRole: "user",
+        candidateRole: "user",
+        differenceCount: 0,
+        unresolvedOperationCount: 0,
+        rootProtected: false,
+        safetyGatePassed: true,
+        permissionUnionApplied: false
+      }
+    });
+    expect(JSON.stringify(response.body)).not.toContain(currentPolicy.checksum);
+    expect(JSON.stringify(response.body)).not.toContain("legacy:25");
+    expect(JSON.stringify(response.body)).not.toContain("legacyUserId");
+    expect(iamRepository.subjectAssignmentWrites).toHaveLength(0);
+    expect(operations.inputs).toHaveLength(beforeOperationCount);
+  });
+
   it("distinguishes a stale configured candidate from the current Legacy policy without performing a write", async () => {
     const iamRepository = new FakeIamRepository();
     const staleChecksum = await seedRoleWritePolicy(iamRepository);

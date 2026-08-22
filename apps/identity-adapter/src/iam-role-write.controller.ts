@@ -74,6 +74,57 @@ export class IamRoleWriteController {
     };
   }
 
+  @Get("v1/plugin-user/internal/iam/role-write/preflight")
+  async publicPrefixReadOnlyPreflight(
+    @Headers("x-identity-internal-token") token: string | undefined,
+    @Query("legacyUserId") legacyUserId: string | undefined
+  ) {
+    this.assertInternalToken(token);
+    const parsedLegacyUserId = parseLegacyUserId(legacyUserId ?? "");
+    const configuredChecksum = parsePolicyChecksum(this.config.iam.roleWritePolicyChecksum);
+    const [baseline, policy, alignment] = await Promise.all([
+      this.roleWrite.operationLedgerBaseline(parsedLegacyUserId),
+      this.roleWrite.policyDiagnostics(),
+      this.roleWrite.subjectAlignment({ legacyUserId: parsedLegacyUserId, policyChecksum: configuredChecksum })
+    ]);
+    const legacyRoles = alignment.assignments.legacy.filter((assignment) => assignment.startsWith("role:"));
+    const candidateRoles = alignment.assignments.candidate.filter((assignment) => assignment.startsWith("role:"));
+    const assignmentDifferenceCount =
+      alignment.assignments.missingInCandidate.length +
+      alignment.assignments.extraInCandidate.length +
+      alignment.assignments.legacyOutsidePolicy.length +
+      alignment.assignments.candidateOutsidePolicy.length;
+
+    return {
+      status: "ok",
+      service: "identity-adapter",
+      capability: "iam-role-write-public-prefix-read-only-preflight",
+      data: {
+        readOnly: true,
+        writePerformed: false,
+        baseline,
+        policy: {
+          configured: policy.configuredPolicy.checksumConfigured,
+          current: policy.configuredPolicy.matchesCurrentLegacyPolicy,
+          candidateAvailable:
+            policy.configuredPolicy.candidateLookup === "available" &&
+            policy.currentLegacyPolicy.candidateLookup === "available",
+          blockedReasonCount: policy.blockedReasons.length,
+          legacyRemainsAuthoritative: policy.legacyRemainsAuthoritative
+        },
+        alignment: {
+          legacyRole: legacyRoles.length === 1 ? legacyRoles[0]?.slice("role:".length) : "invalid",
+          candidateRole: candidateRoles.length === 1 ? candidateRoles[0]?.slice("role:".length) : "invalid",
+          differenceCount: assignmentDifferenceCount,
+          unresolvedOperationCount: alignment.operations.unresolvedCount,
+          rootProtected: alignment.rootProtection.protected,
+          safetyGatePassed: alignment.safetyGate.passed,
+          permissionUnionApplied: alignment.safety.permissionUnionApplied
+        }
+      }
+    };
+  }
+
   @Get("internal/iam/role-write/subjects/:legacyUserId/alignment")
   async subjectAlignment(
     @Headers("x-identity-internal-token") token: string | undefined,
