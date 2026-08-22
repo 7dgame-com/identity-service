@@ -60,6 +60,20 @@ export class IamRoleWriteController {
     };
   }
 
+  @Get("internal/iam/role-write/operations/baseline")
+  async operationLedgerBaseline(
+    @Headers("x-identity-internal-token") token: string | undefined,
+    @Query("legacyUserId") legacyUserId: string | undefined
+  ) {
+    this.assertInternalToken(token);
+    return {
+      status: "ok",
+      service: "identity-adapter",
+      capability: "iam-role-write-operation-ledger-baseline",
+      data: await this.roleWrite.operationLedgerBaseline(parseLegacyUserId(legacyUserId ?? ""))
+    };
+  }
+
   @Get("internal/iam/role-write/subjects/:legacyUserId/alignment")
   async subjectAlignment(
     @Headers("x-identity-internal-token") token: string | undefined,

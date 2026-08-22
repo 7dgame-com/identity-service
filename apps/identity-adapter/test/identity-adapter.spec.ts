@@ -431,6 +431,31 @@ class FakePluginUserWriteOperationRepository {
     }));
   }
 
+  async summarizeBaselineForLegacyUser(legacyUserId: number) {
+    const roleRecords = [...this.records.values()].filter((record) => ["change-role", "people-auth"].includes(record.route));
+    const completed = (record: PluginUserWriteOperationRecord) =>
+      record.status === "completed" && ["none", "completed"].includes(record.compensationStatus);
+    const counts = (records: PluginUserWriteOperationRecord[]) => ({
+      total: records.length,
+      completed: records.filter(completed).length,
+      unresolved: records.filter((record) => !completed(record)).length
+    });
+    const targetRecords = roleRecords.filter((record) => record.legacyUserId === legacyUserId);
+    const target = counts(targetRecords);
+    const grouped = new Map<number, PluginUserWriteOperationRecord[]>();
+    for (const record of roleRecords) {
+      if (record.legacyUserId === null) continue;
+      grouped.set(record.legacyUserId, [...(grouped.get(record.legacyUserId) ?? []), record]);
+    }
+    const uniqueCompletedTargetCount = target.total === 0
+      ? 0
+      : [...grouped.values()].filter((records) => {
+        const candidate = counts(records);
+        return candidate.total === target.total && candidate.completed === target.completed && candidate.unresolved === 0;
+      }).length;
+    return { global: counts(roleRecords), target, uniqueCompletedTargetCount };
+  }
+
   async listRecentSafe(input: { limit: number }): Promise<PluginUserWriteOperationRecentRow[]> {
     return [...this.records.values()].slice(-Math.max(1, input.limit)).reverse().map((operation) => ({
       route: operation.route,
@@ -4998,6 +5023,90 @@ describe("identity-adapter IAM role write API", () => {
     expect(JSON.stringify(response.body)).not.toContain(currentPolicy.checksum);
     expect(iamRepository.subjectAssignmentWrites).toHaveLength(0);
     expect(operations.inputs).toHaveLength(0);
+  });
+
+  it("returns an all-history read-only role-write baseline without echoing the target selector", async () => {
+    const operations = new FakePluginUserWriteOperationRepository();
+    for (const [index, legacyUserId] of [25, 25, 26].entries()) {
+      const operationKey = `role-write-baseline-${index}`;
+      await operations.begin({
+        operationKey,
+        idempotencyKey: operationKey,
+        route: index === 1 ? "people-auth" : "change-role",
+        mode: "dual-write",
+        actorSubject: "legacy:1",
+        targetSubject: `legacy:${legacyUserId}`,
+        legacyUserId
+      });
+      await operations.update({ operationKey, status: "completed", compensationStatus: "none" });
+    }
+    app = await createLifecycleTestApp(operations);
+    const beforeOperationCount = operations.inputs.length;
+
+    await request(app.getHttpServer())
+      .get("/internal/iam/role-write/operations/baseline?legacyUserId=25")
+      .expect(401);
+    await request(app.getHttpServer())
+      .get("/internal/iam/role-write/operations/baseline?legacyUserId=invalid")
+      .set("x-identity-internal-token", "role-write-test-token")
+      .expect(400);
+
+    const response = await request(app.getHttpServer())
+      .get("/internal/iam/role-write/operations/baseline?legacyUserId=25")
+      .set("x-identity-internal-token", "role-write-test-token")
+      .expect(200);
+
+    expect(response.body.data).toEqual({
+      configured: true,
+      readOnly: true,
+      writePerformed: false,
+      global: { total: 3, completed: 3, unresolved: 0 },
+      target: { total: 2, completed: 2, unresolved: 0 },
+      uniqueCompletedTargetCount: 1,
+      targetUnique: true
+    });
+    expect(JSON.stringify(response.body)).not.toContain("legacyUserId");
+    expect(JSON.stringify(response.body)).not.toContain("legacy:25");
+    expect(operations.inputs).toHaveLength(beforeOperationCount);
+
+    for (const index of [3, 4]) {
+      const operationKey = `role-write-baseline-${index}`;
+      await operations.begin({
+        operationKey,
+        idempotencyKey: operationKey,
+        route: "change-role",
+        mode: "dual-write",
+        actorSubject: "legacy:1",
+        targetSubject: "legacy:27",
+        legacyUserId: 27
+      });
+      await operations.update({ operationKey, status: "completed", compensationStatus: "none" });
+    }
+    const ambiguous = await request(app.getHttpServer())
+      .get("/internal/iam/role-write/operations/baseline?legacyUserId=25")
+      .set("x-identity-internal-token", "role-write-test-token")
+      .expect(200);
+    expect(ambiguous.body.data).toMatchObject({ uniqueCompletedTargetCount: 2, targetUnique: false });
+
+    const unresolvedKey = "role-write-baseline-unresolved";
+    await operations.begin({
+      operationKey: unresolvedKey,
+      idempotencyKey: unresolvedKey,
+      route: "people-auth",
+      mode: "dual-write",
+      actorSubject: "legacy:1",
+      targetSubject: "legacy:25",
+      legacyUserId: 25
+    });
+    const unresolved = await request(app.getHttpServer())
+      .get("/internal/iam/role-write/operations/baseline?legacyUserId=25")
+      .set("x-identity-internal-token", "role-write-test-token")
+      .expect(200);
+    expect(unresolved.body.data).toMatchObject({
+      target: { total: 3, completed: 2, unresolved: 1 },
+      uniqueCompletedTargetCount: 0,
+      targetUnique: false
+    });
   });
 
   it("distinguishes a stale configured candidate from the current Legacy policy without performing a write", async () => {
