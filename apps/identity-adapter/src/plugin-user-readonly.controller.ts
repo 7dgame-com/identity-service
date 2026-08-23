@@ -118,7 +118,53 @@ export class PluginUserReadonlyController {
 
     return {
       code: 0,
-      data: await this.loginAudit.getUserAudit(parsedId)
+      data: await this.loginAudit.getUserAudit(parsedId, claims.roles.includes("root") ? "full" : "masked")
+    };
+  }
+
+  @Get("v1/plugin-user/organizations/:organizationId/login-usage-invoice")
+  async organizationLoginUsageInvoice(
+    @Headers("authorization") authorization: string | undefined,
+    @Param("organizationId") organizationId: string,
+    @Query() query: Record<string, unknown>
+  ) {
+    this.assertEnabled();
+    const claims = this.currentUser(authorization);
+    const parsedOrganizationId = strictPositiveInt(organizationId);
+    if (parsedOrganizationId === null) {
+      throw new HttpException(
+        {
+          code: "INVALID_ORGANIZATION_ID",
+          message: "Organization id must be a positive integer."
+        },
+        HttpStatus.BAD_REQUEST
+      );
+    }
+
+    await this.assertCan(claims, "user-management.view-user");
+    this.assertLoginAuditEnabled();
+    const organization = await this.assertOrganizationInvoiceAccess(claims, parsedOrganizationId);
+    const users = await this.legacyReader.listUsersByOrganization(parsedOrganizationId);
+    const from = parseInvoiceDate(query.from, "from");
+    const to = parseInvoiceDate(query.to, "to");
+    if (from && to && from > to) {
+      throw new HttpException(
+        { code: "INVALID_LOGIN_USAGE_INVOICE_RANGE", message: "from must be before or equal to to." },
+        HttpStatus.BAD_REQUEST
+      );
+    }
+    const invoice = await this.loginAudit.createUsageInvoice({
+      accounts: users.map((user) => ({ legacyUserId: user.id, username: user.username })),
+      from,
+      to
+    });
+
+    return {
+      code: 0,
+      data: {
+        organization,
+        ...invoice
+      }
     };
   }
 
@@ -146,6 +192,32 @@ export class PluginUserReadonlyController {
       throw this.organizationScopeDenied();
     }
     await this.assertShadowMembershipMatches(actorUser);
+  }
+
+  private async assertOrganizationInvoiceAccess(
+    claims: VerifiedAccessToken,
+    organizationId: number
+  ): Promise<{ id: number; name: string; title: string }> {
+    const organization = (await this.legacyReader.listOrganizations()).find((item) => item.id === organizationId);
+    if (!organization) {
+      throw new HttpException(
+        {
+          code: "ORGANIZATION_NOT_FOUND",
+          message: "Organization does not exist."
+        },
+        HttpStatus.NOT_FOUND
+      );
+    }
+
+    if (!claims.roles.includes("root")) {
+      const actorUser = await this.readAuthoritativeUser(claims.uid);
+      if (!actorUser || !belongsToOrganization(actorUser, organizationId)) {
+        throw this.organizationScopeDenied();
+      }
+      await this.assertShadowMembershipMatches(actorUser);
+    }
+
+    return { id: organization.id, name: organization.name, title: organization.title };
   }
 
   private resolveAuditOrganizationScope(
@@ -330,6 +402,25 @@ function strictPositiveInt(value: unknown): number | null {
 
 function hasMalformedOrganizationScope(query: Record<string, unknown>): boolean {
   return Object.keys(query).some((key) => key.startsWith("organization_id["));
+}
+
+function parseInvoiceDate(value: unknown, field: string): Date | undefined {
+  if (value === undefined || value === "") return undefined;
+  if (typeof value !== "string") {
+    throw new HttpException(
+      { code: "INVALID_LOGIN_USAGE_INVOICE_DATE", message: `${field} must be an ISO-8601 date.` },
+      HttpStatus.BAD_REQUEST
+    );
+  }
+
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new HttpException(
+      { code: "INVALID_LOGIN_USAGE_INVOICE_DATE", message: `${field} must be an ISO-8601 date.` },
+      HttpStatus.BAD_REQUEST
+    );
+  }
+  return parsed;
 }
 
 function sameOrganizationMemberships(

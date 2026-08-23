@@ -61,10 +61,17 @@ export const configSchema = z.object({
     user: z.string().optional(),
     password: z.string().optional()
   }),
+  network: z.object({
+    // `req.ip` only consumes X-Forwarded-For after this explicit proxy trust
+    // boundary has been configured for the deployment.
+    trustProxyHops: numberFromEnv.default(0).pipe(z.number().int().min(0).max(10))
+  }),
   loginAudit: z.object({
     enabled: boolFromEnv.default(false),
     internalToken: optionalStringFromEnv,
-    hashSalt: z.string().default("xrugc-login-audit-v1")
+    hashSalt: z.string().default("xrugc-login-audit-v1"),
+    billingTimezone: z.string().default("Asia/Shanghai"),
+    unitPriceCents: numberFromEnv.default(10000).pipe(z.number().int().min(0).max(100000000))
   }),
   usageBilling: z.object({
     shadowEnabled: boolFromEnv.default(false),
@@ -198,6 +205,7 @@ export const configSchema = z.object({
     enabled: boolFromEnv.default(false),
     mode: z.enum(["disabled", "legacy-proxy", "native"]).default("disabled"),
     legacyApiBaseUrl: optionalStringFromEnv,
+    wechatProxyBaseUrl: optionalStringFromEnv,
     timeoutMs: numberFromEnv.default(1500),
     registerEnabled: boolFromEnv.default(false),
     passwordEnabled: boolFromEnv.default(false),
@@ -313,10 +321,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
       user: env.IDENTITY_DB_USER,
       password: env.IDENTITY_DB_PASSWORD
     },
+    network: {
+      trustProxyHops: env.IDENTITY_TRUST_PROXY_HOPS
+    },
     loginAudit: {
       enabled: env.IDENTITY_LOGIN_AUDIT_ENABLED,
       internalToken: env.IDENTITY_INTERNAL_API_TOKEN,
-      hashSalt: env.IDENTITY_LOGIN_AUDIT_HASH_SALT
+      hashSalt: env.IDENTITY_LOGIN_AUDIT_HASH_SALT,
+      billingTimezone: env.IDENTITY_LOGIN_AUDIT_BILLING_TIMEZONE,
+      unitPriceCents: env.IDENTITY_LOGIN_AUDIT_UNIT_PRICE_CENTS
     },
     usageBilling: {
       shadowEnabled: env.IDENTITY_USAGE_BILLING_SHADOW_ENABLED,
@@ -451,6 +464,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
       enabled: env.IDENTITY_ACCOUNT_LIFECYCLE_ENABLED,
       mode: env.IDENTITY_ACCOUNT_LIFECYCLE_MODE,
       legacyApiBaseUrl: env.IDENTITY_ACCOUNT_LIFECYCLE_LEGACY_API_BASE_URL,
+      wechatProxyBaseUrl: env.IDENTITY_WECHAT_PROXY_BASE_URL,
       timeoutMs: env.IDENTITY_ACCOUNT_LIFECYCLE_TIMEOUT_MS,
       registerEnabled: env.IDENTITY_ACCOUNT_REGISTER_ENABLED,
       passwordEnabled: env.IDENTITY_ACCOUNT_PASSWORD_ENABLED,

@@ -233,6 +233,22 @@ export class LegacyIdentityReader implements OnModuleDestroy {
     return users.filter((user): user is LegacyUserReadModel => user !== null);
   }
 
+  async listUsersByOrganization(organizationId: number): Promise<LegacyUserReadModel[]> {
+    if (!this.pool || !(await this.tableExists("user_organization"))) {
+      return [];
+    }
+
+    const rows = await this.query<RowDataPacket[]>(
+      `SELECT user_id AS userId
+         FROM user_organization
+        WHERE organization_id = ?
+        ORDER BY user_id ASC`,
+      [organizationId]
+    );
+    const users = await Promise.all(rows.map((row) => this.getUserById(Number(row.userId))));
+    return users.filter((user): user is LegacyUserReadModel => user !== null);
+  }
+
   async readOrganizationCandidateSourceSnapshot(): Promise<LegacyOrganizationCandidateSourceSnapshot> {
     if (!this.pool) {
       return Object.freeze({

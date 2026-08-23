@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
+import { isIP } from "node:net";
 import { BadRequestException, Injectable, ServiceUnavailableException } from "@nestjs/common";
 import { z } from "zod";
 import { loadConfig } from "./config.js";
-import { LoginAuditRepository } from "./login-audit.repository.js";
+import { LoginAuditIpExposure, LoginAuditRepository } from "./login-audit.repository.js";
 
 const payloadSchema = z.object({
   eventKey: z.string().min(8).max(128),
@@ -20,6 +21,15 @@ const payloadSchema = z.object({
 });
 
 export type LoginAuditPayload = z.infer<typeof payloadSchema>;
+
+export interface LoginUsageInvoiceAccount {
+  legacyUserId: number;
+  username: string | null;
+  successfulLoginCount: number;
+  usageCount: number;
+  usageDays: string[];
+  amountCents: number;
+}
 
 @Injectable()
 export class LoginAuditService {
@@ -46,7 +56,8 @@ export class LoginAuditService {
       eventType: parsed.eventType,
       success: parsed.success,
       occurredAt,
-      ipAddressHash: hashMaybe(parsed.ipAddress, this.config.loginAudit.hashSalt),
+      ipAddress: normalizeIpAddress(parsed.ipAddress),
+      ipAddressHash: hashMaybe(normalizeIpAddress(parsed.ipAddress), this.config.loginAudit.hashSalt),
       userAgentHash: hashMaybe(parsed.userAgent, this.config.loginAudit.hashSalt),
       source: parsed.source,
       traceId: parsed.traceId ?? null,
@@ -56,7 +67,7 @@ export class LoginAuditService {
     return { accepted: true, duplicate: result.duplicate };
   }
 
-  async getUserAudit(legacyUserId: number) {
+  async getUserAudit(legacyUserId: number, ipExposure: LoginAuditIpExposure = "full") {
     if (!this.repository.isConfigured()) {
       throw new ServiceUnavailableException({
         code: "IDENTITY_DB_NOT_CONFIGURED",
@@ -64,7 +75,71 @@ export class LoginAuditService {
       });
     }
 
-    return this.repository.getUserAudit(legacyUserId);
+    return this.repository.getUserAudit(legacyUserId, 20, ipExposure);
+  }
+
+  async createUsageInvoice(input: {
+    accounts: Array<{ legacyUserId: number; username: string | null }>;
+    from?: Date;
+    to?: Date;
+  }) {
+    if (!this.repository.isConfigured()) {
+      throw new ServiceUnavailableException({
+        code: "IDENTITY_DB_NOT_CONFIGURED",
+        message: "Identity database is not configured for login audit."
+      });
+    }
+
+    const accountsById = new Map(
+      input.accounts
+        .filter((account) => Number.isSafeInteger(account.legacyUserId) && account.legacyUserId > 0)
+        .map((account) => [account.legacyUserId, account])
+    );
+    const events = await this.repository.listSuccessfulLoginEventsByLegacyUserIds([...accountsById.keys()], {
+      from: input.from,
+      to: input.to
+    });
+    const usagesByAccount = new Map<number, { successfulLoginCount: number; usageDays: Set<string> }>();
+    for (const event of events) {
+      const current = usagesByAccount.get(event.legacyUserId) ?? { successfulLoginCount: 0, usageDays: new Set<string>() };
+      current.successfulLoginCount += 1;
+      current.usageDays.add(calendarDay(event.occurredAt, this.config.loginAudit.billingTimezone));
+      usagesByAccount.set(event.legacyUserId, current);
+    }
+
+    const accounts: LoginUsageInvoiceAccount[] = [...accountsById.values()]
+      .map((account) => {
+        const usage = usagesByAccount.get(account.legacyUserId) ?? { successfulLoginCount: 0, usageDays: new Set<string>() };
+        const usageDays = [...usage.usageDays].sort();
+        const usageCount = usageDays.length;
+        return {
+          legacyUserId: account.legacyUserId,
+          username: account.username,
+          successfulLoginCount: usage.successfulLoginCount,
+          usageCount,
+          usageDays,
+          amountCents: usageCount * this.config.loginAudit.unitPriceCents
+        };
+      })
+      .filter((account) => account.usageCount > 0)
+      .sort((left, right) => left.username?.localeCompare(right.username ?? "") || left.legacyUserId - right.legacyUserId);
+    const usageCount = accounts.reduce((total, account) => total + account.usageCount, 0);
+
+    return {
+      billingRule: "successful-login-per-account-calendar-day-v1",
+      billingTimezone: this.config.loginAudit.billingTimezone,
+      unitPriceCents: this.config.loginAudit.unitPriceCents,
+      period: {
+        from: input.from?.toISOString() ?? null,
+        to: input.to?.toISOString() ?? null
+      },
+      accountCount: accountsById.size,
+      accountsWithUsage: accounts.length,
+      successfulLoginCount: events.length,
+      usageCount,
+      amountCents: usageCount * this.config.loginAudit.unitPriceCents,
+      accounts
+    };
   }
 
   private parsePayload(payload: unknown): LoginAuditPayload {
@@ -115,6 +190,25 @@ function hashMaybe(value: string | null | undefined, salt: string): string | nul
   }
 
   return createHash("sha256").update(salt).update("\0").update(normalized).digest("hex");
+}
+
+function normalizeIpAddress(value: string | null | undefined): string | null {
+  const candidate = value?.trim();
+  if (!candidate) return null;
+  const normalized = candidate.startsWith("::ffff:") ? candidate.slice("::ffff:".length) : candidate;
+  return isIP(normalized) ? normalized.toLowerCase() : null;
+}
+
+function calendarDay(value: Date, timeZone: string): string {
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  });
+  const parts = formatter.formatToParts(value);
+  const part = (type: Intl.DateTimeFormatPartTypes) => parts.find((item) => item.type === type)?.value;
+  return `${part("year")}-${part("month")}-${part("day")}`;
 }
 
 export function sanitizeMetadata(value: Record<string, unknown>): Record<string, unknown> {
