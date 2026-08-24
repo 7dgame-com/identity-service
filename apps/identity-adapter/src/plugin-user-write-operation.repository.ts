@@ -92,6 +92,20 @@ export interface PluginUserWriteOperationRecentRow {
   idempotencySource?: "client-header" | "per-request" | null;
 }
 
+export interface PluginUserWriteOperationBaselineSummary {
+  global: {
+    total: number;
+    completed: number;
+    unresolved: number;
+  };
+  target: {
+    total: number;
+    completed: number;
+    unresolved: number;
+  };
+  uniqueCompletedTargetCount: number;
+}
+
 @Injectable()
 export class PluginUserWriteOperationRepository implements OnModuleDestroy {
   private readonly config = loadConfig();
@@ -313,6 +327,57 @@ export class PluginUserWriteOperationRepository implements OnModuleDestroy {
       firstRequestedAt: dateString(row.firstRequestedAt),
       lastRequestedAt: dateString(row.lastRequestedAt)
     }));
+  }
+
+  async summarizeBaselineForLegacyUser(legacyUserId: number): Promise<PluginUserWriteOperationBaselineSummary | null> {
+    if (!(await this.tableExists("plugin_user_write_operations"))) {
+      return null;
+    }
+
+    const pool = this.requirePool();
+    const completionPredicate = "status = 'completed' AND compensation_status IN ('none', 'completed')";
+    const [globalRows] = await pool.execute<RowDataPacket[]>(
+      `SELECT COUNT(*) AS total,
+              SUM(CASE WHEN ${completionPredicate} THEN 1 ELSE 0 END) AS completed,
+              SUM(CASE WHEN NOT (${completionPredicate}) THEN 1 ELSE 0 END) AS unresolved
+         FROM plugin_user_write_operations
+        WHERE route IN ('change-role', 'people-auth')`
+    );
+    const [targetRows] = await pool.execute<RowDataPacket[]>(
+      `SELECT COUNT(*) AS total,
+              SUM(CASE WHEN ${completionPredicate} THEN 1 ELSE 0 END) AS completed,
+              SUM(CASE WHEN NOT (${completionPredicate}) THEN 1 ELSE 0 END) AS unresolved
+         FROM plugin_user_write_operations
+        WHERE legacy_user_id = ?
+          AND route IN ('change-role', 'people-auth')`,
+      [legacyUserId]
+    );
+
+    const target = operationBaselineCounts(targetRows[0]);
+    let uniqueCompletedTargetCount = 0;
+    if (target.total > 0) {
+      const [uniqueRows] = await pool.execute<RowDataPacket[]>(
+        `SELECT COUNT(*) AS total
+           FROM (
+             SELECT legacy_user_id
+               FROM plugin_user_write_operations
+              WHERE legacy_user_id IS NOT NULL
+                AND route IN ('change-role', 'people-auth')
+              GROUP BY legacy_user_id
+             HAVING COUNT(*) = ?
+                AND SUM(CASE WHEN ${completionPredicate} THEN 1 ELSE 0 END) = ?
+                AND SUM(CASE WHEN NOT (${completionPredicate}) THEN 1 ELSE 0 END) = 0
+           ) AS completed_targets`,
+        [target.total, target.completed]
+      );
+      uniqueCompletedTargetCount = Number(uniqueRows[0]?.total ?? 0);
+    }
+
+    return {
+      global: operationBaselineCounts(globalRows[0]),
+      target,
+      uniqueCompletedTargetCount
+    };
   }
 
   async listRecentSafe(input: { sinceMinutes: number; limit: number }): Promise<PluginUserWriteOperationRecentRow[]> {
@@ -648,4 +713,12 @@ function nullableNumber(value: unknown): number | null {
 
   const numeric = Number(value);
   return Number.isFinite(numeric) ? numeric : null;
+}
+
+function operationBaselineCounts(row: RowDataPacket | undefined): { total: number; completed: number; unresolved: number } {
+  return {
+    total: Number(row?.total ?? 0),
+    completed: Number(row?.completed ?? 0),
+    unresolved: Number(row?.unresolved ?? 0)
+  };
 }

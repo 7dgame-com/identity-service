@@ -175,13 +175,46 @@ export class IamRoleWriteService {
     };
   }
 
+  async operationLedgerBaseline(legacyUserId: number) {
+    if (!this.operations.isConfigured()) {
+      return {
+        configured: false,
+        readOnly: true,
+        writePerformed: false,
+        global: { total: 0, completed: 0, unresolved: 0 },
+        target: { total: 0, completed: 0, unresolved: 0 },
+        uniqueCompletedTargetCount: 0,
+        targetUnique: false
+      };
+    }
+    const summary = await this.operations.summarizeBaselineForLegacyUser(legacyUserId);
+    if (!summary) {
+      return {
+        configured: true,
+        readOnly: true,
+        writePerformed: false,
+        global: { total: 0, completed: 0, unresolved: 0 },
+        target: { total: 0, completed: 0, unresolved: 0 },
+        uniqueCompletedTargetCount: 0,
+        targetUnique: false
+      };
+    }
+    return {
+      configured: true,
+      readOnly: true,
+      writePerformed: false,
+      ...summary,
+      targetUnique: summary.target.total > 0 && summary.uniqueCompletedTargetCount === 1
+    };
+  }
+
   /**
    * Explains why a configured role-write candidate is (or is not) executable without
    * disclosing a policy checksum or mutating Legacy, Identity, or the operation ledger.
    */
-  async policyDiagnostics() {
+  async policyDiagnostics(policyChecksumOverride?: string) {
     const { iam } = this.config;
-    const configuredChecksum = iam.roleWritePolicyChecksum;
+    const configuredChecksum = policyChecksumOverride ?? iam.roleWritePolicyChecksum;
     const sources = {
       legacyReaderConfigured: this.legacyReader.isConfigured(),
       identityRepositoryConfigured: this.iamRepository.isConfigured()
