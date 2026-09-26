@@ -2,9 +2,10 @@ import { Controller, Get, Headers, HttpException, HttpStatus, Param, Query, Res 
 import { loadConfig } from "./config.js";
 import { JwtIssuerService, VerifiedAccessToken } from "./jwt-issuer.service.js";
 import { IamRepository, type IdentityOrganizationShadowRow } from "./iam.repository.js";
-import { LegacyIdentityReader, LegacyUserReadModel } from "./legacy-identity.reader.js";
+import { LegacyIdentityReader, LegacyUserReadModel, type LegacyAuditMember } from "./legacy-identity.reader.js";
 import { LoginAuditService } from "./login-audit.service.js";
 import { PluginUserPrimaryReadService, PluginUserReadSource } from "./plugin-user-primary-read.service.js";
+import { auditPrimaryRole, parseOrganizationLoginQuery } from "./organization-login-events.js";
 
 const ELEVATED_ROLES = new Set(["root", "admin", "manager"]);
 
@@ -119,6 +120,67 @@ export class PluginUserReadonlyController {
     return {
       code: 0,
       data: await this.loginAudit.getUserAudit(parsedId)
+    };
+  }
+
+  @Get("v1/plugin-user/login-events")
+  async organizationLoginEvents(
+    @Headers("authorization") authorization: string | undefined,
+    @Query() query: Record<string, unknown>
+  ) {
+    this.assertEnabled();
+    const claims = this.currentUser(authorization);
+    if (!claims.roles.some((role) => ELEVATED_ROLES.has(role))) throw this.organizationScopeDenied();
+    this.assertLoginAuditEnabled();
+    const organizationId = this.resolveAuditOrganizationScope(claims, query);
+    if (organizationId === null) {
+      throw new HttpException({ code: "ORGANIZATION_SCOPE_REQUIRED", message: "请选择具体组织后查看登录流水" }, HttpStatus.FORBIDDEN);
+    }
+    const filters = parseOrganizationLoginQuery(query);
+    if (!claims.roles.includes("root")) {
+      await this.assertOrganizationScopedAuditAccess(claims, claims.uid, organizationId);
+    }
+
+    let members: LegacyAuditMember[];
+    try {
+      if (!this.iamRepository.isConfigured()) throw this.organizationScopeDenied();
+      members = await this.legacyReader.listOrganizationAuditMembers(organizationId);
+      const shadow = await this.iamRepository.listOrganizationMembershipsShadowForUsers(members.map((member) => member.id));
+      const byUser = new Map<number, IdentityOrganizationShadowRow[]>();
+      for (const membership of shadow) {
+        if (membership.legacyUserId === null) throw this.organizationScopeDenied();
+        const memberships = byUser.get(membership.legacyUserId) ?? [];
+        memberships.push(membership);
+        byUser.set(membership.legacyUserId, memberships);
+      }
+      for (const member of members) {
+        if (!member.organizations.some((organization) => organization.id === organizationId)
+          || !sameOrganizationMemberships(member, byUser.get(member.id) ?? [])) {
+          throw this.organizationScopeDenied();
+        }
+      }
+    } catch {
+      throw new HttpException({ code: "ORGANIZATION_SCOPE_DENIED", message: "无法确认当前组织成员范围，请稍后重试" }, HttpStatus.FORBIDDEN);
+    }
+
+    members = await this.primaryRead.withAuditMemberRoles(members);
+    const search = filters.search?.toLocaleLowerCase();
+    const selected = members.filter((member) =>
+      (!filters.role || auditPrimaryRole(member.roles) === filters.role)
+      && (!search || [member.username, member.nickname].some((value) => value?.toLocaleLowerCase().includes(search)))
+    );
+    const selectedById = new Map(selected.map((member) => [member.id, member]));
+    const result = await this.loginAudit.listOrganizationEvents({
+      userIds: selected.map((member) => member.id), startAt: filters.start_at, endAt: filters.end_at,
+      page: filters.page, pageSize: filters.pageSize
+    });
+    return {
+      code: 0,
+      data: result.events.map((event) => {
+        const member = selectedById.get(event.userId)!;
+        return { ...event, username: member.username, nickname: member.nickname, primaryRole: auditPrimaryRole(member.roles) };
+      }),
+      pagination: { page: filters.page, pageSize: filters.pageSize, total: result.total, totalPages: Math.ceil(result.total / filters.pageSize) }
     };
   }
 
@@ -333,7 +395,7 @@ function hasMalformedOrganizationScope(query: Record<string, unknown>): boolean 
 }
 
 function sameOrganizationMemberships(
-  legacyUser: LegacyUserReadModel,
+  legacyUser: Pick<LegacyUserReadModel, "id" | "organizations">,
   shadowMemberships: IdentityOrganizationShadowRow[]
 ): boolean {
   const legacyOrganizationIds = new Set(legacyUser.organizations.map((organization) => organization.id));

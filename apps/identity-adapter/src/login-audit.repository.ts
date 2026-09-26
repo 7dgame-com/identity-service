@@ -1,6 +1,7 @@
 import { Injectable, OnModuleDestroy } from "@nestjs/common";
 import mysql, { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { loadConfig } from "./config.js";
+import type { OrganizationLoginEvent, OrganizationLoginEventQuery } from "./organization-login-events.js";
 
 export interface PersistedLoginAuditEvent {
   eventKey: string;
@@ -54,6 +55,45 @@ export class LoginAuditRepository implements OnModuleDestroy {
 
   isConfigured(): boolean {
     return this.pool !== null;
+  }
+
+  async listOrganizationEvents(input: OrganizationLoginEventQuery): Promise<{ events: OrganizationLoginEvent[]; total: number }> {
+    const pool = this.requirePool();
+    await this.ensureSchema();
+    if (input.userIds.length === 0) return { events: [], total: 0 };
+    const connection = await pool.getConnection();
+    try {
+      // Keep count and page consistent even while new logins are being recorded.
+      await connection.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+      await connection.query("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY");
+      // MySQL 8 JSON_TABLE avoids an unbounded number of prepared-statement placeholders.
+      const from = `FROM auth_login_events e
+        JOIN JSON_TABLE(?, '$[*]' COLUMNS (user_id BIGINT PATH '$')) members
+          ON members.user_id = e.legacy_user_id
+        WHERE e.event_type = 'login' AND e.success = 1
+          AND e.occurred_at >= ? AND e.occurred_at < ?`;
+      const parameters = [JSON.stringify([...new Set(input.userIds)]), input.startAt, input.endAt];
+      const [counts] = await connection.execute<RowDataPacket[]>(`SELECT COUNT(*) AS total ${from}`, parameters);
+      const [rows] = await connection.query<RowDataPacket[]>(
+        `SELECT e.event_key AS eventKey, e.legacy_user_id AS userId,
+                e.occurred_at AS occurredAt, e.source ${from}
+          ORDER BY e.occurred_at DESC, e.id DESC LIMIT ? OFFSET ?`,
+        [...parameters, input.pageSize, (input.page - 1) * input.pageSize]
+      );
+      await connection.commit();
+      return {
+        total: Number(counts[0].total),
+        events: rows.map((row) => ({
+          eventKey: String(row.eventKey), userId: Number(row.userId),
+          occurredAt: dateToIso(row.occurredAt)!, source: String(row.source)
+        }))
+      };
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
   }
 
   async recordEvent(event: PersistedLoginAuditEvent): Promise<{ duplicate: boolean }> {

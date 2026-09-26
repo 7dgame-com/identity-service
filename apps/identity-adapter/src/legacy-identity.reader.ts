@@ -74,6 +74,8 @@ export interface LegacyUserCredential {
   passwordHash: string | null;
 }
 
+export type LegacyAuditMember = Pick<LegacyUserReadModel, "id" | "username" | "nickname" | "roles" | "organizations">;
+
 export interface LegacyUserListInput {
   afterId: number;
   limit: number;
@@ -127,6 +129,46 @@ export class LegacyIdentityReader implements OnModuleDestroy {
 
   isConfigured(): boolean {
     return this.pool !== null;
+  }
+
+  /** One readonly snapshot: profiles, roles and ALL memberships of current organization members. */
+  async listOrganizationAuditMembers(organizationId: number): Promise<LegacyAuditMember[]> {
+    if (!this.pool) throw new Error("Legacy database is not configured for organization audit.");
+    const connection = await this.pool.getConnection();
+    try {
+      await connection.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+      await connection.query("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY");
+      const scope = `EXISTS (SELECT 1 FROM user_organization scope
+        WHERE scope.user_id = u.id AND scope.organization_id = ?)`;
+      const [users] = await connection.query<RowDataPacket[]>(
+        `SELECT u.id, u.username, u.nickname FROM user u WHERE ${scope}`, [organizationId]
+      );
+      const [roles] = await connection.query<RowDataPacket[]>(
+        `SELECT u.id AS userId, aa.item_name AS role FROM user u
+          JOIN auth_assignment aa ON aa.user_id = CAST(u.id AS BINARY)
+          JOIN auth_item ai ON ai.name = aa.item_name AND ai.type = 1
+          WHERE ${scope}`, [organizationId]
+      );
+      const [memberships] = await connection.query<RowDataPacket[]>(
+        `SELECT u.id AS userId, o.id, o.name, o.title,
+                o.created_at AS createdAt, o.updated_at AS updatedAt
+           FROM user u JOIN user_organization uo ON uo.user_id = u.id
+           JOIN organization o ON o.id = uo.organization_id WHERE ${scope}`, [organizationId]
+      );
+      const byId = new Map<number, LegacyAuditMember>(users.map((row) => [Number(row.id), {
+        id: Number(row.id), username: row.username ?? null, nickname: row.nickname ?? null,
+        roles: [], organizations: []
+      }]));
+      for (const row of roles) byId.get(Number(row.userId))?.roles.push(String(row.role));
+      for (const row of memberships) byId.get(Number(row.userId))?.organizations.push(normalizeOrganization(row));
+      await connection.commit();
+      return [...byId.values()];
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
   }
 
   async health(): Promise<"configured" | "not_configured" | "unavailable"> {

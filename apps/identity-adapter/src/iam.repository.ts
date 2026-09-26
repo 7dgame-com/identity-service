@@ -408,6 +408,44 @@ export class IamRepository implements OnModuleDestroy {
     return rows.map(normalizeOrganizationShadow);
   }
 
+  async listOrganizationMembershipsShadowForUsers(userIds: number[]): Promise<IdentityOrganizationShadowRow[]> {
+    if (!this.isConfigured()) throw new Error("Identity database is not configured.");
+    const result: IdentityOrganizationShadowRow[] = [];
+    for (let offset = 0; offset < userIds.length; offset += 500) {
+      const batch = userIds.slice(offset, offset + 500);
+      const rows = await this.query<RowDataPacket[]>(
+        `SELECT identity_user_id AS identityUserId, legacy_user_id AS legacyUserId,
+                organization_id AS organizationId, organization_role AS organizationRole,
+                source, status, observed_at AS observedAt, metadata
+           FROM identity_organization_memberships_shadow
+          WHERE legacy_user_id IN (${batch.map(() => "?").join(",")}) AND status = 'shadow'`, batch
+      );
+      result.push(...rows.map(normalizeOrganizationShadow));
+    }
+    return result;
+  }
+
+  async listAuditNativeRoles(userIds: number[], policyChecksum: string): Promise<Map<number, string[]>> {
+    const result = new Map<number, string[]>();
+    for (let offset = 0; offset < userIds.length; offset += 500) {
+      const batch = userIds.slice(offset, offset + 500);
+      const rows = await this.query<RowDataPacket[]>(
+        `SELECT identity_user_id AS identityUserId, item_name AS role
+           FROM identity_iam_subject_assignments
+          WHERE identity_user_id IN (${batch.map(() => "?").join(",")})
+            AND policy_checksum = ? AND status = 'candidate' AND item_type = 'role'`,
+        [...batch.map((id) => `legacy:${id}`), policyChecksum]
+      );
+      for (const row of rows) {
+        const id = Number(String(row.identityUserId).slice("legacy:".length));
+        const roles = result.get(id) ?? [];
+        roles.push(String(row.role));
+        result.set(id, roles);
+      }
+    }
+    return result;
+  }
+
   async upsertIdentityUserShadow(input: IdentityUserShadowInput): Promise<void> {
     const pool = this.requirePool();
     await this.ensureSchema();
