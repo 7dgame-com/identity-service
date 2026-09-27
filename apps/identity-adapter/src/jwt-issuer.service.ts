@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { Injectable, ServiceUnavailableException } from "@nestjs/common";
 import { loadConfig } from "./config.js";
 import type { LegacyUserReadModel } from "./legacy-identity.reader.js";
+import { assertDeviceSnAccount, deviceSnClaims, deviceSnSource, type DeviceSnSource } from "./device-sn-source.js";
 
 export interface IssuedAccessToken {
   accessToken: string;
@@ -15,6 +16,8 @@ export interface VerifiedAccessToken {
   username: string | null;
   sessionId: string | null;
   roles: string[];
+  authMethod?: "device_sn";
+  deviceSnId?: number;
 }
 
 export interface OidcIdTokenInput {
@@ -31,9 +34,12 @@ export interface OidcIdTokenInput {
 export class JwtIssuerService {
   private readonly config = loadConfig();
 
-  issue(user: LegacyUserReadModel, sessionId: string): IssuedAccessToken {
+  issue(user: LegacyUserReadModel, sessionId: string, source?: DeviceSnSource | null): IssuedAccessToken {
+    source = deviceSnSource(source?.authMethod, source?.deviceSnId);
+    if (source) assertDeviceSnAccount(user);
     const now = new Date();
-    const expiresAt = new Date(now.getTime() + this.config.tokenIssuance.accessTokenTtlSeconds * 1000);
+    const ttl = source ? Math.min(10800, this.config.tokenIssuance.accessTokenTtlSeconds) : this.config.tokenIssuance.accessTokenTtlSeconds;
+    const expiresAt = new Date(now.getTime() + ttl * 1000);
     const jwtId = randomId();
     const privateKey = this.privateKey();
 
@@ -57,6 +63,10 @@ export class JwtIssuerService {
 
     if (this.config.jwt.audience) {
       payload.aud = this.config.jwt.audience;
+    }
+    if (source) {
+      payload.auth_method = source.authMethod;
+      payload.device_sn_id = source.deviceSnId;
     }
 
     const signingInput = `${base64urlJson(header)}.${base64urlJson(payload)}`;
@@ -169,7 +179,11 @@ export class JwtIssuerService {
     }
 
     const payload = parseJwtPart(encodedPayload);
+    const source = deviceSnClaims(payload);
     const now = seconds(new Date());
+    if (source && (typeof payload.exp !== "number" || typeof payload.iat !== "number" || payload.exp - payload.iat > 10800)) {
+      throw new Error("invalid device token lifetime");
+    }
     if (typeof payload.exp === "number" && payload.exp <= now) {
       throw new Error("token expired");
     }
@@ -192,7 +206,8 @@ export class JwtIssuerService {
       uid,
       username: typeof payload.username === "string" ? payload.username : null,
       sessionId: typeof payload.session_id === "string" ? payload.session_id : null,
-      roles: Array.isArray(payload.roles) ? payload.roles.filter((role): role is string => typeof role === "string") : []
+      roles: Array.isArray(payload.roles) ? payload.roles.filter((role): role is string => typeof role === "string") : [],
+      ...(source ?? {})
     };
   }
 

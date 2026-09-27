@@ -7,6 +7,7 @@ import { JwtIssuerService } from "./jwt-issuer.service.js";
 import { LegacyIdentityReader, LegacyUserReadModel } from "./legacy-identity.reader.js";
 import { verifyLegacyPassword } from "./legacy-password.js";
 import { LoginAuditService } from "./login-audit.service.js";
+import { assertDeviceSnAccount, deviceSnSource, throwDeviceSnFailure, type DeviceSnSource } from "./device-sn-source.js";
 
 const loginSchema = z.object({
   username: z.string().min(1).max(255),
@@ -22,8 +23,10 @@ const logoutSchema = z.object({
 });
 
 const issueUserTokenSchema = z.object({
-  legacyUserId: z.coerce.number().int().positive()
-});
+  legacyUserId: z.coerce.number().int().positive(),
+  auth_method: z.literal("device_sn").optional(),
+  device_sn_id: z.number().int().positive().optional()
+}).strict();
 
 export interface RequestContext {
   ip?: string | null;
@@ -78,9 +81,12 @@ export class TokenIssuanceService {
     this.assertEnabled();
     const parsed = parseBody(refreshSchema, payload);
 
+    let source: DeviceSnSource | null = null;
     try {
       const current = await this.sessions.findValidSession(parsed.refreshToken);
+      source = deviceSnSource(current.authMethod, current.deviceSnId);
       const user = await this.requireLegacyUser(current.legacyUserId);
+      await this.assertDeviceSource(user, source);
       const nextSessionId = randomId();
       const refreshExpiresAt = this.refreshExpiresAt();
       const rotated = await this.sessions.rotate(parsed.refreshToken, {
@@ -89,18 +95,22 @@ export class TokenIssuanceService {
         sessionId: nextSessionId,
         expiresAt: refreshExpiresAt,
         ipAddressHash: hashMaybe(context.ip),
-        userAgentHash: hashMaybe(context.userAgent)
+        userAgentHash: hashMaybe(context.userAgent),
+        ...(source ?? {})
       });
-      const token = this.jwtIssuer.issue(user, rotated.sessionId);
+      // Recheck after rotation as well: disabling may race with the identity DB write.
+      await this.assertDeviceSource(user, source);
+      const token = this.jwtIssuer.issue(user, rotated.sessionId, source);
 
       return tokenResponse("refresh", token.accessToken, rotated.refreshToken, token.expiresAt);
     } catch (error) {
       if (error instanceof InvalidRefreshTokenError) {
         throw new UnauthorizedException({
-          code: "REFRESH_TOKEN_INVALID",
+          code: source ? "DEVICE_SN_REFRESH_INVALID" : "REFRESH_TOKEN_INVALID",
           message: "Refresh token is invalid."
         });
       }
+      if (source) throwDeviceSnFailure(error);
       throw error;
     }
   }
@@ -123,17 +133,23 @@ export class TokenIssuanceService {
   async issueLegacyUserToken(payload: unknown, context: RequestContext = {}): Promise<AuthTokenResponse> {
     this.assertEnabled();
     const parsed = parseBody(issueUserTokenSchema, payload);
-    const user = await this.requireLegacyUser(parsed.legacyUserId);
-    const sessionId = randomId();
-
-    return this.issueForUser(user, sessionId, context, "login");
+    const source = deviceSnSource(parsed.auth_method, parsed.device_sn_id);
+    try {
+      const user = await this.requireLegacyUser(parsed.legacyUserId);
+      const sessionId = randomId();
+      return await this.issueForUser(user, sessionId, context, "login", source);
+    } catch (error) {
+      if (source) throwDeviceSnFailure(error);
+      throw error;
+    }
   }
 
   private async issueForUser(
     user: LegacyUserReadModel,
     sessionId: string,
     context: RequestContext,
-    message: "login" | "refresh" | "register"
+    message: "login" | "refresh" | "register",
+    source?: DeviceSnSource | null
   ): Promise<AuthTokenResponse> {
     if (!this.sessions.isConfigured()) {
       throw new BadRequestException({
@@ -143,17 +159,26 @@ export class TokenIssuanceService {
     }
 
     const refreshExpiresAt = this.refreshExpiresAt();
+    await this.assertDeviceSource(user, source);
     const session = await this.sessions.issue({
       legacyUserId: user.id,
       username: user.username,
       sessionId,
       expiresAt: refreshExpiresAt,
       ipAddressHash: hashMaybe(context.ip),
-      userAgentHash: hashMaybe(context.userAgent)
+      userAgentHash: hashMaybe(context.userAgent),
+      ...(source ?? {})
     });
-    const token = this.jwtIssuer.issue(user, session.sessionId);
+    await this.assertDeviceSource(user, source);
+    const token = this.jwtIssuer.issue(user, session.sessionId, source);
 
     return tokenResponse(message, token.accessToken, session.refreshToken, token.expiresAt);
+  }
+
+  private async assertDeviceSource(user: LegacyUserReadModel, source?: DeviceSnSource | null): Promise<void> {
+    if (!source) return;
+    assertDeviceSnAccount(user);
+    await this.legacyReader.assertDeviceSnAuthorized(source.deviceSnId, user.id);
   }
 
   private async requireLegacyUser(id: number): Promise<LegacyUserReadModel> {

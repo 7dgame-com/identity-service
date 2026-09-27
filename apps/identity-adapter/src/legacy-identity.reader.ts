@@ -1,4 +1,4 @@
-import { Injectable, OnModuleDestroy } from "@nestjs/common";
+import { Injectable, OnModuleDestroy, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
 import mysql, { Pool, RowDataPacket } from "mysql2/promise";
 import { loadConfig } from "./config.js";
 import { assertReadonlySql } from "./readonly-write.guard.js";
@@ -129,6 +129,37 @@ export class LegacyIdentityReader implements OnModuleDestroy {
 
   isConfigured(): boolean {
     return this.pool !== null;
+  }
+
+  /** Must use the authoritative legacy writer, never an asynchronously replicated reader. */
+  async assertDeviceSnAuthorized(deviceSnId: number, userId: number, requireEnabled = true): Promise<void> {
+    if (!this.pool) throw new ServiceUnavailableException("Authoritative device authorization database is not configured.");
+    const rows = await this.query<RowDataPacket[]>(
+      `SELECT sn.id, sn.device_uuid AS deviceUuid
+         FROM device_sn sn
+         JOIN user u ON u.id = sn.user_id
+        WHERE sn.id = ? AND sn.user_id = ? AND sn.activated_at IS NOT NULL
+          AND sn.device_uuid IS NOT NULL AND CHAR_LENGTH(TRIM(sn.device_uuid)) > 0
+          AND u.status = 10 AND (? = 0 OR sn.enabled = 1)
+          AND NOT EXISTS (SELECT 1 FROM auth_assignment aa
+            WHERE aa.user_id = CAST(u.id AS BINARY) AND aa.item_name IN ('root', 'admin', 'manager'))
+        LIMIT 1`,
+      [deviceSnId, userId, requireEnabled ? 1 : 0]
+    );
+    const uuid = rows[0]?.deviceUuid;
+    // Exact match avoids collation-dependent acceptance and JavaScript '$' accepting a trailing newline.
+    const validUuid = typeof uuid === "string" && uuid.match(/^[a-z0-9][a-z0-9._:-]{0,254}$/u)?.[0] === uuid;
+    if (!rows.length || !validUuid) throw new UnauthorizedException({ code: "DEVICE_SN_UNAVAILABLE", message: "Device authorization is unavailable." });
+  }
+
+  async deviceSnReadiness(): Promise<boolean> {
+    if (!this.pool) return false;
+    try {
+      await this.query(`SELECT sn.id, sn.user_id, sn.device_uuid, sn.enabled, sn.activated_at, u.status, aa.item_name
+        FROM device_sn sn JOIN user u ON u.id = sn.user_id
+        LEFT JOIN auth_assignment aa ON aa.user_id = CAST(u.id AS BINARY) LIMIT 0`);
+      return true;
+    } catch { return false; }
   }
 
   /** One readonly snapshot: profiles, roles and ALL memberships of current organization members. */

@@ -1,7 +1,8 @@
 import { createHash, randomBytes } from "node:crypto";
 import { Injectable, OnModuleDestroy } from "@nestjs/common";
-import mysql, { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
+import mysql, { Pool, PoolConnection, ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { loadConfig } from "./config.js";
+import { deviceSnSource } from "./device-sn-source.js";
 
 export class InvalidRefreshTokenError extends Error {
   constructor(message = "refresh token is invalid") {
@@ -17,6 +18,8 @@ export interface IdentitySessionInput {
   expiresAt: Date;
   ipAddressHash?: string | null;
   userAgentHash?: string | null;
+  authMethod?: "device_sn" | null;
+  deviceSnId?: number | null;
 }
 
 export interface IssuedIdentitySession {
@@ -26,6 +29,8 @@ export interface IssuedIdentitySession {
   legacyUserId: number;
   username: string | null;
   expiresAt: Date;
+  authMethod?: "device_sn";
+  deviceSnId?: number;
 }
 
 interface StoredIdentitySession {
@@ -36,6 +41,8 @@ interface StoredIdentitySession {
   username: string | null;
   expiresAt: Date;
   revokedAt: Date | null;
+  authMethod?: "device_sn";
+  deviceSnId?: number;
 }
 
 @Injectable()
@@ -59,6 +66,11 @@ export class IdentitySessionRepository implements OnModuleDestroy {
   async issue(input: IdentitySessionInput): Promise<IssuedIdentitySession> {
     const pool = this.requirePool();
     await this.ensureSchema();
+    return this.issueUsing(pool, input);
+  }
+
+  private async issueUsing(pool: Pool | PoolConnection, input: IdentitySessionInput): Promise<IssuedIdentitySession> {
+    const source = deviceSnSource(input.authMethod, input.deviceSnId);
 
     const refreshToken = randomBytes(48).toString("base64url");
     const refreshTokenHash = hashRefreshToken(refreshToken);
@@ -66,8 +78,8 @@ export class IdentitySessionRepository implements OnModuleDestroy {
     await pool.execute<ResultSetHeader>(
       `INSERT INTO identity_refresh_sessions
         (refresh_token_hash, session_id, legacy_user_id, username, issued_at, expires_at,
-         ip_hash, user_agent_hash)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+         ip_hash, user_agent_hash, auth_method, device_sn_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         refreshTokenHash,
         input.sessionId,
@@ -76,7 +88,9 @@ export class IdentitySessionRepository implements OnModuleDestroy {
         new Date(),
         input.expiresAt,
         input.ipAddressHash ?? null,
-        input.userAgentHash ?? null
+        input.userAgentHash ?? null,
+        source?.authMethod ?? null,
+        source?.deviceSnId ?? null
       ]
     );
 
@@ -86,7 +100,8 @@ export class IdentitySessionRepository implements OnModuleDestroy {
       sessionId: input.sessionId,
       legacyUserId: input.legacyUserId,
       username: input.username,
-      expiresAt: input.expiresAt
+      expiresAt: input.expiresAt,
+      ...(source ?? {})
     };
   }
 
@@ -94,17 +109,26 @@ export class IdentitySessionRepository implements OnModuleDestroy {
     const pool = this.requirePool();
     await this.ensureSchema();
 
-    const current = await this.findValidSession(refreshToken);
-    const replacement = await this.issue(next);
-
-    await pool.execute(
-      `UPDATE identity_refresh_sessions
-          SET revoked_at = ?, replaced_by_hash = ?
-        WHERE id = ? AND revoked_at IS NULL`,
-      [new Date(), replacement.refreshTokenHash, current.id]
-    );
-
-    return replacement;
+    const connection = await pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const current = await this.readValidSession(connection, refreshToken, true);
+      // Provenance belongs to the stored session, never a caller-supplied replacement.
+      const source = deviceSnSource(current.authMethod, current.deviceSnId);
+      const replacement = await this.issueUsing(connection, {
+        ...next, legacyUserId: current.legacyUserId,
+        authMethod: source?.authMethod ?? null, deviceSnId: source?.deviceSnId ?? null
+      });
+      await connection.execute(
+        `UPDATE identity_refresh_sessions SET revoked_at = ?, replaced_by_hash = ? WHERE id = ? AND revoked_at IS NULL`,
+        [new Date(), replacement.refreshTokenHash, current.id]
+      );
+      await connection.commit();
+      return replacement;
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally { connection.release(); }
   }
 
   async revoke(refreshToken: string | null | undefined): Promise<boolean> {
@@ -142,6 +166,10 @@ export class IdentitySessionRepository implements OnModuleDestroy {
   async findValidSession(refreshToken: string): Promise<StoredIdentitySession> {
     const pool = this.requirePool();
     await this.ensureSchema();
+    return this.readValidSession(pool, refreshToken);
+  }
+
+  private async readValidSession(pool: Pool | PoolConnection, refreshToken: string, lock = false): Promise<StoredIdentitySession> {
     const refreshTokenHash = hashRefreshToken(refreshToken);
 
     const [rows] = await pool.execute<RowDataPacket[]>(
@@ -151,10 +179,12 @@ export class IdentitySessionRepository implements OnModuleDestroy {
               legacy_user_id AS legacyUserId,
               username,
               expires_at AS expiresAt,
-              revoked_at AS revokedAt
+              revoked_at AS revokedAt,
+              auth_method AS authMethod,
+              device_sn_id AS deviceSnId
          FROM identity_refresh_sessions
         WHERE refresh_token_hash = ?
-        LIMIT 1`,
+        LIMIT 1${lock ? " FOR UPDATE" : ""}`,
       [refreshTokenHash]
     );
 
@@ -166,9 +196,20 @@ export class IdentitySessionRepository implements OnModuleDestroy {
     return session;
   }
 
+  async deviceSnReadiness(): Promise<boolean> {
+    if (!this.pool) return false;
+    try {
+      await this.pool.query("SELECT auth_method, device_sn_id FROM identity_refresh_sessions LIMIT 0");
+      return true;
+    } catch { return false; }
+  }
+
   private async ensureSchema(): Promise<void> {
     if (!this.schemaReady) {
-      this.schemaReady = this.createSchema();
+      this.schemaReady = this.createSchema().catch((error) => {
+        this.schemaReady = null;
+        throw error;
+      });
     }
 
     return this.schemaReady;
@@ -190,6 +231,8 @@ export class IdentitySessionRepository implements OnModuleDestroy {
         replaced_by_hash CHAR(64) NULL,
         ip_hash CHAR(64) NULL,
         user_agent_hash CHAR(64) NULL,
+        auth_method VARCHAR(32) NULL,
+        device_sn_id INT NULL,
         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         PRIMARY KEY (id),
@@ -198,6 +241,16 @@ export class IdentitySessionRepository implements OnModuleDestroy {
         KEY idx_identity_refresh_sessions_session (session_id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `);
+    // CREATE TABLE IF NOT EXISTS does not upgrade installations created before device SN.
+    for (const [name, definition] of [["auth_method", "VARCHAR(32) NULL"], ["device_sn_id", "INT NULL"]]) {
+      const [columns] = await pool.query<RowDataPacket[]>(
+        "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'identity_refresh_sessions' AND COLUMN_NAME = ?", [name]
+      );
+      if (!columns.length) {
+        try { await pool.query(`ALTER TABLE identity_refresh_sessions ADD COLUMN ${name} ${definition}`); }
+        catch (error) { if ((error as { code?: string }).code !== "ER_DUP_FIELDNAME") throw error; }
+      }
+    }
   }
 
   private requirePool(): Pool {
@@ -232,6 +285,7 @@ export function hashRefreshToken(refreshToken: string): string {
 }
 
 function normalizeStoredSession(row: RowDataPacket): StoredIdentitySession {
+  const source = deviceSnSource(row.authMethod, row.deviceSnId == null ? null : Number(row.deviceSnId));
   return {
     id: Number(row.id),
     refreshTokenHash: String(row.refreshTokenHash),
@@ -239,7 +293,8 @@ function normalizeStoredSession(row: RowDataPacket): StoredIdentitySession {
     legacyUserId: Number(row.legacyUserId),
     username: row.username ?? null,
     expiresAt: normalizeDate(row.expiresAt),
-    revokedAt: row.revokedAt ? normalizeDate(row.revokedAt) : null
+    revokedAt: row.revokedAt ? normalizeDate(row.revokedAt) : null,
+    ...(source ?? {})
   };
 }
 

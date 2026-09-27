@@ -112,6 +112,13 @@ jobs:
           LOGIN_EVENTS_MYSQL_TEST_PASSWORD: identity_test_root_password
         run: npm test -- apps/identity-adapter/test/organization-login-events.mysql.spec.ts
 
+      - name: Run device SN MySQL integration tests
+        env:
+          NODE_ENV: test
+          DEVICE_SN_MYSQL_TEST_PORT: "3306"
+          DEVICE_SN_MYSQL_TEST_PASSWORD: identity_test_root_password
+        run: npm test -- apps/identity-adapter/test/device-sn-sessions.mysql.spec.ts
+
   build:
     name: Build & Push Docker Image
     runs-on: ubuntu-latest
