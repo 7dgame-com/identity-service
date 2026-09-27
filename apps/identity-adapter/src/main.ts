@@ -12,6 +12,11 @@ async function bootstrap() {
     logger: ["error", "warn", "log"]
   });
 
+  // Do not trust X-Forwarded-For by default. Deployments behind a known proxy
+  // must explicitly set IDENTITY_TRUST_PROXY_HOPS (normally 1).
+  const httpServer = app.getHttpAdapter().getInstance() as { set(name: string, value: unknown): void };
+  httpServer.set("trust proxy", config.network.trustProxyHops);
+
   const corsOrigins = new Set(
     config.corsOrigins.split(",").map((origin) => origin.trim()).filter(Boolean)
   );
