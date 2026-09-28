@@ -4,6 +4,7 @@ import { BadRequestException, Injectable, ServiceUnavailableException } from "@n
 import { z } from "zod";
 import { loadConfig } from "./config.js";
 import { LoginAuditIpExposure, LoginAuditRepository } from "./login-audit.repository.js";
+import type { OrganizationLoginEventQuery } from "./organization-login-events.js";
 
 const payloadSchema = z.object({
   eventKey: z.string().min(8).max(128),
@@ -36,6 +37,17 @@ export class LoginAuditService {
   private readonly config = loadConfig();
 
   constructor(private readonly repository: LoginAuditRepository) {}
+
+  async listOrganizationEvents(query: OrganizationLoginEventQuery) {
+    if (!this.repository.isConfigured()) {
+      throw new ServiceUnavailableException({ code: "IDENTITY_DB_NOT_CONFIGURED", message: "登录记录数据库尚未配置" });
+    }
+    try {
+      return await this.repository.listOrganizationEvents(query);
+    } catch {
+      throw new ServiceUnavailableException({ code: "LOGIN_EVENTS_UNAVAILABLE", message: "登录记录暂时无法加载，请稍后重试" });
+    }
+  }
 
   async record(payload: unknown): Promise<{ accepted: true; duplicate: boolean }> {
     if (!this.repository.isConfigured()) {

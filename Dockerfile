@@ -20,5 +20,6 @@ ENV NODE_ENV=production \
 COPY package*.json ./
 RUN npm ci --omit=dev
 COPY --from=build /app/dist ./dist
+COPY deploy/mysql/migrations ./deploy/mysql/migrations
 EXPOSE 8086
 CMD ["node", "dist/apps/identity-adapter/src/main.js"]

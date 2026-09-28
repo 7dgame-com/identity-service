@@ -1,4 +1,4 @@
-import { Injectable, OnModuleDestroy } from "@nestjs/common";
+import { Injectable, OnModuleDestroy, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
 import mysql, { Pool, RowDataPacket } from "mysql2/promise";
 import { loadConfig } from "./config.js";
 import { assertReadonlySql } from "./readonly-write.guard.js";
@@ -74,6 +74,8 @@ export interface LegacyUserCredential {
   passwordHash: string | null;
 }
 
+export type LegacyAuditMember = Pick<LegacyUserReadModel, "id" | "username" | "nickname" | "roles" | "organizations">;
+
 export interface LegacyUserListInput {
   afterId: number;
   limit: number;
@@ -127,6 +129,77 @@ export class LegacyIdentityReader implements OnModuleDestroy {
 
   isConfigured(): boolean {
     return this.pool !== null;
+  }
+
+  /** Must use the authoritative legacy writer, never an asynchronously replicated reader. */
+  async assertDeviceSnAuthorized(deviceSnId: number, userId: number, requireEnabled = true): Promise<void> {
+    if (!this.pool) throw new ServiceUnavailableException("Authoritative device authorization database is not configured.");
+    const rows = await this.query<RowDataPacket[]>(
+      `SELECT sn.id, sn.device_uuid AS deviceUuid
+         FROM device_sn sn
+         JOIN user u ON u.id = sn.user_id
+        WHERE sn.id = ? AND sn.user_id = ? AND sn.activated_at IS NOT NULL
+          AND sn.device_uuid IS NOT NULL AND CHAR_LENGTH(TRIM(sn.device_uuid)) > 0
+          AND u.status = 10 AND (? = 0 OR sn.enabled = 1)
+          AND NOT EXISTS (SELECT 1 FROM auth_assignment aa
+            WHERE aa.user_id = CAST(u.id AS BINARY) AND aa.item_name IN ('root', 'admin', 'manager'))
+        LIMIT 1`,
+      [deviceSnId, userId, requireEnabled ? 1 : 0]
+    );
+    const uuid = rows[0]?.deviceUuid;
+    // Exact match avoids collation-dependent acceptance and JavaScript '$' accepting a trailing newline.
+    const validUuid = typeof uuid === "string" && uuid.match(/^[a-z0-9][a-z0-9._:-]{0,254}$/u)?.[0] === uuid;
+    if (!rows.length || !validUuid) throw new UnauthorizedException({ code: "DEVICE_SN_UNAVAILABLE", message: "Device authorization is unavailable." });
+  }
+
+  async deviceSnReadiness(): Promise<boolean> {
+    if (!this.pool) return false;
+    try {
+      await this.query(`SELECT sn.id, sn.user_id, sn.device_uuid, sn.enabled, sn.activated_at, u.status, aa.item_name
+        FROM device_sn sn JOIN user u ON u.id = sn.user_id
+        LEFT JOIN auth_assignment aa ON aa.user_id = CAST(u.id AS BINARY) LIMIT 0`);
+      return true;
+    } catch { return false; }
+  }
+
+  /** One readonly snapshot: profiles, roles and ALL memberships of current organization members. */
+  async listOrganizationAuditMembers(organizationId: number): Promise<LegacyAuditMember[]> {
+    if (!this.pool) throw new Error("Legacy database is not configured for organization audit.");
+    const connection = await this.pool.getConnection();
+    try {
+      await connection.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+      await connection.query("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY");
+      const scope = `EXISTS (SELECT 1 FROM user_organization scope
+        WHERE scope.user_id = u.id AND scope.organization_id = ?)`;
+      const [users] = await connection.query<RowDataPacket[]>(
+        `SELECT u.id, u.username, u.nickname FROM user u WHERE ${scope}`, [organizationId]
+      );
+      const [roles] = await connection.query<RowDataPacket[]>(
+        `SELECT u.id AS userId, aa.item_name AS role FROM user u
+          JOIN auth_assignment aa ON aa.user_id = CAST(u.id AS BINARY)
+          JOIN auth_item ai ON ai.name = aa.item_name AND ai.type = 1
+          WHERE ${scope}`, [organizationId]
+      );
+      const [memberships] = await connection.query<RowDataPacket[]>(
+        `SELECT u.id AS userId, o.id, o.name, o.title,
+                o.created_at AS createdAt, o.updated_at AS updatedAt
+           FROM user u JOIN user_organization uo ON uo.user_id = u.id
+           JOIN organization o ON o.id = uo.organization_id WHERE ${scope}`, [organizationId]
+      );
+      const byId = new Map<number, LegacyAuditMember>(users.map((row) => [Number(row.id), {
+        id: Number(row.id), username: row.username ?? null, nickname: row.nickname ?? null,
+        roles: [], organizations: []
+      }]));
+      for (const row of roles) byId.get(Number(row.userId))?.roles.push(String(row.role));
+      for (const row of memberships) byId.get(Number(row.userId))?.organizations.push(normalizeOrganization(row));
+      await connection.commit();
+      return [...byId.values()];
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
   }
 
   async health(): Promise<"configured" | "not_configured" | "unavailable"> {

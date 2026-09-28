@@ -110,6 +110,8 @@ CREATE TABLE IF NOT EXISTS `identity_refresh_sessions` (
   `replaced_by_hash` CHAR(64) NULL,
   `ip_hash` CHAR(64) NULL,
   `user_agent_hash` CHAR(64) NULL,
+  `auth_method` VARCHAR(32) NULL,
+  `device_sn_id` INT NULL,
   `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),

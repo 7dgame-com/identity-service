@@ -1,8 +1,9 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { BadRequestException, Injectable, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
 import { loadConfig } from "./config.js";
-import { IdentitySessionRepository } from "./identity-session.repository.js";
+import { IdentitySessionRepository, InvalidRefreshTokenError } from "./identity-session.repository.js";
 import { JwtIssuerService } from "./jwt-issuer.service.js";
+import { denyDeviceSnCredentialDerivation } from "./device-sn-source.js";
 import { LegacyIdentityReader, LegacyUserReadModel } from "./legacy-identity.reader.js";
 import {
   InvalidAuthorizationCodeError,
@@ -209,6 +210,7 @@ export class OidcService {
     assertPkce(client, request.codeChallenge, request.codeChallengeMethod);
 
     const claims = this.verifyIdentityBearer(authorization);
+    if (claims.authMethod === "device_sn") denyDeviceSnCredentialDerivation();
     const user = await this.requireLegacyUser(claims.uid);
     if (!this.codes.isConfigured()) {
       throw new ServiceUnavailableException({
@@ -401,6 +403,16 @@ export class OidcService {
       throw invalidRequest("refresh_token is required for refresh_token grant.");
     }
 
+    let sourceSession;
+    try {
+      sourceSession = await this.sessions.findValidSession(request.refreshToken);
+    } catch (error) {
+      if (error instanceof InvalidRefreshTokenError) {
+        throw new UnauthorizedException({ code: "REFRESH_TOKEN_INVALID", message: "Refresh token is invalid." });
+      }
+      throw error;
+    }
+    if (sourceSession.authMethod === "device_sn" || sourceSession.deviceSnId != null) denyDeviceSnCredentialDerivation();
     const refreshed = await this.tokenIssuance.refresh({ refreshToken: request.refreshToken });
     const expiresAt = new Date(refreshed.token.expires);
 
