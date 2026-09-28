@@ -1,5 +1,6 @@
 import { Module } from "@nestjs/common";
-import { APP_INTERCEPTOR } from "@nestjs/core";
+import { APP_GUARD, APP_INTERCEPTOR } from "@nestjs/core";
+import { DeviceSnAccessGuard } from "./device-sn-access.guard.js";
 import { AccountEmailRepository } from "./account-email.repository.js";
 import { AccountEmailService } from "./account-email.service.js";
 import { AccountInvitationService } from "./account-invitation.service.js";
@@ -142,6 +143,7 @@ import { UsageBillingService } from "./usage-billing.service.js";
     ProfileWriteOperationRepository,
     ProfileWriteService,
     TokenIssuanceService,
+    { provide: APP_GUARD, useClass: DeviceSnAccessGuard },
     { provide: APP_INTERCEPTOR, useClass: TelemetryInterceptor }
   ]
 })

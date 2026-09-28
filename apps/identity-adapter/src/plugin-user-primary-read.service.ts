@@ -8,6 +8,7 @@ import { IdentityOrganizationShadowRow, IdentityUserRow, IamRepository } from ".
 import { VerifiedAccessToken } from "./jwt-issuer.service.js";
 import {
   LegacyIdentityReader,
+  LegacyAuditMember,
   LegacyManagedUserListInput,
   LegacyManagedUserListResult,
   LegacyOrganization,
@@ -33,6 +34,34 @@ export class PluginUserPrimaryReadService {
     private readonly legacyReader: LegacyIdentityReader,
     private readonly organizationRepository?: IamOrganizationWriteRepository
   ) {}
+
+  /** Keep audit role labels consistent with the staged identity-native role reader, in batches. */
+  async withAuditMemberRoles(members: LegacyAuditMember[]): Promise<LegacyAuditMember[]> {
+    const iam = this.config.iam;
+    if (iam.roleWriteMode !== "identity-native" || !iam.roleWriteIdentityNativeExecutionEnabled) return members;
+    const owned = members.filter((member) => !member.roles.includes("root")
+      && identityNativeRoleWriteTargetDecision(iam, member.id).owned);
+    if (!owned.length) return members;
+    const checksum = (iam.roleWritePolicyChecksum ?? "").trim().toLowerCase();
+    if (!/^[a-f0-9]{64}$/.test(checksum) || !this.repository.isConfigured()) {
+      throw new ServiceUnavailableException({ code: "LOGIN_AUDIT_ROLES_UNAVAILABLE", message: "当前账号身份暂时无法确认" });
+    }
+    let roles: Map<number, string[]>;
+    try {
+      roles = await this.repository.listAuditNativeRoles(owned.map((member) => member.id), checksum);
+    } catch {
+      throw new ServiceUnavailableException({ code: "LOGIN_AUDIT_ROLES_UNAVAILABLE", message: "当前账号身份暂时无法确认" });
+    }
+    const ownedIds = new Set(owned.map((member) => member.id));
+    return members.map((member) => {
+      if (!ownedIds.has(member.id)) return member;
+      const currentRoles = roles.get(member.id) ?? [];
+      if (!currentRoles.length && member.roles.length) {
+        throw new ServiceUnavailableException({ code: "LOGIN_AUDIT_ROLES_UNAVAILABLE", message: "当前账号身份暂时无法确认" });
+      }
+      return { ...member, roles: currentRoles };
+    });
+  }
 
   async getUserById(id: number, claims: VerifiedAccessToken): Promise<PluginUserReadResult<LegacyUserReadModel | null>> {
     const decision = this.readDecision(claims);
