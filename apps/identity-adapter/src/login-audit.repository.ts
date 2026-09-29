@@ -75,14 +75,16 @@ export class LoginAuditRepository implements OnModuleDestroy {
       // Keep count and page consistent even while new logins are being recorded.
       await connection.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
       await connection.query("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY");
-      // MySQL 8 JSON_TABLE avoids an unbounded number of prepared-statement placeholders.
+      // MySQL 8 JSON_TABLE keeps the membership filter to one bound parameter.
       const from = `FROM auth_login_events e
         JOIN JSON_TABLE(?, '$[*]' COLUMNS (user_id BIGINT PATH '$')) members
           ON members.user_id = e.legacy_user_id
         WHERE e.event_type = 'login' AND e.success = 1
           AND e.occurred_at >= ? AND e.occurred_at < ?`;
       const parameters = [JSON.stringify([...new Set(input.userIds)]), input.startAt, input.endAt];
-      const [counts] = await connection.execute<RowDataPacket[]>(`SELECT COUNT(*) AS total ${from}`, parameters);
+      // CynosDB can reject prepared JSON_TABLE statements with ER_UNKNOWN_STMT_HANDLER.
+      // Use mysql2's parameterized text protocol for both reads in this snapshot.
+      const [counts] = await connection.query<RowDataPacket[]>(`SELECT COUNT(*) AS total ${from}`, parameters);
       const [rows] = await connection.query<RowDataPacket[]>(
         `SELECT e.event_key AS eventKey, e.legacy_user_id AS userId,
                 e.occurred_at AS occurredAt, e.source ${from}
