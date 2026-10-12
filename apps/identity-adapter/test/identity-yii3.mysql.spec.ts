@@ -25,9 +25,12 @@ const opts={host:"127.0.0.1",port:Number(process.env.IDENTITY_TEST_MYSQL_PORT??1
 const suffix=randomUUID().replaceAll("-", ""),name=`test_yii3_${suffix}`,business=`test_yii3_sn_${suffix}`;
 const source={application:"yii3-a1",sourceRevision:"1".repeat(40),redisDatabase:1,keyPrefix:"refresh_token:",
   fixedTtlSeconds:2592000,expiryPolicy:"setex-on-create-only",namespaceWritersReviewed:true};
-const makeManifest=(token:string,device=false,expiry=Date.now()+120000)=>exportYii3RefreshSessions({version:1,source,capturedAtMs:Date.now(),entries:[{
-  key:`refresh_token:${token}`,value:device?{version:1,user_id:42,auth_method:"device_sn",device_sn_id:9}:"42",
-  expiry:{kind:"pexpiretime",expiresAtMs:expiry,observedAtMs:Date.now()}}]}).manifest;
+const makeManifest=(token:string,device=false,expiry?:number)=>{
+  const observedAtMs=Date.now();
+  return exportYii3RefreshSessions({version:1,source,capturedAtMs:observedAtMs,entries:[{
+    key:`refresh_token:${token}`,value:device?{version:1,user_id:42,auth_method:"device_sn",device_sn_id:9}:"42",
+    expiry:{kind:"pexpiretime",expiresAtMs:expiry??observedAtMs+120000,observedAtMs}}]}).manifest;
+};
 
 describe.skipIf(process.env.IDENTITY_TEST_MYSQL!=="1")("Yii3 compatibility uses private authority and source-bound sessions",()=>{
   let admin:Connection,db:Connection,devices:Connection,reader:LegacyIdentityReader,sessions:IdentitySessionRepository,native:NativeIdentityService,

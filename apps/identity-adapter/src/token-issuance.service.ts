@@ -138,7 +138,7 @@ export class TokenIssuanceService {
   async logout(payload: unknown): Promise<{ success: true; message: "logout"; revoked: boolean }> {
     this.assertEnabled();
     const parsed = parseBody(logoutSchema, payload ?? {});
-    const revoked = parsed.refreshToken && this.legacyCredentials && !await this.sessions.hasRefreshToken(parsed.refreshToken) && await this.legacyCredentials.hasCredential(parsed.refreshToken)
+    const revoked = this.config.dataSource === "identity" && parsed.refreshToken && this.legacyCredentials && !await this.sessions.hasRefreshToken(parsed.refreshToken) && await this.legacyCredentials.hasCredential(parsed.refreshToken)
       ? await this.legacyCredentials.revoke(parsed.refreshToken) : await this.sessions.revoke(parsed.refreshToken);
 
     return { success: true, message: "logout", revoked };
