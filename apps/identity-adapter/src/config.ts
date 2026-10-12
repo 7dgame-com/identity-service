@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { isIP } from "node:net";
 
 const boolFromEnv = z
   .union([z.boolean(), z.string()])
@@ -33,6 +34,11 @@ const optionalStringFromEnv = z
     const trimmed = value?.trim();
     return trimmed === "" ? undefined : trimmed;
   });
+
+function validMailHost(value: string): boolean {
+  return isIP(value) !== 0 || (value.length > 0 && value.split(".").every((label) =>
+    /^[a-z\d](?:[a-z\d-]{0,61}[a-z\d])?$/i.test(label)));
+}
 
 export const configSchema = z.object({
   nodeEnv: z.string().default("development"),
@@ -266,8 +272,19 @@ export const configSchema = z.object({
     maxKeys: numberFromEnv.default(5000)
   }),
   emailDelivery: z.object({
+    transport: z.enum(["webhook", "smtp"]).default("webhook"),
     webhookUrl: optionalStringFromEnv,
-    webhookToken: optionalStringFromEnv
+    webhookToken: optionalStringFromEnv,
+    smtp: z.object({
+      host: z.string().max(253).refine(validMailHost).default("smtp.exmail.qq.com"),
+      port: numberFromEnv.default(465).pipe(z.number().int().min(1).max(65535)),
+      tlsMode: z.enum(["implicit", "starttls"]).default("implicit"),
+      serverName: z.string().max(253).refine(validMailHost).optional(),
+      username: optionalStringFromEnv,
+      password: z.string().max(4096).optional(),
+      from: z.string().email().max(255).optional(),
+      appName: z.string().min(1).max(100).regex(/^[^\r\n\x00-\x1f\x7f]+$/).default("XR UGC平台")
+    }).default({})
   }),
   emailVerification: z.object({
     codeHashSalt: z.string().default("xrugc-email-verify-v1"),
@@ -548,8 +565,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
       maxKeys: env.IDENTITY_INVITATION_REDIS_MAX_KEYS
     },
     emailDelivery: {
+      transport: env.IDENTITY_EMAIL_TRANSPORT,
       webhookUrl: env.IDENTITY_EMAIL_WEBHOOK_URL,
-      webhookToken: env.IDENTITY_EMAIL_WEBHOOK_TOKEN
+      webhookToken: env.IDENTITY_EMAIL_WEBHOOK_TOKEN,
+      smtp: {
+        host: env.IDENTITY_EMAIL_SMTP_HOST,
+        port: env.IDENTITY_EMAIL_SMTP_PORT,
+        tlsMode: env.IDENTITY_EMAIL_SMTP_TLS_MODE,
+        serverName: env.IDENTITY_EMAIL_SMTP_SERVER_NAME || undefined,
+        username: env.MAILER_USERNAME,
+        password: env.MAILER_PASSWORD,
+        from: env.IDENTITY_EMAIL_FROM || env.MAILER_USERNAME || undefined,
+        appName: env.IDENTITY_EMAIL_APP_NAME
+      }
     },
     emailVerification: {
       codeHashSalt: env.IDENTITY_EMAIL_CODE_HASH_SALT,
