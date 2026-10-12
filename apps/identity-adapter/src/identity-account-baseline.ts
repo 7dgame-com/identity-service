@@ -11,10 +11,12 @@ export async function readAccountBaseline(source: Connection, maxUsers = 100_000
     const tables: Record<string, { rows: number; columns: unknown[]; indexes: unknown[] }> = {};
     const missingTables: string[] = [];
     for (const table of Object.keys(accountImportTables)) {
-      const [present] = await source.execute<RowDataPacket[]>("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=?",[table]);
+      // Offline metadata reads use the text protocol. A proxy may invalidate a
+      // server prepared-statement handle between repeated schema queries.
+      const [present] = await source.query<RowDataPacket[]>("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=?",[table]);
       if (!present.length) { missingTables.push(table); continue; }
-      const [columns] = await source.execute<RowDataPacket[]>("SELECT COLUMN_NAME,DATA_TYPE,COLUMN_TYPE,IS_NULLABLE,COLUMN_KEY,EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? ORDER BY ORDINAL_POSITION",[table]);
-      const [indexes] = await source.execute<RowDataPacket[]>("SELECT INDEX_NAME,NON_UNIQUE,SEQ_IN_INDEX,COLUMN_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? ORDER BY INDEX_NAME,SEQ_IN_INDEX",[table]);
+      const [columns] = await source.query<RowDataPacket[]>("SELECT COLUMN_NAME,DATA_TYPE,COLUMN_TYPE,IS_NULLABLE,COLUMN_KEY,EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? ORDER BY ORDINAL_POSITION",[table]);
+      const [indexes] = await source.query<RowDataPacket[]>("SELECT INDEX_NAME,NON_UNIQUE,SEQ_IN_INDEX,COLUMN_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? ORDER BY INDEX_NAME,SEQ_IN_INDEX",[table]);
       const [count] = await source.query<RowDataPacket[]>(`SELECT COUNT(*) AS total FROM \`${table}\``);
       tables[table]={rows:Number(count[0].total),columns,indexes};
     }
