@@ -1,6 +1,9 @@
 import type { Connection, RowDataPacket } from "mysql2/promise";
 import type { ExecuteValues } from "mysql2";
-import { accountImportTables } from "./identity-account-import.js";
+import { accountImportTables, appendLegacyProfileHistory, legacyProfileArchiveColumns } from "./identity-account-import.js";
+import { projectLegacyProfiles, type ProfileSelectionManifest } from "./identity-profile-migration.js";
+import { assertAccountImportUniqueConstraints } from "./identity-account-constraints.js";
+import { assertProfileJsonValues, legacyProfileJsonTypeSelection } from "./identity-profile-source.js";
 import {
   assertMigrationStaging,
   migrationPrimaryKeys,
@@ -40,6 +43,7 @@ const avatarColumns = ["user_id", "avatar_id"];
 const tables: Readonly<Record<string, readonly string[]>> = {
   ...accountImportTables,
   identity_profile_avatars: avatarColumns,
+  identity_legacy_profile_rows: legacyProfileArchiveColumns,
 };
 const quoted = (columns: readonly string[]) =>
   columns.map((c) => `\`${c}\``).join(",");
@@ -63,7 +67,7 @@ function bind(value: unknown): ExecuteValues {
 export async function syncIdentityAccounts(
   source: Connection,
   target: Connection,
-  options: { apply?: boolean; maxChanges: number; maxRows?: number },
+  options: { apply?: boolean; maxChanges: number; maxRows?: number; profileSelection?: ProfileSelectionManifest },
 ): Promise<AccountSyncReport> {
   const maxRows = options.maxRows ?? 100_000;
   if (
@@ -140,6 +144,10 @@ export async function syncIdentityAccounts(
 
     const datasets = new Map<string, Dataset>();
     let hasAvatarColumn = false;
+    let profileProjection: ReturnType<typeof projectLegacyProfiles> | undefined;
+    const [previousArchiveRows] = await target.query<RowDataPacket[]>(`SELECT ${quoted(legacyProfileArchiveColumns)}
+      FROM identity_legacy_profile_rows LIMIT ${maxRows+1} FOR UPDATE`);
+    if(previousArchiveRows.length>maxRows)throw new Error("Legacy profile archive exceeds the bounded table size");
     for (const [table, allowed] of Object.entries(tables)) {
       const baseline = baselines.get(table) ?? new Map<string, Baseline>();
       let columns: string[],
@@ -153,10 +161,15 @@ export async function syncIdentityAccounts(
           throw new Error(
             "Legacy avatar source schema changed since the baseline.",
           );
-        if (hasAvatarColumn)
-          [rows] = await source.query<RowDataPacket[]>(
-            `SELECT user_id,avatar_id FROM user_info WHERE avatar_id IS NOT NULL LIMIT ${maxRows + 1}`,
-          );
+        rows = (profileProjection?.avatarRows ?? []) as RowDataPacket[];
+      } else if (table === "identity_legacy_profile_rows") {
+        columns = legacyProfileArchiveColumns;
+        rows = (profileProjection?.archiveRows ?? []).map(row=>({...row,is_present:1})) as RowDataPacket[];
+        const presentIds = new Set(rows.map(row=>String(row.id)));
+        const selections = new Map(profileProjection?.report.selections.map(row=>[row.userId,row.profileId]));
+        // A deleted historical record remains archived; no payload is discarded.
+        for(const previous of previousArchiveRows)if(!presentIds.has(String(previous.id)))rows.push({...previous,
+          selected_profile_id:selections.get(Number(previous.user_id))??previous.selected_profile_id,is_present:0} as RowDataPacket);
       } else {
         const [exists] = await source.query<RowDataPacket[]>(
           "SHOW TABLES LIKE ?",
@@ -182,9 +195,17 @@ export async function syncIdentityAccounts(
             throw new Error(
               `Legacy source primary key is incomplete: ${table}`,
             );
+          const readColumns=table==="user_info"&&hasAvatarColumn?[...columns,"avatar_id"]:columns;
+          const profileType=table==="user_info"?legacyProfileJsonTypeSelection(schema):"";
           [rows] = await source.query<RowDataPacket[]>(
-            `SELECT ${quoted(columns)} FROM \`${table}\` LIMIT ${maxRows + 1}`,
+            `SELECT ${quoted(readColumns)}${profileType} FROM \`${table}\` LIMIT ${maxRows + 1}`,
           );
+          if(table==="user_info"){
+            if(rows.length>maxRows)throw new Error("Account sync exceeds the bounded raw profile size");
+            assertProfileJsonValues(rows,true);
+            profileProjection=projectLegacyProfiles(rows,{manifest:options.profileSelection,previousArchiveRows,hasAvatarColumn});
+            rows=profileProjection.canonicalRows as RowDataPacket[];
+          }
         }
       }
       if (
@@ -200,6 +221,7 @@ export async function syncIdentityAccounts(
       const [targetRows] = await target.query<RowDataPacket[]>(
         `SELECT ${quoted(targetColumns)} FROM \`${table}\` LIMIT ${maxRows + 1} FOR UPDATE`,
       );
+      if(table==="user_info")assertProfileJsonValues(targetRows);
       if (rows.length > maxRows || targetRows.length > maxRows)
         throw new Error(
           `Account sync exceeds the bounded table size: ${table}`,
@@ -212,6 +234,8 @@ export async function syncIdentityAccounts(
         target: indexRows(table, targetRows),
       });
     }
+    await assertAccountImportUniqueConstraints(source,target,new Map([...datasets].map(([table,dataset])=>
+      [table,{columns:dataset.columns,rows:[...dataset.source.values()]}])));
 
     const deltas: Delta[] = [];
     for (const dataset of datasets.values()) {
@@ -295,6 +319,8 @@ export async function syncIdentityAccounts(
       if (!delta.source) await applyDelta(target, delta);
     for (const delta of deltas)
       if (delta.source) await applyDelta(target, delta);
+    await appendLegacyProfileHistory(target,deltas.filter(delta=>delta.dataset.table==="identity_legacy_profile_rows"&&delta.source)
+      .map(delta=>delta.source!),sourceLocation[0].name);
     for (const delta of deltas) {
       const { dataset, source: incoming, target: previous } = delta;
       const keyRow = (incoming ?? previous)!;
@@ -364,7 +390,7 @@ export async function syncIdentityAccounts(
   }
 }
 
-function indexRows(table: string, rows: RowDataPacket[]): Map<string, Row> {
+function indexRows(table: string, rows: Row[]): Map<string, Row> {
   const indexed = new Map<string, Row>();
   for (const row of rows) {
     if (table === "user") integerId(row.id);

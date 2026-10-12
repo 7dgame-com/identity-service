@@ -142,9 +142,9 @@ describe.skipIf(!enabled)("staging account delta MySQL sync", () => {
       await syncIdentityAccounts(source, target, { maxChanges: 10 }),
     ).toMatchObject({
       applied: false,
-      changes: 6,
+      changes: 7,
       inserts: 4,
-      updates: 2,
+      updates: 3,
       affectedSubjects: 2,
     });
     expect(
@@ -153,7 +153,7 @@ describe.skipIf(!enabled)("staging account delta MySQL sync", () => {
     expect(await eventCount()).toBe(before);
     expect(
       await syncIdentityAccounts(source, target, { ...apply, maxChanges: 10 }),
-    ).toMatchObject({ applied: true, changes: 6 });
+    ).toMatchObject({ applied: true, changes: 7 });
     expect(
       (await rows("SELECT nickname,password_hash FROM user WHERE id=7001"))[0],
     ).toMatchObject({

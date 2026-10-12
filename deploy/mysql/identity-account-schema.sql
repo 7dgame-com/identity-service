@@ -22,6 +22,20 @@ CREATE TABLE IF NOT EXISTS user_info (
   info JSON NULL,
   PRIMARY KEY (id), UNIQUE KEY account_profile_user (user_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+-- Every legacy identity-profile row is retained separately from the one-row
+-- runtime projection. Business balances remain in the business database.
+CREATE TABLE IF NOT EXISTS identity_legacy_profile_rows (
+  id BIGINT NOT NULL PRIMARY KEY, user_id BIGINT NOT NULL,
+  payload_json JSON NOT NULL, selected_profile_id BIGINT NOT NULL,
+  is_present TINYINT NOT NULL DEFAULT 1,
+  KEY legacy_profile_owner (user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+CREATE TABLE IF NOT EXISTS identity_legacy_profile_history (
+  id BIGINT NOT NULL, payload_hash CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  payload_json JSON NOT NULL, source_database VARCHAR(255) NOT NULL,
+  observed_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (id,payload_hash)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 CREATE TABLE IF NOT EXISTS auth_rule (
   name VARCHAR(64) NOT NULL, data BLOB NULL, created_at BIGINT NULL, updated_at BIGINT NULL,
   PRIMARY KEY (name)

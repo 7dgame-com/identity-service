@@ -5,7 +5,7 @@ type Transaction = Connection | PoolConnection;
 export const migrationPrimaryKeys:Readonly<Record<string,readonly string[]>> = {
   user:["id"],user_info:["id"],auth_rule:["name"],auth_item:["name"],auth_item_child:["parent","child"],
   auth_assignment:["item_name","user_id"],organization:["id"],user_organization:["user_id","organization_id"],
-  wechat:["id"],invitation_record:["id"],invitation:["id"],identity_profile_avatars:["user_id"]
+  wechat:["id"],invitation_record:["id"],invitation:["id"],identity_profile_avatars:["user_id"],identity_legacy_profile_rows:["id"]
 };
 
 /** Caller must hold this row lock through the import transaction. The transition is one-way. */
@@ -25,7 +25,7 @@ export function migrationRowKey(table:string,row:Record<string,unknown>):{keyHas
 export function migrationRowHash(row:Record<string,unknown>,columns:readonly string[]):string {
   const values=columns.map(column=>{
     let value=row[column]??null;
-    if(column==="info" && typeof value==="string"){try{value=JSON.parse(value);}catch{/* Preserve historical text exactly. */}}
+    if(["info","payload_json"].includes(column) && typeof value==="string"){try{value=JSON.parse(value);}catch{/* Preserve historical text exactly. */}}
     return [column,normalize(value)];
   });
   return createHash("sha256").update(JSON.stringify(values)).digest("hex");
