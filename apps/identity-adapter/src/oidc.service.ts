@@ -2,7 +2,8 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { BadRequestException, Injectable, Optional, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
 import { NativeIdentityService } from "./native-identity.service.js";
 import { loadConfig } from "./config.js";
-import { IdentitySessionRepository } from "./identity-session.repository.js";
+import { IdentitySessionRepository, InvalidRefreshTokenError } from "./identity-session.repository.js";
+import { denyDeviceSnCredentialDerivation } from "./device-sn-source.js";
 import { JwtIssuerService } from "./jwt-issuer.service.js";
 import { LegacyIdentityReader, LegacyUserReadModel } from "./legacy-identity.reader.js";
 import {
@@ -43,6 +44,7 @@ interface TokenRequest {
   redirectUri: string | null;
   codeVerifier: string | null;
   refreshToken: string | null;
+  scope: string | null;
 }
 
 interface OidcTokenResponse {
@@ -211,6 +213,7 @@ export class OidcService {
     assertPkce(client, request.codeChallenge, request.codeChallengeMethod);
 
     const claims = await this.verifyIdentityBearer(authorization);
+    if (claims.authMethod === "device_sn") denyDeviceSnCredentialDerivation();
     const user = await this.requireLegacyUser(claims.uid);
     if (!this.codes.isConfigured()) {
       throw new ServiceUnavailableException({
@@ -258,7 +261,7 @@ export class OidcService {
     assertClientAuthenticated(client, request.clientSecret);
 
     if (request.grantType === "refresh_token") {
-      return this.refreshToken(request);
+      return this.config.dataSource === "identity" ? this.refreshNativeToken(request, client) : this.refreshToken(request);
     }
 
     if (!request.code || !request.redirectUri || !request.codeVerifier) {
@@ -291,8 +294,10 @@ export class OidcService {
 
     const user = await this.requireLegacyUser(code.legacyUserId);
     const scopes = code.scope.split(" ").filter(Boolean);
-    const session = scopes.includes("offline_access") ? await this.issueRefreshSession(user) : null;
-    const accessToken = this.jwtIssuer.issue(user, session?.sessionId ?? randomId());
+    const isNative = this.config.dataSource === "identity";
+    if (isNative) assertScopes(client, scopes);
+    const session = isNative || scopes.includes("offline_access") ? await this.issueRefreshSession(user, isNative ? { client, scopes } : undefined) : null;
+    const accessToken = this.jwtIssuer.issue(user, session?.sessionId ?? randomId(), isNative ? { audience: client.clientId, scopes } : undefined);
     const idToken = this.jwtIssuer.issueOidcIdToken({
       user,
       issuer: this.issuer(context),
@@ -307,8 +312,35 @@ export class OidcService {
       token_type: "Bearer",
       expires_in: secondsUntil(accessToken.expiresAt),
       id_token: idToken.accessToken,
-      refresh_token: session?.refreshToken,
+      refresh_token: scopes.includes("offline_access") ? session?.refreshToken : undefined,
       scope: code.scope
+    };
+  }
+
+  async nativeUserinfo(token: string) {
+    if (!this.native?.enabled) throw new ServiceUnavailableException("Native OIDC account authority is unavailable");
+    // Unverified data selects a persisted binding only. Audience and scope become
+    // authoritative after signature verification against that binding's client.
+    const payload = readTokenPayload(token);
+    const sessionId = typeof payload.session_id === "string" && payload.session_id.length <= 128 ? payload.session_id : null;
+    const binding = sessionId ? await this.sessions.getOidcBinding(sessionId) : null;
+    if (!binding) {
+      const user = await this.native.verify(token);
+      return { sub: String(user.id), uid: user.id, preferred_username: user.username, roles: user.roles };
+    }
+    const client = this.requireClient(binding.clientId);
+    const user = await this.native.verify(token, { audience: client.clientId });
+    const scopes = typeof payload.scope === "string" ? payload.scope.split(" ").filter(Boolean) : [];
+    if (!scopes.includes("openid") || !scopes.every((scope) => binding.scopes.includes(scope) && client.scopes.includes(scope))) {
+      throw new UnauthorizedException({ code: "INVALID_ACCESS_TOKEN", message: "OIDC access token scope is invalid." });
+    }
+    return {
+      sub: String(user.id), uid: user.id,
+      ...(scopes.includes("profile") ? { preferred_username: user.username, name: user.nickname ?? user.username } : {}),
+      ...(scopes.includes("email") ? { email: user.email, email_verified: Boolean(user.emailVerifiedAt) } : {}),
+      ...(scopes.includes("roles") ? { roles: user.roles } : {}),
+      ...(scopes.includes("permissions") ? { permissions: user.permissions } : {}),
+      ...(scopes.includes("organization") ? { organization: user.organizations.map(({ id, name, title }) => ({ id, name, title })) } : {})
     };
   }
 
@@ -389,11 +421,12 @@ export class OidcService {
     }
 
     try {
+      const claims = this.jwtIssuer.verifyAccessToken(token);
       if (this.native?.enabled) {
         const user = await this.native.verify(token);
-        return { uid: user.id, roles: user.roles, username: user.username, sessionId: null };
+        return { ...claims, uid: user.id, roles: user.roles, username: user.username };
       }
-      return this.jwtIssuer.verifyAccessToken(token);
+      return claims;
     } catch {
       throw new UnauthorizedException({
         code: "INVALID_ACCESS_TOKEN",
@@ -407,6 +440,14 @@ export class OidcService {
       throw invalidRequest("refresh_token is required for refresh_token grant.");
     }
 
+    let sourceSession;
+    try { sourceSession = await this.sessions.findValidSession(request.refreshToken); }
+    catch (error) {
+      if (error instanceof InvalidRefreshTokenError) throw new UnauthorizedException({ code: "REFRESH_TOKEN_INVALID", message: "Refresh token is invalid." });
+      throw error;
+    }
+    if (sourceSession.authMethod === "device_sn" || sourceSession.deviceSnId != null) denyDeviceSnCredentialDerivation();
+
     const refreshed = await this.tokenIssuance.refresh({ refreshToken: request.refreshToken });
     const expiresAt = new Date(refreshed.token.expires);
 
@@ -416,6 +457,32 @@ export class OidcService {
       expires_in: secondsUntil(expiresAt),
       refresh_token: refreshed.token.refreshToken
     };
+  }
+
+  private async refreshNativeToken(request: TokenRequest, client: OidcClientConfig): Promise<OidcTokenResponse> {
+    if (!request.refreshToken) throw invalidRequest("refresh_token is required for refresh_token grant.");
+    try {
+      const current = await this.sessions.findRefreshCandidate(request.refreshToken);
+      if (current.authMethod === "device_sn" || current.deviceSnId != null) denyDeviceSnCredentialDerivation();
+      const binding = await this.sessions.getOidcBinding(current.sessionId);
+      if (!binding || binding.clientId !== client.clientId || !binding.scopes.includes("offline_access") || !client.scopes.includes("offline_access")) {
+        throw new InvalidRefreshTokenError("Refresh token is not bound to this OIDC client");
+      }
+      const scopes = request.scope === null ? binding.scopes : [...new Set(parseScopes(request.scope))];
+      if (!scopes.includes("openid") || !scopes.every((scope) => binding.scopes.includes(scope))) throw invalidScope("Refresh scope exceeds the original grant.");
+      assertScopes(client, scopes);
+      const user = await this.requireLegacyUser(current.legacyUserId);
+      this.jwtIssuer.assertSigningReady();
+      const rotated = await this.sessions.rotate(request.refreshToken, {
+        legacyUserId: user.id, username: user.username, sessionId: current.sessionId,
+        expiresAt: new Date(Date.now() + this.config.tokenIssuance.refreshTokenTtlSeconds * 1000)
+      });
+      const access = this.jwtIssuer.issue(user, rotated.sessionId, { audience: client.clientId, scopes });
+      return { access_token: access.accessToken, token_type: "Bearer", expires_in: secondsUntil(access.expiresAt), refresh_token: rotated.refreshToken, scope: scopes.join(" ") };
+    } catch (error) {
+      if (error instanceof InvalidRefreshTokenError) throw new UnauthorizedException({ code: "REFRESH_TOKEN_INVALID", message: "Refresh token is invalid." });
+      throw error;
+    }
   }
 
   private async requireLegacyUser(id: number): Promise<LegacyUserReadModel> {
@@ -430,7 +497,7 @@ export class OidcService {
     return user;
   }
 
-  private async issueRefreshSession(user: LegacyUserReadModel) {
+  private async issueRefreshSession(user: LegacyUserReadModel, oidc?: { client: OidcClientConfig; scopes: string[] }) {
     if (!this.sessions.isConfigured()) {
       throw new ServiceUnavailableException({
         code: "IDENTITY_DB_NOT_CONFIGURED",
@@ -438,12 +505,13 @@ export class OidcService {
       });
     }
 
-    return this.sessions.issue({
+    const input = {
       legacyUserId: user.id,
       username: user.username,
       sessionId: randomId(),
       expiresAt: new Date(Date.now() + this.config.tokenIssuance.refreshTokenTtlSeconds * 1000)
-    });
+    };
+    return oidc ? this.sessions.issueOidcSession(input, { clientId: oidc.client.clientId, scopes: oidc.scopes }) : this.sessions.issue(input);
   }
 
   private clients(): OidcClientConfig[] {
@@ -560,8 +628,17 @@ function parseTokenRequest(payload: unknown, authorization: string | undefined):
     code: single(body.code) || null,
     redirectUri: single(body.redirect_uri) || null,
     codeVerifier: single(body.code_verifier) || null,
-    refreshToken: single(body.refresh_token) || null
+    refreshToken: single(body.refresh_token) || null,
+    scope: body.scope === undefined ? null : single(body.scope)
   };
+}
+
+function readTokenPayload(token: string): Record<string, unknown> {
+  try {
+    const payload: unknown = JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8"));
+    if (payload && typeof payload === "object" && !Array.isArray(payload)) return payload as Record<string, unknown>;
+  } catch { /* fall through */ }
+  throw new UnauthorizedException({ code: "INVALID_ACCESS_TOKEN", message: "OIDC access token is invalid." });
 }
 
 function assertRedirectUri(client: OidcClientConfig, redirectUri: string): void {

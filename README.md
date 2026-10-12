@@ -1,6 +1,11 @@
 # XR UGC Identity Service
 
-This repository is the independent identity-service used by the XR UGC platform migration. It starts in readonly mode and can read legacy users, roles and organizations for comparison. Phase 4 adds optional token issuance, but it remains disabled by default and must be explicitly enabled for gray rollout.
+This repository provides the XR UGC platform's identity service. The default
+`IDENTITY_DATA_SOURCE=legacy` keeps the existing readonly comparison deployment.
+Explicit `identity` mode makes the private database authoritative for accounts,
+permissions, organizations, credentials and sessions, with no old account-store
+fallback. Native startup requires completed staging imports and activates the
+migration fence; follow the deployment instructions before starting it.
 
 ## Local Start
 
@@ -67,16 +72,36 @@ hkccr.ccs.tencentyun.com/gdgeek/identity-service:latest  # publish only
 Docker publishing uses the existing 7dgame organization registry secrets:
 `TENCENT_REGISTRY_USER` or `TENCENT_REGISTRY_USERNAME`, and `TENCENT_REGISTRY_PASSWORD`.
 
+For an isolated online development candidate, the `CI/CD` workflow also accepts
+manual `publish_candidate=true` (default false). All test and MySQL gates still
+run. This publishes only `candidate-<full SHA>` for `linux/amd64`, with a guard
+rejecting floating tags and an `identity-candidate-image-provenance-<SHA>` artifact
+containing the registry digest. It never updates `develop`, `publish` or `latest`.
+After a separately authorized push of the candidate branch, dispatch explicitly:
+
+```bash
+gh workflow run ci-cd.yml --repo 7dgame-com/identity-service \
+  --ref codex/identity-online-dev-20261012 -f publish_candidate=true
+```
+
+Online Portainer consumers must use the recorded full registry digest and disable
+Watchtower updates. The platform's `driver/identity-online-develop.md` and
+`docker-compose.identity.online-develop.example.yml` describe cloud schema upgrades,
+staged imports and the authority activation/rollback boundary. Local standalone
+Docker validation does not itself switch online development.
+
 ## IAM Engine Boundary
 
-Keycloak is the default IAM engine behind identity-service. Product code must treat
-identity-service as the stable contract and must not bind directly to Keycloak.
+Product code treats identity-service as the stable contract. Native independent
+mode uses this service's private account/RBAC/session stores and JWT/OIDC code;
+it does not require Keycloak or Redis. Keycloak remains an optional provider
+integration behind that contract.
 
 - Frontends, backends, plugins and future content services use identity-service APIs, SDKs, OpenAPI, JWKS or published OIDC client configuration.
 - Business systems must not call the Keycloak Admin API directly.
 - Business systems must not modify Keycloak database tables or schema.
 - MRPP users, organizations, roles, invitations and plugin permissions belong to the identity-adapter domain model.
-- Keycloak owns protocol-level identity concerns: OIDC/OAuth2, clients, sessions, JWKS, MFA and the minimal user mapping needed for those flows.
+- Enabled native OIDC clients use private session bindings, exact client audiences and bounded scopes. Their refresh credentials cannot be exchanged through generic login refresh or another client.
 - If another IAM engine is selected later, replace the identity-service IAM provider adapter instead of changing every consumer.
 
 ## Phase 3 Safety Rules

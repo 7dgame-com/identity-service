@@ -103,8 +103,7 @@ export class OidcController {
 
     try {
       if (this.native?.enabled) {
-        const user = await this.native.verify(token);
-        return { sub: String(user.id), uid: user.id, preferred_username: user.username, roles: user.roles };
+        return await this.oidc.nativeUserinfo(token);
       }
       const claims = this.jwtIssuer.verifyAccessToken(token);
       return {

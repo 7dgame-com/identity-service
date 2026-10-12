@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main, develop]
   workflow_dispatch:
+    inputs:
+      publish_candidate:
+        description: Publish only candidate-<full SHA> after all release gates pass
+        type: boolean
+        required: false
+        default: false
 
 env:
   REGISTRY: hkccr.ccs.tencentyun.com
@@ -117,6 +123,9 @@ jobs:
           # ephemeral CI service. Never use a production principal here.
           IDENTITY_DB_USER: root
           IDENTITY_DB_PASSWORD: identity_test_root_password
+          IDENTITY_TEST_MYSQL_PORT: "3306"
+          IDENTITY_TEST_MYSQL_USER: root
+          IDENTITY_TEST_MYSQL_PASSWORD: identity_test_root_password
         run: >-
           npm test --
           apps/identity-adapter/test/identity-accounts.mysql.spec.ts
@@ -131,12 +140,33 @@ jobs:
           apps/identity-adapter/test/wechat-binding.mysql.spec.ts
           apps/identity-adapter/test/identity-yii-wechat-import.mysql.spec.ts
           apps/identity-adapter/test/legacy-admin.mysql.spec.ts
+          apps/identity-adapter/test/device-sn-native.mysql.spec.ts
+          apps/identity-adapter/test/organization-login-events-native.mysql.spec.ts
+          apps/identity-adapter/test/oidc-native-session.mysql.spec.ts
+
+      - name: Run organization login events MySQL integration tests
+        env:
+          NODE_ENV: test
+          TZ: Asia/Shanghai
+          LOGIN_EVENTS_MYSQL_TEST_PORT: "3306"
+          LOGIN_EVENTS_MYSQL_TEST_PASSWORD: identity_test_root_password
+        run: npm test -- apps/identity-adapter/test/organization-login-events.mysql.spec.ts
+
+      - name: Run device SN MySQL integration tests
+        env:
+          NODE_ENV: test
+          TZ: Asia/Shanghai
+          DEVICE_SN_MYSQL_TEST_PORT: "3306"
+          DEVICE_SN_MYSQL_TEST_PASSWORD: identity_test_root_password
+        run: npm test -- apps/identity-adapter/test/device-sn-sessions.mysql.spec.ts
 
   build:
     name: Build & Push Docker Image
     runs-on: ubuntu-latest
     needs: [test, mysql-integration]
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/publish')
+    if: >-
+      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/publish')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_candidate == true)
 
     permissions:
       contents: read
@@ -161,9 +191,27 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: latest=false
           tags: |
-            type=ref,event=branch
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/publish' }}
+            type=ref,event=branch,enable=${{ github.event_name == 'push' }}
+            type=raw,value=latest,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/publish' }}
+            type=raw,value=candidate-${{ github.sha }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.publish_candidate == true }}
+
+      - name: Verify candidate cannot update floating tags
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_candidate == true
+        env:
+          CANDIDATE_TAGS: ${{ steps.meta.outputs.tags }}
+          CANDIDATE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          CANDIDATE_SHA: ${{ github.sha }}
+        run: >-
+          node -e '
+          const tags = (process.env.CANDIDATE_TAGS ?? "").split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+          const sha = process.env.CANDIDATE_SHA;
+          const expected = `${process.env.CANDIDATE_REPOSITORY}:candidate-${sha}`;
+          if (!/^[a-f0-9]{40}$/.test(sha ?? "") || tags.length !== 1 || tags[0] !== expected) {
+            console.error("Candidate publication must contain exactly its immutable SHA tag."); process.exit(2);
+          }
+          '
 
       - name: Build and push Docker image
         id: build
@@ -172,6 +220,7 @@ jobs:
           context: .
           file: Dockerfile
           push: true
+          platforms: linux/amd64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
@@ -180,7 +229,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Record immutable Develop image provenance
-        if: github.ref == 'refs/heads/develop'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
         env:
           GIT_SHA: ${{ github.sha }}
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
@@ -199,10 +248,38 @@ jobs:
           '
 
       - name: Retain immutable Develop image provenance
-        if: github.ref == 'refs/heads/develop'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
         uses: actions/upload-artifact@v4
         with:
           name: identity-develop-image-provenance-${{ github.sha }}
           path: identity-develop-image-provenance.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Record immutable candidate image provenance
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_candidate == true
+        env:
+          GIT_SHA: ${{ github.sha }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        run: >-
+          node -e '
+          const fs = require("node:fs");
+          const sha = process.env.GIT_SHA;
+          const digest = process.env.IMAGE_DIGEST;
+          const repository = process.env.IMAGE_REPOSITORY;
+          if (!/^[a-f0-9]{40}$/.test(sha ?? "") || !/^sha256:[a-f0-9]{64}$/.test(digest ?? "") ||
+              !/^[A-Za-z0-9._:/-]+$/.test(repository ?? "")) process.exit(2);
+          const artifact = {contract:"identity-service/candidate-image-provenance/v1",gitSha:sha,
+            image:`${repository}@${digest}`,imageDigest:digest,tag:`candidate-${sha}`,platform:"linux/amd64"};
+          fs.writeFileSync("identity-candidate-image-provenance.json", `${JSON.stringify(artifact)}\n`, {encoding:"utf8",flag:"wx",mode:0o600});
+          '
+
+      - name: Retain immutable candidate image provenance
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_candidate == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: identity-candidate-image-provenance-${{ github.sha }}
+          path: identity-candidate-image-provenance.json
           if-no-files-found: error
           retention-days: 30

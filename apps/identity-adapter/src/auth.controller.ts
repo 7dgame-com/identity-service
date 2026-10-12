@@ -1,7 +1,9 @@
-import { Body, Controller, Headers, Optional, Post } from "@nestjs/common";
+import { Body, Controller, Headers, Optional, Post, Req } from "@nestjs/common";
 import { TokenIssuanceService } from "./token-issuance.service.js";
 import { NativeQrcodeService } from "./native-qrcode.service.js";
 import { loadConfig } from "./config.js";
+
+interface ClientIpRequest { ip?: string; socket?: { remoteAddress?: string | null }; }
 
 @Controller("v1/auth")
 export class AuthController {
@@ -10,11 +12,11 @@ export class AuthController {
   @Post("login")
   login(
     @Body() body: unknown,
-    @Headers("x-forwarded-for") forwardedFor?: string,
+    @Req() request: ClientIpRequest,
     @Headers("user-agent") userAgent?: string
   ) {
     return this.tokenIssuance.login(body, {
-      ip: firstForwardedIp(forwardedFor),
+      ip: clientIpFromRequest(request),
       userAgent: userAgent ?? null
     });
   }
@@ -22,7 +24,7 @@ export class AuthController {
   @Post("refresh")
   refresh(
     @Body() body: unknown,
-    @Headers("x-forwarded-for") forwardedFor?: string,
+    @Req() request: ClientIpRequest,
     @Headers("user-agent") userAgent?: string,
     @Headers("idempotency-key") idempotencyKey?: string
   ) {
@@ -30,11 +32,11 @@ export class AuthController {
     if (loadConfig().dataSource === "identity" && typeof candidate === "string"
       && (candidate.startsWith("web_") || /[?&]web_/.test(candidate))) {
       if (!this.qrcode) throw new Error("Native QR service is not available");
-      return this.qrcode.redeemLoginCode(candidate, {idempotencyKey,ip:firstForwardedIp(forwardedFor),userAgent:userAgent??null});
+      return this.qrcode.redeemLoginCode(candidate, {idempotencyKey,ip:clientIpFromRequest(request),userAgent:userAgent??null});
     }
     return this.tokenIssuance.refresh(body, {
       idempotencyKey,
-      ip: firstForwardedIp(forwardedFor),
+      ip: clientIpFromRequest(request),
       userAgent: userAgent ?? null
     });
   }
@@ -45,6 +47,9 @@ export class AuthController {
   }
 }
 
-function firstForwardedIp(value: string | undefined): string | null {
-  return value?.split(",")[0]?.trim() || null;
+export function clientIpFromRequest(request: ClientIpRequest): string | null {
+  const candidate = request.ip ?? request.socket?.remoteAddress;
+  if (!candidate?.trim()) return null;
+  const normalized = candidate.trim();
+  return normalized.startsWith("::ffff:") ? normalized.slice(7) : normalized;
 }

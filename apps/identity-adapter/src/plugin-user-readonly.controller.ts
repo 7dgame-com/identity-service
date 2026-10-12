@@ -1,13 +1,15 @@
 import { NativeIdentityService } from "./native-identity.service.js";
-import { Controller, Optional, Get, Headers, HttpException, HttpStatus, Param, Query, Res } from "@nestjs/common";
+import { Controller, Optional, Get, Headers, HttpException, HttpStatus, Param, Query, Res, ServiceUnavailableException } from "@nestjs/common";
 import { loadConfig } from "./config.js";
 import { JwtIssuerService, VerifiedAccessToken } from "./jwt-issuer.service.js";
 import { IamRepository, type IdentityOrganizationShadowRow } from "./iam.repository.js";
-import { LegacyIdentityReader, LegacyUserReadModel } from "./legacy-identity.reader.js";
+import { LegacyIdentityReader, LegacyUserReadModel, type LegacyAuditMember } from "./legacy-identity.reader.js";
 import { LoginAuditService } from "./login-audit.service.js";
 import { PluginUserPrimaryReadService, PluginUserReadSource } from "./plugin-user-primary-read.service.js";
+import { auditPrimaryRole, parseOrganizationLoginQuery } from "./organization-login-events.js";
 
 const ELEVATED_ROLES = new Set(["root", "admin", "manager"]);
+type AuditActor = Pick<VerifiedAccessToken, "uid" | "roles">;
 
 interface HeaderResponse {
   setHeader(name: string, value: string): void;
@@ -32,9 +34,9 @@ export class PluginUserReadonlyController {
     @Res({ passthrough: true }) response: HeaderResponse,
     @Headers("authorization") authorization?: string
   ) {
-    if (this.native?.enabled) {
+    if (this.config.dataSource === "identity") {
       response.setHeader("X-Identity-User-Source", "identity-db");
-      return this.native.managedUsers({headers:{authorization}},query);
+      return this.requireNative().managedUsers({headers:{authorization}},query);
     }
     this.assertEnabled();
     const claims = this.currentUser(authorization);
@@ -92,16 +94,17 @@ export class PluginUserReadonlyController {
     @Param("legacyUserId") legacyUserId: string,
     @Query() query: Record<string, unknown>
   ) {
-    if (this.native?.enabled) {
-      const actor = await this.native.actor({headers:{authorization}});
+    if (this.config.dataSource === "identity") {
+      const native = this.requireNative();
+      const actor = await native.actor({headers:{authorization}});
       const parsedId = positiveInt(legacyUserId);
       if (parsedId === null) throw new HttpException({code:"INVALID_USER_ID",message:"User id must be a positive integer."},HttpStatus.BAD_REQUEST);
-      if (!actor.roles.some(role=>ELEVATED_ROLES.has(role))) await this.native.requirePermission(actor,"user-management.view-user");
+      if (!actor.roles.some(role=>ELEVATED_ROLES.has(role))) await native.requirePermission(actor,"user-management.view-user");
       this.assertLoginAuditEnabled();
       const scope = this.resolveAuditOrganizationScope(actor,query);
-      const target = await this.native.subject(parsedId);
+      const target = await native.subject(parsedId);
       if (scope !== null && (!belongsToOrganization(target,scope) || (!actor.roles.includes("root") && !belongsToOrganization(actor,scope)))) throw this.organizationScopeDenied();
-      return {code:0,data:await this.loginAudit.getUserAudit(parsedId)};
+      return {code:0,data:await this.loginAudit.getUserAudit(parsedId, actor.roles.includes("root") ? "full" : "masked")};
     }
     this.assertEnabled();
     const claims = this.currentUser(authorization);
@@ -135,12 +138,119 @@ export class PluginUserReadonlyController {
 
     return {
       code: 0,
-      data: await this.loginAudit.getUserAudit(parsedId)
+      data: await this.loginAudit.getUserAudit(parsedId, claims.roles.includes("root") ? "full" : "masked")
+    };
+  }
+
+  @Get("v1/plugin-user/organizations/:organizationId/login-usage-invoice")
+  async organizationLoginUsageInvoice(
+    @Headers("authorization") authorization: string | undefined,
+    @Param("organizationId") organizationId: string,
+    @Query() query: Record<string, unknown>
+  ) {
+    const claims = await this.auditActor(authorization);
+    const parsedOrganizationId = strictPositiveInt(organizationId);
+    if (parsedOrganizationId === null) {
+      throw new HttpException(
+        {
+          code: "INVALID_ORGANIZATION_ID",
+          message: "Organization id must be a positive integer."
+        },
+        HttpStatus.BAD_REQUEST
+      );
+    }
+
+    await this.assertCan(claims, "user-management.view-user");
+    this.assertLoginAuditEnabled();
+    const organization = await this.assertOrganizationInvoiceAccess(claims, parsedOrganizationId);
+    const users = await this.legacyReader.listUsersByOrganization(parsedOrganizationId);
+    const from = parseInvoiceDate(query.from, "from");
+    const to = parseInvoiceDate(query.to, "to");
+    if (from && to && from > to) {
+      throw new HttpException(
+        { code: "INVALID_LOGIN_USAGE_INVOICE_RANGE", message: "from must be before or equal to to." },
+        HttpStatus.BAD_REQUEST
+      );
+    }
+    const invoice = await this.loginAudit.createUsageInvoice({
+      accounts: users.map((user) => ({ legacyUserId: user.id, username: user.username })),
+      from,
+      to
+    });
+
+    return {
+      code: 0,
+      data: {
+        organization,
+        ...invoice
+      }
+    };
+  }
+
+  @Get("v1/plugin-user/login-events")
+  async organizationLoginEvents(
+    @Headers("authorization") authorization: string | undefined,
+    @Query() query: Record<string, unknown>
+  ) {
+    const claims = await this.auditActor(authorization);
+    if (!claims.roles.some((role) => ELEVATED_ROLES.has(role))) throw this.organizationScopeDenied();
+    this.assertLoginAuditEnabled();
+    const organizationId = this.resolveAuditOrganizationScope(claims, query);
+    if (organizationId === null) {
+      throw new HttpException({ code: "ORGANIZATION_SCOPE_REQUIRED", message: "请选择具体组织后查看登录流水" }, HttpStatus.FORBIDDEN);
+    }
+    const filters = parseOrganizationLoginQuery(query);
+    if (!claims.roles.includes("root")) {
+      await this.assertOrganizationScopedAuditAccess(claims, claims.uid, organizationId);
+    }
+
+    let members: LegacyAuditMember[];
+    try {
+      members = await this.legacyReader.listOrganizationAuditMembers(organizationId);
+      if (this.config.dataSource !== "identity") {
+        if (!this.iamRepository.isConfigured()) throw this.organizationScopeDenied();
+        const shadow = await this.iamRepository.listOrganizationMembershipsShadowForUsers(members.map((member) => member.id));
+        const byUser = new Map<number, IdentityOrganizationShadowRow[]>();
+        for (const membership of shadow) {
+          if (membership.legacyUserId === null) throw this.organizationScopeDenied();
+          const memberships = byUser.get(membership.legacyUserId) ?? [];
+          memberships.push(membership);
+          byUser.set(membership.legacyUserId, memberships);
+        }
+        for (const member of members) {
+          if (!member.organizations.some((organization) => organization.id === organizationId)
+            || !sameOrganizationMemberships(member, byUser.get(member.id) ?? [])) {
+            throw this.organizationScopeDenied();
+          }
+        }
+      }
+    } catch {
+      throw new HttpException({ code: "ORGANIZATION_SCOPE_DENIED", message: "无法确认当前组织成员范围，请稍后重试" }, HttpStatus.FORBIDDEN);
+    }
+
+    members = await this.primaryRead.withAuditMemberRoles(members);
+    const search = filters.search?.toLocaleLowerCase();
+    const selected = members.filter((member) =>
+      (!filters.role || auditPrimaryRole(member.roles) === filters.role)
+      && (!search || [member.username, member.nickname].some((value) => value?.toLocaleLowerCase().includes(search)))
+    );
+    const selectedById = new Map(selected.map((member) => [member.id, member]));
+    const result = await this.loginAudit.listOrganizationEvents({
+      userIds: selected.map((member) => member.id), startAt: filters.start_at, endAt: filters.end_at,
+      page: filters.page, pageSize: filters.pageSize
+    });
+    return {
+      code: 0,
+      data: result.events.map((event) => {
+        const member = selectedById.get(event.userId)!;
+        return { ...event, username: member.username, nickname: member.nickname, primaryRole: auditPrimaryRole(member.roles) };
+      }),
+      pagination: { page: filters.page, pageSize: filters.pageSize, total: result.total, totalPages: Math.ceil(result.total / filters.pageSize) }
     };
   }
 
   private async assertOrganizationScopedAuditAccess(
-    claims: VerifiedAccessToken,
+    claims: AuditActor,
     targetUserId: number,
     organizationId: number | null
   ): Promise<void> {
@@ -163,6 +273,32 @@ export class PluginUserReadonlyController {
       throw this.organizationScopeDenied();
     }
     await this.assertShadowMembershipMatches(actorUser);
+  }
+
+  private async assertOrganizationInvoiceAccess(
+    claims: AuditActor,
+    organizationId: number
+  ): Promise<{ id: number; name: string; title: string }> {
+    const organization = (await this.legacyReader.listOrganizations()).find((item) => item.id === organizationId);
+    if (!organization) {
+      throw new HttpException(
+        {
+          code: "ORGANIZATION_NOT_FOUND",
+          message: "Organization does not exist."
+        },
+        HttpStatus.NOT_FOUND
+      );
+    }
+
+    if (!claims.roles.includes("root")) {
+      const actorUser = await this.readAuthoritativeUser(claims.uid);
+      if (!actorUser || !belongsToOrganization(actorUser, organizationId)) {
+        throw this.organizationScopeDenied();
+      }
+      await this.assertShadowMembershipMatches(actorUser);
+    }
+
+    return { id: organization.id, name: organization.name, title: organization.title };
   }
 
   private resolveAuditOrganizationScope(
@@ -207,6 +343,9 @@ export class PluginUserReadonlyController {
   }
 
   private async assertShadowMembershipMatches(user: LegacyUserReadModel): Promise<void> {
+    // Native memberships and roles are read directly from the private account
+    // schema. Staged shadow rows stop being an authority after activation.
+    if (this.config.dataSource === "identity") return;
     if (!this.iamRepository.isConfigured()) {
       throw this.organizationScopeDenied();
     }
@@ -281,7 +420,23 @@ export class PluginUserReadonlyController {
     }
   }
 
-  private async assertCan(claims: VerifiedAccessToken, permission: string): Promise<void> {
+  private requireNative(): NativeIdentityService {
+    if (!this.native?.enabled) {
+      throw new ServiceUnavailableException({ code: "IDENTITY_NATIVE_UNAVAILABLE", message: "Identity account authority is unavailable." });
+    }
+    return this.native;
+  }
+
+  private async auditActor(authorization?: string): Promise<AuditActor> {
+    if (this.config.dataSource === "identity") {
+      const actor = await this.requireNative().actor({ headers: { authorization } });
+      return { uid: actor.id, roles: actor.roles };
+    }
+    this.assertEnabled();
+    return this.currentUser(authorization);
+  }
+
+  private async assertCan(claims: AuditActor, permission: string): Promise<void> {
     if (claims.roles.some((role) => ELEVATED_ROLES.has(role))) {
       return;
     }
@@ -349,8 +504,27 @@ function hasMalformedOrganizationScope(query: Record<string, unknown>): boolean 
   return Object.keys(query).some((key) => key.startsWith("organization_id["));
 }
 
+function parseInvoiceDate(value: unknown, field: string): Date | undefined {
+  if (value === undefined || value === "") return undefined;
+  if (typeof value !== "string") {
+    throw new HttpException(
+      { code: "INVALID_LOGIN_USAGE_INVOICE_DATE", message: `${field} must be an ISO-8601 date.` },
+      HttpStatus.BAD_REQUEST
+    );
+  }
+
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new HttpException(
+      { code: "INVALID_LOGIN_USAGE_INVOICE_DATE", message: `${field} must be an ISO-8601 date.` },
+      HttpStatus.BAD_REQUEST
+    );
+  }
+  return parsed;
+}
+
 function sameOrganizationMemberships(
-  legacyUser: LegacyUserReadModel,
+  legacyUser: Pick<LegacyUserReadModel, "id" | "organizations">,
   shadowMemberships: IdentityOrganizationShadowRow[]
 ): boolean {
   const legacyOrganizationIds = new Set(legacyUser.organizations.map((organization) => organization.id));

@@ -4,6 +4,7 @@ import { Injectable, ServiceUnavailableException } from "@nestjs/common";
 import { verifyImportedAccessToken } from "./legacy-token-verifier.js";
 import { loadConfig } from "./config.js";
 import type { LegacyUserReadModel } from "./legacy-identity.reader.js";
+import { assertDeviceSnAccount, deviceSnClaims, deviceSnSource, type DeviceSnSource } from "./device-sn-source.js";
 
 export interface IssuedAccessToken {
   accessToken: string;
@@ -17,6 +18,8 @@ export interface VerifiedAccessToken {
   sessionId: string | null;
   roles: string[];
   importedLegacy?: boolean;
+  authMethod?: "device_sn";
+  deviceSnId?: number;
 }
 
 export interface OidcIdTokenInput {
@@ -39,9 +42,12 @@ export class JwtIssuerService {
     if(derived.x!==actual.x || derived.y!==actual.y)throw new Error("Identity signing key pair does not match");
   }
 
-  issue(user: LegacyUserReadModel, sessionId: string, options?: { audience?: string; scopes?: string[]; expiresInSeconds?: number }): IssuedAccessToken {
+  issue(user: LegacyUserReadModel, sessionId: string, options?: { audience?: string; scopes?: string[]; expiresInSeconds?: number } & Partial<DeviceSnSource>): IssuedAccessToken {
+    const source = deviceSnSource(options?.authMethod, options?.deviceSnId);
+    if (source) assertDeviceSnAccount(user);
     const now = new Date();
-    const expiresAt = new Date(now.getTime() + (options?.expiresInSeconds ?? this.config.tokenIssuance.accessTokenTtlSeconds) * 1000);
+    const configuredTtl = options?.expiresInSeconds ?? this.config.tokenIssuance.accessTokenTtlSeconds;
+    const expiresAt = new Date(now.getTime() + (source ? Math.min(10800, configuredTtl) : configuredTtl) * 1000);
     const jwtId = randomId();
     const privateKey = this.privateKey();
 
@@ -69,6 +75,7 @@ export class JwtIssuerService {
       payload.aud = audience;
     }
     if (options?.scopes) payload.scope = options.scopes.join(" ");
+    if (source) { payload.auth_method = source.authMethod; payload.device_sn_id = source.deviceSnId; }
 
     const signingInput = `${base64urlJson(header)}.${base64urlJson(payload)}`;
     const signature = sign("sha256", Buffer.from(signingInput), {
@@ -169,8 +176,9 @@ export class JwtIssuerService {
       if (options?.audience && payload.aud !== options.audience) throw new Error("invalid imported token audience");
       const uid = Number(payload.uid);
       if (!Number.isSafeInteger(uid) || uid <= 0) throw new Error("invalid token subject");
+      const source = verifiedDeviceSource(payload);
       return { uid, username: typeof payload.username === "string" ? payload.username : null,
-        sessionId: typeof payload.session_id === "string" ? payload.session_id : null, roles: [], importedLegacy: true };
+        sessionId: typeof payload.session_id === "string" ? payload.session_id : null, roles: [], importedLegacy: true, ...(source ?? {}) };
     }
   }
 
@@ -195,6 +203,7 @@ export class JwtIssuerService {
     }
 
     const payload = parseJwtPart(encodedPayload);
+    const source = verifiedDeviceSource(payload);
     const now = seconds(new Date());
     if (this.config.dataSource === "identity" && (typeof payload.iat !== "number" || !Number.isFinite(payload.iat) || payload.iat > now + 10)) throw new Error("invalid token issue time");
     if (!Number.isFinite(payload.exp) || Number(payload.exp) <= now) {
@@ -223,7 +232,8 @@ export class JwtIssuerService {
       uid,
       username: typeof payload.username === "string" ? payload.username : null,
       sessionId: typeof payload.session_id === "string" ? payload.session_id : null,
-      roles: Array.isArray(payload.roles) ? payload.roles.filter((role): role is string => typeof role === "string") : []
+      roles: Array.isArray(payload.roles) ? payload.roles.filter((role): role is string => typeof role === "string") : [],
+      ...(source ?? {})
     };
   }
 
@@ -251,6 +261,13 @@ export class JwtIssuerService {
 
 function base64urlJson(value: unknown): string {
   return Buffer.from(JSON.stringify(value)).toString("base64url");
+}
+
+function verifiedDeviceSource(payload: Record<string, unknown>): DeviceSnSource | null {
+  const source = deviceSnClaims(payload);
+  if (source && (typeof payload.exp !== "number" || typeof payload.iat !== "number" || !Number.isFinite(payload.exp)
+    || !Number.isFinite(payload.iat) || payload.exp - payload.iat > 10800 || payload.exp <= payload.iat)) throw new Error("invalid device token lifetime");
+  return source;
 }
 
 function parseJwtPart(value: string): Record<string, unknown> {

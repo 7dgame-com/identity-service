@@ -10,6 +10,7 @@ import { hashLegacyPassword } from "./legacy-password.js";
 import { validatePasswordPolicy } from "./password-policy.js";
 import { enqueueSubjectEvent } from "./subject-events.js";
 import { activateIdentityAuthority } from "./migration-state.js";
+import { deviceSnSource } from "./device-sn-source.js";
 
 export interface NativeRequest { headers: Record<string, string | string[] | undefined>; body?: unknown; }
 const positiveId = z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER);
@@ -61,12 +62,17 @@ export class NativeIdentityService implements OnModuleDestroy, OnApplicationBoot
   async verify(token: string, options?: { audience: string }) {
     let claims;
     try { claims = this.jwt.verifyAccessToken(token, options); } catch { throw new UnauthorizedException({ code: 2001, message: "请先登录" }); }
+    if(!options && claims.sessionId && await this.sessions.isOAuthBound(claims.sessionId)) {
+      throw new UnauthorizedException({ code: "OAUTH_CLIENT_TOKEN_REQUIRED", message: "Client access tokens must use their bound endpoint" });
+    }
+    const source = deviceSnSource(claims.authMethod, claims.deviceSnId);
+    if (source) await this.reader.assertDeviceSnAuthorized(source.deviceSnId, claims.uid, false);
     const user = await this.subject(claims.uid);
     const payload = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString("utf8"));
     if (user.status !== 10 || await this.sessions.isAccessRevoked(user.id, Number(payload.iat), claims.sessionId, claims.importedLegacy)) {
       throw new UnauthorizedException({ code: "SESSION_REVOKED", message: "登录已失效" });
     }
-    return user;
+    return source ? { ...user, authContext: { auth_method: source.authMethod, device_sn_id: source.deviceSnId } } : user;
   }
   async actor(request: NativeRequest) {
     const header = request.headers.authorization;
@@ -81,7 +87,10 @@ export class NativeIdentityService implements OnModuleDestroy, OnApplicationBoot
       claims=this.jwt.verifyAccessToken(token);
       payload=JSON.parse(Buffer.from(token.split(".")[1],"base64url").toString("utf8"));
     } catch { throw new UnauthorizedException(); }
-    if(claims.uid!==userId || await this.sessions.isAccessRevoked(userId,Number(payload.iat),claims.sessionId,claims.importedLegacy,connection))throw new UnauthorizedException();
+    if(claims.uid!==userId || (claims.sessionId && await this.sessions.isOAuthBound(claims.sessionId,connection))
+      || await this.sessions.isAccessRevoked(userId,Number(payload.iat),claims.sessionId,claims.importedLegacy,connection))throw new UnauthorizedException();
+    const source = deviceSnSource(claims.authMethod, claims.deviceSnId);
+    if (source) await this.reader.assertDeviceSnAuthorized(source.deviceSnId, userId, false);
   }
   async allowed(userId: number, permission: string) {
     const user = await this.subject(userId);

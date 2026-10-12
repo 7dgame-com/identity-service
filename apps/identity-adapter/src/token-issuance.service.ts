@@ -8,6 +8,7 @@ import { LegacyIdentityReader, LegacyUserReadModel } from "./legacy-identity.rea
 import { verifyLegacyPassword } from "./legacy-password.js";
 import { LoginAuditService } from "./login-audit.service.js";
 import type { PoolConnection, RowDataPacket } from "mysql2/promise";
+import { assertDeviceSnAccount, deviceSnSource, throwDeviceSnFailure, type DeviceSnSource } from "./device-sn-source.js";
 
 const loginSchema = z.object({
   username: z.string().min(1).max(255),
@@ -23,8 +24,10 @@ const logoutSchema = z.object({
 });
 
 const issueUserTokenSchema = z.object({
-  legacyUserId: z.coerce.number().int().positive()
-});
+  legacyUserId: z.coerce.number().int().positive(),
+  auth_method: z.literal("device_sn").optional(),
+  device_sn_id: z.number().int().positive().optional()
+}).strict();
 
 export interface RequestContext {
   ip?: string | null;
@@ -82,33 +85,43 @@ export class TokenIssuanceService {
     this.assertEnabled();
     const parsed = parseBody(refreshSchema, payload);
 
+    let source: DeviceSnSource | null = null;
+    let issuedRefresh: string | undefined;
     try {
       const current = await (typeof this.sessions.findRefreshCandidate === "function"
         ? this.sessions.findRefreshCandidate(parsed.refreshToken) : this.sessions.findValidSession(parsed.refreshToken));
+      source = deviceSnSource(current.authMethod, current.deviceSnId);
       if (this.config.dataSource === "identity" && await this.sessions.isOAuthBound(current.sessionId)) throw new InvalidRefreshTokenError("OAuth refresh tokens must use their bound client");
       const user = await this.requireLegacyUser(current.legacyUserId);
+      await this.assertDeviceSource(user, source);
       const nextSessionId = current.sessionId;
       const refreshExpiresAt = this.refreshExpiresAt();
       // Validate signing configuration before consuming a refresh token.
-      this.jwtIssuer.issue(user, nextSessionId);
+      this.jwtIssuer.issue(user, nextSessionId, source ?? undefined);
       const rotated = await this.sessions.rotate(parsed.refreshToken, {
         legacyUserId: user.id,
         username: user.username,
         sessionId: nextSessionId,
         expiresAt: refreshExpiresAt,
         ipAddressHash: hashMaybe(context.ip),
-        userAgentHash: hashMaybe(context.userAgent)
+        userAgentHash: hashMaybe(context.userAgent),
+        ...(source ?? {})
       }, context.idempotencyKey);
-      const token = this.jwtIssuer.issue(user, rotated.sessionId);
+      issuedRefresh = rotated.refreshToken;
+      const currentUser = source ? await this.requireLegacyUser(user.id) : user;
+      await this.assertDeviceSource(currentUser, source);
+      const token = this.jwtIssuer.issue(currentUser, rotated.sessionId, source ?? undefined);
 
       return tokenResponse("refresh", token.accessToken, rotated.refreshToken, token.expiresAt);
     } catch (error) {
+      if (source && issuedRefresh) await this.revokeFailedDeviceSession(issuedRefresh);
       if (error instanceof InvalidRefreshTokenError) {
         throw new UnauthorizedException({
-          code: "REFRESH_TOKEN_INVALID",
+          code: source ? "DEVICE_SN_REFRESH_INVALID" : "REFRESH_TOKEN_INVALID",
           message: "Refresh token is invalid."
         });
       }
+      if (source) throwDeviceSnFailure(error);
       throw error;
     }
   }
@@ -131,10 +144,14 @@ export class TokenIssuanceService {
   async issueLegacyUserToken(payload: unknown, context: RequestContext = {}): Promise<AuthTokenResponse> {
     this.assertEnabled();
     const parsed = parseBody(issueUserTokenSchema, payload);
-    const user = await this.requireLegacyUser(parsed.legacyUserId);
-    const sessionId = randomId();
-
-    return this.issueForUser(user, sessionId, context, "login");
+    const source = deviceSnSource(parsed.auth_method, parsed.device_sn_id);
+    try {
+      const user = await this.requireLegacyUser(parsed.legacyUserId);
+      return await this.issueForUser(user, randomId(), context, "login", undefined, undefined, source);
+    } catch (error) {
+      if (source) throwDeviceSnFailure(error);
+      throw error;
+    }
   }
 
   async exchangeLegacyPhpSession(payload:unknown,context:RequestContext={}):Promise<AuthTokenResponse>{
@@ -175,7 +192,8 @@ export class TokenIssuanceService {
     context: RequestContext,
     message: "login" | "refresh" | "register",
     expectedPasswordHash?: string,
-    expectedLegacyAuthKey?: string
+    expectedLegacyAuthKey?: string,
+    source?: DeviceSnSource | null
   ): Promise<AuthTokenResponse> {
     if (!this.sessions.isConfigured()) {
       throw new BadRequestException({
@@ -184,7 +202,8 @@ export class TokenIssuanceService {
       });
     }
 
-    const token = this.jwtIssuer.issue(user, sessionId);
+    await this.assertDeviceSource(user, source);
+    const token = this.jwtIssuer.issue(user, sessionId, source ?? undefined);
     const refreshExpiresAt = this.refreshExpiresAt();
     let session;
     try { session = await this.sessions.issue({
@@ -195,10 +214,15 @@ export class TokenIssuanceService {
       ipAddressHash: hashMaybe(context.ip),
       userAgentHash: hashMaybe(context.userAgent),
       expectedPasswordHash,
-      expectedLegacyAuthKey
+      expectedLegacyAuthKey,
+      ...(source ?? {})
     }); } catch (error) {
       if(error instanceof InvalidRefreshTokenError)throw new UnauthorizedException({code:"ACCOUNT_CHANGED",message:"Account credentials changed while authenticating"});
       throw error;
+    }
+    if (source) {
+      try { await this.assertDeviceSource(await this.requireLegacyUser(user.id), source); }
+      catch (error) { await this.revokeFailedDeviceSession(session.refreshToken); throw error; }
     }
 
     return tokenResponse(message, token.accessToken, session.refreshToken, token.expiresAt);
@@ -214,6 +238,18 @@ export class TokenIssuanceService {
     }
 
     return user;
+  }
+
+  private async assertDeviceSource(user: LegacyUserReadModel, source?: DeviceSnSource | null): Promise<void> {
+    if (!source) return;
+    assertDeviceSnAccount(user);
+    await this.legacyReader.assertDeviceSnAuthorized(source.deviceSnId, user.id);
+  }
+
+  private async revokeFailedDeviceSession(refreshToken: string): Promise<void> {
+    // No token is returned after failed revalidation. Preserve its stable failure
+    // if storage also becomes unavailable; all later uses revalidate the source.
+    try { await this.sessions.revoke(refreshToken); } catch { /* best-effort cleanup */ }
   }
 
   private async recordLoginAudit(user: LegacyUserReadModel, sessionId: string, context: RequestContext): Promise<void> {

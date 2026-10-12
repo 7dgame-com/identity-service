@@ -67,6 +67,8 @@ export class AccountLifecycleService {
       if (this.config.dataSource === "identity") {
         throw new ServiceUnavailableException({ code: "IDENTITY_LEGACY_PROXY_FORBIDDEN", message: "Independent identity accounts cannot use the legacy account API." });
       }
+      const proxyBaseUrl = this.proxyBaseUrlForPath(path);
+      if (proxyBaseUrl) return this.forwardToLegacy(request, path, proxyBaseUrl);
       if (!accountLifecycle.legacyApiBaseUrl) {
         throw new ServiceUnavailableException({
           code: "ACCOUNT_LIFECYCLE_LEGACY_API_NOT_CONFIGURED",
@@ -83,8 +85,9 @@ export class AccountLifecycleService {
         return this.accountRegistration.registerInvitation(path, request.body);
       }
       if (scope === "register") {
-        if (this.config.dataSource === "legacy" && LEGACY_REGISTER_PROXY_ONLY_PATHS.has(path) && accountLifecycle.legacyApiBaseUrl) {
-          return this.forwardToLegacy(request, path);
+        const proxyBaseUrl = this.proxyBaseUrlForPath(path);
+        if (this.config.dataSource === "legacy" && LEGACY_REGISTER_PROXY_ONLY_PATHS.has(path) && proxyBaseUrl) {
+          return this.forwardToLegacy(request, path, proxyBaseUrl);
         }
 
         return this.accountRegistration.register(path, request.body, requestContext(request));
@@ -160,12 +163,18 @@ export class AccountLifecycleService {
     }
   }
 
-  private async forwardToLegacy(request: AccountLifecycleRequest, path: string): Promise<AccountLifecycleProxyResponse> {
+  private proxyBaseUrlForPath(path: string): string | undefined {
+    const { accountLifecycle } = this.config;
+    return LEGACY_REGISTER_PROXY_ONLY_PATHS.has(path)
+      ? accountLifecycle.wechatProxyBaseUrl ?? accountLifecycle.legacyApiBaseUrl : accountLifecycle.legacyApiBaseUrl;
+  }
+
+  private async forwardToLegacy(request: AccountLifecycleRequest, path: string, baseUrl?: string): Promise<AccountLifecycleProxyResponse> {
     if (this.config.dataSource === "identity") {
       throw new ServiceUnavailableException({ code: "IDENTITY_LEGACY_PROXY_FORBIDDEN", message: "Independent identity accounts cannot use the legacy account API." });
     }
     const { accountLifecycle } = this.config;
-    const url = new URL(path, `${accountLifecycle.legacyApiBaseUrl!.replace(/\/+$/, "")}/`);
+    const url = new URL(path, `${(baseUrl ?? accountLifecycle.legacyApiBaseUrl)!.replace(/\/+$/, "")}/`);
     const query = queryStringFromOriginalUrl(request.originalUrl);
     if (query) {
       url.search = query;

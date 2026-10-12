@@ -43,3 +43,11 @@ CREATE TABLE IF NOT EXISTS identity_refresh_replays (
   created_at DATETIME(3) NOT NULL, expires_at DATETIME(3) NOT NULL,
   KEY idx_identity_refresh_replay_expiry (expires_at)
 ) ENGINE=InnoDB;
+-- Standard OIDC grants have their own namespace; WeChat OAuth bindings remain
+-- in identity_oauth_session_bindings. Both prevent generic refresh elevation.
+CREATE TABLE IF NOT EXISTS identity_oidc_session_bindings (
+  session_id VARCHAR(128) NOT NULL PRIMARY KEY,
+  client_id VARCHAR(128) NOT NULL,
+  scopes_json JSON NOT NULL,
+  KEY identity_oidc_client (client_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;

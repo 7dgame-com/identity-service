@@ -1,7 +1,9 @@
-import { Injectable, OnModuleDestroy } from "@nestjs/common";
+import { Injectable, OnModuleDestroy, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
 import mysql, { Pool, RowDataPacket } from "mysql2/promise";
 import { identityAccountReadDb, loadConfig } from "./config.js";
 import { assertReadonlySql } from "./readonly-write.guard.js";
+import { DeviceSnAuthorizationReader } from "./device-sn-authorization.reader.js";
+import { assertDeviceSnAccount, isDeviceSnUuid, throwDeviceSnFailure } from "./device-sn-source.js";
 
 export interface LegacyRole {
   name: string;
@@ -74,6 +76,8 @@ export interface LegacyUserCredential {
   passwordHash: string | null;
 }
 
+export type LegacyAuditMember = Pick<LegacyUserReadModel, "id" | "username" | "nickname" | "roles" | "organizations">;
+
 export interface LegacyUserListInput {
   afterId: number;
   limit: number;
@@ -116,17 +120,148 @@ export interface LegacyManagedUserListResult {
 export class LegacyIdentityReader implements OnModuleDestroy {
   private readonly config = loadConfig();
   private readonly pool: Pool | null;
+  private readonly deviceSource: DeviceSnAuthorizationReader | null;
 
   constructor() {
     this.pool = this.createPool();
+    this.deviceSource = this.config.dataSource === "identity" ? new DeviceSnAuthorizationReader(this.config.deviceSnDb) : null;
   }
 
   async onModuleDestroy(): Promise<void> {
     await this.pool?.end();
+    await this.deviceSource?.close();
   }
 
   isConfigured(): boolean {
     return this.pool !== null;
+  }
+
+  /** Must use the authoritative legacy writer, never an asynchronously replicated reader. */
+  async assertDeviceSnAuthorized(deviceSnId: number, userId: number, requireEnabled = true): Promise<void> {
+    if (this.config.dataSource === "identity") {
+      try {
+        if (!this.pool || !this.deviceSource) throw new ServiceUnavailableException();
+        await this.deviceSource.assertAuthorized(deviceSnId, userId, requireEnabled);
+        const activeRows = await this.query<RowDataPacket[]>("SELECT id FROM user WHERE id=? AND deleted_at IS NULL", [userId]);
+        if (activeRows.length !== 1) throw new UnauthorizedException({ code: "DEVICE_SN_UNAVAILABLE", message: "Device account is unavailable." });
+        const user = await this.getUserById(userId);
+        if (!user) throw new UnauthorizedException({ code: "DEVICE_SN_UNAVAILABLE", message: "Device account is unavailable." });
+        // Inherited privileged roles are credentials too; use the live private graph.
+        const policy = await this.readRbacPolicySnapshot();
+        const reachable = new Set(user.roles);
+        const queue = [...reachable];
+        const children = new Map<string, string[]>();
+        for (const relation of policy.relations) children.set(relation.parent, [...(children.get(relation.parent) ?? []), relation.child]);
+        while (queue.length) for (const child of children.get(queue.shift()!) ?? []) {
+          if (!reachable.has(child)) { reachable.add(child); queue.push(child); }
+        }
+        assertDeviceSnAccount({ status: user.status, roles: [...reachable] });
+        return;
+      } catch (error) { throwDeviceSnFailure(error); }
+    }
+    if (!this.pool) throw new ServiceUnavailableException("Authoritative device authorization database is not configured.");
+    const rows = await this.query<RowDataPacket[]>(
+      `SELECT sn.id, sn.device_uuid AS deviceUuid
+         FROM device_sn sn
+         JOIN user u ON u.id = sn.user_id
+        WHERE sn.id = ? AND sn.user_id = ? AND sn.activated_at IS NOT NULL
+          AND sn.device_uuid IS NOT NULL AND CHAR_LENGTH(TRIM(sn.device_uuid)) > 0
+          AND u.status = 10 AND (? = 0 OR sn.enabled = 1)
+          AND NOT EXISTS (SELECT 1 FROM auth_assignment aa
+            WHERE aa.user_id = CAST(u.id AS BINARY) AND aa.item_name IN ('root', 'admin', 'manager'))
+        LIMIT 1`,
+      [deviceSnId, userId, requireEnabled ? 1 : 0]
+    );
+    const uuid = rows[0]?.deviceUuid;
+    // Exact match avoids collation-dependent acceptance and JavaScript '$' accepting a trailing newline.
+    const validUuid = isDeviceSnUuid(uuid);
+    if (!rows.length || !validUuid) throw new UnauthorizedException({ code: "DEVICE_SN_UNAVAILABLE", message: "Device authorization is unavailable." });
+  }
+
+  async deviceSnReadiness(): Promise<boolean> {
+    if (!this.pool) return false;
+    try {
+      if (this.config.dataSource === "identity") {
+        if (!(await this.deviceSource?.readiness())) return false;
+        await this.query(`SELECT u.id, u.status, u.deleted_at, aa.item_name, ai.type
+          FROM user u LEFT JOIN auth_assignment aa ON aa.user_id = CAST(u.id AS BINARY)
+          LEFT JOIN auth_item ai ON ai.name = aa.item_name LIMIT 0`);
+        await this.query("SELECT parent, child FROM auth_item_child LIMIT 0");
+        return true;
+      }
+      await this.query(`SELECT sn.id, sn.user_id, sn.device_uuid, sn.enabled, sn.activated_at, u.status, aa.item_name
+        FROM device_sn sn JOIN user u ON u.id = sn.user_id
+        LEFT JOIN auth_assignment aa ON aa.user_id = CAST(u.id AS BINARY) LIMIT 0`);
+      return true;
+    } catch { return false; }
+  }
+
+  /** Minimal canonical account selector for the business SN management UI. */
+  async listDeviceSnAccounts(q: string, page: number, pageSize: number) {
+    if (this.config.dataSource !== "identity" || !this.pool) throw new ServiceUnavailableException("Private account source is unavailable.");
+    if (typeof q !== "string" || q.length > 200 || !Number.isSafeInteger(page) || page < 1 || page > 1000000
+      || !Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > 100) throw new UnauthorizedException("Invalid account selector.");
+    const policy = await this.readRbacPolicySnapshot();
+    if (policy.items.length > 10000 || policy.relations.length > 10000) throw new ServiceUnavailableException("Account policy exceeds the supported bound.");
+    const normalize = (role: string) => role.normalize("NFKD").replace(/\p{M}/gu, "").trim().toLowerCase();
+    const forbidden = new Set(["root", "admin", "manager"]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const relation of policy.relations) if (forbidden.has(normalize(relation.child)) && !forbidden.has(normalize(relation.parent))) {
+        forbidden.add(normalize(relation.parent)); changed = true;
+      }
+    }
+    const names = [...new Set([...forbidden, ...policy.items.filter((item) => forbidden.has(normalize(item.name))).map((item) => item.name)])];
+    const where = `u.status=10 AND u.deleted_at IS NULL AND NOT EXISTS
+      (SELECT 1 FROM auth_assignment aa WHERE aa.user_id=CAST(u.id AS BINARY) AND aa.item_name IN (${names.map(() => "?").join(",")}))
+      AND (? = '' OR u.username LIKE ? OR u.nickname LIKE ?)`;
+    const search = q.trim(), params = [...names, search, `%${search}%`, `%${search}%`];
+    const total = await this.query<RowDataPacket[]>(`SELECT COUNT(*) AS total FROM user u WHERE ${where}`, params);
+    const rows = await this.query<RowDataPacket[]>(`SELECT u.id,u.username,u.nickname FROM user u WHERE ${where}
+      ORDER BY u.id ASC LIMIT ? OFFSET ?`, [...params, pageSize, (page - 1) * pageSize]);
+    return { items: rows.map((row) => ({ id: Number(row.id), username: row.username ?? null, nickname: row.nickname ?? null })),
+      total: Number(total[0]?.total ?? 0), page, page_size: pageSize };
+  }
+
+  /** One readonly snapshot: profiles, roles and ALL memberships of current organization members. */
+  async listOrganizationAuditMembers(organizationId: number): Promise<LegacyAuditMember[]> {
+    if (!this.pool) throw new Error("Legacy database is not configured for organization audit.");
+    const connection = await this.pool.getConnection();
+    try {
+      await connection.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+      await connection.query("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY");
+      const scope = `EXISTS (SELECT 1 FROM user_organization scope
+        WHERE scope.user_id = u.id AND scope.organization_id = ?)`;
+      const [users] = await connection.query<RowDataPacket[]>(
+        `SELECT u.id, u.username, u.nickname FROM user u WHERE ${scope}`, [organizationId]
+      );
+      const [roles] = await connection.query<RowDataPacket[]>(
+        `SELECT u.id AS userId, aa.item_name AS role FROM user u
+          JOIN auth_assignment aa ON aa.user_id = CAST(u.id AS BINARY)
+          JOIN auth_item ai ON ai.name = aa.item_name AND ai.type = 1
+          WHERE ${scope}`, [organizationId]
+      );
+      const [memberships] = await connection.query<RowDataPacket[]>(
+        `SELECT u.id AS userId, o.id, o.name, o.title,
+                o.created_at AS createdAt, o.updated_at AS updatedAt
+           FROM user u JOIN user_organization uo ON uo.user_id = u.id
+           JOIN organization o ON o.id = uo.organization_id WHERE ${scope}`, [organizationId]
+      );
+      const byId = new Map<number, LegacyAuditMember>(users.map((row) => [Number(row.id), {
+        id: Number(row.id), username: row.username ?? null, nickname: row.nickname ?? null,
+        roles: [], organizations: []
+      }]));
+      for (const row of roles) byId.get(Number(row.userId))?.roles.push(String(row.role));
+      for (const row of memberships) byId.get(Number(row.userId))?.organizations.push(normalizeOrganization(row));
+      await connection.commit();
+      return [...byId.values()];
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
   }
 
   async health(): Promise<"configured" | "not_configured" | "unavailable"> {
@@ -230,6 +365,22 @@ export class LegacyIdentityReader implements OnModuleDestroy {
     );
 
     const users = await Promise.all(rows.map((row) => this.getUserById(Number(row.id))));
+    return users.filter((user): user is LegacyUserReadModel => user !== null);
+  }
+
+  async listUsersByOrganization(organizationId: number): Promise<LegacyUserReadModel[]> {
+    if (!this.pool || !(await this.tableExists("user_organization"))) {
+      return [];
+    }
+
+    const rows = await this.query<RowDataPacket[]>(
+      `SELECT user_id AS userId
+         FROM user_organization
+        WHERE organization_id = ?
+        ORDER BY user_id ASC`,
+      [organizationId]
+    );
+    const users = await Promise.all(rows.map((row) => this.getUserById(Number(row.userId))));
     return users.filter((user): user is LegacyUserReadModel => user !== null);
   }
 

@@ -132,6 +132,20 @@ describe.skipIf(process.env.IDENTITY_TEST_MYSQL!=="1")("private identity runtime
   await tokens.logout({refreshToken:initial.token.refreshToken});await expect(native.verify(responses[0].token.accessToken)).rejects.toMatchObject({status:401});
   await expect(tokens.refresh({refreshToken:initial.token.refreshToken},{idempotencyKey:"same-refresh-request"})).rejects.toMatchObject({status:401});
  });
+ it("keeps SN provenance and family immutable during concurrent replay and predecessor logout",async()=>{
+  const source={authMethod:"device_sn" as const,deviceSnId:42};const family=`device-family-${randomUUID()}`;
+  const initial=await sessions.issue({legacyUserId:4,username:"native-user",sessionId:family,expiresAt:new Date(Date.now()+60000),...source});
+  const next={legacyUserId:4,username:"native-user",sessionId:"caller-chosen-family",expiresAt:new Date(Date.now()+60000),authMethod:null,deviceSnId:null};
+  const successors=await Promise.all([sessions.rotate(initial.refreshToken,next,"source-retry"),sessions.rotate(initial.refreshToken,next,"source-retry")]);
+  expect(successors[0].refreshToken).toBe(successors[1].refreshToken);
+  for(const successor of successors)expect(successor).toMatchObject({...source,sessionId:family,legacyUserId:4});
+  const stored=await sessions.findValidSession(successors[0].refreshToken);expect(stored).toMatchObject({...source,sessionId:family});
+  const [rows]=await db.execute<RowDataPacket[]>("SELECT COUNT(*) AS total FROM identity_refresh_sessions WHERE session_id=? AND revoked_at IS NULL",[family]);expect(Number(rows[0].total)).toBe(1);
+  const ordinary=await sessions.issue({legacyUserId:4,username:"native-user",sessionId:`ordinary-${randomUUID()}`,expiresAt:new Date(Date.now()+60000)});
+  const ordinaryNext=await sessions.rotate(ordinary.refreshToken,{...next,...source});expect(ordinaryNext.authMethod).toBeUndefined();expect(ordinaryNext.deviceSnId).toBeUndefined();
+  await sessions.revoke(initial.refreshToken);await expect(sessions.findValidSession(successors[0].refreshToken)).rejects.toBeInstanceOf(InvalidRefreshTokenError);
+  await expect(sessions.rotate(initial.refreshToken,next,"source-retry")).rejects.toBeInstanceOf(InvalidRefreshTokenError);
+ });
  it("does not restore a session when logout races rotation",async()=>{
   for(let i=0;i<6;i++){
    const initial=await tokens.login({username:"native-user",password});
