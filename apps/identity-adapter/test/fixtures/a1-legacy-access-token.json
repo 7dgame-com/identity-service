@@ -1,0 +1,9 @@
+{
+    "syntheticOnly": true,
+    "sourceRevision": "f5bf6667a6fc5bfc65590f13bccd9d8ba0612a74",
+    "bizleyVersion": "4.1.2",
+    "lcobucciVersion": "5.6.1",
+    "secretBase64": "IAlzeW50aGV0aWMtYTEtZml4dHVyZS1rZXktMDEyMzQ1Njc4OWFiY2RlZg0K",
+    "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczovL2ExLmV4YW1wbGUudGVzdCIsImlhdCI6MTc5MTc2MzIwMC4xMjM0NTYsIm5iZiI6MTc5MTc2MzIwMC4xMjM0NTYsImV4cCI6MTc5MTc3NDAwMC4xMjM0NTYsInVpZCI6NDJ9.vKxNYFiWMHvlpDFCXivzAOCP1nPecoUq_GtkDFkgLsI",
+    "stringUidToken": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczovL2ExLmV4YW1wbGUudGVzdCIsImlhdCI6MTc5MTc2MzIwMC4xMjM0NTYsIm5iZiI6MTc5MTc2MzIwMC4xMjM0NTYsImV4cCI6MTc5MTc3NDAwMC4xMjM0NTYsInVpZCI6IjQyIn0.7yKMQi3YMHodrt0qFtucXFEyKH2o-1aHJ9vn9SrggVY"
+}

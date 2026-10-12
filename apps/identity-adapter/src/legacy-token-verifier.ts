@@ -1,15 +1,20 @@
 import { createPublicKey, verify } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { verifyImportedYii3AccessToken } from "./identity-yii3-token-verifier.js";
+import { verifyImportedA1AccessToken } from "./identity-a1-token-verifier.js";
 
 /** Explicit, time-bounded trust for credentials issued before the cutover. */
 export function verifyImportedAccessToken(token: string): Record<string, unknown> {
-  // Yii3 uses a separately reviewed symmetric key and deadline. It must never
-  // inherit the ES256/Yii2 or auth-service trust configuration.
+  // Each historical signer has independent trust. The unverified shape only
+  // selects one strict verifier; failure never falls through to another key.
   const parts = token.split(".");
   if (parts.length !== 3) throw new Error("invalid token format");
   const header = JSON.parse(Buffer.from(parts[0], "base64url").toString("utf8"));
-  if (header?.alg === "HS256") return verifyImportedYii3AccessToken(token);
+  if (header?.alg === "HS256") {
+    const claims = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    return claims && typeof claims === "object" && Object.hasOwn(claims, "iss")
+      ? verifyImportedA1AccessToken(token) : verifyImportedYii3AccessToken(token);
+  }
   const filename = process.env.IDENTITY_LEGACY_JWT_CONFIG_FILE;
   if (!filename) throw new Error("legacy token trust is not configured");
   const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));

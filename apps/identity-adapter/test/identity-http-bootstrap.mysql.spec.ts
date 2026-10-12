@@ -294,4 +294,35 @@ describe.skipIf(!enabled)("compiled AppModule independent HTTP bootstrap",()=>{
     const [rows]=await db!.execute<RowDataPacket[]>("SELECT token_hash,consumed_at FROM identity_password_reset_tokens WHERE token_hash=?",[digest]);
     expect(rows[0].token_hash).toBe(digest);expect(rows[0].consumed_at).not.toBeNull();
   });
+
+  it("accepts real PHP A1 access tokens only under their own trust and current private roles/status/cutoff",async()=>{
+    const fixture=JSON.parse(await readFile(new URL("fixtures/a1-legacy-access-token.json",import.meta.url),"utf8"));
+    const secretFile=join(buildDirectory!,"synthetic-a1-key"),trustFile=join(buildDirectory!,"a1-trust.json");
+    await writeFile(secretFile,Buffer.from(fixture.secretBase64,"base64"),{mode:0o600});
+    const now=Date.parse("2026-10-12T00:00:01Z");
+    await writeFile(trustFile,JSON.stringify({version:1,algorithm:"HS256",secretFile,issuers:["https://a1.example.test"],
+      issuedBefore:new Date(now).toISOString(),acceptUntil:new Date(now+10800000).toISOString(),maxAccessTtlSeconds:10800}),{mode:0o600});
+    await db!.query("INSERT INTO user(id,username,email,email_verified_at,password_hash,status) SELECT 42,'http-a1-imported','a1@example.test',1,password_hash,10 FROM user WHERE id=1; INSERT INTO user_info(user_id) VALUES(42); INSERT INTO auth_assignment(item_name,user_id) VALUES('admin','42')");
+    // Freeze only the wall-clock reading to exercise the reproducible real PHP vector.
+    const clock=vi.spyOn(Date,"now").mockReturnValue(now);
+    vi.stubEnv("IDENTITY_LEGACY_A1_JWT_CONFIG_FILE","");
+    try {
+      expect((await http("/v1/user/info","GET",undefined,bearer(fixture.token))).status).toBe(401);
+      vi.stubEnv("IDENTITY_LEGACY_A1_JWT_CONFIG_FILE",trustFile);
+      const verified=await http("/v1/user/info","GET",undefined,bearer(fixture.token));
+      expect(verified.status).toBe(200);expect(verified.body.data).toMatchObject({id:42,roles:["admin"]});
+      expect((await http("/internal/auth/verify-access-token","POST",{token:fixture.stringUidToken},{"x-identity-internal-token":internalToken})).status).toBe(201);
+      await db!.query("DELETE FROM auth_assignment WHERE user_id='42'; INSERT INTO auth_assignment(item_name,user_id) VALUES('user','42')");
+      expect((await http("/v1/user/info","GET",undefined,bearer(fixture.token))).body.data.roles).toEqual(["user"]);
+      await db!.query("UPDATE user SET status=0 WHERE id=42");
+      expect((await http("/v1/user/info","GET",undefined,bearer(fixture.token))).status).toBe(401);
+      await db!.query("UPDATE user SET status=10 WHERE id=42");
+      expect((await http("/v1/user/info","GET",undefined,bearer(fixture.token))).status).toBe(200);
+      const resetToken=randomBytes(24).toString("base64url");
+      await db!.execute("INSERT INTO identity_password_reset_tokens(token_hash,legacy_user_id,email,issued_at,expires_at) VALUES (?,42,'a1@example.test',UTC_TIMESTAMP(3),DATE_ADD(UTC_TIMESTAMP(3),INTERVAL 1 MINUTE))",[createHash("sha256").update(resetToken).digest("hex")]);
+      expect((await http("/v1/password/reset","POST",{token:resetToken,password:"Renewed-private!94"})).status).toBe(200);
+      expect((await http("/v1/user/info","GET",undefined,bearer(fixture.token))).status).toBe(401);
+      expect((await http("/internal/auth/verify-access-token","POST",{token:fixture.stringUidToken},{"x-identity-internal-token":internalToken})).status).toBe(401);
+    } finally {clock.mockRestore();vi.stubEnv("IDENTITY_LEGACY_A1_JWT_CONFIG_FILE","");}
+  });
 });
