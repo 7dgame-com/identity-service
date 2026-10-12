@@ -1,6 +1,7 @@
 import { createPrivateKey, createPublicKey, randomBytes, sign, verify } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { Injectable, ServiceUnavailableException } from "@nestjs/common";
+import { verifyImportedAccessToken } from "./legacy-token-verifier.js";
 import { loadConfig } from "./config.js";
 import type { LegacyUserReadModel } from "./legacy-identity.reader.js";
 
@@ -15,6 +16,7 @@ export interface VerifiedAccessToken {
   username: string | null;
   sessionId: string | null;
   roles: string[];
+  importedLegacy?: boolean;
 }
 
 export interface OidcIdTokenInput {
@@ -30,10 +32,16 @@ export interface OidcIdTokenInput {
 @Injectable()
 export class JwtIssuerService {
   private readonly config = loadConfig();
+  assertSigningReady():void {
+    const privateKey=this.privateKey(), publicKey=this.publicKey();
+    if(privateKey.asymmetricKeyType!=="ec" || privateKey.asymmetricKeyDetails?.namedCurve!=="prime256v1")throw new Error("Identity signing key must use P-256");
+    const derived=createPublicKey(privateKey).export({format:"jwk"});const actual=publicKey.export({format:"jwk"});
+    if(derived.x!==actual.x || derived.y!==actual.y)throw new Error("Identity signing key pair does not match");
+  }
 
-  issue(user: LegacyUserReadModel, sessionId: string): IssuedAccessToken {
+  issue(user: LegacyUserReadModel, sessionId: string, options?: { audience?: string; scopes?: string[]; expiresInSeconds?: number }): IssuedAccessToken {
     const now = new Date();
-    const expiresAt = new Date(now.getTime() + this.config.tokenIssuance.accessTokenTtlSeconds * 1000);
+    const expiresAt = new Date(now.getTime() + (options?.expiresInSeconds ?? this.config.tokenIssuance.accessTokenTtlSeconds) * 1000);
     const jwtId = randomId();
     const privateKey = this.privateKey();
 
@@ -49,15 +57,18 @@ export class JwtIssuerService {
       username: user.username,
       roles: user.roles,
       session_id: sessionId,
+      token_use: "access",
       jti: jwtId,
       iat: seconds(now),
       nbf: seconds(now),
       exp: seconds(expiresAt)
     };
 
-    if (this.config.jwt.audience) {
-      payload.aud = this.config.jwt.audience;
+    const audience = options?.audience ?? this.config.jwt.audience;
+    if (audience) {
+      payload.aud = audience;
     }
+    if (options?.scopes) payload.scope = options.scopes.join(" ");
 
     const signingInput = `${base64urlJson(header)}.${base64urlJson(payload)}`;
     const signature = sign("sha256", Buffer.from(signingInput), {
@@ -150,7 +161,21 @@ export class JwtIssuerService {
     }
   }
 
-  verifyAccessToken(token: string): VerifiedAccessToken {
+  verifyAccessToken(token: string, options?: { audience: string }): VerifiedAccessToken {
+    try { return this.verifyCurrentAccessToken(token, options); }
+    catch (error) {
+      if (this.config.dataSource !== "identity") throw error;
+      const payload = verifyImportedAccessToken(token);
+      if (options?.audience && payload.aud !== options.audience) throw new Error("invalid imported token audience");
+      const uid = Number(payload.uid);
+      if (!Number.isSafeInteger(uid) || uid <= 0) throw new Error("invalid token subject");
+      return { uid, username: typeof payload.username === "string" ? payload.username : null,
+        sessionId: typeof payload.session_id === "string" ? payload.session_id : null, roles: [], importedLegacy: true };
+    }
+  }
+
+  private verifyCurrentAccessToken(token: string, options?: { audience: string }): VerifiedAccessToken {
+    if (token.split(".").length !== 3) throw new Error("invalid token format");
     const [encodedHeader, encodedPayload, encodedSignature] = token.split(".");
     if (!encodedHeader || !encodedPayload || !encodedSignature) {
       throw new Error("invalid token format");
@@ -160,6 +185,7 @@ export class JwtIssuerService {
     if (header.alg !== "ES256") {
       throw new Error("unsupported token algorithm");
     }
+    if (this.config.dataSource === "identity" && header.kid !== this.config.jwt.keyId) throw new Error("unrecognized signing key");
 
     const signingInput = `${encodedHeader}.${encodedPayload}`;
     const signature = Buffer.from(encodedSignature, "base64url");
@@ -170,7 +196,8 @@ export class JwtIssuerService {
 
     const payload = parseJwtPart(encodedPayload);
     const now = seconds(new Date());
-    if (typeof payload.exp === "number" && payload.exp <= now) {
+    if (this.config.dataSource === "identity" && (typeof payload.iat !== "number" || !Number.isFinite(payload.iat) || payload.iat > now + 10)) throw new Error("invalid token issue time");
+    if (!Number.isFinite(payload.exp) || Number(payload.exp) <= now) {
       throw new Error("token expired");
     }
     if (typeof payload.nbf === "number" && payload.nbf > now) {
@@ -179,7 +206,9 @@ export class JwtIssuerService {
     if (payload.iss !== this.config.jwt.issuer) {
       throw new Error("invalid token issuer");
     }
-    if (this.config.jwt.audience && payload.aud !== this.config.jwt.audience) {
+    const expectedAudience = options?.audience ?? this.config.jwt.audience;
+    if (this.config.dataSource === "identity" && !expectedAudience && payload.aud != null) throw new Error("invalid token audience");
+    if (expectedAudience && payload.aud !== expectedAudience) {
       throw new Error("invalid token audience");
     }
 
@@ -187,6 +216,8 @@ export class JwtIssuerService {
     if (!Number.isInteger(uid) || uid <= 0) {
       throw new Error("invalid token subject");
     }
+    if (this.config.dataSource === "identity" && (Number(payload.uid)!==uid || String(payload.sub)!==String(uid)
+      || typeof payload.session_id!=="string" || !payload.session_id || (payload.token_use!=null && payload.token_use!=="access"))) throw new Error("invalid access token purpose");
 
     return {
       uid,

@@ -1,6 +1,6 @@
 import { Injectable, OnModuleDestroy } from "@nestjs/common";
 import mysql, { Pool, RowDataPacket } from "mysql2/promise";
-import { loadConfig } from "./config.js";
+import { identityAccountReadDb, loadConfig } from "./config.js";
 import { assertReadonlySql } from "./readonly-write.guard.js";
 
 export interface LegacyRole {
@@ -57,7 +57,7 @@ export interface LegacyUserReadModel {
   userInfo: unknown;
   roles: string[];
   organizations: LegacyOrganization[];
-  source: "legacy";
+  source: "legacy" | "identity-db";
 }
 
 interface LegacyRoleAssignmentRow extends RowDataPacket {
@@ -182,7 +182,7 @@ export class LegacyIdentityReader implements OnModuleDestroy {
       userInfo: parseJsonMaybe(user.userInfo),
       roles,
       organizations,
-      source: "legacy"
+      source: this.config.dataSource === "identity" ? "identity-db" : "legacy"
     };
   }
 
@@ -291,7 +291,7 @@ export class LegacyIdentityReader implements OnModuleDestroy {
           userInfo: {},
           roles: [],
           organizations: [],
-          source: "legacy"
+          source: this.config.dataSource === "identity" ? "identity-db" : "legacy"
         });
       }
       for (const row of roleRows) {
@@ -352,6 +352,7 @@ export class LegacyIdentityReader implements OnModuleDestroy {
     const pageSize = Math.max(1, Math.min(input.pageSize, 100));
     const offset = (page - 1) * pageSize;
     const where: string[] = [];
+    if (this.config.dataSource === "identity") where.push("u.deleted_at IS NULL");
     const params: unknown[] = [];
 
     if (input.search?.trim()) {
@@ -574,13 +575,15 @@ export class LegacyIdentityReader implements OnModuleDestroy {
     );
 
     return {
-      legacyDatabaseConfigured: this.isConfigured(),
+      dataSource: this.config.dataSource,
+      legacyDatabaseConfigured: this.config.dataSource === "legacy" && this.isConfigured(),
+      accountDatabaseConfigured: this.isConfigured(),
       tables: Object.fromEntries(tables)
     };
   }
 
   private createPool(): Pool | null {
-    const { legacyDb } = this.config;
+    const legacyDb = identityAccountReadDb(this.config);
     if (!legacyDb.host || !legacyDb.user) {
       return null;
     }
@@ -591,6 +594,7 @@ export class LegacyIdentityReader implements OnModuleDestroy {
       database: legacyDb.name,
       user: legacyDb.user,
       password: legacyDb.password,
+      ...(this.config.dataSource === "identity" ? { timezone: "Z" } : {}),
       waitForConnections: true,
       connectionLimit: 5,
       namedPlaceholders: false

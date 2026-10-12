@@ -1,6 +1,6 @@
 import { Injectable, OnModuleDestroy } from "@nestjs/common";
 import mysql, { Pool, RowDataPacket } from "mysql2/promise";
-import { loadConfig } from "./config.js";
+import { identityAccountReadDb, loadConfig } from "./config.js";
 
 export interface InvitationRecordStats {
   configured: boolean;
@@ -121,7 +121,7 @@ export class InvitationRecordRepository implements OnModuleDestroy {
   }
 
   private createPool(): Pool | null {
-    const { legacyDb } = this.config;
+    const legacyDb = identityAccountReadDb(this.config);
     if (!legacyDb.host || !legacyDb.user) {
       return null;
     }
@@ -132,6 +132,7 @@ export class InvitationRecordRepository implements OnModuleDestroy {
       database: legacyDb.name,
       user: legacyDb.user,
       password: legacyDb.password,
+      ...(this.config.dataSource === "identity" ? { timezone: "Z" } : {}),
       waitForConnections: true,
       connectionLimit: 3,
       namedPlaceholders: false

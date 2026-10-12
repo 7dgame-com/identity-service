@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   BadRequestException,
   Injectable,
+  Optional,
   NotFoundException,
   OnApplicationBootstrap,
   ServiceUnavailableException,
@@ -15,6 +16,7 @@ import { calculateEffectivePermissions, createIamPermissionPolicySnapshot } from
 import { JwtIssuerService, VerifiedAccessToken } from "./jwt-issuer.service.js";
 import { LegacyIdentityReader, LegacyUserReadModel } from "./legacy-identity.reader.js";
 import { sanitizeMetadata } from "./login-audit.service.js";
+import { NativeIdentityService } from "./native-identity.service.js";
 
 type IamViewScope = "user" | "role" | "permission" | "organization" | "plugin";
 type IamReconciliationScope = IamViewScope;
@@ -82,7 +84,8 @@ export class IamService implements OnApplicationBootstrap {
   constructor(
     private readonly repository: IamRepository,
     private readonly legacyReader: LegacyIdentityReader,
-    private readonly jwtIssuer: JwtIssuerService
+    private readonly jwtIssuer: JwtIssuerService,
+    @Optional() private readonly native?: NativeIdentityService
   ) {}
 
   async onApplicationBootstrap() {
@@ -152,6 +155,15 @@ export class IamService implements OnApplicationBootstrap {
   }
 
   async authzResolve(rawInput: unknown) {
+    if (this.native?.enabled) {
+      const parsed = z.object({ permission: z.string().min(1).max(256), subject: z.object({ legacyUserId: z.number().int().positive() }) }).safeParse(rawInput);
+      if (!parsed.success) throw new BadRequestException("A canonical identity subject and permission are required");
+      const allowed = await this.native.allowed(parsed.data.subject.legacyUserId, parsed.data.permission);
+      return { capability: "iam-authz-read", runtimeRouteDecision: true,
+        selection: { sourceOfTruth: "identity", compareIdentity: false },
+        outcome: { decision: allowed ? "allow" : "deny", responseSource: "identity", fallbackUsed: false, failClosed: false },
+        safety: { permissionUnionApplied: false, semanticMismatchFallbackAllowed: false, legacyAuthoritativeByDefault: false } };
+    }
     const input = this.parseAuthzResolveInput(rawInput);
     const selection = decideIamAuthzRead(this.config.iam, input.subject);
 

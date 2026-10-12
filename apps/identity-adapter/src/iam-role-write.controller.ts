@@ -1,4 +1,5 @@
-import { Body, Controller, Get, Headers, HttpException, HttpStatus, Param, Post, Put, Query, Req, Res } from "@nestjs/common";
+import { NativeIdentityService } from "./native-identity.service.js";
+import { Body, Optional, Controller, Get, Headers, HttpException, HttpStatus, Param, Post, Put, Query, Req, Res } from "@nestjs/common";
 import { loadConfig } from "./config.js";
 import { roleWriteEvidenceHeaders } from "./iam-role-write-evidence.js";
 import { IamRoleWriteService } from "./iam-role-write.service.js";
@@ -7,7 +8,7 @@ import { IamRoleWriteService } from "./iam-role-write.service.js";
 export class IamRoleWriteController {
   private readonly config = loadConfig();
 
-  constructor(private readonly roleWrite: IamRoleWriteService) {}
+  constructor(private readonly roleWrite: IamRoleWriteService, @Optional() private readonly native?: NativeIdentityService) {}
 
   @Get("internal/iam/role-write/readiness")
   async readiness(@Headers("x-identity-internal-token") token: string | undefined) {
@@ -194,6 +195,7 @@ export class IamRoleWriteController {
     @Res({ passthrough: true }) response: IamRoleWriteExpressResponse,
     @Body() _body: unknown
   ): Promise<unknown> {
+    if (this.native?.enabled) return (await this.native.person(request,"auth")).body;
     const upstream = await this.roleWrite.proxyPeopleAuth(request);
     response.status(upstream.status);
     response.setHeader("X-Identity-IAM-Role-Write", upstream.mode);

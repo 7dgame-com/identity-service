@@ -2574,6 +2574,10 @@ describe("identity-adapter OIDC standardization API", () => {
   const originalEnv = { ...process.env };
 
   beforeEach(async () => {
+    // This readiness fixture deliberately has no authorization-code store,
+    // even when the full suite enables a disposable MySQL integration database.
+    delete process.env.IDENTITY_DB_HOST;
+    delete process.env.IDENTITY_DB_USER;
     process.env.IDENTITY_INTERNAL_API_TOKEN = "test-internal-token";
     process.env.IDENTITY_OIDC_ENABLED = "true";
     process.env.IDENTITY_OIDC_ISSUER = "https://identity.example.com";

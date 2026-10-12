@@ -28,11 +28,11 @@ export class InvitationRedisReader {
   private readonly config = loadConfig();
 
   isConfigured(): boolean {
-    return Boolean(this.config.invitationDiagnostics.redisUrl);
+    return this.config.dataSource === "legacy" && Boolean(this.config.invitationDiagnostics.redisUrl);
   }
 
   async scanInvitations(code?: string | null): Promise<LegacyRedisInvitationScan> {
-    if (!this.config.invitationDiagnostics.redisUrl) {
+    if (!this.isConfigured() || !this.config.invitationDiagnostics.redisUrl) {
       return {
         configured: false,
         scannedKeys: 0,

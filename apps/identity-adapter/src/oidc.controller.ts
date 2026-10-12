@@ -1,4 +1,5 @@
-import { Body, Controller, Get, Headers, HttpCode, HttpException, HttpStatus, Post, Query, Res } from "@nestjs/common";
+import { Body, Controller, Get, Headers, HttpCode, HttpException, HttpStatus, Optional, Post, Query, Res } from "@nestjs/common";
+import { NativeIdentityService } from "./native-identity.service.js";
 import { JwtIssuerService } from "./jwt-issuer.service.js";
 import { OidcService } from "./oidc.service.js";
 
@@ -11,7 +12,8 @@ interface MinimalHttpResponse {
 export class OidcController {
   constructor(
     private readonly oidc: OidcService,
-    private readonly jwtIssuer: JwtIssuerService
+    private readonly jwtIssuer: JwtIssuerService,
+    @Optional() private readonly native?: NativeIdentityService
   ) {}
 
   @Get(".well-known/openid-configuration")
@@ -87,7 +89,7 @@ export class OidcController {
   }
 
   @Get("userinfo")
-  userinfo(@Headers("authorization") authorization?: string) {
+  async userinfo(@Headers("authorization") authorization?: string) {
     const token = bearerToken(authorization);
     if (!token) {
       throw new HttpException(
@@ -100,6 +102,10 @@ export class OidcController {
     }
 
     try {
+      if (this.native?.enabled) {
+        const user = await this.native.verify(token);
+        return { sub: String(user.id), uid: user.id, preferred_username: user.username, roles: user.roles };
+      }
       const claims = this.jwtIssuer.verifyAccessToken(token);
       return {
         sub: String(claims.uid),

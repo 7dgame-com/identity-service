@@ -7,6 +7,7 @@ import { JwtIssuerService } from "./jwt-issuer.service.js";
 import { LegacyIdentityReader, LegacyUserReadModel } from "./legacy-identity.reader.js";
 import { verifyLegacyPassword } from "./legacy-password.js";
 import { LoginAuditService } from "./login-audit.service.js";
+import type { PoolConnection, RowDataPacket } from "mysql2/promise";
 
 const loginSchema = z.object({
   username: z.string().min(1).max(255),
@@ -28,6 +29,7 @@ const issueUserTokenSchema = z.object({
 export interface RequestContext {
   ip?: string | null;
   userAgent?: string | null;
+  idempotencyKey?: string;
 }
 
 export interface AuthTokenResponse {
@@ -41,6 +43,8 @@ export interface AuthTokenResponse {
     tokenType: "Bearer";
   };
 }
+
+export interface TransactionalAuthResponse extends AuthTokenResponse { sessionId:string;refreshTokenHash:string; }
 
 @Injectable()
 export class TokenIssuanceService {
@@ -67,7 +71,7 @@ export class TokenIssuanceService {
 
     const user = await this.requireLegacyUser(credential.id);
     const sessionId = randomId();
-    const response = await this.issueForUser(user, sessionId, context, "login");
+    const response = await this.issueForUser(user, sessionId, context, "login", credential.passwordHash);
 
     await this.recordLoginAudit(user, sessionId, context);
 
@@ -79,10 +83,14 @@ export class TokenIssuanceService {
     const parsed = parseBody(refreshSchema, payload);
 
     try {
-      const current = await this.sessions.findValidSession(parsed.refreshToken);
+      const current = await (typeof this.sessions.findRefreshCandidate === "function"
+        ? this.sessions.findRefreshCandidate(parsed.refreshToken) : this.sessions.findValidSession(parsed.refreshToken));
+      if (this.config.dataSource === "identity" && await this.sessions.isOAuthBound(current.sessionId)) throw new InvalidRefreshTokenError("OAuth refresh tokens must use their bound client");
       const user = await this.requireLegacyUser(current.legacyUserId);
-      const nextSessionId = randomId();
+      const nextSessionId = current.sessionId;
       const refreshExpiresAt = this.refreshExpiresAt();
+      // Validate signing configuration before consuming a refresh token.
+      this.jwtIssuer.issue(user, nextSessionId);
       const rotated = await this.sessions.rotate(parsed.refreshToken, {
         legacyUserId: user.id,
         username: user.username,
@@ -90,7 +98,7 @@ export class TokenIssuanceService {
         expiresAt: refreshExpiresAt,
         ipAddressHash: hashMaybe(context.ip),
         userAgentHash: hashMaybe(context.userAgent)
-      });
+      }, context.idempotencyKey);
       const token = this.jwtIssuer.issue(user, rotated.sessionId);
 
       return tokenResponse("refresh", token.accessToken, rotated.refreshToken, token.expiresAt);
@@ -113,11 +121,11 @@ export class TokenIssuanceService {
     return { success: true, message: "logout", revoked };
   }
 
-  async issueRegisteredUser(user: LegacyUserReadModel, context: RequestContext = {}): Promise<AuthTokenResponse> {
+  async issueRegisteredUser(user: LegacyUserReadModel, context: RequestContext = {}, expectedPasswordHash?: string): Promise<AuthTokenResponse> {
     this.assertEnabled();
     const sessionId = randomId();
 
-    return this.issueForUser(user, sessionId, context, "register");
+    return this.issueForUser(user, sessionId, context, "register", expectedPasswordHash);
   }
 
   async issueLegacyUserToken(payload: unknown, context: RequestContext = {}): Promise<AuthTokenResponse> {
@@ -129,11 +137,45 @@ export class TokenIssuanceService {
     return this.issueForUser(user, sessionId, context, "login");
   }
 
+  async exchangeLegacyPhpSession(payload:unknown,context:RequestContext={}):Promise<AuthTokenResponse>{
+    this.assertEnabled();
+    if(this.config.dataSource!=="identity")throw new UnauthorizedException();
+    const parsed=parseBody(z.object({userId:z.number().int().positive(),authKey:z.string().min(16).max(255)}),payload);
+    const user=await this.requireLegacyUser(parsed.userId);
+    return this.issueForUser(user,randomId(),context,"login",undefined,parsed.authKey);
+  }
+
+  async assertTransactionIssuanceReady():Promise<void>{
+    this.assertEnabled();
+    if(this.config.dataSource!=="identity"||!this.sessions.isConfigured())throw new BadRequestException("Private Identity session storage is required");
+    this.jwtIssuer.assertSigningReady();
+    await this.sessions.ensureSchema();
+  }
+
+  /** Consume the proof and create its session under the same private account transaction. */
+  async issueInTransaction(connection:PoolConnection,userId:number,context:RequestContext={}):Promise<TransactionalAuthResponse>{
+    this.assertEnabled();
+    if(this.config.dataSource!=="identity")throw new UnauthorizedException();
+    const [rows]=await connection.execute<RowDataPacket[]>("SELECT * FROM user WHERE id=? FOR UPDATE",[userId]);const row=rows[0];
+    if(!row||Number(row.status)!==10||row.deleted_at!=null)throw new UnauthorizedException("Account is inactive");
+    const [roles]=await connection.execute<RowDataPacket[]>(`SELECT aa.item_name AS name FROM auth_assignment aa
+      JOIN auth_item ai ON ai.name=aa.item_name WHERE aa.user_id=? AND ai.type=1 ORDER BY aa.item_name`,[String(userId)]);
+    const user:LegacyUserReadModel={id:userId,username:row.username??null,email:row.email??null,status:10,nickname:row.nickname??null,
+      emailVerifiedAt:row.email_verified_at==null?null:Number(row.email_verified_at),createdAt:row.created_at==null?null:Number(row.created_at),
+      updatedAt:row.updated_at==null?null:Number(row.updated_at),roles:roles.map(role=>String(role.name)),organizations:[],userInfo:null,source:"identity-db"};
+    const sessionId=randomId(),access=this.jwtIssuer.issue(user,sessionId);
+    const session=await this.sessions.issueInTransaction(connection,{legacyUserId:userId,username:user.username,sessionId,
+      expiresAt:this.refreshExpiresAt(),expectedPasswordHash:row.password_hash??undefined,ipAddressHash:hashMaybe(context.ip),userAgentHash:hashMaybe(context.userAgent)});
+    return {...tokenResponse("login",access.accessToken,session.refreshToken,access.expiresAt),sessionId,refreshTokenHash:session.refreshTokenHash};
+  }
+
   private async issueForUser(
     user: LegacyUserReadModel,
     sessionId: string,
     context: RequestContext,
-    message: "login" | "refresh" | "register"
+    message: "login" | "refresh" | "register",
+    expectedPasswordHash?: string,
+    expectedLegacyAuthKey?: string
   ): Promise<AuthTokenResponse> {
     if (!this.sessions.isConfigured()) {
       throw new BadRequestException({
@@ -142,23 +184,29 @@ export class TokenIssuanceService {
       });
     }
 
+    const token = this.jwtIssuer.issue(user, sessionId);
     const refreshExpiresAt = this.refreshExpiresAt();
-    const session = await this.sessions.issue({
+    let session;
+    try { session = await this.sessions.issue({
       legacyUserId: user.id,
       username: user.username,
       sessionId,
       expiresAt: refreshExpiresAt,
       ipAddressHash: hashMaybe(context.ip),
-      userAgentHash: hashMaybe(context.userAgent)
-    });
-    const token = this.jwtIssuer.issue(user, session.sessionId);
+      userAgentHash: hashMaybe(context.userAgent),
+      expectedPasswordHash,
+      expectedLegacyAuthKey
+    }); } catch (error) {
+      if(error instanceof InvalidRefreshTokenError)throw new UnauthorizedException({code:"ACCOUNT_CHANGED",message:"Account credentials changed while authenticating"});
+      throw error;
+    }
 
     return tokenResponse(message, token.accessToken, session.refreshToken, token.expiresAt);
   }
 
   private async requireLegacyUser(id: number): Promise<LegacyUserReadModel> {
     const user = await this.legacyReader.getUserById(id);
-    if (!user) {
+    if (!user || user.status !== 10) {
       throw new UnauthorizedException({
         code: "LEGACY_USER_NOT_FOUND",
         message: "Legacy user was not found."

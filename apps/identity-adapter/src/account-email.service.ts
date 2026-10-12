@@ -1,4 +1,4 @@
-import { HttpException, Injectable, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
+import { HttpException, Inject, Injectable, Optional, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
 import { z } from "zod";
 import { AccountEmailRepository, EmailUserProfile, NativeEmailError, normalizeEmail } from "./account-email.repository.js";
 import { loadConfig } from "./config.js";
@@ -6,6 +6,7 @@ import { EmailChangeTokenError, EmailChangeTokenRepository } from "./email-chang
 import { EmailDeliveryService } from "./email-delivery.service.js";
 import { EmailVerificationChallengeError, EmailVerificationChallengeRepository } from "./email-verification-challenge.repository.js";
 import { JwtIssuerService } from "./jwt-issuer.service.js";
+import { NativeIdentityService } from "./native-identity.service.js";
 
 const basicEmailNativePaths = ["/v1/email/status", "/v1/email/send-verification", "/v1/email/verify", "/v1/email/cooldown"];
 const emailChangeNativePaths = ["/v1/email/send-change-confirmation", "/v1/email/verify-change-confirmation", "/v1/email/unbind"];
@@ -51,7 +52,8 @@ export class AccountEmailService {
     private readonly challenges: EmailVerificationChallengeRepository,
     private readonly changeTokens: EmailChangeTokenRepository,
     private readonly emailDelivery: EmailDeliveryService,
-    private readonly jwtIssuer: JwtIssuerService
+    private readonly jwtIssuer: JwtIssuerService,
+    @Optional() @Inject(NativeIdentityService) private readonly native?: NativeIdentityService
   ) {}
 
   isVerifyNativeReady(): boolean {
@@ -160,10 +162,12 @@ export class AccountEmailService {
       }
       await this.assertEmailNotBoundByOther(email, user.id);
       const verifiedAt = Math.floor(Date.now() / 1000);
-      const updatedUser = await this.emails.bindVerifiedEmail(user.id, email, verifiedAt);
-      await this.challenges.consume(challenge.challengeKey);
-      if (changeTokenRecord) {
-        await this.changeTokens.consume(changeTokenRecord.tokenKey);
+      const updatedUser = this.config.dataSource==="identity"
+        ? await this.emails.bindVerifiedEmail(user.id,email,verifiedAt,{challengeKey:challenge.challengeKey,changeTokenKey:changeTokenRecord?.tokenKey,expectedEmail:user.email,authorize:user.authorizeWrite})
+        : await this.emails.bindVerifiedEmail(user.id, email, verifiedAt);
+      if(this.config.dataSource==="legacy") {
+        await this.challenges.consume(challenge.challengeKey);
+        if (changeTokenRecord) await this.changeTokens.consume(changeTokenRecord.tokenKey);
       }
 
       return {
@@ -218,8 +222,10 @@ export class AccountEmailService {
         throw new EmailVerificationChallengeError(400, "INVALID_CODE", "验证码不存在或已过期");
       }
 
-      await this.challenges.consume(challenge.challengeKey);
-      const { token, expiresIn } = await this.changeTokens.createToken(user.id);
+      if(this.config.dataSource==="legacy") await this.challenges.consume(challenge.challengeKey);
+      const { token, expiresIn } = this.config.dataSource==="identity"
+        ? await this.changeTokens.createToken(user.id,challenge.challengeKey)
+        : await this.changeTokens.createToken(user.id);
 
       return {
         success: true,
@@ -257,8 +263,10 @@ export class AccountEmailService {
       }
 
       const updatedAt = Math.floor(Date.now() / 1000);
-      const updatedUser = await this.emails.unbindEmail(user.id, updatedAt);
-      if (challengeKey) {
+      const updatedUser = this.config.dataSource==="identity"
+        ? await this.emails.unbindEmail(user.id,updatedAt,{challengeKey,expectedEmail:user.email,authorize:user.authorizeWrite})
+        : await this.emails.unbindEmail(user.id, updatedAt);
+      if (challengeKey && this.config.dataSource==="legacy") {
         await this.challenges.consume(challengeKey);
       }
 
@@ -314,6 +322,10 @@ export class AccountEmailService {
     let claims: { uid: number };
     try {
       claims = this.jwtIssuer.verifyAccessToken(token);
+      if (this.config.dataSource === "identity") {
+        if (!this.native) throw new Error("Identity account authority is required");
+        await this.native.verify(token);
+      }
     } catch {
       throw unauthorized("用户未登录");
     }
@@ -323,7 +335,7 @@ export class AccountEmailService {
       throw unauthorized("用户未登录");
     }
 
-    return user;
+    return this.config.dataSource==="identity"?{...user,authorizeWrite:(connection)=>this.native!.assertAccessInTransaction(token,user.id,connection)}:user;
   }
 
   private assertEmailVerifyNativeReady(): void {

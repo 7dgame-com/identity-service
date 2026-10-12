@@ -1,4 +1,5 @@
-import { BadRequestException, Controller, Get, Post, Query, Req, Res } from "@nestjs/common";
+import { NativeIdentityService } from "./native-identity.service.js";
+import { BadRequestException, Optional, Controller, Get, Post, Query, Req, Res } from "@nestjs/common";
 import { roleWriteEvidenceHeaders } from "./iam-role-write-evidence.js";
 import { IamRoleWriteService } from "./iam-role-write.service.js";
 import { organizationWriteEvidenceHeaders } from "./iam-organization-write-evidence.js";
@@ -10,7 +11,8 @@ export class PluginUserWriteController {
   constructor(
     private readonly pluginUserWrite: PluginUserWriteService,
     private readonly iamRoleWrite: IamRoleWriteService,
-    private readonly iamOrganizationWrite: IamOrganizationWriteService
+    private readonly iamOrganizationWrite: IamOrganizationWriteService,
+    @Optional() private readonly native?: NativeIdentityService
   ) {}
 
   @Get("internal/plugin-user-write/readiness")
@@ -92,6 +94,7 @@ export class PluginUserWriteController {
     response: PluginUserWriteExpressResponse,
     path: string
   ): Promise<unknown> {
+    if (this.native?.enabled) return this.native.pluginWrite(request, path.split("/").pop()!);
     const organizationUpstream = path === "/v1/plugin-user/update-user"
       ? await this.iamOrganizationWrite.proxyMembershipUpdate(request)
       : null;
@@ -112,6 +115,7 @@ export class PluginUserWriteController {
     request: PluginUserWriteExpressRequest,
     response: PluginUserWriteExpressResponse
   ): Promise<unknown> {
+    if (this.native?.enabled) return this.native.pluginWrite(request, "change-role");
     const upstream = await this.iamRoleWrite.proxyPluginUser(request);
     response.status(upstream.status);
     response.setHeader("X-Identity-Plugin-User-Write", upstream.mode);

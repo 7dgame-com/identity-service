@@ -1,4 +1,5 @@
-import { Controller, Get, HttpException, HttpStatus, Inject, Param } from "@nestjs/common";
+import { Controller, Get, Headers, HttpException, HttpStatus, Inject, Optional, Param, ForbiddenException } from "@nestjs/common";
+import { NativeIdentityService } from "./native-identity.service.js";
 import { loadConfig } from "./config.js";
 import { JwtIssuerService } from "./jwt-issuer.service.js";
 import { LegacyIdentityReader } from "./legacy-identity.reader.js";
@@ -9,7 +10,8 @@ export class IdentityController {
 
   constructor(
     @Inject(LegacyIdentityReader) private readonly legacyReader: LegacyIdentityReader,
-    @Inject(JwtIssuerService) private readonly jwtIssuer: JwtIssuerService
+    @Inject(JwtIssuerService) private readonly jwtIssuer: JwtIssuerService,
+    @Optional() private readonly native?: NativeIdentityService
   ) {}
 
   @Get("jwks.json")
@@ -32,7 +34,8 @@ export class IdentityController {
   }
 
   @Get("admin/users/:id")
-  async user(@Param("id") id: string) {
+  async user(@Param("id") id: string, @Headers("authorization") authorization?: string) {
+    await this.protect(authorization);
     const parsedId = Number(id);
     if (!Number.isInteger(parsedId) || parsedId <= 0) {
       throw new HttpException(
@@ -62,7 +65,8 @@ export class IdentityController {
   }
 
   @Get("admin/roles")
-  async roles() {
+  async roles(@Headers("authorization") authorization?: string) {
+    await this.protect(authorization);
     return {
       data: await this.legacyReader.listRoles(),
       diagnostics: await this.legacyReader.diagnostics()
@@ -70,10 +74,17 @@ export class IdentityController {
   }
 
   @Get("admin/organizations")
-  async organizations() {
+  async organizations(@Headers("authorization") authorization?: string) {
+    await this.protect(authorization);
     return {
       data: await this.legacyReader.listOrganizations(),
       diagnostics: await this.legacyReader.diagnostics()
     };
+  }
+
+  private async protect(authorization?: string) {
+    if (!this.native?.enabled) return;
+    const user = await this.native.actor({headers:{authorization}});
+    if (!user.roles.some((role) => role === "root" || role === "admin")) throw new ForbiddenException();
   }
 }

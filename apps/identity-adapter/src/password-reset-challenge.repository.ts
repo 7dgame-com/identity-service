@@ -2,6 +2,7 @@ import { createHash, randomInt, randomUUID } from "node:crypto";
 import { Injectable, OnModuleDestroy } from "@nestjs/common";
 import mysql, { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { loadConfig } from "./config.js";
+import { importedChallengePrefix, readLegacyChallengeLimits, incrementLegacyChallengeAttempts } from "./legacy-challenge-limits.js";
 
 export interface PasswordResetChallenge {
   id: number;
@@ -14,6 +15,15 @@ export interface PasswordResetChallenge {
   lockedUntil: Date | null;
   consumedAt: Date | null;
   createdAt: Date;
+}
+
+export interface PasswordResetToken {
+  tokenHash: string;
+  legacyUserId: number;
+  email: string;
+  issuedAt: Date;
+  expiresAt: Date;
+  consumedAt: Date | null;
 }
 
 export class PasswordResetChallengeError extends Error {
@@ -51,8 +61,10 @@ export class PasswordResetChallengeRepository implements OnModuleDestroy {
     await this.ensureSchema();
     const email = normalizeEmail(input.email);
     const latest = await this.findLatestByEmail(email);
-    if (latest) {
-      const availableAt = latest.createdAt.getTime() + this.config.passwordReset.rateLimitSeconds * 1000;
+    const limits = this.config.dataSource === "identity" ? await readLegacyChallengeLimits(pool, "password_reset", email) : null;
+    {
+      const availableAt = Math.max(limits?.rateLimitUntil?.getTime() ?? 0,
+        latest && !latest.challengeKey.startsWith(importedChallengePrefix) ? latest.createdAt.getTime() + this.config.passwordReset.rateLimitSeconds * 1000 : 0);
       if (availableAt > Date.now()) {
         throw new PasswordResetChallengeError(
           429,
@@ -82,6 +94,10 @@ export class PasswordResetChallengeRepository implements OnModuleDestroy {
   }
 
   async verifyCode(email: string, code: string): Promise<PasswordResetChallenge> {
+    const limits = this.config.dataSource === "identity" ? await readLegacyChallengeLimits(this.requirePool(), "password_reset", normalizeEmail(email)) : null;
+    if (limits?.attemptsExpiresAt && limits.attemptsExpiresAt.getTime() > Date.now() && limits.attempts >= this.config.passwordReset.maxAttempts) {
+      throw new PasswordResetChallengeError(429, "ACCOUNT_LOCKED", "验证失败次数过多，账户已被锁定", Math.ceil((limits.attemptsExpiresAt.getTime()-Date.now())/1000));
+    }
     const challenge = await this.requireActiveChallenge(email);
     if (challenge.lockedUntil && challenge.lockedUntil.getTime() > Date.now()) {
       throw new PasswordResetChallengeError(
@@ -100,6 +116,28 @@ export class PasswordResetChallengeRepository implements OnModuleDestroy {
     }
 
     return challenge;
+  }
+
+  /** Imported opaque tokens are separate from six-digit code challenge keys. */
+  async findResetToken(token: string, activeOnly = false): Promise<PasswordResetToken | null> {
+    const [rows] = await this.requirePool().execute<RowDataPacket[]>(
+      `SELECT t.token_hash AS tokenHash, t.legacy_user_id AS legacyUserId, t.email,
+              t.issued_at AS issuedAt, t.expires_at AS expiresAt, t.consumed_at AS consumedAt
+         FROM identity_password_reset_tokens t WHERE t.token_hash = ?
+          ${activeOnly ? `AND t.consumed_at IS NULL AND t.expires_at > UTC_TIMESTAMP(3)
+            AND t.issued_at <= UTC_TIMESTAMP(3)` : ""}
+          ${activeOnly && this.config.dataSource === "identity" ? `AND EXISTS (SELECT 1 FROM user u
+               WHERE u.id = t.legacy_user_id AND u.status = 10 AND u.deleted_at IS NULL
+                 AND u.email_verified_at IS NOT NULL AND LOWER(u.email) = t.email)` : ""}
+        LIMIT 1`, [createHash("sha256").update(token).digest("hex")]
+    );
+    const row = rows[0];
+    return row ? { tokenHash: String(row.tokenHash), legacyUserId: Number(row.legacyUserId), email: String(row.email),
+      issuedAt: toDate(row.issuedAt), expiresAt: toDate(row.expiresAt), consumedAt: row.consumedAt ? toDate(row.consumedAt) : null } : null;
+  }
+
+  async findActiveByToken(token: string): Promise<PasswordResetToken | null> {
+    return this.findResetToken(token, true);
   }
 
   async consume(challengeKey: string): Promise<void> {
@@ -148,6 +186,7 @@ export class PasswordResetChallengeRepository implements OnModuleDestroy {
 
   private async incrementAttempts(challenge: PasswordResetChallenge): Promise<void> {
     const pool = this.requirePool();
+    if (this.config.dataSource === "identity" && await incrementLegacyChallengeAttempts(pool, "password_reset", challenge.email)) return;
     const nextAttempts = challenge.attempts + 1;
     const lockedUntil = nextAttempts >= this.config.passwordReset.maxAttempts ? new Date(Date.now() + this.config.passwordReset.lockSeconds * 1000) : null;
     await pool.execute(
@@ -215,7 +254,8 @@ export class PasswordResetChallengeRepository implements OnModuleDestroy {
       password: identityDb.password,
       waitForConnections: true,
       connectionLimit: 5,
-      namedPlaceholders: false
+      namedPlaceholders: false,
+      timezone: "Z"
     });
   }
 }

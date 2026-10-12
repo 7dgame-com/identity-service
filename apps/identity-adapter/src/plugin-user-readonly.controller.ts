@@ -1,4 +1,5 @@
-import { Controller, Get, Headers, HttpException, HttpStatus, Param, Query, Res } from "@nestjs/common";
+import { NativeIdentityService } from "./native-identity.service.js";
+import { Controller, Optional, Get, Headers, HttpException, HttpStatus, Param, Query, Res } from "@nestjs/common";
 import { loadConfig } from "./config.js";
 import { JwtIssuerService, VerifiedAccessToken } from "./jwt-issuer.service.js";
 import { IamRepository, type IdentityOrganizationShadowRow } from "./iam.repository.js";
@@ -21,7 +22,8 @@ export class PluginUserReadonlyController {
     private readonly jwtIssuer: JwtIssuerService,
     private readonly primaryRead: PluginUserPrimaryReadService,
     private readonly loginAudit: LoginAuditService,
-    private readonly iamRepository: IamRepository
+    private readonly iamRepository: IamRepository,
+    @Optional() private readonly native?: NativeIdentityService
   ) {}
 
   @Get("v1/plugin-user/users")
@@ -30,6 +32,10 @@ export class PluginUserReadonlyController {
     @Res({ passthrough: true }) response: HeaderResponse,
     @Headers("authorization") authorization?: string
   ) {
+    if (this.native?.enabled) {
+      response.setHeader("X-Identity-User-Source", "identity-db");
+      return this.native.managedUsers({headers:{authorization}},query);
+    }
     this.assertEnabled();
     const claims = this.currentUser(authorization);
     const id = positiveInt(query.id);
@@ -86,6 +92,17 @@ export class PluginUserReadonlyController {
     @Param("legacyUserId") legacyUserId: string,
     @Query() query: Record<string, unknown>
   ) {
+    if (this.native?.enabled) {
+      const actor = await this.native.actor({headers:{authorization}});
+      const parsedId = positiveInt(legacyUserId);
+      if (parsedId === null) throw new HttpException({code:"INVALID_USER_ID",message:"User id must be a positive integer."},HttpStatus.BAD_REQUEST);
+      if (!actor.roles.some(role=>ELEVATED_ROLES.has(role))) await this.native.requirePermission(actor,"user-management.view-user");
+      this.assertLoginAuditEnabled();
+      const scope = this.resolveAuditOrganizationScope(actor,query);
+      const target = await this.native.subject(parsedId);
+      if (scope !== null && (!belongsToOrganization(target,scope) || (!actor.roles.includes("root") && !belongsToOrganization(actor,scope)))) throw this.organizationScopeDenied();
+      return {code:0,data:await this.loginAudit.getUserAudit(parsedId)};
+    }
     this.assertEnabled();
     const claims = this.currentUser(authorization);
     const parsedId = positiveInt(legacyUserId);
@@ -149,7 +166,7 @@ export class PluginUserReadonlyController {
   }
 
   private resolveAuditOrganizationScope(
-    claims: VerifiedAccessToken,
+    claims: Pick<VerifiedAccessToken,"roles">,
     query: Record<string, unknown>
   ): number | null {
     const organizationId = query.organization_id;

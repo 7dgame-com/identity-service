@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { HttpException, Inject, Injectable, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
+import { HttpException, Inject, Injectable, Optional, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
 import { z } from "zod";
 import { loadConfig } from "./config.js";
 import { IdentityInvitation, InvitationIdentityRepository } from "./invitation-identity.repository.js";
@@ -7,6 +7,8 @@ import { InvitationLegacyRedisRepository } from "./invitation-legacy-redis.repos
 import { InvitationRecordRepository } from "./invitation-record.repository.js";
 import { InvitationRedisReader, LegacyRedisInvitation } from "./invitation-redis.reader.js";
 import { JwtIssuerService, VerifiedAccessToken } from "./jwt-issuer.service.js";
+import { LegacyIdentityReader } from "./legacy-identity.reader.js";
+import { NativeIdentityService } from "./native-identity.service.js";
 
 const createInvitationSchema = z.object({
   quota: z.union([z.number(), z.string()]).transform((value) => Number(value)),
@@ -42,15 +44,16 @@ export class AccountInvitationService {
     @Inject(InvitationRecordRepository)
     private readonly invitationRecords: InvitationRecordRepository,
     @Inject(JwtIssuerService)
-    private readonly jwtIssuer: JwtIssuerService
+    private readonly jwtIssuer: JwtIssuerService,
+    @Optional() @Inject(LegacyIdentityReader) private readonly identityReader?: LegacyIdentityReader,
+    @Optional() @Inject(NativeIdentityService) private readonly native?: NativeIdentityService
   ) {}
 
   isManagementNativeReady(): boolean {
     return (
       this.config.accountLifecycle.invitationManagementNativeEnabled &&
       this.identityInvitations.isConfigured() &&
-      this.legacyRedis.isConfigured() &&
-      this.redisReader.isConfigured()
+      (this.config.dataSource === "identity" || (this.legacyRedis.isConfigured() && this.redisReader.isConfigured()))
     );
   }
 
@@ -93,14 +96,14 @@ export class AccountInvitationService {
     }
     if (path === "/v1/plugin-user/invitation-records") {
       this.assertRecordsReady();
-      const claims = this.currentUser(request.authorization);
+      const claims = await this.currentUser(request.authorization);
       this.assertCanManageInvitations(claims);
 
       return { status: 200, body: await this.records(request.originalUrl) };
     }
 
     this.assertManagementReady();
-    const claims = this.currentUser(request.authorization);
+    const claims = await this.currentUser(request.authorization);
     this.assertCanManageInvitations(claims);
 
     if (path === "/v1/plugin-user/invitations") {
@@ -124,7 +127,7 @@ export class AccountInvitationService {
     }
 
     const identityInvitation = (await this.identityInvitations.findByCodes([code]))[0] ?? null;
-    if (this.redisReader.isConfigured()) {
+    if (this.config.dataSource === "legacy" && this.redisReader.isConfigured()) {
       const redisInvitation = (await this.redisReader.scanInvitations(code)).invitations[0] ?? null;
       if (hasCheckMismatch(identityInvitation, redisInvitation)) {
         throw new InvitationNativeFallbackRequiredError("identity invitation check differs from legacy Redis");
@@ -149,6 +152,12 @@ export class AccountInvitationService {
   }
 
   private async list() {
+    if (this.config.dataSource === "identity") {
+      return (await this.identityInvitations.listActive()).map((invitation) => ({
+        ...invitationResponseFromIdentity(invitation),
+        status: statusFromFields(invitation.expiresAt, invitation.remaining)
+      }));
+    }
     const redisScan = await this.redisReader.scanInvitations();
     if (!redisScan.configured) {
       throw new ServiceUnavailableException({
@@ -200,9 +209,9 @@ export class AccountInvitationService {
       creatorName: invitation.creatorName,
       note: invitation.note,
       legacyCreatedAt: invitation.createdAt,
-      source: "identity-service-dual-write"
+      source: this.config.dataSource === "identity" ? "identity-service" : "identity-service-dual-write"
     });
-    await this.legacyRedis.create(invitation);
+    if (this.config.dataSource === "legacy") await this.legacyRedis.create(invitation);
 
     return {
       code: 0,
@@ -212,12 +221,15 @@ export class AccountInvitationService {
 
   private async delete(payload: unknown) {
     const parsed = parseBody(deleteInvitationSchema, payload);
-    if (!(await this.legacyRedis.exists(parsed.code))) {
+    const exists = this.config.dataSource === "identity"
+      ? (await this.identityInvitations.findByCodes([parsed.code])).some((invitation) => invitation.status !== "deleted")
+      : await this.legacyRedis.exists(parsed.code);
+    if (!exists) {
       throw legacyError(404, 4004, "邀请码不存在或已过期");
     }
 
     await this.identityInvitations.markDeleted(parsed.code);
-    await this.legacyRedis.delete(parsed.code);
+    if (this.config.dataSource === "legacy") await this.legacyRedis.delete(parsed.code);
 
     return {
       code: 0,
@@ -238,7 +250,7 @@ export class AccountInvitationService {
         message: "Identity database is required for native invitation management."
       });
     }
-    if (!this.legacyRedis.isConfigured() || !this.redisReader.isConfigured()) {
+    if (this.config.dataSource === "legacy" && (!this.legacyRedis.isConfigured() || !this.redisReader.isConfigured())) {
       throw new ServiceUnavailableException({
         code: "LEGACY_INVITATION_REDIS_NOT_CONFIGURED",
         message: "Legacy invitation Redis is required for dual-write invitation management."
@@ -276,14 +288,21 @@ export class AccountInvitationService {
     }
   }
 
-  private currentUser(authorization: string | string[] | undefined): VerifiedAccessToken {
+  private async currentUser(authorization: string | string[] | undefined): Promise<VerifiedAccessToken> {
     const token = bearerToken(authorization);
     if (!token) {
       throw unauthorized("用户未登录");
     }
 
     try {
-      return this.jwtIssuer.verifyAccessToken(token);
+      const claims = this.jwtIssuer.verifyAccessToken(token);
+      if (this.config.dataSource === "identity") {
+        if (!this.identityReader || !this.native) throw new Error("Identity account authority is required for invitation authorization.");
+        const user = await this.native.verify(token);
+        if (!user || user.status !== 10) throw unauthorized("用户未登录");
+        return { ...claims, roles: user.roles, username: user.username };
+      }
+      return claims;
     } catch {
       throw unauthorized("用户未登录");
     }

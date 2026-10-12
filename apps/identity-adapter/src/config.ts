@@ -36,6 +36,7 @@ const optionalStringFromEnv = z
 
 export const configSchema = z.object({
   nodeEnv: z.string().default("development"),
+  dataSource: z.enum(["legacy", "identity"]).default("legacy"),
   port: numberFromEnv.default(8086),
   readonlyMode: boolFromEnv.default(true),
   corsOrigins: z.string().default("http://localhost:3000,http://localhost:3001,http://localhost:3002,http://localhost:3004,http://localhost:3005,http://localhost:3008"),
@@ -194,6 +195,12 @@ export const configSchema = z.object({
     clientsJson: z.string().default("[]"),
     adminMfaRequired: boolFromEnv.default(false)
   }),
+  wechatOauth: z.object({
+    clientsJson: z.string().default("[]"),
+    authorizationCodeTtlSeconds: numberFromEnv.default(600),
+    accessTokenTtlSeconds: numberFromEnv.default(900),
+    refreshTokenTtlSeconds: numberFromEnv.default(2592000)
+  }),
   accountLifecycle: z.object({
     enabled: boolFromEnv.default(false),
     mode: z.enum(["disabled", "legacy-proxy", "native"]).default("disabled"),
@@ -285,9 +292,19 @@ export const configSchema = z.object({
 
 export type IdentityConfig = z.infer<typeof configSchema>;
 
+/** The sole database authority for account data; identity mode never falls back. */
+export function identityAccountReadDb(config: IdentityConfig): IdentityConfig["legacyDb"] {
+  return config.dataSource === "identity" ? config.identityDb : config.legacyDb;
+}
+
+export function identityAccountWriteDb(config: IdentityConfig): IdentityConfig["legacyWriteDb"] {
+  return config.dataSource === "identity" ? config.identityDb : config.legacyWriteDb;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig {
   return configSchema.parse({
     nodeEnv: env.NODE_ENV,
+    dataSource: env.IDENTITY_DATA_SOURCE,
     port: env.PORT,
     readonlyMode: env.IDENTITY_READONLY_MODE,
     corsOrigins: env.IDENTITY_CORS_ORIGINS,
@@ -446,6 +463,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
       authorizationCodeTtlSeconds: env.IDENTITY_OIDC_AUTHORIZATION_CODE_TTL_SECONDS,
       clientsJson: env.IDENTITY_OIDC_CLIENTS_JSON,
       adminMfaRequired: env.IDENTITY_OIDC_ADMIN_MFA_REQUIRED
+    },
+    wechatOauth: {
+      clientsJson: env.IDENTITY_WECHAT_OAUTH_CLIENTS_JSON ?? env.AUTH_OAUTH_CLIENTS_JSON,
+      authorizationCodeTtlSeconds: env.IDENTITY_WECHAT_OAUTH_CODE_TTL_SECONDS,
+      accessTokenTtlSeconds: env.IDENTITY_WECHAT_OAUTH_ACCESS_TTL_SECONDS,
+      refreshTokenTtlSeconds: env.IDENTITY_WECHAT_OAUTH_REFRESH_TTL_SECONDS
     },
     accountLifecycle: {
       enabled: env.IDENTITY_ACCOUNT_LIFECYCLE_ENABLED,

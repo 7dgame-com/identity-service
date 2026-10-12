@@ -2,6 +2,7 @@ import { Injectable, OnModuleDestroy } from "@nestjs/common";
 import mysql, { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { loadConfig } from "./config.js";
 import { LegacyRedisInvitation } from "./invitation-redis.reader.js";
+import { assertMigrationStaging } from "./migration-state.js";
 
 export interface IdentityInvitation {
   inviteCode: string;
@@ -154,12 +155,16 @@ export class InvitationIdentityRepository implements OnModuleDestroy {
 
     const pool = this.requirePool();
     await this.ensureSchema();
+    const connection = await pool.getConnection();
     let affected = 0;
+    try {
+    await connection.beginTransaction();
+    await assertMigrationStaging(connection);
     for (const invitation of invitations) {
       if (!isImportable(invitation)) {
         continue;
       }
-      const [result] = await pool.execute<ResultSetHeader>(
+      const [result] = await connection.execute<ResultSetHeader>(
         `INSERT INTO identity_invitations
           (invite_code, quota, remaining, expires_at, creator_legacy_user_id, creator_name, note, legacy_created_at, status, source, imported_at, last_seen_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'legacy-redis', ?, ?)
@@ -190,8 +195,9 @@ export class InvitationIdentityRepository implements OnModuleDestroy {
       );
       affected += result.affectedRows;
     }
-
+    await connection.commit();
     return affected;
+    } catch(error) { await connection.rollback();throw error; } finally { connection.release(); }
   }
 
   async ensureSchema(): Promise<void> {
@@ -270,6 +276,7 @@ export class InvitationIdentityRepository implements OnModuleDestroy {
       database: identityDb.name,
       user: identityDb.user,
       password: identityDb.password,
+      timezone: "Z",
       waitForConnections: true,
       connectionLimit: 5,
       namedPlaceholders: false

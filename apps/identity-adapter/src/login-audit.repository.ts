@@ -245,6 +245,7 @@ export class LoginAuditRepository implements OnModuleDestroy {
       database: identityDb.name,
       user: identityDb.user,
       password: identityDb.password,
+      timezone: "Z",
       waitForConnections: true,
       connectionLimit: 5,
       namedPlaceholders: false

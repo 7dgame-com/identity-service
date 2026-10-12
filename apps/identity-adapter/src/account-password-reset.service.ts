@@ -5,7 +5,7 @@ import {
   AccountLifecycleOperationRepository,
   operationKeyForPasswordReset
 } from "./account-lifecycle-operation.repository.js";
-import { AccountPasswordRepository } from "./account-password.repository.js";
+import { AccountPasswordRepository, NativePasswordError } from "./account-password.repository.js";
 import { loadConfig } from "./config.js";
 import { EmailDeliveryService } from "./email-delivery.service.js";
 import { IdentitySessionRepository } from "./identity-session.repository.js";
@@ -24,11 +24,15 @@ const verifyCodeSchema = z.object({
   code: z.string().trim().regex(/^\d{6}$/)
 });
 
-const resetSchema = z.object({
+const verifyTokenSchema = z.object({ token: z.string().trim().min(1).max(255) });
+
+const resetCodeSchema = z.object({
   email: z.string().trim().email(),
   code: z.string().trim().regex(/^\d{6}$/),
   password: z.string().min(1).max(1024)
 });
+const resetTokenSchema = z.object({ token: z.string().trim().min(1).max(255), password: z.string().min(1).max(1024) });
+const resetSchema = z.union([resetTokenSchema, resetCodeSchema]);
 
 @Injectable()
 export class AccountPasswordResetService {
@@ -55,13 +59,17 @@ export class AccountPasswordResetService {
   }
 
   async handle(path: string, payload: unknown): Promise<{ status: number; body: unknown }> {
-    this.assertResetNativeReady();
+    const tokenReset = path === "/v1/password/reset" && payload !== null && typeof payload === "object" && "token" in payload;
+    this.assertResetNativeReady(path !== "/v1/password/verify-token" && !tokenReset);
 
     if (path === "/v1/password/request-reset") {
       return { status: 200, body: await this.requestReset(payload) };
     }
     if (path === "/v1/password/verify-code") {
       return { status: 200, body: await this.verifyCode(payload) };
+    }
+    if (path === "/v1/password/verify-token") {
+      return { status: 200, body: await this.verifyToken(payload) };
     }
     if (path === "/v1/password/reset") {
       return { status: 200, body: await this.reset(payload) };
@@ -119,8 +127,22 @@ export class AccountPasswordResetService {
     }
   }
 
+  private async verifyToken(payload: unknown) {
+    const { token } = parseBody(verifyTokenSchema, payload);
+    const challenge = await this.challenges.findActiveByToken(token);
+    if (!challenge) throw passwordError(400, "INVALID_TOKEN", "重置令牌无效或已过期");
+    if (this.config.dataSource === "legacy") {
+      const user = await this.passwords.getCredentialById(challenge.legacyUserId);
+      if (!user || user.status !== 10 || user.emailVerifiedAt === null || user.email?.toLowerCase() !== challenge.email) {
+        throw passwordError(400, "INVALID_TOKEN", "重置令牌无效或已过期");
+      }
+    }
+    return { success: true, message: "重置令牌有效" };
+  }
+
   private async reset(payload: unknown) {
     const parsed = parseBody(resetSchema, payload);
+    if ("token" in parsed) return this.resetWithToken(parsed);
     const email = parsed.email.toLowerCase();
     const operationKey = operationKeyForPasswordReset(email, parsed.code, parsed.password);
     const operation = {
@@ -135,8 +157,12 @@ export class AccountPasswordResetService {
     };
 
     try {
-      const completed = await this.operations.findCompleted(operationKey);
+      const completed = await this.operations.findCompleted(operationKey) ??
+        (this.config.dataSource === "identity" ? await this.passwords.findCompletedPasswordOperation(operationKey) : null);
       if (completed) {
+        if (this.config.dataSource === "identity") {
+          await this.operations.complete({ ...operation, username: completed.username, user: completed });
+        }
         return resetSuccess();
       }
 
@@ -154,15 +180,19 @@ export class AccountPasswordResetService {
         throw validationError({ password: passwordErrors });
       }
 
-      const changedUser = await this.passwords.changePassword(user, parsed.password);
-      await this.challenges.consume(challenge.challengeKey);
+      const changedUser = this.config.dataSource === "identity"
+        ? await this.passwords.changePassword(user, parsed.password, { operationKey, resetChallengeKey: challenge.challengeKey })
+        : await this.passwords.changePassword(user, parsed.password);
+      if (this.config.dataSource === "legacy") await this.challenges.consume(challenge.challengeKey);
+      if (this.config.dataSource === "legacy") {
+        await this.sessions.revokeUserSessions(user.id);
+        await this.legacySessions.revokeUserSessions(user.id, "password.reset");
+      }
       await this.operations.complete({
         ...operation,
         username: user.username,
         user: changedUser
       });
-      await this.sessions.revokeUserSessions(user.id);
-      await this.legacySessions.revokeUserSessions(user.id, "password.reset");
 
       return resetSuccess();
     } catch (error) {
@@ -182,7 +212,39 @@ export class AccountPasswordResetService {
     }
   }
 
-  private assertResetNativeReady(): void {
+  private async resetWithToken(input: z.infer<typeof resetTokenSchema>) {
+    if (this.config.dataSource !== "identity") {
+      throw new ServiceUnavailableException({ code: "IDENTITY_TOKEN_RESET_REQUIRES_PRIVATE_DATABASE", message: "Opaque reset tokens require the private Identity account authority." });
+    }
+    const token = await this.challenges.findResetToken(input.token);
+    if (!token) throw passwordError(400, "INVALID_TOKEN", "重置令牌无效或已过期");
+    const operationKey = operationKeyForPasswordReset(token.email, `opaque:${token.tokenHash}`, input.password);
+    const operation = { operationKey, operationType: "password.reset", username: null, email: token.email,
+      metadata: { provider: "identity-service", path: "/v1/password/reset", credentialKind: "opaque-token" } };
+    try {
+      const completed = await this.operations.findCompleted(operationKey) ?? await this.passwords.findCompletedPasswordOperation(operationKey, token.legacyUserId);
+      if (completed) return resetSuccess();
+      await this.operations.begin(operation);
+      const active = await this.challenges.findActiveByToken(input.token);
+      if (!active) throw passwordError(400, "INVALID_TOKEN", "重置令牌无效或已过期");
+      const user = await this.passwords.getCredentialById(active.legacyUserId);
+      if (!user || user.status !== 10 || user.emailVerifiedAt === null || user.email?.toLowerCase() !== active.email) {
+        throw passwordError(400, "INVALID_TOKEN", "重置令牌无效或已过期");
+      }
+      const errors = validatePasswordPolicy(input.password, { username: user.username, email: user.email });
+      if (errors.length) throw validationError({ password: errors });
+      const changed = await this.passwords.changePassword(user, input.password, { operationKey, resetTokenHash: active.tokenHash });
+      await this.operations.complete({ ...operation, username: user.username, user: changed });
+      return resetSuccess();
+    } catch (error) {
+      if (error instanceof AccountLifecycleOperationInProgressError) throw passwordError(409, "PASSWORD_RESET_OPERATION_IN_PROGRESS", "同一重置密码操作正在处理中");
+      const mapped = this.mapChallengeError(error);
+      await this.failOperationQuietly(operation, mapped);
+      throw mapped;
+    }
+  }
+
+  private assertResetNativeReady(requireEmailDelivery = true): void {
     if (!this.config.accountLifecycle.passwordResetNativeEnabled) {
       throw new ServiceUnavailableException({
         code: "PASSWORD_RESET_NATIVE_DISABLED",
@@ -201,7 +263,7 @@ export class AccountPasswordResetService {
         message: "Identity database is required for native password reset."
       });
     }
-    if (!this.emailDelivery.isConfigured()) {
+    if (requireEmailDelivery && !this.emailDelivery.isConfigured()) {
       throw new ServiceUnavailableException({
         code: "EMAIL_WEBHOOK_NOT_CONFIGURED",
         message: "Email delivery webhook is not configured."
@@ -210,6 +272,7 @@ export class AccountPasswordResetService {
   }
 
   private mapChallengeError(error: unknown): HttpException {
+    if (error instanceof NativePasswordError) return new HttpException(error.body, error.status);
     if (error instanceof PasswordResetChallengeError) {
       const code = error.code === "RATE_LIMIT_EXCEEDED" ? "RATE_LIMIT_EXCEEDED" : error.code === "ACCOUNT_LOCKED" ? "ACCOUNT_LOCKED" : "INVALID_CODE";
       return passwordError(error.status, code, error.message, error.retryAfter);

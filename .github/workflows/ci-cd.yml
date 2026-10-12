@@ -70,6 +70,7 @@ jobs:
         image: mysql:8.4
         env:
           MYSQL_ROOT_PASSWORD: identity_test_root_password
+          MYSQL_ROOT_HOST: "%"
           MYSQL_DATABASE: xrugc_identity_test
           MYSQL_USER: identity_test
           MYSQL_PASSWORD: identity_test_password
@@ -104,6 +105,32 @@ jobs:
           IDENTITY_DB_USER: identity_test
           IDENTITY_DB_PASSWORD: identity_test_password
         run: npm test -- apps/identity-adapter/test/plugin-user-write-operation.mysql.spec.ts apps/identity-adapter/test/iam-organization-write.mysql.spec.ts
+
+      - name: Run independent authority and migration integration tests
+        env:
+          NODE_ENV: test
+          TZ: Asia/Shanghai
+          IDENTITY_TEST_MYSQL: "1"
+          IDENTITY_DB_HOST: 127.0.0.1
+          IDENTITY_DB_PORT: "3306"
+          # These fixtures create and drop random, isolated databases on this
+          # ephemeral CI service. Never use a production principal here.
+          IDENTITY_DB_USER: root
+          IDENTITY_DB_PASSWORD: identity_test_root_password
+        run: >-
+          npm test --
+          apps/identity-adapter/test/identity-accounts.mysql.spec.ts
+          apps/identity-adapter/test/identity-runtime.mysql.spec.ts
+          apps/identity-adapter/test/identity-http-bootstrap.mysql.spec.ts
+          apps/identity-adapter/test/identity-account-sync.mysql.spec.ts
+          apps/identity-adapter/test/apple-identity.mysql.spec.ts
+          apps/identity-adapter/test/legacy-session-import.mysql.spec.ts
+          apps/identity-adapter/test/legacy-challenge-import.mysql.spec.ts
+          apps/identity-adapter/test/legacy-qrcode-import.mysql.spec.ts
+          apps/identity-adapter/test/native-qrcode-mysql.spec.ts
+          apps/identity-adapter/test/wechat-binding.mysql.spec.ts
+          apps/identity-adapter/test/identity-yii-wechat-import.mysql.spec.ts
+          apps/identity-adapter/test/legacy-admin.mysql.spec.ts
 
   build:
     name: Build & Push Docker Image

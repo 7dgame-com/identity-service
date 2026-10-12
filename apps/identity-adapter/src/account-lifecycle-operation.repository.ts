@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { Injectable, OnModuleDestroy } from "@nestjs/common";
 import mysql, { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { loadConfig } from "./config.js";
@@ -223,6 +223,7 @@ export class AccountLifecycleOperationRepository implements OnModuleDestroy {
       database: identityDb.name,
       user: identityDb.user,
       password: identityDb.password,
+      timezone: "Z",
       waitForConnections: true,
       connectionLimit: 5,
       namedPlaceholders: false
@@ -231,18 +232,32 @@ export class AccountLifecycleOperationRepository implements OnModuleDestroy {
 }
 
 export function operationKeyForRegister(kind: "standard" | "wechat", parts: string[]): string {
-  const digest = createHash("sha256").update(parts.map((part) => part.trim().toLowerCase()).join("\u001f")).digest("hex");
+  // Normalize account identifiers, never passwords or opaque WeChat tokens.
+  const normalized = parts.map((part, index) => {
+    const identifierIndex = kind === "standard" ? [0, 1] : [1, 2];
+    return identifierIndex.includes(index) ? part.trim().toLowerCase() : part;
+  });
+  const digest = credentialOperationDigest(normalized);
   return `register:${kind}:${digest.slice(0, 48)}`;
 }
 
 export function operationKeyForPasswordChange(userId: number, oldPassword: string, newPassword: string): string {
-  const digest = createHash("sha256").update([String(userId), oldPassword, newPassword].join("\u001f")).digest("hex");
+  const digest = credentialOperationDigest([String(userId), oldPassword, newPassword]);
   return `password:change:${digest.slice(0, 48)}`;
 }
 
 export function operationKeyForPasswordReset(email: string, code: string, newPassword: string): string {
-  const digest = createHash("sha256").update([email.trim().toLowerCase(), code, newPassword].join("\u001f")).digest("hex");
+  const digest = credentialOperationDigest([email.trim().toLowerCase(), code, newPassword]);
   return `password:reset:${digest.slice(0, 48)}`;
+}
+
+/** JSON preserves boundaries; HMAC prevents the ledger becoming a fast password verifier. */
+export function credentialOperationDigest(parts:string[]):string {
+  const config=loadConfig();
+  if(config.dataSource==="legacy")return createHash("sha256").update(parts.join("\u001f")).digest("hex");
+  const secret=config.tokenIssuance.internalToken??config.iam.internalToken??process.env.IDENTITY_REFRESH_REPLAY_KEY;
+  if(!secret)throw new Error("Identity credential fingerprint key is required");
+  return createHmac("sha256",secret).update(JSON.stringify(parts)).digest("hex");
 }
 
 function stringifyJson(value: Record<string, unknown> | null | undefined): string {

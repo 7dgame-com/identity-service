@@ -1,5 +1,6 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { BadRequestException, Injectable, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
+import { BadRequestException, Injectable, Optional, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
+import { NativeIdentityService } from "./native-identity.service.js";
 import { loadConfig } from "./config.js";
 import { IdentitySessionRepository } from "./identity-session.repository.js";
 import { JwtIssuerService } from "./jwt-issuer.service.js";
@@ -67,7 +68,8 @@ export class OidcService {
     private readonly legacyReader: LegacyIdentityReader,
     private readonly sessions: IdentitySessionRepository,
     private readonly jwtIssuer: JwtIssuerService,
-    private readonly tokenIssuance: TokenIssuanceService
+    private readonly tokenIssuance: TokenIssuanceService,
+    @Optional() private readonly native?: NativeIdentityService
   ) {}
 
   discovery(context?: OidcIssuerContext) {
@@ -208,7 +210,7 @@ export class OidcService {
     const scope = assertScopes(client, request.scope);
     assertPkce(client, request.codeChallenge, request.codeChallengeMethod);
 
-    const claims = this.verifyIdentityBearer(authorization);
+    const claims = await this.verifyIdentityBearer(authorization);
     const user = await this.requireLegacyUser(claims.uid);
     if (!this.codes.isConfigured()) {
       throw new ServiceUnavailableException({
@@ -377,7 +379,7 @@ export class OidcService {
       .filter((host): host is string => Boolean(host));
   }
 
-  private verifyIdentityBearer(authorization: string | undefined) {
+  private async verifyIdentityBearer(authorization: string | undefined) {
     const token = bearerToken(authorization);
     if (!token) {
       throw new UnauthorizedException({
@@ -387,6 +389,10 @@ export class OidcService {
     }
 
     try {
+      if (this.native?.enabled) {
+        const user = await this.native.verify(token);
+        return { uid: user.id, roles: user.roles, username: user.username, sessionId: null };
+      }
       return this.jwtIssuer.verifyAccessToken(token);
     } catch {
       throw new UnauthorizedException({
@@ -414,7 +420,7 @@ export class OidcService {
 
   private async requireLegacyUser(id: number): Promise<LegacyUserReadModel> {
     const user = await this.legacyReader.getUserById(id);
-    if (!user) {
+    if (!user || (this.config.dataSource === "identity" && user.status !== 10)) {
       throw new UnauthorizedException({
         code: "LEGACY_USER_NOT_FOUND",
         message: "Legacy user was not found."

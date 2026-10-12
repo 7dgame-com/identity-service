@@ -1,6 +1,9 @@
 import { Injectable, OnModuleDestroy } from "@nestjs/common";
-import mysql, { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
-import { loadConfig } from "./config.js";
+import mysql, { Pool, PoolConnection, ResultSetHeader, RowDataPacket } from "mysql2/promise";
+import { identityAccountWriteDb, loadConfig } from "./config.js";
+import { enqueueSubjectEvent } from "./subject-events.js";
+
+export interface EmailWriteProof { challengeKey?:string|null;changeTokenKey?:string|null;expectedEmail?:string|null;authorize?:(connection:PoolConnection)=>Promise<void>; }
 
 export interface EmailUserProfile {
   id: number;
@@ -8,6 +11,7 @@ export interface EmailUserProfile {
   email: string | null;
   status: number;
   emailVerifiedAt: number | null;
+  authorizeWrite?:(connection:PoolConnection)=>Promise<void>;
 }
 
 export class NativeEmailError extends Error {
@@ -69,14 +73,13 @@ export class AccountEmailRepository implements OnModuleDestroy {
     return Boolean(rows[0]);
   }
 
-  async bindVerifiedEmail(legacyUserId: number, email: string, verifiedAt: number): Promise<EmailUserProfile> {
-    const pool = this.requirePool();
+  async bindVerifiedEmail(legacyUserId: number, email: string, verifiedAt: number, proof?:EmailWriteProof): Promise<EmailUserProfile> {
     try {
-      const [result] = await pool.execute<ResultSetHeader>(
+      const result = await this.writeUser(
         `UPDATE user
             SET email = ?, email_verified_at = ?, updated_at = ?
           WHERE id = ?`,
-        [normalizeEmail(email), verifiedAt, verifiedAt, legacyUserId]
+        [normalizeEmail(email), verifiedAt, verifiedAt, legacyUserId], legacyUserId,proof
       );
       if (result.affectedRows !== 1) {
         throw new NativeEmailError(500, "BIND_FAILED", "邮箱绑定失败，请稍后重试");
@@ -96,13 +99,12 @@ export class AccountEmailRepository implements OnModuleDestroy {
     return user;
   }
 
-  async unbindEmail(legacyUserId: number, updatedAt: number): Promise<EmailUserProfile> {
-    const pool = this.requirePool();
-    const [result] = await pool.execute<ResultSetHeader>(
+  async unbindEmail(legacyUserId: number, updatedAt: number, proof?:EmailWriteProof): Promise<EmailUserProfile> {
+    const result = await this.writeUser(
       `UPDATE user
           SET email = NULL, email_verified_at = NULL, updated_at = ?
         WHERE id = ?`,
-      [updatedAt, legacyUserId]
+      [updatedAt, legacyUserId], legacyUserId,proof
     );
     if (result.affectedRows !== 1) {
       throw new NativeEmailError(500, "UNBIND_FAILED", "邮箱解绑失败，请稍后重试");
@@ -116,6 +118,39 @@ export class AccountEmailRepository implements OnModuleDestroy {
     return user;
   }
 
+  private async writeUser(sql: string, params: Array<string | number | null>, userId: number,proof?:EmailWriteProof): Promise<ResultSetHeader> {
+    const pool = this.requirePool();
+    if (this.config.dataSource === "legacy") return (await pool.execute<ResultSetHeader>(sql, params))[0];
+    const connection = await pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const [users]=await connection.execute<RowDataPacket[]>("SELECT status,email FROM user WHERE id=? FOR UPDATE",[userId]);
+      if(Number(users[0]?.status)!==10 || (proof && "expectedEmail" in proof && (users[0]?.email??null)!==proof.expectedEmail)) {
+        throw new NativeEmailError(409,"ACCOUNT_CHANGED","账号或邮箱已变更，请重新验证");
+      }
+      await proof?.authorize?.(connection);
+      if(proof?.challengeKey) {
+        const [consumed]=await connection.execute<ResultSetHeader>(`UPDATE email_verification_challenges SET consumed_at=UTC_TIMESTAMP(3)
+          WHERE challenge_key=? AND legacy_user_id=? AND consumed_at IS NULL AND expires_at>UTC_TIMESTAMP(3)`,[proof.challengeKey,userId]);
+        if(consumed.affectedRows!==1)throw new NativeEmailError(400,"INVALID_CODE","验证码不存在或已过期");
+      }
+      if(proof?.changeTokenKey) {
+        const [consumed]=await connection.execute<ResultSetHeader>(`UPDATE email_change_tokens SET consumed_at=UTC_TIMESTAMP(3)
+          WHERE token_key=? AND legacy_user_id=? AND consumed_at IS NULL AND expires_at>UTC_TIMESTAMP(3)`,[proof.changeTokenKey,userId]);
+        if(consumed.affectedRows!==1)throw new NativeEmailError(400,"INVALID_CODE","改绑邮箱需重新完成旧邮箱验证");
+      }
+      const [result] = await connection.execute<ResultSetHeader>(sql, params);
+      if (result.affectedRows === 1) await enqueueSubjectEvent(connection,userId);
+      await connection.commit();
+      return result;
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
+  }
+
   private requirePool(): Pool {
     if (!this.pool) {
       throw new NativeEmailError(503, "LEGACY_WRITE_DB_NOT_CONFIGURED", "Legacy write database is not configured.");
@@ -125,7 +160,7 @@ export class AccountEmailRepository implements OnModuleDestroy {
   }
 
   private createPool(): Pool | null {
-    const { legacyWriteDb } = this.config;
+    const legacyWriteDb = identityAccountWriteDb(this.config);
     if (!legacyWriteDb.host || !legacyWriteDb.user) {
       return null;
     }
@@ -136,6 +171,7 @@ export class AccountEmailRepository implements OnModuleDestroy {
       database: legacyWriteDb.name,
       user: legacyWriteDb.user,
       password: legacyWriteDb.password,
+      ...(this.config.dataSource === "identity" ? { timezone: "Z" } : {}),
       waitForConnections: true,
       connectionLimit: 5,
       namedPlaceholders: false

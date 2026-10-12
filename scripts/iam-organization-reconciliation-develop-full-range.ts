@@ -565,6 +565,7 @@ function connectionFactory(configuration: DatabaseConfiguration): MysqlRepeatabl
   return async () => {
     const connection = await mysql.createConnection({
       ...captured,
+      ...(configuration.name === ORGANIZATION_RECONCILIATION_DEVELOP_IDENTITY_DATABASE ? { timezone: "Z" } : {}),
       charset: "utf8mb4",
       connectTimeout: 5_000,
       multipleStatements: false,

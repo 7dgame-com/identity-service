@@ -33,7 +33,8 @@ export class AccountLifecycleService {
     return {
       enabled: accountLifecycle.enabled,
       mode: accountLifecycle.mode,
-      legacyProxyConfigured: Boolean(accountLifecycle.legacyApiBaseUrl),
+      dataSource: this.config.dataSource,
+      legacyProxyConfigured: this.config.dataSource === "legacy" && Boolean(accountLifecycle.legacyApiBaseUrl),
       nativeRegisterConfigured: this.accountRegistration.isNativeReady(),
       nativePasswordChangeConfigured: this.accountPassword.isChangeNativeReady(),
       nativePasswordResetConfigured: this.accountPasswordReset.isResetNativeReady(),
@@ -63,6 +64,9 @@ export class AccountLifecycleService {
 
     const { accountLifecycle } = this.config;
     if (accountLifecycle.mode === "legacy-proxy") {
+      if (this.config.dataSource === "identity") {
+        throw new ServiceUnavailableException({ code: "IDENTITY_LEGACY_PROXY_FORBIDDEN", message: "Independent identity accounts cannot use the legacy account API." });
+      }
       if (!accountLifecycle.legacyApiBaseUrl) {
         throw new ServiceUnavailableException({
           code: "ACCOUNT_LIFECYCLE_LEGACY_API_NOT_CONFIGURED",
@@ -74,8 +78,12 @@ export class AccountLifecycleService {
     }
 
     if (accountLifecycle.mode === "native") {
+      if (this.config.dataSource === "identity" && scope === "invitation" &&
+          ["/v1/plugin-user/register-send-code", "/v1/plugin-user/register"].includes(path)) {
+        return this.accountRegistration.registerInvitation(path, request.body);
+      }
       if (scope === "register") {
-        if (LEGACY_REGISTER_PROXY_ONLY_PATHS.has(path) && accountLifecycle.legacyApiBaseUrl) {
+        if (this.config.dataSource === "legacy" && LEGACY_REGISTER_PROXY_ONLY_PATHS.has(path) && accountLifecycle.legacyApiBaseUrl) {
           return this.forwardToLegacy(request, path);
         }
 
@@ -84,7 +92,7 @@ export class AccountLifecycleService {
       if (scope === "password" && path === "/v1/password/change") {
         return this.accountPassword.changePassword(request.body, request.headers.authorization);
       }
-      if (scope === "password" && ["/v1/password/request-reset", "/v1/password/verify-code", "/v1/password/reset"].includes(path)) {
+      if (scope === "password" && ["/v1/password/request-reset", "/v1/password/verify-code", "/v1/password/verify-token", "/v1/password/reset"].includes(path)) {
         if (accountLifecycle.passwordResetNativeEnabled) {
           return this.accountPasswordReset.handle(path, request.body);
         }
@@ -113,7 +121,7 @@ export class AccountLifecycleService {
           }
         }
       }
-      if (accountLifecycle.legacyApiBaseUrl) {
+      if (this.config.dataSource === "legacy" && accountLifecycle.legacyApiBaseUrl) {
         return this.forwardToLegacy(request, path);
       }
 
@@ -153,6 +161,9 @@ export class AccountLifecycleService {
   }
 
   private async forwardToLegacy(request: AccountLifecycleRequest, path: string): Promise<AccountLifecycleProxyResponse> {
+    if (this.config.dataSource === "identity") {
+      throw new ServiceUnavailableException({ code: "IDENTITY_LEGACY_PROXY_FORBIDDEN", message: "Independent identity accounts cannot use the legacy account API." });
+    }
     const { accountLifecycle } = this.config;
     const url = new URL(path, `${accountLifecycle.legacyApiBaseUrl!.replace(/\/+$/, "")}/`);
     const query = queryStringFromOriginalUrl(request.originalUrl);

@@ -1,4 +1,4 @@
-import { HttpException, Injectable, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
+import { HttpException, Inject, Injectable, Optional, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
 import { z } from "zod";
 import {
   AccountLifecycleOperationInProgressError,
@@ -11,6 +11,7 @@ import { IdentitySessionRepository } from "./identity-session.repository.js";
 import { JwtIssuerService } from "./jwt-issuer.service.js";
 import { LegacySessionRevocationService } from "./legacy-session-revocation.service.js";
 import { validatePasswordPolicy } from "./password-policy.js";
+import { NativeIdentityService } from "./native-identity.service.js";
 
 const changePasswordSchema = z.object({
   old_password: z.string().min(1).max(1024),
@@ -27,7 +28,8 @@ export class AccountPasswordService {
     private readonly operations: AccountLifecycleOperationRepository,
     private readonly sessions: IdentitySessionRepository,
     private readonly legacySessions: LegacySessionRevocationService,
-    private readonly jwtIssuer: JwtIssuerService
+    private readonly jwtIssuer: JwtIssuerService,
+    @Optional() @Inject(NativeIdentityService) private readonly native?: NativeIdentityService
   ) {}
 
   isChangeNativeReady(): boolean {
@@ -67,11 +69,19 @@ export class AccountPasswordService {
     };
 
     try {
-      const completed = await this.operations.findCompleted(operationKey);
+      const completed = await this.operations.findCompleted(operationKey) ??
+        (this.config.dataSource === "identity" ? await this.passwords.findCompletedPasswordOperation(operationKey, claims.uid) : null);
       if (completed) {
+        if (this.config.dataSource === "identity") {
+          await this.operations.complete({ ...operation, email: completed.email, user: completed });
+        }
         return successResponse();
       }
 
+      if (this.config.dataSource === "identity") {
+        if (!this.native) throw unauthorized("用户未登录");
+        await this.native.verify(token);
+      }
       await this.operations.begin(operation);
       const user = await this.passwords.getCredentialById(claims.uid);
       if (!user) {
@@ -102,14 +112,18 @@ export class AccountPasswordService {
         });
       }
 
-      const changedUser = await this.passwords.changePassword(user, parsed.new_password);
+      const changedUser = this.config.dataSource === "identity"
+        ? await this.passwords.changePassword(user, parsed.new_password, { operationKey,authorize:(connection)=>this.native!.assertAccessInTransaction(token,user.id,connection) })
+        : await this.passwords.changePassword(user, parsed.new_password);
+      if (this.config.dataSource === "legacy") {
+        await this.sessions.revokeUserSessions(user.id);
+        await this.legacySessions.revokeUserSessions(user.id, "password.change");
+      }
       await this.operations.complete({
         ...operation,
         email: user.email,
         user: changedUser
       });
-      await this.sessions.revokeUserSessions(user.id);
-      await this.legacySessions.revokeUserSessions(user.id, "password.change");
 
       return successResponse();
     } catch (error) {

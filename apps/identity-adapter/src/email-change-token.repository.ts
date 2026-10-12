@@ -42,7 +42,7 @@ export class EmailChangeTokenRepository implements OnModuleDestroy {
     return this.pool !== null;
   }
 
-  async createToken(legacyUserId: number): Promise<{ token: string; expiresIn: number; record: EmailChangeToken }> {
+  async createToken(legacyUserId: number,challengeKey?:string): Promise<{ token: string; expiresIn: number; record: EmailChangeToken }> {
     const pool = this.requirePool();
     await this.ensureSchema();
     const token = randomBytes(32).toString("base64url");
@@ -50,12 +50,22 @@ export class EmailChangeTokenRepository implements OnModuleDestroy {
     const expiresIn = this.config.emailChange.tokenTtlSeconds;
     const expiresAt = new Date(Date.now() + expiresIn * 1000);
 
-    await pool.execute<ResultSetHeader>(
+    const connection=this.config.dataSource==="identity"&&challengeKey?await pool.getConnection():null;
+    try {
+      if(connection) {
+        await connection.beginTransaction();
+        const [consumed]=await connection.execute<ResultSetHeader>(`UPDATE email_verification_challenges SET consumed_at=UTC_TIMESTAMP(3)
+          WHERE challenge_key=? AND legacy_user_id=? AND consumed_at IS NULL AND expires_at>UTC_TIMESTAMP(3)`,[challengeKey!,legacyUserId]);
+        if(consumed.affectedRows!==1)throw new EmailChangeTokenError(400,"INVALID_CODE","验证码不存在或已过期");
+      }
+      await (connection??pool).execute<ResultSetHeader>(
       `INSERT INTO email_change_tokens
         (token_key, legacy_user_id, token_hash, expires_at)
        VALUES (?, ?, ?, ?)`,
       [tokenKey, legacyUserId, this.hashToken(legacyUserId, token), expiresAt]
-    );
+      );
+      await connection?.commit();
+    }catch(error){await connection?.rollback();throw error;}finally{connection?.release();}
 
     const record = await this.findLatestByUser(legacyUserId);
     if (!record) {
@@ -167,7 +177,8 @@ export class EmailChangeTokenRepository implements OnModuleDestroy {
       password: identityDb.password,
       waitForConnections: true,
       connectionLimit: 5,
-      namedPlaceholders: false
+      namedPlaceholders: false,
+      timezone: "Z"
     });
   }
 }

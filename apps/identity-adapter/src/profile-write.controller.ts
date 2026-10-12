@@ -1,4 +1,5 @@
-import { Body, Controller, Get, Headers, HttpException, HttpStatus, Post, Put, Query, Req, Res } from "@nestjs/common";
+import { NativeIdentityService } from "./native-identity.service.js";
+import { Body, Optional, Controller, Get, Headers, HttpException, HttpStatus, Post, Put, Query, Req, Res } from "@nestjs/common";
 import { loadConfig } from "./config.js";
 import { ProfileWriteService } from "./profile-write.service.js";
 
@@ -6,7 +7,7 @@ import { ProfileWriteService } from "./profile-write.service.js";
 export class ProfileWriteController {
   private readonly config = loadConfig();
 
-  constructor(private readonly profileWrite: ProfileWriteService) {}
+  constructor(private readonly profileWrite: ProfileWriteService, @Optional() private readonly native?: NativeIdentityService) {}
 
   @Get("internal/profile-write/readiness")
   readiness(@Headers("x-identity-internal-token") token: string | undefined) {
@@ -76,6 +77,7 @@ export class ProfileWriteController {
     response: ProfileWriteExpressResponse,
     path: string
   ): Promise<unknown> {
+    if (this.native?.enabled) return this.native.profile(request);
     const upstream = await this.profileWrite.proxy(request, path);
     response.status(upstream.status);
     response.setHeader("X-Identity-Profile-Write", upstream.mode);

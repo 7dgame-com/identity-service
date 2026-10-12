@@ -1,8 +1,23 @@
+import { NativeIdentityController } from "./native-identity.controller.js";
+import { LegacyAdminController, LegacyPolicyController } from "./legacy-admin.controller.js";
+import { LegacyAdminService } from "./legacy-admin.service.js";
+import { AppleIdentityController } from "./apple-identity.controller.js";
+import { LegacyEmailLinkService } from "./legacy-email-link.service.js";
+import { LegacyEmailLinkController } from "./legacy-email-link.controller.js";
+import { LegacyPhpSessionController } from "./legacy-php-session.controller.js";
+import { AppleIdentityService } from "./apple-identity.service.js";
+import { NativeIdentityService } from "./native-identity.service.js";
 import { Module } from "@nestjs/common";
 import { APP_INTERCEPTOR } from "@nestjs/core";
 import { AccountEmailRepository } from "./account-email.repository.js";
 import { AccountEmailService } from "./account-email.service.js";
 import { AccountInvitationService } from "./account-invitation.service.js";
+import { NativeQrcodeController } from "./native-qrcode.controller.js";
+import { NativeQrcodeService } from "./native-qrcode.service.js";
+import { NativeQrcodeRepository } from "./native-qrcode.repository.js";
+import { NativePersonController } from "./native-person.controller.js";
+import { IdentityWechatOAuthController } from "./identity-wechat-oauth.controller.js";
+import { IdentityWechatOAuthService } from "./identity-wechat-oauth.service.js";
 import { AccountLifecycleController } from "./account-lifecycle.controller.js";
 import { AccountLifecycleOperationRepository } from "./account-lifecycle-operation.repository.js";
 import { AccountLifecycleService } from "./account-lifecycle.service.js";
@@ -64,6 +79,14 @@ import { UsageBillingService } from "./usage-billing.service.js";
 
 @Module({
   controllers: [
+    LegacyAdminController,
+    LegacyPolicyController,
+    LegacyEmailLinkController,
+    LegacyPhpSessionController,
+    AppleIdentityController,
+    IdentityWechatOAuthController,
+    NativeQrcodeController,
+    NativeIdentityController,
     HealthController,
     IdentityController,
     LoginAuditController,
@@ -73,6 +96,7 @@ import { UsageBillingService } from "./usage-billing.service.js";
     InternalAuthController,
     IamController,
     IamRoleWriteController,
+    NativePersonController,
     IamOrganizationWriteController,
     PluginUserReadonlyController,
     PluginUserTemporaryAuthorizationController,
@@ -82,6 +106,13 @@ import { UsageBillingService } from "./usage-billing.service.js";
     OidcController
   ],
   providers: [
+    LegacyAdminService,
+    LegacyEmailLinkService,
+    AppleIdentityService,
+    IdentityWechatOAuthService,
+    NativeQrcodeService,
+    NativeQrcodeRepository,
+    NativeIdentityService,
     AccountLifecycleService,
     AccountEmailRepository,
     AccountEmailService,
@@ -92,14 +123,18 @@ import { UsageBillingService } from "./usage-billing.service.js";
         legacyRedis: InvitationLegacyRedisRepository,
         redisReader: InvitationRedisReader,
         invitationRecords: InvitationRecordRepository,
-        jwtIssuer: JwtIssuerService
-      ) => new AccountInvitationService(identityInvitations, legacyRedis, redisReader, invitationRecords, jwtIssuer),
+        jwtIssuer: JwtIssuerService,
+        identityReader: LegacyIdentityReader,
+        native: NativeIdentityService
+      ) => new AccountInvitationService(identityInvitations, legacyRedis, redisReader, invitationRecords, jwtIssuer, identityReader, native),
       inject: [
         InvitationIdentityRepository,
         InvitationLegacyRedisRepository,
         InvitationRedisReader,
         InvitationRecordRepository,
-        JwtIssuerService
+        JwtIssuerService,
+        LegacyIdentityReader,
+        NativeIdentityService
       ]
     },
     AccountLifecycleOperationRepository,

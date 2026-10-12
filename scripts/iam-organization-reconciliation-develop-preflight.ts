@@ -169,6 +169,7 @@ function connectionFactory(config: {
   return async () => {
     const connection = await mysql.createConnection({
       ...captured,
+      ...(config.name === ORGANIZATION_RECONCILIATION_DEVELOP_IDENTITY_DATABASE ? { timezone: "Z" } : {}),
       charset: "utf8mb4",
       connectTimeout: 5_000,
       multipleStatements: false,

@@ -1,6 +1,6 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, createCipheriv, createDecipheriv, timingSafeEqual } from "node:crypto";
 import { Injectable, OnModuleDestroy } from "@nestjs/common";
-import mysql, { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
+import mysql, { Pool, PoolConnection, ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { loadConfig } from "./config.js";
 
 export class InvalidRefreshTokenError extends Error {
@@ -17,6 +17,8 @@ export interface IdentitySessionInput {
   expiresAt: Date;
   ipAddressHash?: string | null;
   userAgentHash?: string | null;
+  expectedPasswordHash?: string;
+  expectedLegacyAuthKey?: string;
 }
 
 export interface IssuedIdentitySession {
@@ -28,7 +30,7 @@ export interface IssuedIdentitySession {
   expiresAt: Date;
 }
 
-interface StoredIdentitySession {
+export interface StoredIdentitySession {
   id: number;
   refreshTokenHash: string;
   sessionId: string;
@@ -60,83 +62,193 @@ export class IdentitySessionRepository implements OnModuleDestroy {
     const pool = this.requirePool();
     await this.ensureSchema();
 
-    const refreshToken = randomBytes(48).toString("base64url");
-    const refreshTokenHash = hashRefreshToken(refreshToken);
-
-    await pool.execute<ResultSetHeader>(
-      `INSERT INTO identity_refresh_sessions
-        (refresh_token_hash, session_id, legacy_user_id, username, issued_at, expires_at,
-         ip_hash, user_agent_hash)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        refreshTokenHash,
-        input.sessionId,
-        input.legacyUserId,
-        input.username,
-        new Date(),
-        input.expiresAt,
-        input.ipAddressHash ?? null,
-        input.userAgentHash ?? null
-      ]
-    );
-
-    return {
-      refreshToken,
-      refreshTokenHash,
-      sessionId: input.sessionId,
-      legacyUserId: input.legacyUserId,
-      username: input.username,
-      expiresAt: input.expiresAt
-    };
+    const connection = await pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      await this.lockActiveUser(connection, input);
+      const session = await this.insertSession(connection, input);
+      await connection.commit();
+      return session;
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally { connection.release(); }
   }
 
-  async rotate(refreshToken: string, next: IdentitySessionInput): Promise<IssuedIdentitySession> {
+  /** Caller owns the transaction; readiness must be checked before taking account locks. */
+  async issueInTransaction(connection:PoolConnection,input:IdentitySessionInput):Promise<IssuedIdentitySession>{
+    await this.lockActiveUser(connection,input);
+    return this.insertSession(connection,input);
+  }
+
+  /** A verification retry can replay only its original still-live refresh credential. */
+  async canReplayInTransaction(connection:PoolConnection,userId:number,sessionId:string,refreshTokenHash:string):Promise<boolean>{
+    const [rows]=await connection.execute<RowDataPacket[]>(`SELECT issued_at,expires_at,revoked_at FROM identity_refresh_sessions
+      WHERE legacy_user_id=? AND session_id=? AND refresh_token_hash=? FOR SHARE`,[userId,sessionId,refreshTokenHash]);
+    if(!rows[0]||rows[0].revoked_at||normalizeDate(rows[0].expires_at).getTime()<=Date.now())return false;
+    const [cutoffs]=await connection.execute<RowDataPacket[]>("SELECT revoked_before FROM identity_user_revocations WHERE user_id=? FOR SHARE",[userId]);
+    return !cutoffs[0]||normalizeDate(rows[0].issued_at).getTime()>normalizeDate(cutoffs[0].revoked_before).getTime();
+  }
+
+  /** Consume and replace under the same row lock. Never issue two successors. */
+  async rotate(refreshToken: string, next: IdentitySessionInput, idempotencyKey?: string): Promise<IssuedIdentitySession> {
     const pool = this.requirePool();
     await this.ensureSchema();
+    const connection = await pool.getConnection();
+    const tokenHash = hashRefreshToken(refreshToken);
+    const replayKey = replayEncryptionKey();
+    try {
+      await connection.beginTransaction();
+      await this.lockActiveUser(connection, next);
+      const [rows] = await connection.execute<RowDataPacket[]>(
+        `SELECT id, revoked_at, expires_at, legacy_user_id FROM identity_refresh_sessions
+          WHERE refresh_token_hash = ? LIMIT 1 FOR UPDATE`, [tokenHash]);
+      const current = rows[0];
+      if (!current || normalizeDate(current.expires_at).getTime() <= Date.now()
+          || Number(current.legacy_user_id) !== next.legacyUserId) throw new InvalidRefreshTokenError();
+      if (current.revoked_at) {
+        const replay = replayKey ? await this.readReplay(connection, tokenHash, idempotencyKey, replayKey) : null;
+        if (!replay) throw new InvalidRefreshTokenError();
+        await connection.commit();
+        return replay;
+      }
+      const replacement = await this.insertSession(connection, next);
+      const [changed] = await connection.execute<ResultSetHeader>(
+        `UPDATE identity_refresh_sessions SET revoked_at = UTC_TIMESTAMP(3), replaced_by_hash = ?
+          WHERE id = ? AND revoked_at IS NULL`, [replacement.refreshTokenHash, current.id]);
+      if (changed.affectedRows !== 1) throw new InvalidRefreshTokenError();
+      if (replayKey) {
+        await connection.execute(
+          `INSERT INTO identity_refresh_replays (predecessor_hash, successor_hash, request_hash, encrypted_response, created_at, expires_at)
+           VALUES (?, ?, ?, ?, UTC_TIMESTAMP(3), DATE_ADD(UTC_TIMESTAMP(3), INTERVAL 30 SECOND))`,
+          [tokenHash, replacement.refreshTokenHash, hashMaybe(idempotencyKey), encryptReplay(replacement, replayKey)]);
+      }
+      await connection.commit();
+      return replacement;
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally { connection.release(); }
+  }
 
-    const current = await this.findValidSession(refreshToken);
-    const replacement = await this.issue(next);
+  private async insertSession(connection: PoolConnection, input: IdentitySessionInput): Promise<IssuedIdentitySession> {
+    const refreshToken = randomBytes(48).toString("base64url");
+    const refreshTokenHash = hashRefreshToken(refreshToken);
+    await connection.execute(
+      `INSERT INTO identity_refresh_sessions (refresh_token_hash, session_id, legacy_user_id, username, issued_at, expires_at, ip_hash, user_agent_hash)
+       VALUES (?, ?, ?, ?, GREATEST(UTC_TIMESTAMP(3), COALESCE((SELECT DATE_ADD(revoked_before, INTERVAL 1000 MICROSECOND) FROM identity_user_revocations WHERE user_id = ?), UTC_TIMESTAMP(3))), ?, ?, ?)`,
+      [refreshTokenHash, input.sessionId, input.legacyUserId, input.username, input.legacyUserId, input.expiresAt,
+       input.ipAddressHash ?? null, input.userAgentHash ?? null]);
+    return { refreshToken, refreshTokenHash, sessionId: input.sessionId, legacyUserId: input.legacyUserId,
+      username: input.username, expiresAt: input.expiresAt };
+  }
 
-    await pool.execute(
-      `UPDATE identity_refresh_sessions
-          SET revoked_at = ?, replaced_by_hash = ?
-        WHERE id = ? AND revoked_at IS NULL`,
-      [new Date(), replacement.refreshTokenHash, current.id]
-    );
+  private async readReplay(connection: PoolConnection, hash: string, requestKey: string | undefined, key: Buffer): Promise<IssuedIdentitySession | null> {
+    const [rows] = await connection.execute<RowDataPacket[]>(
+      `SELECT r.encrypted_response, r.request_hash, r.created_at FROM identity_refresh_replays r
+       JOIN identity_refresh_sessions s ON s.refresh_token_hash = r.successor_hash
+       WHERE r.predecessor_hash = ? AND r.expires_at > UTC_TIMESTAMP(3)
+         AND s.revoked_at IS NULL AND s.expires_at > UTC_TIMESTAMP(3) LIMIT 1`, [hash]);
+    const row = rows[0];
+    if (!row) return null;
+    const sameRequest = !!requestKey && row.request_hash === hashMaybe(requestKey);
+    if (!sameRequest && Date.now() - normalizeDate(row.created_at).getTime() > 5000) return null;
+    const result = decryptReplay(String(row.encrypted_response), key);
+    return { ...result, expiresAt: new Date(result.expiresAt) };
+  }
 
-    return replacement;
+  /** Peek also permits a bounded replay; rotation remains the sole consumer. */
+  async findRefreshCandidate(refreshToken: string): Promise<StoredIdentitySession> {
+    try { return await this.findValidSession(refreshToken); }
+    catch (error) {
+      if (!(error instanceof InvalidRefreshTokenError) || !replayEncryptionKey()) throw error;
+      const [rows] = await this.requirePool().execute<RowDataPacket[]>(
+        `SELECT s.id, s.refresh_token_hash AS refreshTokenHash, s.session_id AS sessionId,
+          s.legacy_user_id AS legacyUserId, s.username, s.expires_at AS expiresAt, s.revoked_at AS revokedAt
+         FROM identity_refresh_sessions s JOIN identity_refresh_replays r ON r.predecessor_hash = s.refresh_token_hash
+         WHERE s.refresh_token_hash = ? AND r.expires_at > UTC_TIMESTAMP(3) LIMIT 1`, [hashRefreshToken(refreshToken)]);
+      if (!rows[0]) throw error;
+      return normalizeStoredSession(rows[0]);
+    }
+  }
+
+  async isAccessRevoked(userId: number, issuedAt: number, sessionId: string | null, allowUntrackedLegacy = false, connection?: PoolConnection): Promise<boolean> {
+    if (this.config.dataSource !== "identity") return false;
+    await this.ensureSchema();
+    const pool = connection ?? this.requirePool();
+    const lock = connection ? " FOR SHARE" : "";
+    const [rows] = await pool.execute<RowDataPacket[]>(
+      `SELECT revoked_before FROM identity_user_revocations WHERE user_id = ?${lock}`, [userId]);
+    const cutoff = rows[0] ? normalizeDate(rows[0].revoked_before).getTime() : null;
+    if (!sessionId) return cutoff !== null && issuedAt * 1000 <= cutoff;
+    const [sessions] = await pool.execute<RowDataPacket[]>(
+      `SELECT issued_at, revoked_at, replaced_by_hash FROM identity_refresh_sessions WHERE session_id = ? AND legacy_user_id = ? ORDER BY id DESC LIMIT 1${lock}`,
+      [sessionId, userId]);
+    const session = sessions[0];
+    if (!session) return !allowUntrackedLegacy || (cutoff !== null && issuedAt * 1000 <= cutoff);
+    if (cutoff !== null && normalizeDate(session.issued_at).getTime() <= cutoff) return true;
+    // Stable session IDs survive rotation. Explicit logout revokes the whole family.
+    return !!session.revoked_at && !session.replaced_by_hash;
   }
 
   async revoke(refreshToken: string | null | undefined): Promise<boolean> {
-    if (!refreshToken) {
-      return true;
-    }
-
-    const pool = this.requirePool();
+    if (!refreshToken) return true;
     await this.ensureSchema();
-    const refreshTokenHash = hashRefreshToken(refreshToken);
-
-    await pool.execute(
-      `UPDATE identity_refresh_sessions
-          SET revoked_at = COALESCE(revoked_at, ?)
-        WHERE refresh_token_hash = ?`,
-      [new Date(), refreshTokenHash]
-    );
-
-    return true;
+    const connection = await this.requirePool().getConnection();
+    try {
+      await connection.beginTransaction();
+      let hash: string | null = hashRefreshToken(refreshToken);
+      const visited = new Set<string>();
+      // Lock the same predecessor as rotate before following its committed successors.
+      while (hash && !visited.has(hash)) {
+        visited.add(hash);
+        const [rows]: [RowDataPacket[], unknown] = await connection.execute<RowDataPacket[]>(
+          "SELECT session_id, replaced_by_hash FROM identity_refresh_sessions WHERE refresh_token_hash = ? FOR UPDATE", [hash]);
+        if (!rows[0]) break;
+        const next: string | null = rows[0].replaced_by_hash ? String(rows[0].replaced_by_hash) : null;
+        await connection.execute(`UPDATE identity_refresh_sessions
+          SET revoked_at = COALESCE(revoked_at, UTC_TIMESTAMP(3)), replaced_by_hash = NULL
+          WHERE session_id = ?`, [rows[0].session_id]);
+        hash = next;
+      }
+      await connection.commit();
+      return true;
+    } catch (error) { await connection.rollback(); throw error; }
+    finally { connection.release(); }
   }
 
   async revokeUserSessions(legacyUserId: number): Promise<number> {
-    const pool = this.requirePool();
     await this.ensureSchema();
-    const [result] = await pool.execute<ResultSetHeader>(
-      `UPDATE identity_refresh_sessions
-          SET revoked_at = COALESCE(revoked_at, ?)
-        WHERE legacy_user_id = ? AND revoked_at IS NULL`,
-      [new Date(), legacyUserId]
-    );
+    const connection = await this.requirePool().getConnection();
+    try {
+      await connection.beginTransaction();
+      if (this.config.dataSource === "identity") {
+        await connection.execute("SELECT id FROM user WHERE id = ? FOR UPDATE", [legacyUserId]);
+        await connection.execute(`INSERT INTO identity_user_revocations (user_id, revoked_before) VALUES (?, UTC_TIMESTAMP(3))
+          ON DUPLICATE KEY UPDATE revoked_before = UTC_TIMESTAMP(3)`, [legacyUserId]);
+      }
+      const [result] = await connection.execute<ResultSetHeader>(`UPDATE identity_refresh_sessions
+        SET revoked_at = COALESCE(revoked_at, UTC_TIMESTAMP(3)), replaced_by_hash = NULL
+        WHERE legacy_user_id = ? AND revoked_at IS NULL`, [legacyUserId]);
+      await connection.commit();
+      return result.affectedRows;
+    } catch (error) { await connection.rollback(); throw error; }
+    finally { connection.release(); }
+  }
 
-    return result.affectedRows;
+  private async lockActiveUser(connection: PoolConnection, input: IdentitySessionInput) {
+    if (this.config.dataSource !== "identity") return;
+    const [users] = await connection.execute<RowDataPacket[]>(
+      "SELECT status,password_hash,auth_key FROM user WHERE id = ? FOR UPDATE", [input.legacyUserId]);
+    if (Number(users[0]?.status) !== 10 || (input.expectedPasswordHash !== undefined && users[0]?.password_hash !== input.expectedPasswordHash)) {
+      throw new InvalidRefreshTokenError("account changed while authenticating");
+    }
+    if(input.expectedLegacyAuthKey!==undefined){
+      const actual=Buffer.from(String(users[0]?.auth_key??"")),expected=Buffer.from(input.expectedLegacyAuthKey);
+      const deadline=Date.parse(process.env.IDENTITY_LEGACY_PHP_SESSION_ACCEPT_UNTIL??"");
+      const [revocations]=await connection.execute<RowDataPacket[]>("SELECT user_id FROM identity_user_revocations WHERE user_id=? FOR SHARE",[input.legacyUserId]);
+      if(!Number.isFinite(deadline)||Date.now()>=deadline||expected.length<16||actual.length!==expected.length||!timingSafeEqual(actual,expected)||revocations.length)throw new InvalidRefreshTokenError("legacy browser session is no longer accepted");
+    }
   }
 
   async findValidSession(refreshToken: string): Promise<StoredIdentitySession> {
@@ -165,10 +277,15 @@ export class IdentitySessionRepository implements OnModuleDestroy {
 
     return session;
   }
+  async isOAuthBound(sessionId:string):Promise<boolean> {
+    await this.ensureSchema();
+    const [rows]=await this.requirePool().execute<RowDataPacket[]>("SELECT session_id FROM identity_oauth_session_bindings WHERE session_id=? LIMIT 1",[sessionId]);
+    return rows.length>0;
+  }
 
-  private async ensureSchema(): Promise<void> {
+  async ensureSchema(): Promise<void> {
     if (!this.schemaReady) {
-      this.schemaReady = this.createSchema();
+      this.schemaReady = this.createSchema().catch((error) => { this.schemaReady = null; throw error; });
     }
 
     return this.schemaReady;
@@ -198,6 +315,19 @@ export class IdentitySessionRepository implements OnModuleDestroy {
         KEY idx_identity_refresh_sessions_session (session_id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `);
+    await pool.query(`CREATE TABLE IF NOT EXISTS identity_refresh_replays (
+      predecessor_hash CHAR(64) PRIMARY KEY, successor_hash CHAR(64) NOT NULL,
+      request_hash CHAR(64) NULL, encrypted_response TEXT NOT NULL,
+      created_at DATETIME(3) NOT NULL, expires_at DATETIME(3) NOT NULL,
+      KEY idx_identity_refresh_replay_expiry (expires_at)
+    ) ENGINE=InnoDB`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS identity_user_revocations (
+      user_id BIGINT PRIMARY KEY, revoked_before DATETIME(3) NOT NULL
+    ) ENGINE=InnoDB`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS identity_oauth_session_bindings (
+      session_id VARCHAR(128) PRIMARY KEY, client_id VARCHAR(128) NOT NULL, scopes_json JSON NOT NULL,
+      legacy_subject VARCHAR(128) NULL, KEY oauth_client (client_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
   }
 
   private requirePool(): Pool {
@@ -222,7 +352,8 @@ export class IdentitySessionRepository implements OnModuleDestroy {
       password: identityDb.password,
       waitForConnections: true,
       connectionLimit: 5,
-      namedPlaceholders: false
+      namedPlaceholders: false,
+      timezone: "Z"
     });
   }
 }
@@ -250,4 +381,24 @@ function normalizeDate(value: unknown): Date {
 
   const parsed = new Date(String(value));
   return Number.isNaN(parsed.getTime()) ? new Date(0) : parsed;
+}
+
+function hashMaybe(value?: string): string | null { return value ? createHash("sha256").update(value).digest("hex") : null; }
+function replayEncryptionKey(): Buffer | null {
+  const raw = process.env.IDENTITY_REFRESH_REPLAY_KEY;
+  if (!raw) return null;
+  const key = Buffer.from(raw, "base64url");
+  if (key.length !== 32) throw new Error("IDENTITY_REFRESH_REPLAY_KEY must encode 32 random bytes");
+  return key;
+}
+function encryptReplay(value: IssuedIdentitySession, key: Buffer): string {
+  const iv = randomBytes(12); const cipher = createCipheriv("aes-256-gcm", key, iv);
+  const encrypted = Buffer.concat([cipher.update(JSON.stringify(value), "utf8"), cipher.final()]);
+  return Buffer.concat([iv, cipher.getAuthTag(), encrypted]).toString("base64url");
+}
+function decryptReplay(value: string, key: Buffer): IssuedIdentitySession {
+  const bytes = Buffer.from(value, "base64url");
+  const decipher = createDecipheriv("aes-256-gcm", key, bytes.subarray(0, 12));
+  decipher.setAuthTag(bytes.subarray(12, 28));
+  return JSON.parse(Buffer.concat([decipher.update(bytes.subarray(28)), decipher.final()]).toString("utf8"));
 }

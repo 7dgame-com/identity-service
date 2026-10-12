@@ -1,4 +1,4 @@
-import { Controller, Get, Inject } from "@nestjs/common";
+import { Controller, Get, Inject, ServiceUnavailableException } from "@nestjs/common";
 import { trace } from "@opentelemetry/api";
 import { publicBuildRevision } from "./build-revision.js";
 import { loadConfig } from "./config.js";
@@ -15,14 +15,16 @@ export class HealthController {
     const span = trace.getTracer(this.config.otel.serviceName).startSpan("identity.health");
     try {
       const legacyDatabase = await this.legacyReader.health();
+      if(this.config.dataSource==="identity"&&legacyDatabase!=="configured")throw new ServiceUnavailableException("Identity account storage is unavailable");
       return {
         status: "ok",
         service: "identity-adapter",
-        mode: this.config.readonlyMode ? "readonly" : "unsafe",
+        mode: this.config.dataSource === "identity" ? "independent" : this.config.readonlyMode ? "readonly" : "unsafe",
+        accountAuthority: this.config.dataSource,
         version: process.env.npm_package_version ?? "0.1.0",
         revision: publicBuildRevision(),
         dependencies: {
-          legacyDatabase,
+          ...(this.config.dataSource === "identity" ? {identityDatabase: legacyDatabase} : {legacyDatabase}),
           keycloak: this.config.keycloak.baseUrl ? "configured" : "not_configured"
         },
         capabilities: {

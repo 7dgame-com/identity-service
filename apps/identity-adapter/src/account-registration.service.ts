@@ -1,9 +1,10 @@
-import { BadRequestException, HttpException, Injectable, ServiceUnavailableException } from "@nestjs/common";
+import { BadRequestException, HttpException, Inject, Injectable, Optional, ServiceUnavailableException } from "@nestjs/common";
 import { z } from "zod";
 import {
   AccountLifecycleOperationInProgressError,
   AccountLifecycleOperationRepository,
-  operationKeyForRegister
+  operationKeyForRegister,
+  credentialOperationDigest
 } from "./account-lifecycle-operation.repository.js";
 import {
   AccountRegistrationRepository,
@@ -14,6 +15,7 @@ import {
 import { loadConfig } from "./config.js";
 import { RequestContext, TokenIssuanceService } from "./token-issuance.service.js";
 import { validatePasswordPolicy } from "./password-policy.js";
+import { EmailDeliveryService } from "./email-delivery.service.js";
 
 const registerSchema = z.object({
   username: z.string().trim().min(1).max(255),
@@ -32,11 +34,40 @@ export class AccountRegistrationService {
   constructor(
     private readonly registrationRepository: AccountRegistrationRepository,
     private readonly operations: AccountLifecycleOperationRepository,
-    private readonly tokenIssuance: TokenIssuanceService
+    private readonly tokenIssuance: TokenIssuanceService,
+    @Optional() @Inject(EmailDeliveryService) private readonly emailDelivery?: EmailDeliveryService
   ) {}
 
   isNativeReady(): boolean {
     return this.registrationRepository.isConfigured() && this.operations.isConfigured() && this.config.tokenIssuance.enabled;
+  }
+
+  async registerInvitation(path: string, payload: unknown): Promise<{ status: number; body: unknown }> {
+    if (this.config.dataSource !== "identity" || !this.registrationRepository.isConfigured()) {
+      throw new ServiceUnavailableException({ code: "INVITATION_REGISTER_NOT_CONFIGURED", message: "Independent invitation registration is not configured." });
+    }
+    const schema = path === "/v1/plugin-user/register-send-code"
+      ? z.object({ inviteCode: z.string().trim().min(1).max(64), email: z.string().trim().email(), locale: z.string().optional() })
+      : registerSchema.extend({ email: z.string().trim().email(), inviteCode: z.string().trim().min(1).max(64), verificationCode: z.string().regex(/^\d{6}$/) });
+    const parsed = schema.safeParse(payload);
+    if (!parsed.success) throw new BadRequestException({ code: 4001, message: "所有字段均为必填且格式必须有效" });
+    try {
+      const data = parsed.data;
+      if (path === "/v1/plugin-user/register-send-code") {
+        if (!this.emailDelivery?.isConfigured()) throw new ServiceUnavailableException({ code: "EMAIL_WEBHOOK_NOT_CONFIGURED", message: "Email delivery webhook is not configured." });
+        const code = await this.registrationRepository.createInvitationEmailChallenge(data.inviteCode, data.email);
+        await this.emailDelivery.sendEmailVerificationCode({ email: data.email, code });
+        return { status: 200, body: { code: 0, message: "验证码已发送到您的邮箱" } };
+      }
+      const input = registerSchema.extend({ email: z.string().trim().email(), inviteCode: z.string(), verificationCode: z.string() }).parse(data);
+      this.assertPasswordPolicy(input);
+      const digest = credentialOperationDigest([input.inviteCode, input.username.trim().toLowerCase(), input.email.toLowerCase(), input.password, input.verificationCode]);
+      const user = await this.registrationRepository.registerInvitation(input, `register:invitation:${digest}`);
+      return { status: 201, body: { code: 0, message: "注册成功", data: { id: user.id, username: user.username, email: user.email, roles: user.roles } } };
+    } catch (error) {
+      if (error instanceof NativeRegistrationError) throw new HttpException(error.body, error.status);
+      throw error;
+    }
   }
 
   async register(path: string, payload: unknown, context: RequestContext = {}): Promise<{ status: number; body: unknown }> {
@@ -103,6 +134,21 @@ export class AccountRegistrationService {
         path: "wechatToken" in input ? "/v1/wechat/register" : "/v1/auth/register"
       }
     };
+
+    // In the independent database the request claim and account commit share a
+    // transaction. A crash before token issuance can therefore be retried.
+    if (this.config.dataSource === "identity") {
+      try {
+        const user = "wechatToken" in input
+          ? await this.registrationRepository.registerWechat(input, operationKey)
+          : await this.registrationRepository.register(input, operationKey);
+        const token = await this.tokenIssuance.issueRegisteredUser(user, context,user.expectedPasswordHash);
+        return { success: true, message: "register", uid: user.id, token: token.token };
+      } catch (error) {
+        if (error instanceof NativeRegistrationError) throw new HttpException(error.body, error.status);
+        throw error;
+      }
+    }
 
     try {
       const completed = await this.operations.findCompleted(operationKey);

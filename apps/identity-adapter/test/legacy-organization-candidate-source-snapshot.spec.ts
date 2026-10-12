@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { loadConfig } from "../src/config.js";
 import {
   LEGACY_ORGANIZATION_CANDIDATE_SOURCE_SNAPSHOT_CONTRACT,
   LegacyIdentityReader
@@ -123,6 +124,7 @@ function snapshotFixture(input: {
   };
   const pool = { getConnection: vi.fn(async () => connection) };
   const reader = Object.create(LegacyIdentityReader.prototype) as LegacyIdentityReader;
+  Object.defineProperty(reader,"config",{value:loadConfig({IDENTITY_DATA_SOURCE:"legacy"})});
   Object.defineProperty(reader, "pool", { value: pool });
   return { reader, connection, pool };
 }

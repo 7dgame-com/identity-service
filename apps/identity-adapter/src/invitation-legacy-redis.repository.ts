@@ -18,7 +18,7 @@ export class InvitationLegacyRedisRepository {
   private readonly config = loadConfig();
 
   isConfigured(): boolean {
-    return Boolean(this.config.invitationDiagnostics.redisUrl);
+    return this.config.dataSource === "legacy" && Boolean(this.config.invitationDiagnostics.redisUrl);
   }
 
   async create(input: InvitationLegacyRedisInput): Promise<void> {
@@ -59,7 +59,7 @@ export class InvitationLegacyRedisRepository {
   }
 
   private async client(): Promise<RedisClient> {
-    if (!this.config.invitationDiagnostics.redisUrl) {
+    if (!this.isConfigured() || !this.config.invitationDiagnostics.redisUrl) {
       throw new Error("legacy invitation Redis is not configured");
     }
 

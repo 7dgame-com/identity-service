@@ -1,9 +1,11 @@
-import { Controller, Get, Post, Req, Res } from "@nestjs/common";
+import { Controller, Get, Optional, Post, Req, Res } from "@nestjs/common";
+import { NativeQrcodeService } from "./native-qrcode.service.js";
+import { loadConfig } from "./config.js";
 import { AccountLifecycleScope, AccountLifecycleService } from "./account-lifecycle.service.js";
 
 @Controller()
 export class AccountLifecycleController {
-  constructor(private readonly accountLifecycle: AccountLifecycleService) {}
+  constructor(private readonly accountLifecycle: AccountLifecycleService, @Optional() private readonly qrcode?: NativeQrcodeService) {}
 
   @Get("internal/account-lifecycle/readiness")
   readiness() {
@@ -22,16 +24,19 @@ export class AccountLifecycleController {
 
   @Post("v1/wechat/register")
   wechatRegister(@Req() request: AccountLifecycleExpressRequest, @Res({ passthrough: true }) response: AccountLifecycleExpressResponse) {
+    if (loadConfig().dataSource === "identity" && this.qrcode) return this.qrcode.wechatRegister(request.body, {}, typeof request.headers["idempotency-key"] === "string" ? request.headers["idempotency-key"] : undefined);
     return this.forward("register", request, response, "/v1/wechat/register");
   }
 
   @Get("v1/wechat/qrcode")
   wechatQrcode(@Req() request: AccountLifecycleExpressRequest, @Res({ passthrough: true }) response: AccountLifecycleExpressResponse) {
+    if (loadConfig().dataSource === "identity" && this.qrcode) return this.qrcode.createWechatQr();
     return this.forward("register", request, response, "/v1/wechat/qrcode");
   }
 
   @Get("v1/wechat/refresh")
   wechatRefresh(@Req() request: AccountLifecycleExpressRequest, @Res({ passthrough: true }) response: AccountLifecycleExpressResponse) {
+    if (loadConfig().dataSource === "identity" && this.qrcode) return this.qrcode.wechatStatus(new URL(request.originalUrl ?? "/", "http://identity.local").searchParams.get("token"));
     return this.forward("register", request, response, "/v1/wechat/refresh");
   }
 
@@ -43,6 +48,11 @@ export class AccountLifecycleController {
   @Post("v1/password/verify-code")
   passwordVerifyCode(@Req() request: AccountLifecycleExpressRequest, @Res({ passthrough: true }) response: AccountLifecycleExpressResponse) {
     return this.forward("password", request, response, "/v1/password/verify-code");
+  }
+
+  @Post("v1/password/verify-token")
+  passwordVerifyToken(@Req() request: AccountLifecycleExpressRequest, @Res({ passthrough: true }) response: AccountLifecycleExpressResponse) {
+    return this.forward("password", request, response, "/v1/password/verify-token");
   }
 
   @Post("v1/password/reset")

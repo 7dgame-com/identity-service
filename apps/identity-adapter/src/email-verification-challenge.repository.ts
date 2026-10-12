@@ -2,6 +2,7 @@ import { createHash, randomInt, randomUUID } from "node:crypto";
 import { Injectable, OnModuleDestroy } from "@nestjs/common";
 import mysql, { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { loadConfig } from "./config.js";
+import { importedChallengePrefix, readLegacyChallengeLimits, incrementLegacyChallengeAttempts } from "./legacy-challenge-limits.js";
 
 export interface EmailVerificationChallenge {
   id: number;
@@ -85,6 +86,10 @@ export class EmailVerificationChallengeRepository implements OnModuleDestroy {
   }
 
   async verifyCode(email: string, code: string): Promise<EmailVerificationChallenge> {
+    const limits = this.config.dataSource === "identity" ? await readLegacyChallengeLimits(this.requirePool(), "email_verification", normalizeEmail(email)) : null;
+    if (limits?.attemptsExpiresAt && limits.attemptsExpiresAt.getTime() > Date.now() && limits.attempts >= this.config.emailVerification.maxAttempts) {
+      throw new EmailVerificationChallengeError(429, "ACCOUNT_LOCKED", "验证失败次数过多，账户已被锁定", Math.ceil((limits.attemptsExpiresAt.getTime()-Date.now())/1000));
+    }
     const challenge = await this.requireActiveChallenge(email);
     if (challenge.lockedUntil && challenge.lockedUntil.getTime() > Date.now()) {
       throw new EmailVerificationChallengeError(
@@ -119,11 +124,9 @@ export class EmailVerificationChallengeRepository implements OnModuleDestroy {
   async getCooldown(email: string): Promise<EmailVerificationCooldown> {
     const latest = await this.findLatestByEmail(normalizeEmail(email));
     const limitSeconds = this.config.emailVerification.rateLimitSeconds;
-    if (!latest) {
-      return { canSend: true, retryAfter: 0, limitSeconds };
-    }
-
-    const availableAt = latest.createdAt.getTime() + limitSeconds * 1000;
+    const limits = this.config.dataSource === "identity" ? await readLegacyChallengeLimits(this.requirePool(), "email_verification", normalizeEmail(email)) : null;
+    const availableAt = Math.max(limits?.rateLimitUntil?.getTime() ?? 0,
+      latest && !latest.challengeKey.startsWith(importedChallengePrefix) ? latest.createdAt.getTime() + limitSeconds * 1000 : 0);
     const retryAfter = Math.max(0, Math.ceil((availableAt - Date.now()) / 1000));
     return {
       canSend: retryAfter === 0,
@@ -167,6 +170,7 @@ export class EmailVerificationChallengeRepository implements OnModuleDestroy {
 
   private async incrementAttempts(challenge: EmailVerificationChallenge): Promise<void> {
     const pool = this.requirePool();
+    if (this.config.dataSource === "identity" && await incrementLegacyChallengeAttempts(pool, "email_verification", challenge.email)) return;
     const nextAttempts = challenge.attempts + 1;
     const lockedUntil =
       nextAttempts >= this.config.emailVerification.maxAttempts ? new Date(Date.now() + this.config.emailVerification.lockSeconds * 1000) : null;
@@ -235,7 +239,8 @@ export class EmailVerificationChallengeRepository implements OnModuleDestroy {
       password: identityDb.password,
       waitForConnections: true,
       connectionLimit: 5,
-      namedPlaceholders: false
+      namedPlaceholders: false,
+      timezone: "Z"
     });
   }
 }
