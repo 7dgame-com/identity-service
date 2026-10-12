@@ -1,7 +1,7 @@
 import "reflect-metadata";
 import { execFile } from "node:child_process";
-import { generateKeyPairSync, randomBytes, randomUUID, createHash } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { generateKeyPairSync, randomBytes, randomUUID, createHash, createHmac } from "node:crypto";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
@@ -14,6 +14,7 @@ import { hashLegacyPassword } from "../src/legacy-password.js";
 const enabled=process.env.IDENTITY_TEST_MYSQL==="1";
 const projectRoot=fileURLToPath(new URL("../../../",import.meta.url));
 const databaseName=`test_identity_http_${randomUUID().replaceAll("-","")}`;
+const deviceDatabaseName=`test_identity_http_sn_${randomUUID().replaceAll("-","")}`;
 const options={host:process.env.IDENTITY_DB_HOST??"127.0.0.1",port:Number(process.env.IDENTITY_DB_PORT??3306),
   user:process.env.IDENTITY_DB_USER??"root",password:process.env.IDENTITY_DB_PASSWORD??"",multipleStatements:true,timezone:"Z"};
 const password="Http-bootstrap!73",internalToken=randomBytes(32).toString("hex"),authInternalToken=randomBytes(32).toString("hex");
@@ -44,6 +45,9 @@ describe.skipIf(!enabled)("compiled AppModule independent HTTP bootstrap",()=>{
     expect(controllerCode).toContain('__metadata("design:paramtypes"');
     admin=await mysql.createConnection(options);
     await admin.query(`CREATE DATABASE \`${databaseName}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`);
+    await admin.query(`CREATE DATABASE \`${deviceDatabaseName}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+      CREATE TABLE \`${deviceDatabaseName}\`.device_sn(id INT PRIMARY KEY,user_id INT,device_uuid VARCHAR(255),enabled BOOL,activated_at DATETIME);
+      INSERT INTO \`${deviceDatabaseName}\`.device_sn VALUES(9,4,'http-yii3-device',1,NOW())`);
     db=await mysql.createConnection({...options,database:databaseName});
     const init=await readFile(join(projectRoot,"deploy/mysql/init.sql"),"utf8");
     await db.query(init.slice(init.indexOf("CREATE TABLE IF NOT EXISTS `auth_login_events`")));
@@ -54,6 +58,8 @@ describe.skipIf(!enabled)("compiled AppModule independent HTTP bootstrap",()=>{
       IDENTITY_DB_PASSWORD:options.password,IDENTITY_DB_NAME:databaseName,IDENTITY_TOKEN_ISSUANCE_ENABLED:"true",IDENTITY_REFRESH_REPLAY_KEY:randomBytes(32).toString("base64url"),
       IDENTITY_INTERNAL_API_TOKEN:internalToken,IDENTITY_IAM_INTERNAL_API_TOKEN:internalToken,IDENTITY_JWT_PRIVATE_KEY_PEM:keys.privateKey.export({type:"pkcs8",format:"pem"}).toString(),
       IDENTITY_TOKEN_ISSUANCE_INTERNAL_API_TOKEN:authInternalToken,
+      IDENTITY_CORS_ORIGINS:"https://http-school.example.test",
+      DEVICE_SN_DB_HOST:options.host,DEVICE_SN_DB_PORT:String(options.port),DEVICE_SN_DB_NAME:deviceDatabaseName,DEVICE_SN_DB_USER:options.user,DEVICE_SN_DB_PASSWORD:options.password,
       IDENTITY_JWT_PUBLIC_KEY_PEM:keys.publicKey.export({type:"spki",format:"pem"}).toString(),IDENTITY_JWT_ISSUER:"https://identity-http.test",IDENTITY_JWT_AUDIENCE:"http-private-api",
       IDENTITY_ACCOUNT_LIFECYCLE_ENABLED:"true",IDENTITY_ACCOUNT_LIFECYCLE_MODE:"native",IDENTITY_ACCOUNT_REGISTER_ENABLED:"true",IDENTITY_ACCOUNT_EMAIL_ENABLED:"true",
       IDENTITY_ACCOUNT_EMAIL_VERIFY_NATIVE_ENABLED:"true",IDENTITY_ACCOUNT_EMAIL_CHANGE_NATIVE_ENABLED:"true",IDENTITY_ACCOUNT_PASSWORD_ENABLED:"true",
@@ -76,7 +82,7 @@ describe.skipIf(!enabled)("compiled AppModule independent HTTP bootstrap",()=>{
   },120000);
   afterAll(async()=>{
     await app?.close();await db?.end();
-    if(admin){await admin.query(`DROP DATABASE IF EXISTS \`${databaseName}\``);await admin.end();}
+    if(admin){await admin.query(`DROP DATABASE IF EXISTS \`${databaseName}\`;DROP DATABASE IF EXISTS \`${deviceDatabaseName}\``);await admin.end();}
     if(buildDirectory)await rm(buildDirectory,{recursive:true,force:true});
     vi.unstubAllEnvs();
   },30000);
@@ -125,6 +131,56 @@ describe.skipIf(!enabled)("compiled AppModule independent HTTP bootstrap",()=>{
     const verified=await http("/internal/auth/verify-access-token","POST",{token:token.accessToken},headers);
     expect(verified.status).toBe(201);expect(verified.body.data.id).toBe(4);
     expect((await http("/internal/wechat-oauth/users/4/identity?providerAppId=wx-private","GET",undefined,{"x-identity-internal-token":authInternalToken})).body).toBeNull();
+  });
+
+  it("routes Yii3 code context, multi-device exchange and strict refresh through the scoped internal auth key",async()=>{
+    const key=randomBytes(32).toString("base64url"),now=Math.floor(Date.now()/1000),headers={"x-identity-internal-token":authInternalToken};
+    await db!.execute("INSERT INTO identity_login_codes(code_hash,user_id,issued_at,expires_at,context_json) VALUES (?,4,?,?,?)",
+      [createHash("sha256").update(key).digest("hex"),now,now+60,JSON.stringify({frontend_domain:"http-school.example.test"})]);
+    const path="/internal/yii3/login-code",body={key,operation:"context"};
+    const rejectedHeaders:Record<string,string>[]=[{},{"x-identity-internal-token":internalToken},{"x-identity-internal-token":"incorrect"}];
+    for(const rejected of rejectedHeaders)expect((await http(path,"POST",body,rejected)).status).toBe(401);
+    const [before]=await db!.query<RowDataPacket[]>("SELECT COUNT(*) AS n FROM identity_refresh_sessions");
+    const context=await http(path,"POST",body,headers);expect(context.status).toBe(201);expect(context.body).toEqual({frontendDomain:"http-school.example.test"});
+    const [after]=await db!.query<RowDataPacket[]>("SELECT COUNT(*) AS n FROM identity_refresh_sessions");expect(Number(after[0].n)).toBe(Number(before[0].n));
+    const exchanges=await Promise.all([1,2].map(()=>http(path,"POST",{key:`web_${key}`,operation:"redeem"},headers)));
+    for(const exchanged of exchanges){expect(exchanged.status).toBe(201);expect(exchanged.body.subject).toMatchObject({id:4,status:10});
+      const claims=JSON.parse(Buffer.from(exchanged.body.authTokens.accessToken.split(".")[1],"base64url").toString());expect(claims.aud).toBe("http-private-api");}
+    expect(exchanges[0].body.authTokens.refreshToken).not.toBe(exchanges[1].body.authTokens.refreshToken);
+    const refreshPath="/internal/yii3/refresh",initial=exchanges[0].body.authTokens;
+    expect((await http(refreshPath,"POST",{refreshToken:key,allowLoginCode:false},headers)).status).toBe(401);
+    expect((await http(refreshPath,"POST",{refreshToken:key,allowLoginCode:true},headers)).status).toBe(201);
+    const refreshed=await http(refreshPath,"POST",{refreshToken:initial.refreshToken,allowLoginCode:false},{...headers,"idempotency-key":"http-yii3-refresh"});
+    expect(refreshed.status).toBe(201);expect(refreshed.body.authTokens.refreshToken).not.toBe(initial.refreshToken);
+    expect((await http("/v1/auth/logout","POST",{refreshToken:initial.refreshToken})).status).toBe(201);
+    expect((await http(refreshPath,"POST",{refreshToken:initial.refreshToken,allowLoginCode:true},headers)).status).toBe(401);
+    const root=await login("http-root"),issued=await http("/v1/tools/user-linked","GET",undefined,{...bearer(root.accessToken),origin:"https://http-school.example.test"});
+    expect(issued.status).toBe(200);
+    expect((await http(path,"POST",{key:issued.body.key,operation:"context"},headers)).body).toEqual({frontendDomain:"http-school.example.test"});
+    const untrusted=await http("/v1/tools/user-linked","GET",undefined,{...bearer(root.accessToken),origin:"https://untrusted.example.test",referer:"https://http-school.example.test/page"});
+    expect(untrusted.status).toBe(200);
+    expect((await http(path,"POST",{key:untrusted.body.key,operation:"context"},headers)).body).toEqual({frontendDomain:null});
+  });
+
+  it("verifies old Yii3 HS256 and current SN claims through IAM while preventing ordinary credential derivation",async()=>{
+    const secret=randomBytes(32).toString("hex"),secretFile=join(buildDirectory!,"yii3-key"),trustFile=join(buildDirectory!,"yii3-trust.json"),now=Date.now()/1000;
+    await writeFile(secretFile,` \n${secret}\n`,{mode:0o600});
+    await writeFile(trustFile,JSON.stringify({version:1,algorithm:"HS256",secretFile,issuedBefore:new Date(Date.now()+1000).toISOString(),
+      acceptUntil:new Date(Date.now()+3600000).toISOString(),maxAccessTtlSeconds:10800}),{mode:0o600});
+    vi.stubEnv("IDENTITY_LEGACY_YII3_JWT_CONFIG_FILE",trustFile);
+    try {
+      const input=[{alg:"HS256"},{uid:4,iat:now-1.123456,exp:now+120,auth_method:"device_sn",device_sn_id:9}]
+        .map(value=>Buffer.from(JSON.stringify(value)).toString("base64url")).join(".");
+      const token=`${input}.${createHmac("sha256",secret).update(input).digest("base64url")}`;
+      const verified=await http("/internal/auth/verify-access-token","POST",{token},{"x-identity-internal-token":internalToken});
+      expect(verified.status).toBe(201);expect(verified.body.data).toMatchObject({id:4,status:10,auth_method:"device_sn",device_sn_id:9});
+      expect((await http("/v1/tools/user-linked","GET",undefined,bearer(token))).status).toBe(403);
+      const issued=await http("/internal/auth/issue-user-token","POST",{legacyUserId:4,auth_method:"device_sn",device_sn_id:9},{"x-identity-internal-token":authInternalToken});
+      expect(issued.status).toBe(201);
+      const current=await http("/internal/auth/verify-access-token","POST",{token:issued.body.token.accessToken},{"x-identity-internal-token":internalToken});
+      expect(current.body.data).toMatchObject({id:4,auth_method:"device_sn",device_sn_id:9});
+      expect((await http("/v1/tools/user-linked","GET",undefined,bearer(issued.body.token.accessToken))).status).toBe(403);
+    } finally {vi.stubEnv("IDENTITY_LEGACY_YII3_JWT_CONFIG_FILE","");}
   });
 
   it("routes verified Apple proofs through the real controller with private accounts and legacy token strings",async()=>{

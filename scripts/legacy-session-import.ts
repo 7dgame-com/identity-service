@@ -3,6 +3,7 @@ import {
   connectLegacySessionImportTarget,
   importLegacySessions,
 } from "../apps/identity-adapter/src/legacy-session-import.js";
+import { LegacyIdentityReader } from "../apps/identity-adapter/src/legacy-identity.reader.js";
 
 async function main() {
   const args = process.argv.slice(2);
@@ -30,12 +31,15 @@ async function main() {
     throw new Error("Legacy session manifest exceeds the size limit.");
   const manifest: unknown = JSON.parse(await readFile(filename, "utf8"));
   const target = await connectLegacySessionImportTarget();
+  const reader = new LegacyIdentityReader();
   try {
     console.log(
-      JSON.stringify(await importLegacySessions(target, manifest, { apply })),
+      JSON.stringify(await importLegacySessions(target, manifest, { apply,
+        assertDeviceSnAuthorized: (deviceSnId, userId) => reader.assertDeviceSnAuthorized(deviceSnId, userId, true) })),
     );
   } finally {
     await target.end();
+    await reader.onModuleDestroy();
   }
 }
 

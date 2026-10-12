@@ -19,7 +19,8 @@ export class NativeIdentityController {
   @Post("v1/plugin-campus/users/password") campusPassword(@Req() request:NativeRequest) {this.enabled();return this.native.campusPassword(request);}
   @Post("internal/auth/verify-access-token") async verify(@Headers("x-identity-internal-token") key:string|undefined,@Body() body:{token?:unknown}) {
     this.internal(key); if(typeof body?.token!=="string") throw new UnauthorizedException();
-    return {success:true,data:await this.native.verify(body.token)};
+    const subject=await this.native.verify(body.token);
+    return {success:true,data:"authContext" in subject?{...subject,...subject.authContext}:subject};
   }
   @Get("internal/identity/subjects/:id") async subject(@Headers("x-identity-internal-token") key:string|undefined,@Param("id") id:string) {
     this.internal(key);return {success:true,data:await this.native.subject(validId(id))};

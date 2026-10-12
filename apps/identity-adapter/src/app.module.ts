@@ -1,4 +1,6 @@
 import { NativeIdentityController } from "./native-identity.controller.js";
+import { Yii3CompatibilityController } from "./yii3-compatibility.controller.js";
+import { Yii3CompatibilityService } from "./yii3-compatibility.service.js";
 import { LegacyAdminController, LegacyPolicyController } from "./legacy-admin.controller.js";
 import { LegacyAdminService } from "./legacy-admin.service.js";
 import { AppleIdentityController } from "./apple-identity.controller.js";
@@ -80,6 +82,7 @@ import { UsageBillingService } from "./usage-billing.service.js";
 
 @Module({
   controllers: [
+    Yii3CompatibilityController,
     LegacyAdminController,
     LegacyPolicyController,
     LegacyEmailLinkController,
@@ -107,6 +110,7 @@ import { UsageBillingService } from "./usage-billing.service.js";
     OidcController
   ],
   providers: [
+    Yii3CompatibilityService,
     LegacyAdminService,
     LegacyEmailLinkService,
     AppleIdentityService,

@@ -27,7 +27,7 @@ export class DeviceSnAccessGuard implements CanActivate {
       }
       // Disabled SN access may finish its <=3h lifetime; account elevation/deletion is immediate.
       await this.legacyReader.assertDeviceSnAuthorized(claims.deviceSnId, claims.uid, false);
-      if (path === "/authorize" || path === "/token" ||
+      if (path === "/authorize" || path === "/token" || path === "/v1/tools/user-linked" ||
         (request.method !== "GET" && /^\/v1\/(?:password|email)(?:\/|$)/.test(path)) ||
         (request.method !== "GET" && /^\/v1\/(?:person|people)(?:\/|$)/.test(path)) ||
         ["/v1/auth/register", "/v1/wechat/register", "/v1/wechat/binding", "/v1/plugin-user/register", "/v1/plugin-user/register-send-code",

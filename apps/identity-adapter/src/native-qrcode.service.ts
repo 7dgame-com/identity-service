@@ -5,6 +5,8 @@ import { NativeQrcodeRepository } from "./native-qrcode.repository.js";
 import { IdentityWechatOAuthService } from "./identity-wechat-oauth.service.js";
 import { AuthTokenResponse, RequestContext, TokenIssuanceService } from "./token-issuance.service.js";
 import { AccountRegistrationService } from "./account-registration.service.js";
+import { denyDeviceSnCredentialDerivation } from "./device-sn-source.js";
+import { loginCodeContext } from "./login-code-context.js";
 
 export const LOGIN_CODE_LIFETIME_SECONDS = 60;
 const WECHAT_SCENE_LIFETIME_SECONDS = 6 * 24 * 3600;
@@ -19,14 +21,23 @@ export class NativeQrcodeService {
   get internalToken() { return this.native.config.tokenIssuance.internalToken; }
   private assertEnabled() { if (!this.enabled) throw new NotFoundException(); }
   protected now() { return Math.floor(Date.now() / 1000); }
+  protected loginCodeCandidate() { return randomBytes(32).toString("base64url"); }
 
   async issueLoginCode(request: NativeRequest) {
     this.assertEnabled();
     const actor = await this.native.actor(request);
+    if("authContext" in actor && actor.authContext?.auth_method === "device_sn")denyDeviceSnCredentialDerivation();
     await this.native.requirePermission(actor, "/v1/tools/user-linked");
-    const key = randomBytes(32).toString("base64url");
+    // These transport/source prefixes are interpreted by historical consumers.
+    let key = "";
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const candidate = this.loginCodeCandidate();
+      if (!candidate.startsWith("web_") && !candidate.startsWith("dsn_")) { key = candidate; break; }
+    }
+    if (!key) throw new ServiceUnavailableException("Login code generation is unavailable.");
     const issuedAt = this.now(); const expiresAt = issuedAt + LOGIN_CODE_LIFETIME_SECONDS;
-    await this.repository.issueLoginCode(actor.id, digest(key), issuedAt, expiresAt);
+    await this.repository.issueLoginCode(actor.id, digest(key), issuedAt, expiresAt,
+      loginCodeContext(request.headers,this.native.config.corsOrigins));
     return { success: true, message: "user-linked", key, expires_at: expiresAt, expires_in: LOGIN_CODE_LIFETIME_SECONDS };
   }
 

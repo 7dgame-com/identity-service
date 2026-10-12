@@ -133,6 +133,7 @@ jobs:
           apps/identity-adapter/test/identity-http-bootstrap.mysql.spec.ts
           apps/identity-adapter/test/identity-account-sync.mysql.spec.ts
           apps/identity-adapter/test/identity-profile-migration.mysql.spec.ts
+          apps/identity-adapter/test/identity-yii3.mysql.spec.ts
           apps/identity-adapter/test/apple-identity.mysql.spec.ts
           apps/identity-adapter/test/legacy-session-import.mysql.spec.ts
           apps/identity-adapter/test/legacy-challenge-import.mysql.spec.ts

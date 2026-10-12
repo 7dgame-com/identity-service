@@ -3,10 +3,11 @@ import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import { assertMigrationStaging } from "./migration-state.js";
 import { z } from "zod";
 import { loadConfig } from "./config.js";
+import { yii3SessionEvidenceSchema, yii3RefreshLifetime } from "./yii3-session-evidence.js";
 
 const hash = (value: string) =>
   createHash("sha256").update(value).digest("hex");
-const digest = z.string().regex(/^[a-fA-F0-9]{64}$/);
+const digest = z.string().length(64).regex(/^[a-fA-F0-9]{64}$/);
 const timestamp = z.union([
   z.number().finite().nonnegative(),
   z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/),
@@ -34,6 +35,9 @@ const entrySchema = z
     ip: z.string().max(128).nullable().optional(),
     user_agent: z.string().max(4096).nullable().optional(),
     client: clientSchema.nullable(),
+    auth_method: z.literal("device_sn").optional(),
+    device_sn_id: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+    yii3: yii3SessionEvidenceSchema.optional(),
   })
   .strict();
 
@@ -49,6 +53,8 @@ export interface ImportedLegacySession {
   ipHash: string | null;
   userAgentHash: string | null;
   client: z.infer<typeof clientSchema> | null;
+  authMethod: "device_sn" | null;
+  deviceSnId: number | null;
 }
 export interface LegacySessionImportReport {
   applied: boolean;
@@ -62,6 +68,8 @@ export interface LegacySessionImportReport {
   expired: number;
   revoked: number;
   clientBindings: number;
+  deviceSessions: number;
+  notFinal: true;
 }
 
 /** No heuristic key detection: a 64-character hex plaintext token is still plaintext. */
@@ -113,9 +121,20 @@ export function normalizeLegacySessionManifest(
     const revokedAt = row.revoked_at === null ? null : date(row.revoked_at);
     if (expiresAt <= issuedAt || (revokedAt && revokedAt < issuedAt))
       throw invalid();
+    const refreshHash = row.keyEncoding === "plain" ? hash(row.key) : row.key.toLowerCase();
+    const isDevice = row.auth_method === "device_sn";
+    if (isDevice !== (row.device_sn_id !== undefined) || ((isDevice || row.session_id.startsWith("yii3:")) && !row.yii3)
+      || (row.keyEncoding === "plain" && row.key.startsWith("dsn_") && !isDevice)) throw invalid();
+    if (row.yii3) {
+      const lifetime = yii3RefreshLifetime(row.yii3);
+      if (row.yii3.credentialKind !== (isDevice ? "device_sn" : "ordinary")
+        || row.session_id !== `yii3:${refreshHash}` || row.client !== null || revokedAt !== null || row.replaced_by_hash != null
+        || issuedAt.getTime() !== lifetime.issuedAtMs || expiresAt.getTime() !== lifetime.expiresAtMs
+        || (row.keyEncoding === "plain" && (isDevice ? !/^dsn_[a-f0-9]{64}$/.test(row.key) || row.key.length !== 68
+          : !/^[a-f0-9]{64}$/.test(row.key) || row.key.length !== 64))) throw invalid();
+    }
     return {
-      refreshHash:
-        row.keyEncoding === "plain" ? hash(row.key) : row.key.toLowerCase(),
+      refreshHash,
       userId: row.user_id,
       sessionId: row.session_id,
       username: row.username ?? null,
@@ -128,6 +147,8 @@ export function normalizeLegacySessionManifest(
         row.user_agent_hash?.toLowerCase() ??
         (row.user_agent ? hash(row.user_agent) : null),
       client: row.client,
+      authMethod: isDevice ? "device_sn" : null,
+      deviceSnId: row.device_sn_id ?? null,
     };
   });
 }
@@ -141,6 +162,7 @@ export async function importLegacySessions(
     environment?: string;
     maxRows?: number;
     now?: Date;
+    assertDeviceSnAuthorized?: (deviceSnId: number, userId: number) => Promise<void>;
   } = {},
 ): Promise<LegacySessionImportReport> {
   if (
@@ -170,6 +192,8 @@ export async function importLegacySessions(
     expired: sessions.filter((s) => s.expiresAt <= now).length,
     revoked: sessions.filter((s) => s.revokedAt !== null).length,
     clientBindings: 0,
+    deviceSessions: sessions.filter((s) => s.authMethod === "device_sn").length,
+    notFinal: true,
   };
   await target.beginTransaction();
   try {
@@ -189,14 +213,22 @@ export async function importLegacySessions(
         throw new Error(
           "Legacy session import references a missing identity account.",
         );
+      // An active device credential must have a live independent device-source
+      // check, in dry-run too. Historical expired rows cannot authorize access.
+      if (row.authMethod === "device_sn" && row.expiresAt > now && row.revokedAt === null) {
+        if (!options.assertDeviceSnAuthorized) throw new Error("A current device authorization check is required for active device sessions.");
+        await options.assertDeviceSnAuthorized(row.deviceSnId!, row.userId);
+      }
       const [existing] = await target.execute<RowDataPacket[]>(
-        `SELECT legacy_user_id, session_id FROM identity_refresh_sessions WHERE refresh_token_hash = ?${lock}`,
+        `SELECT legacy_user_id, session_id, auth_method, device_sn_id FROM identity_refresh_sessions WHERE refresh_token_hash = ?${lock}`,
         [row.refreshHash],
       );
       if (existing[0]) {
         if (
           Number(existing[0].legacy_user_id) !== row.userId ||
-          existing[0].session_id !== row.sessionId
+          existing[0].session_id !== row.sessionId ||
+          (existing[0].auth_method ?? null) !== row.authMethod ||
+          (existing[0].device_sn_id == null ? null : Number(existing[0].device_sn_id)) !== row.deviceSnId
         )
           throw new Error("Legacy session identity conflict.");
         // Never replace any stored lifetime, revocation, successor or binding.
@@ -256,8 +288,8 @@ export async function importLegacySessions(
       if (options.apply) {
         await target.execute(
           `INSERT INTO identity_refresh_sessions
-          (refresh_token_hash,session_id,legacy_user_id,username,issued_at,expires_at,revoked_at,replaced_by_hash,ip_hash,user_agent_hash)
-          VALUES (?,?,?,?,?,?,?,?,?,?)`,
+          (refresh_token_hash,session_id,legacy_user_id,username,issued_at,expires_at,revoked_at,replaced_by_hash,ip_hash,user_agent_hash,auth_method,device_sn_id)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
           [
             row.refreshHash,
             row.sessionId,
@@ -269,6 +301,8 @@ export async function importLegacySessions(
             row.replacedByHash,
             row.ipHash,
             row.userAgentHash,
+            row.authMethod,
+            row.deviceSnId,
           ],
         );
         report.imported++;

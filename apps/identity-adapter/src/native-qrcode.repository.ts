@@ -2,7 +2,7 @@ import { Injectable, OnModuleDestroy, ServiceUnavailableException, UnauthorizedE
 import mysql, { Pool, RowDataPacket } from "mysql2/promise";
 import { loadConfig } from "./config.js";
 
-export interface NativeLoginCode { userId: number; expiresAt: number; }
+export interface NativeLoginCode { userId: number; expiresAt: number; context?: Record<string, unknown> | null; }
 export interface NativeWechatScene { expiresAt: number; providerAppId: string | null; openId: string | null; userId: number | null; profile: Record<string, unknown> | null; }
 
 /** Private Identity state stores code digests and subjects, never refresh tokens. */
@@ -23,7 +23,7 @@ export class NativeQrcodeRepository implements OnModuleDestroy {
     return this.pool;
   }
 
-  async issueLoginCode(userId: number, digest: string, issuedAt: number, expiresAt: number): Promise<void> {
+  async issueLoginCode(userId: number, digest: string, issuedAt: number, expiresAt: number, context: {frontend_domain?: string} = {}): Promise<void> {
     const connection = await this.db().getConnection();
     try {
       await connection.beginTransaction();
@@ -34,8 +34,8 @@ export class NativeQrcodeRepository implements OnModuleDestroy {
       const configured = Number(process.env.LOGIN_CODE_ISSUE_LIMIT ?? 5);
       const limit = Number.isInteger(configured) && configured >= 2 && configured <= 20 ? configured : 5;
       if (Number(counts[0]?.total) >= limit) throw new HttpException({ code: "LOGIN_CODE_RATE_LIMITED", message: "登录码生成过于频繁" }, 429);
-      await connection.execute("INSERT INTO identity_login_codes (code_hash,user_id,issued_at,expires_at) VALUES (?,?,?,?)",
-        [digest, userId, issuedAt, expiresAt]);
+      await connection.execute("INSERT INTO identity_login_codes (code_hash,user_id,issued_at,expires_at,context_json) VALUES (?,?,?,?,?)",
+        [digest, userId, issuedAt, expiresAt, JSON.stringify(context)]);
       await connection.commit();
     } catch (error) {
       await connection.rollback();
@@ -45,8 +45,11 @@ export class NativeQrcodeRepository implements OnModuleDestroy {
 
   async loginCode(digest: string): Promise<NativeLoginCode | null> {
     const [rows] = await this.db().execute<RowDataPacket[]>(
-      "SELECT user_id,expires_at FROM identity_login_codes WHERE code_hash = ?", [digest]);
-    return rows.length ? { userId: Number(rows[0].user_id), expiresAt: Number(rows[0].expires_at) } : null;
+      "SELECT user_id,expires_at,context_json FROM identity_login_codes WHERE code_hash = ?", [digest]);
+    if(!rows.length)return null;
+    const context=rows[0].context_json;
+    if(context!=null&&(typeof context!=="object"||Array.isArray(context)))throw new UnauthorizedException("Login code context is invalid.");
+    return { userId: Number(rows[0].user_id), expiresAt: Number(rows[0].expires_at), context:context??null };
   }
 
   async createWechatScene(digest: string, expiresAt: number): Promise<void> {

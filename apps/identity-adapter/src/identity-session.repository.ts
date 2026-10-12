@@ -330,6 +330,14 @@ export class IdentitySessionRepository implements OnModuleDestroy {
 
     return session;
   }
+
+  /** Credential classification includes expired/revoked rows; they must never become login codes. */
+  async hasRefreshToken(refreshToken:string):Promise<boolean> {
+    await this.ensureSchema();
+    const [rows]=await this.requirePool().execute<RowDataPacket[]>(
+      "SELECT id FROM identity_refresh_sessions WHERE refresh_token_hash=? LIMIT 1",[hashRefreshToken(refreshToken)]);
+    return rows.length>0;
+  }
   async isOAuthBound(sessionId:string,connection?:PoolConnection):Promise<boolean> {
     await this.ensureSchema();
     const [rows]=await (connection??this.requirePool()).execute<RowDataPacket[]>(`SELECT session_id FROM identity_oauth_session_bindings WHERE session_id=?

@@ -16,6 +16,8 @@ class TestQrcodeService extends NativeQrcodeService {
   clock = now;
   providerCalls: unknown[] = [];
   providerResponse: Record<string, unknown> = { ticket: "wechat-ticket" };
+  candidates: string[] = [];
+  protected loginCodeCandidate() { return this.candidates.shift() ?? super.loginCodeCandidate(); }
   protected now() { return this.clock; }
   protected async provider(action: "qrcode" | "profile", payload: Record<string, unknown>) {
     this.providerCalls.push({ action, payload }); return this.providerResponse;
@@ -47,7 +49,7 @@ describe("Independent Identity QR compatibility", () => {
   it("keeps the 60 second protocol and persists only code hash plus subject", async () => {
     const result = await service.issueLoginCode({ headers: {} });
     expect(result.expires_at).toBe(now + 60); expect(result.expires_in).toBe(60);
-    expect(repository.issueLoginCode).toHaveBeenCalledWith(42, createHash("sha256").update(result.key).digest("hex"), now, now + 60);
+    expect(repository.issueLoginCode).toHaveBeenCalledWith(42, createHash("sha256").update(result.key).digest("hex"), now, now + 60, {});
     expect(JSON.stringify(repository.issueLoginCode.mock.calls)).not.toContain(result.key);
     expect(tokens.issueLegacyUserToken).not.toHaveBeenCalled();
     expect(native.requirePermission).toHaveBeenCalledWith({ id: 42, status: 10 }, "/v1/tools/user-linked");
@@ -59,6 +61,21 @@ describe("Independent Identity QR compatibility", () => {
     expect(first.token.refreshToken).not.toBe(second.token.refreshToken);
     expect(tokens.issueLegacyUserToken).toHaveBeenNthCalledWith(1, { legacyUserId: 42 }, { ip: "127.0.0.1" });
     expect(tokens.issueLegacyUserToken).toHaveBeenNthCalledWith(2, { legacyUserId: 42 }, { ip: "127.0.0.2" });
+  });
+
+  it("never issues a code with a reserved transport or device-credential prefix", async () => {
+    service.candidates = ["web_reserved_candidate", "dsn_reserved_candidate", rawCode];
+    const result = await service.issueLoginCode({ headers: {} });
+    expect(result.key).toBe(rawCode);
+    expect(service.candidates).toEqual([]);
+  });
+
+  it("persists only an allowlisted browser host as code context", async () => {
+    native.config={corsOrigins:"https://school.example.test",tokenIssuance:{internalToken:"internal-secret"}};
+    await service.issueLoginCode({headers:{origin:"https://school.example.test"}});
+    expect(repository.issueLoginCode.mock.calls[0][4]).toEqual({frontend_domain:"school.example.test"});
+    await service.issueLoginCode({headers:{origin:"https://untrusted.example.test",referer:"https://school.example.test/"}});
+    expect(repository.issueLoginCode.mock.calls[1][4]).toEqual({});
   });
 
   it("rejects at the exact expiry boundary without signing a session", async () => {
