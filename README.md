@@ -17,11 +17,31 @@ Health check:
 curl http://localhost:8086/health
 ```
 
-Docker:
+Independent Docker deployment from the platform checkout:
 
 ```bash
-docker compose --profile identity up --build
+cd ../../driver
+# Configure driver/.env credentials, salts, replay key and P-256 key directory first.
+export IDENTITY_BUILD_REVISION="$(git -C ../services/identity-service rev-parse HEAD)"
+docker compose -f docker-compose.identity.standalone.yml --profile identity-standalone config --quiet
+docker compose -f docker-compose.identity.standalone.yml --profile identity-standalone build identity-standalone
+docker compose -f docker-compose.identity.standalone.yml --profile identity-standalone up -d identity-standalone-db
 ```
+
+The build revision is required and must be a full lowercase 40-character service
+commit. Leave the application stopped while importing and checking the staging
+database, including final sessions and provider bindings. The first native HTTP
+bootstrap permanently activates Identity authority and blocks later legacy imports.
+After completing those checks, start the prebuilt application:
+
+```bash
+docker compose -f docker-compose.identity.standalone.yml --profile identity-standalone up -d --no-build identity-standalone
+curl --fail http://localhost:8086/health
+```
+
+The older readonly Compose below the service directory remains available for
+historical comparison. Its image build also needs the explicit revision:
+`docker compose --profile identity build --build-arg BUILD_REVISION=<full-service-commit> identity-adapter`.
 
 ## Branches and CI/CD
 
