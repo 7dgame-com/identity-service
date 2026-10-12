@@ -8,6 +8,7 @@ import { validatePasswordPolicy } from "./password-policy.js";
 import { enqueueSubjectEvent } from "./subject-events.js";
 import { TokenIssuanceService,type AuthTokenResponse } from "./token-issuance.service.js";
 import { IdentitySessionRepository } from "./identity-session.repository.js";
+import { revokeLegacyRefreshCredentialsInTransaction } from "./legacy-refresh-credential-revocation.js";
 
 const tokenSchema=z.string().min(16).max(255);
 type LinkResult={userId:number;username:string;email:string|null;status:number};
@@ -48,6 +49,7 @@ export class LegacyEmailLinkService implements OnModuleDestroy {
       const user=await this.proofUser(connection,"password_reset_token",token,10);
       const scopedErrors=validatePasswordPolicy(password,{username:user.username,email:user.email});if(scopedErrors.length)throw new BadRequestException({errors:scopedErrors});
       await connection.execute("UPDATE user SET password_hash=?,password_reset_token=NULL,updated_at=? WHERE id=?",[passwordHash,Math.floor(Date.now()/1000),user.id]);
+      await revokeLegacyRefreshCredentialsInTransaction(connection,Number(user.id));
       await connection.execute("UPDATE identity_refresh_sessions SET revoked_at=COALESCE(revoked_at,UTC_TIMESTAMP(3)) WHERE legacy_user_id=?",[user.id]);
       await connection.execute("INSERT INTO identity_user_revocations(user_id,revoked_before) VALUES (?,UTC_TIMESTAMP(3)) ON DUPLICATE KEY UPDATE revoked_before=UTC_TIMESTAMP(3)",[user.id]);
       await enqueueSubjectEvent(connection,Number(user.id));

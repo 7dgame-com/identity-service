@@ -76,6 +76,7 @@ import { ProfileWriteOperationRepository } from "./profile-write-operation.repos
 import { ProfileWriteService } from "./profile-write.service.js";
 import { TelemetryInterceptor } from "./telemetry.interceptor.js";
 import { TokenIssuanceService } from "./token-issuance.service.js";
+import { LegacyRefreshCredentialRepository } from "./legacy-refresh-credential.repository.js";
 import { UsageBillingController } from "./usage-billing.controller.js";
 import { UsageBillingRepository } from "./usage-billing.repository.js";
 import { UsageBillingService } from "./usage-billing.service.js";
@@ -110,6 +111,7 @@ import { UsageBillingService } from "./usage-billing.service.js";
     OidcController
   ],
   providers: [
+    LegacyRefreshCredentialRepository,
     Yii3CompatibilityService,
     LegacyAdminService,
     LegacyEmailLinkService,

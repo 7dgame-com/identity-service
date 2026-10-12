@@ -11,6 +11,7 @@ import { validatePasswordPolicy } from "./password-policy.js";
 import { enqueueSubjectEvent } from "./subject-events.js";
 import { activateIdentityAuthority } from "./migration-state.js";
 import { deviceSnSource } from "./device-sn-source.js";
+import { revokeLegacyRefreshCredentialsInTransaction } from "./legacy-refresh-credential-revocation.js";
 
 export interface NativeRequest { headers: Record<string, string | string[] | undefined>; body?: unknown; }
 const positiveId = z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER);
@@ -384,6 +385,7 @@ export class NativeIdentityService implements OnModuleDestroy, OnApplicationBoot
     if (!rows.length) throw new NotFoundException("用户不存在");
   }
   private async revokeInTransaction(connection:PoolConnection,id:number) {
+    await revokeLegacyRefreshCredentialsInTransaction(connection,id);
     await connection.execute("UPDATE identity_refresh_sessions SET revoked_at=COALESCE(revoked_at,UTC_TIMESTAMP(3)) WHERE legacy_user_id = ?",[id]);
     await connection.execute("INSERT INTO identity_user_revocations (user_id,revoked_before) VALUES (?,UTC_TIMESTAMP(3)) ON DUPLICATE KEY UPDATE revoked_before=UTC_TIMESTAMP(3)",[id]);
   }

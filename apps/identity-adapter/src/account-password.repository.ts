@@ -4,6 +4,7 @@ import { identityAccountWriteDb, loadConfig } from "./config.js";
 import { hashLegacyPassword, verifyLegacyPassword } from "./legacy-password.js";
 import { LegacyUserReadModel } from "./legacy-identity.reader.js";
 import { enqueueSubjectEvent } from "./subject-events.js";
+import { revokeLegacyRefreshCredentialsInTransaction } from "./legacy-refresh-credential-revocation.js";
 
 export interface PasswordUserCredential {
   id: number;
@@ -155,6 +156,7 @@ export class AccountPasswordRepository implements OnModuleDestroy {
           "UPDATE identity_refresh_sessions SET revoked_at = COALESCE(revoked_at, UTC_TIMESTAMP(3)) WHERE legacy_user_id = ?", [user.id]
         );
         await enqueueSubjectEvent(connection,user.id);
+        await revokeLegacyRefreshCredentialsInTransaction(connection,user.id);
       }
       if (connection) await connection.commit();
     } catch (error) {

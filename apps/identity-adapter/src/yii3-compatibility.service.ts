@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, NotFoundException, UnauthorizedException } from "@nestjs/common";
+import { BadRequestException, Injectable, NotFoundException, Optional, UnauthorizedException } from "@nestjs/common";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { NativeIdentityService } from "./native-identity.service.js";
@@ -7,14 +7,16 @@ import { NativeQrcodeService, normalizeLoginCode } from "./native-qrcode.service
 import { IdentitySessionRepository } from "./identity-session.repository.js";
 import { TokenIssuanceService, type AuthTokenResponse, type RequestContext } from "./token-issuance.service.js";
 import { validateFrontendDomain } from "./login-code-context.js";
+import { LegacyRefreshCredentialRepository } from "./legacy-refresh-credential.repository.js";
 
 const loginSchema=z.object({key:z.string().min(1).max(4096),operation:z.enum(["redeem","context"])}).strict();
-const refreshSchema=z.object({refreshToken:z.string().min(1).max(4096),allowLoginCode:z.boolean()}).strict();
+const refreshSchema=z.object({refreshToken:z.string().min(1).max(4096),allowLoginCode:z.boolean(),consumer:z.enum(["server","a1"]).optional()}).strict();
 
 @Injectable()
 export class Yii3CompatibilityService {
   constructor(private readonly native:NativeIdentityService,private readonly repository:NativeQrcodeRepository,
-    private readonly codes:NativeQrcodeService,private readonly sessions:IdentitySessionRepository,private readonly tokens:TokenIssuanceService){}
+    private readonly codes:NativeQrcodeService,private readonly sessions:IdentitySessionRepository,private readonly tokens:TokenIssuanceService,
+    @Optional() private readonly legacyCredentials?:LegacyRefreshCredentialRepository){}
 
   async loginCode(input:unknown,context:RequestContext={}) {
     this.assertEnabled();
@@ -32,13 +34,16 @@ export class Yii3CompatibilityService {
   async refresh(input:unknown,context:RequestContext={}) {
     this.assertEnabled();
     const parsed=refreshSchema.safeParse(input);if(!parsed.success)throw new BadRequestException("Invalid refresh request.");
+    if(parsed.data.consumer==="a1"&&parsed.data.allowLoginCode)throw new BadRequestException("A1 refresh cannot redeem login codes.");
     const raw=parsed.data.refreshToken.trim();
     const credential=parsed.data.allowLoginCode?(normalizeLoginCode(raw)||raw):raw;
     // Check the raw form as well: wrapping a known revoked refresh must not hide
     // its credential type. Stored refresh rows retain that classification.
-    const knownRaw=await this.sessions.hasRefreshToken(raw);
-    const known=knownRaw||(credential!==raw&&await this.sessions.hasRefreshToken(credential));
-    if(known)return this.response(await this.tokens.refresh({refreshToken:knownRaw?raw:credential},context));
+    const knownRaw=await this.sessions.hasRefreshToken(raw)||!!(this.legacyCredentials&&await this.legacyCredentials.hasCredential(raw));
+    const known=knownRaw||(credential!==raw&&(await this.sessions.hasRefreshToken(credential)||!!(this.legacyCredentials&&await this.legacyCredentials.hasCredential(credential))));
+    if(known)return this.response(await (parsed.data.consumer==="a1"
+      ?this.tokens.refresh({refreshToken:knownRaw?raw:credential},context,"a1")
+      :this.tokens.refresh({refreshToken:knownRaw?raw:credential},context)));
     if(!parsed.data.allowLoginCode||credential.startsWith("dsn_"))throw new UnauthorizedException("Refresh token is invalid.");
     const response=await this.loginCode({key:credential,operation:"redeem"},context);
     if(!("authTokens" in response))throw new UnauthorizedException("Refresh token is invalid.");

@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { BadRequestException, Injectable, NotFoundException, UnauthorizedException } from "@nestjs/common";
+import { BadRequestException, Injectable, NotFoundException, Optional, UnauthorizedException } from "@nestjs/common";
 import { z } from "zod";
 import { loadConfig } from "./config.js";
 import { IdentitySessionRepository, InvalidRefreshTokenError } from "./identity-session.repository.js";
@@ -9,6 +9,7 @@ import { verifyLegacyPassword } from "./legacy-password.js";
 import { LoginAuditService } from "./login-audit.service.js";
 import type { PoolConnection, RowDataPacket } from "mysql2/promise";
 import { assertDeviceSnAccount, deviceSnSource, throwDeviceSnFailure, type DeviceSnSource } from "./device-sn-source.js";
+import { LegacyRefreshCredentialRepository } from "./legacy-refresh-credential.repository.js";
 
 const loginSchema = z.object({
   username: z.string().min(1).max(255),
@@ -57,7 +58,8 @@ export class TokenIssuanceService {
     private readonly legacyReader: LegacyIdentityReader,
     private readonly sessions: IdentitySessionRepository,
     private readonly jwtIssuer: JwtIssuerService,
-    private readonly loginAudit: LoginAuditService
+    private readonly loginAudit: LoginAuditService,
+    @Optional() private readonly legacyCredentials?: LegacyRefreshCredentialRepository
   ) {}
 
   async login(payload: unknown, context: RequestContext = {}): Promise<AuthTokenResponse> {
@@ -81,9 +83,12 @@ export class TokenIssuanceService {
     return response;
   }
 
-  async refresh(payload: unknown, context: RequestContext = {}): Promise<AuthTokenResponse> {
+  async refresh(payload: unknown, context: RequestContext = {}, consumer: "server" | "a1" = "server"): Promise<AuthTokenResponse> {
     this.assertEnabled();
     const parsed = parseBody(refreshSchema, payload);
+    if (this.config.dataSource === "identity" && this.legacyCredentials && !await this.sessions.hasRefreshToken(parsed.refreshToken) && await this.legacyCredentials.hasCredential(parsed.refreshToken)) {
+      return this.legacyCredentials.redeem(parsed.refreshToken, context, consumer);
+    }
 
     let source: DeviceSnSource | null = null;
     let issuedRefresh: string | undefined;
@@ -126,10 +131,15 @@ export class TokenIssuanceService {
     }
   }
 
+  async hasRefreshCredential(raw: string): Promise<boolean> {
+    return await this.sessions.hasRefreshToken(raw) || !!(this.legacyCredentials && await this.legacyCredentials.hasCredential(raw));
+  }
+
   async logout(payload: unknown): Promise<{ success: true; message: "logout"; revoked: boolean }> {
     this.assertEnabled();
     const parsed = parseBody(logoutSchema, payload ?? {});
-    const revoked = await this.sessions.revoke(parsed.refreshToken);
+    const revoked = parsed.refreshToken && this.legacyCredentials && !await this.sessions.hasRefreshToken(parsed.refreshToken) && await this.legacyCredentials.hasCredential(parsed.refreshToken)
+      ? await this.legacyCredentials.revoke(parsed.refreshToken) : await this.sessions.revoke(parsed.refreshToken);
 
     return { success: true, message: "logout", revoked };
   }

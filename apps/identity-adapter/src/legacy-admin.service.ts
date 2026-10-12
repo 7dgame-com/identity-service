@@ -7,6 +7,7 @@ import { NativeIdentityService, NativeRequest } from "./native-identity.service.
 import { enqueueSubjectEvent } from "./subject-events.js";
 import { hashLegacyPassword } from "./legacy-password.js";
 import { validatePasswordPolicy } from "./password-policy.js";
+import { revokeLegacyRefreshCredentialsInTransaction } from "./legacy-refresh-credential-revocation.js";
 
 /** Keeps Yii administration views while making the private DB the only writer. */
 @Injectable()
@@ -54,6 +55,7 @@ export class LegacyAdminService implements OnModuleDestroy {
             const [root]=await c.execute<RowDataPacket[]>("SELECT item_name FROM auth_assignment WHERE user_id=? AND item_name='root'",[String(body.id)]);
             if(root.length){const [actors]=await c.execute<RowDataPacket[]>("SELECT item_name FROM auth_assignment WHERE user_id=? AND item_name='root'",[String(actor)]);if(!actors.length)throw new ForbiddenException("Root accounts require a root actor");}
             await c.execute("UPDATE user SET status=0,deleted_at=?,updated_at=? WHERE id=?",[now,now,body.id]);
+            await revokeLegacyRefreshCredentialsInTransaction(c,body.id);
             await c.execute("UPDATE identity_refresh_sessions SET revoked_at=COALESCE(revoked_at,UTC_TIMESTAMP(3)),replaced_by_hash=NULL WHERE legacy_user_id=?",[body.id]);await c.execute("INSERT INTO identity_user_revocations(user_id,revoked_before) VALUES (?,UTC_TIMESTAMP(3)) ON DUPLICATE KEY UPDATE revoked_before=UTC_TIMESTAMP(3)",[body.id]);
           }else await c.execute("UPDATE user SET status=10,updated_at=? WHERE id=?",[now,body.id]);
           await enqueueSubjectEvent(c,body.id);return {success:true};

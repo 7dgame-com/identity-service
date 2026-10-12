@@ -3,6 +3,8 @@ import { Injectable, OnModuleDestroy } from "@nestjs/common";
 import mysql, { Pool, PoolConnection, ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { loadConfig } from "./config.js";
 import { assertDeviceSnAccount, deviceSnSource } from "./device-sn-source.js";
+import { legacyRefreshCredentialSchema } from "./legacy-refresh-credential-schema.js";
+import { revokeLegacyRefreshCredentialsInTransaction, revokeLegacyRefreshFamilyInTransaction } from "./legacy-refresh-credential-revocation.js";
 
 export class InvalidRefreshTokenError extends Error {
   constructor(message = "refresh token is invalid") {
@@ -243,6 +245,10 @@ export class IdentitySessionRepository implements OnModuleDestroy {
     const connection = await this.requirePool().getConnection();
     try {
       await connection.beginTransaction();
+      if (this.config.dataSource === "identity") {
+        const [owners] = await connection.execute<RowDataPacket[]>("SELECT legacy_user_id FROM identity_refresh_sessions WHERE refresh_token_hash=?", [hashRefreshToken(refreshToken)]);
+        if (owners[0]) await connection.execute("SELECT id FROM user WHERE id=? FOR UPDATE", [owners[0].legacy_user_id]);
+      }
       let hash: string | null = hashRefreshToken(refreshToken);
       const visited = new Set<string>();
       // Lock the same predecessor as rotate before following its committed successors.
@@ -255,6 +261,7 @@ export class IdentitySessionRepository implements OnModuleDestroy {
         await connection.execute(`UPDATE identity_refresh_sessions
           SET revoked_at = COALESCE(revoked_at, UTC_TIMESTAMP(3)), replaced_by_hash = NULL
           WHERE session_id = ?`, [rows[0].session_id]);
+        if (this.config.dataSource === "identity") await revokeLegacyRefreshFamilyInTransaction(connection, String(rows[0].session_id));
         hash = next;
       }
       await connection.commit();
@@ -276,6 +283,7 @@ export class IdentitySessionRepository implements OnModuleDestroy {
       const [result] = await connection.execute<ResultSetHeader>(`UPDATE identity_refresh_sessions
         SET revoked_at = COALESCE(revoked_at, UTC_TIMESTAMP(3)), replaced_by_hash = NULL
         WHERE legacy_user_id = ? AND revoked_at IS NULL`, [legacyUserId]);
+      if (this.config.dataSource === "identity") await revokeLegacyRefreshCredentialsInTransaction(connection, legacyUserId);
       await connection.commit();
       return result.affectedRows;
     } catch (error) { await connection.rollback(); throw error; }
@@ -402,6 +410,7 @@ export class IdentitySessionRepository implements OnModuleDestroy {
     await pool.query(`CREATE TABLE IF NOT EXISTS identity_user_revocations (
       user_id BIGINT PRIMARY KEY, revoked_before DATETIME(3) NOT NULL
     ) ENGINE=InnoDB`);
+    await pool.query(legacyRefreshCredentialSchema);
     await pool.query(`CREATE TABLE IF NOT EXISTS identity_oauth_session_bindings (
       session_id VARCHAR(128) PRIMARY KEY, client_id VARCHAR(128) NOT NULL, scopes_json JSON NOT NULL,
       legacy_subject VARCHAR(128) NULL, KEY oauth_client (client_id)

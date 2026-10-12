@@ -299,7 +299,7 @@ describe.skipIf(!enabled)("independent identity account MySQL integration", () =
     expect(Number(consumed[0].count)).toBe(1);
   });
 
-  it("rolls back in-flight email and password writes when logout commits before their transactional authorization",async()=>{
+  it("rejects in-flight email and password requests when logout commits before their account transaction",async()=>{
     const keys=generateKeyPairSync("ec",{namedCurve:"prime256v1"});
     vi.stubEnv("IDENTITY_JWT_PRIVATE_KEY_PEM",String(keys.privateKey.export({type:"pkcs8",format:"pem"})));
     vi.stubEnv("IDENTITY_JWT_PUBLIC_KEY_PEM",String(keys.publicKey.export({type:"spki",format:"pem"})));
@@ -312,9 +312,12 @@ describe.skipIf(!enabled)("independent identity account MySQL integration", () =
       const token=jwt.issue(user,session.sessionId).accessToken;await native.verify(token);
       let enter!:()=>void,release!:()=>void;
       const entered=new Promise<void>((resolve)=>{enter=resolve;}),gate=new Promise<void>((resolve)=>{release=resolve;});
-      const authorize=async(connection:Parameters<NativeIdentityService["assertAccessInTransaction"]>[2])=>{enter();await gate;await native.assertAccessInTransaction(token,user.id,connection);};
-      const pending=operation==="email"?emails.bindVerifiedEmail(user.id,"logout-forbidden@example.test",Math.floor(Date.now()/1000),{expectedEmail:user.email,authorize})
-        :passwords.changePassword((await passwords.getCredentialById(user.id))!,"Logout-forbidden!83",{operationKey:"logout-forbidden-password",authorize});
+      const authorize=async(connection:Parameters<NativeIdentityService["assertAccessInTransaction"]>[2])=>native.assertAccessInTransaction(token,user.id,connection);
+      // Logout and account writes now share an account-first lock order. Pause
+      // the already verified request before its transaction acquires that lock.
+      const pending=(async()=>{enter();await gate;return operation==="email"
+        ?emails.bindVerifiedEmail(user.id,"logout-forbidden@example.test",Math.floor(Date.now()/1000),{expectedEmail:user.email,authorize})
+        :passwords.changePassword((await passwords.getCredentialById(user.id))!,"Logout-forbidden!83",{operationKey:"logout-forbidden-password",authorize});})();
       await entered;await sessions.revoke(session.refreshToken);release();
       await expect(pending).rejects.toMatchObject({status:401});
     }

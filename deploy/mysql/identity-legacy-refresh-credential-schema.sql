@@ -1,0 +1,28 @@
+-- Reviewed Yii2 Redis ActiveRecord credentials only. No synthetic issued_at or expiry.
+CREATE TABLE IF NOT EXISTS identity_legacy_refresh_credentials (
+  credential_hash CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  source_record_id BIGINT UNSIGNED NOT NULL,
+  legacy_user_id BIGINT NOT NULL,
+  source_kind VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  source_revision CHAR(40) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  source_fields_json JSON NOT NULL,
+  key_encoding VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  a1_compatible BOOLEAN NOT NULL,
+  server_compatible BOOLEAN NOT NULL,
+  snapshot_at DATETIME(3) NOT NULL,
+  account_fingerprint CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  expires_at DATETIME(3) NULL,
+  source_revoked_at DATETIME(3) NULL,
+  revoked_at DATETIME(3) NULL,
+  redeemed_at DATETIME(3) NULL,
+  redeemed_consumer VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NULL,
+  session_id VARCHAR(128) NULL,
+  successor_hash CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL,
+  request_hash CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL,
+  encrypted_response TEXT NULL,
+  replay_expires_at DATETIME(3) NULL,
+  PRIMARY KEY (credential_hash),
+  UNIQUE KEY legacy_ar_record (source_record_id),
+  KEY legacy_ar_user (legacy_user_id),
+  KEY legacy_ar_session (session_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
