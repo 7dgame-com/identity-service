@@ -1,0 +1,33 @@
+{
+  "auditedAt": "2026-10-12",
+  "lockfileSha256": "c198dcc4cc5c2c338dd474d36eece776f91f51a6007673617e6e237e4bda01a8",
+  "node": "v24.19.0",
+  "npm": "10.9.9",
+  "scope": "ci",
+  "command": [
+    "npm",
+    "audit",
+    "--include=dev",
+    "--json"
+  ],
+  "auditReportVersion": 2,
+  "metadata": {
+    "vulnerabilities": {
+      "info": 0,
+      "low": 0,
+      "moderate": 0,
+      "high": 0,
+      "critical": 0,
+      "total": 0
+    },
+    "dependencies": {
+      "prod": 181,
+      "dev": 124,
+      "optional": 58,
+      "peer": 0,
+      "peerOptional": 0,
+      "total": 304
+    }
+  },
+  "vulnerabilities": {}
+}

@@ -22,14 +22,20 @@ Independent Docker deployment from the platform checkout:
 ```bash
 cd ../../driver
 # Configure driver/.env credentials, salts, replay key and P-256 key directory first.
+if [ -n "$(git -C ../services/identity-service status --porcelain)" ]; then
+  echo "Commit the identity-service changes before building its revision-tagged image." >&2
+  exit 1
+fi
 export IDENTITY_BUILD_REVISION="$(git -C ../services/identity-service rev-parse HEAD)"
 docker compose -f docker-compose.identity.standalone.yml --profile identity-standalone config --quiet
 docker compose -f docker-compose.identity.standalone.yml --profile identity-standalone build identity-standalone
 docker compose -f docker-compose.identity.standalone.yml --profile identity-standalone up -d identity-standalone-db
 ```
 
-The build revision is required and must be a full lowercase 40-character service
-commit. Leave the application stopped while importing and checking the staging
+Build only from a clean service checkout: the revision records committed source,
+so uncommitted or untracked build inputs must be committed first. The build
+revision is required and must be a full lowercase 40-character service commit.
+Leave the application stopped while importing and checking the staging
 database, including final sessions and provider bindings. The first native HTTP
 bootstrap permanently activates Identity authority and blocks later legacy imports.
 After completing those checks, start the prebuilt application:
