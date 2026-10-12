@@ -259,6 +259,8 @@ describe.skipIf(process.env.IDENTITY_TEST_MYSQL!=="1")("private identity runtime
   expect(JSON.stringify(baseline)).not.toContain("Strong-private");expect(JSON.stringify(baseline)).not.toContain("native-root");
   await expect(readAccountBaseline(db,1)).rejects.toThrow("budget");
  });
+ // This full journey performs seven cost-12 hashes and two password checks,
+ // including competing resets and response retries on shared CI CPUs.
  it("atomically continues old reset links and does not revoke a fresh login on response retry",async()=>{
   const created=await native.pluginWrite(request({username:"legacy-reset-account",email:"legacy-reset@example.test",password},"legacy-reset-account"),"create-user") as {data:{id:number}};
   const token=`${randomBytes(24).toString("base64url")}_${Math.floor(Date.now()/1000)}`;
@@ -275,7 +277,7 @@ describe.skipIf(process.env.IDENTITY_TEST_MYSQL!=="1")("private identity runtime
   await db.execute("UPDATE user SET password_reset_token=? WHERE id=?",[`expired-token-with-enough-entropy_${Math.floor(Date.now()/1000)-3601}`,created.data.id]);
   await expect(links.validateReset({token:`expired-token-with-enough-entropy_${Math.floor(Date.now()/1000)-3601}`})).rejects.toMatchObject({status:400});
   expect(()=>new LegacyEmailLinkController(links).reset("incorrect-internal-key",undefined,payload)).toThrow();
- });
+ },15_000);
  it("preserves emailed invitation signup and verification without duplicate accounts or grants",async()=>{
   await db.execute("INSERT INTO invitation(code,sender_id,used,auth_item_name) VALUES ('historical-email-invite',1,0,'manager')");
   const signup={username:"email-invited-account",email:"email-invited@example.test",password,invitation:"historical-email-invite"};
