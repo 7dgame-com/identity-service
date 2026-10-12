@@ -38,6 +38,8 @@ export async function importLegacyRefreshCredentials(target: Connection, payload
       if (legacyRefreshAccountFingerprint(users[0].password_hash ?? null, users[0].auth_key ?? null) !== row.accountFingerprint) {
         throw new Error("Reviewed source account credentials no longer match the private account.");
       }
+      const [signup]=await target.execute<RowDataPacket[]>(`SELECT credential_hash FROM identity_legacy_wechat_signup_credentials WHERE credential_hash=?${lock}`,[row.credentialHash]);
+      if(signup.length)throw new Error("Legacy refresh conflicts with a known signup classification.");
       const [native] = await target.execute<RowDataPacket[]>(`SELECT id FROM identity_refresh_sessions WHERE refresh_token_hash=?${lock}`, [row.credentialHash]);
       if (native.length) throw new Error("Legacy credential conflicts with an existing native refresh classification.");
       const [cutoffs] = await target.execute<RowDataPacket[]>(`SELECT revoked_before FROM identity_user_revocations WHERE user_id=?${lock}`, [row.userId]);

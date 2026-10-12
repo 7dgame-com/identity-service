@@ -9,6 +9,7 @@ import { verifyLegacyPassword } from "./legacy-password.js";
 import { LoginAuditService } from "./login-audit.service.js";
 import type { PoolConnection, RowDataPacket } from "mysql2/promise";
 import { assertDeviceSnAccount, deviceSnSource, throwDeviceSnFailure, type DeviceSnSource } from "./device-sn-source.js";
+import { LegacyWechatSignupRepository } from "./legacy-wechat-signup.repository.js";
 import { LegacyRefreshCredentialRepository } from "./legacy-refresh-credential.repository.js";
 
 const loginSchema = z.object({
@@ -59,7 +60,8 @@ export class TokenIssuanceService {
     private readonly sessions: IdentitySessionRepository,
     private readonly jwtIssuer: JwtIssuerService,
     private readonly loginAudit: LoginAuditService,
-    @Optional() private readonly legacyCredentials?: LegacyRefreshCredentialRepository
+    @Optional() private readonly legacyCredentials?: LegacyRefreshCredentialRepository,
+    @Optional() private readonly legacySignup?: LegacyWechatSignupRepository
   ) {}
 
   async login(payload: unknown, context: RequestContext = {}): Promise<AuthTokenResponse> {
@@ -86,6 +88,7 @@ export class TokenIssuanceService {
   async refresh(payload: unknown, context: RequestContext = {}, consumer: "server" | "a1" = "server"): Promise<AuthTokenResponse> {
     this.assertEnabled();
     const parsed = parseBody(refreshSchema, payload);
+    if(await this.legacySignup?.hasCredential(parsed.refreshToken))throw new UnauthorizedException("A signup credential is not a refresh token.");
     if (this.config.dataSource === "identity" && this.legacyCredentials && !await this.sessions.hasRefreshToken(parsed.refreshToken) && await this.legacyCredentials.hasCredential(parsed.refreshToken)) {
       return this.legacyCredentials.redeem(parsed.refreshToken, context, consumer);
     }
@@ -132,12 +135,19 @@ export class TokenIssuanceService {
   }
 
   async hasRefreshCredential(raw: string): Promise<boolean> {
-    return await this.sessions.hasRefreshToken(raw) || !!(this.legacyCredentials && await this.legacyCredentials.hasCredential(raw));
+    return !!(this.legacySignup&&await this.legacySignup.hasCredential(raw)) || await this.sessions.hasRefreshToken(raw) || !!(this.legacyCredentials && await this.legacyCredentials.hasCredential(raw));
   }
 
   async logout(payload: unknown): Promise<{ success: true; message: "logout"; revoked: boolean }> {
     this.assertEnabled();
     const parsed = parseBody(logoutSchema, payload ?? {});
+    if(parsed.refreshToken&&this.legacySignup&&await this.legacySignup.hasCredential(parsed.refreshToken)){
+      const signupRevoked=await this.legacySignup.revoke(parsed.refreshToken);
+      // Out-of-band classification corruption must not leave another known family live after successful logout.
+      const nativeRevoked=await this.sessions.revoke(parsed.refreshToken);
+      const legacyRevoked=this.legacyCredentials&&await this.legacyCredentials.hasCredential(parsed.refreshToken)?await this.legacyCredentials.revoke(parsed.refreshToken):false;
+      return {success:true,message:"logout",revoked:signupRevoked||nativeRevoked||legacyRevoked};
+    }
     const revoked = this.config.dataSource === "identity" && parsed.refreshToken && this.legacyCredentials && !await this.sessions.hasRefreshToken(parsed.refreshToken) && await this.legacyCredentials.hasCredential(parsed.refreshToken)
       ? await this.legacyCredentials.revoke(parsed.refreshToken) : await this.sessions.revoke(parsed.refreshToken);
 

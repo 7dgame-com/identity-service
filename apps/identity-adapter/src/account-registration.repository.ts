@@ -257,6 +257,12 @@ export class AccountRegistrationRepository implements OnModuleDestroy {
     );
   }
 
+  /** Reuse the native account/role/profile policy inside an atomic provider-proof transaction. */
+  async createUserInTransaction(connection:PoolConnection,input:NativeRegisterInput):Promise<NativeRegisteredUser>{
+    this.assertIndependent();
+    try{return await this.insertUser(connection,input);}catch(error){throw normalizeWriteError(error);}
+  }
+
   private async insertUser(connection: PoolConnection, input: NativeRegisterInput): Promise<NativeRegisteredUser> {
     const username = input.username.trim();
     const email = input.email?.trim().toLowerCase() || null;

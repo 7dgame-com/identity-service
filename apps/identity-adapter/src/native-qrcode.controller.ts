@@ -31,5 +31,5 @@ export class NativeQrcodeController {
 }
 
 function context(request: NativeRequest & { ip?: string }): RequestContext {
-  return { ip: request.ip, userAgent: typeof request.headers["user-agent"] === "string" ? request.headers["user-agent"] : null };
+  return { idempotencyKey:typeof request.headers["idempotency-key"]==="string"?request.headers["idempotency-key"]:undefined, ip: request.ip, userAgent: typeof request.headers["user-agent"] === "string" ? request.headers["user-agent"] : null };
 }

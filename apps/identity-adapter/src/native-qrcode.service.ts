@@ -1,11 +1,12 @@
 import { createHash, randomBytes } from "node:crypto";
-import { BadRequestException, ConflictException, Injectable, NotFoundException, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
+import { BadRequestException, ConflictException, Injectable, Optional, NotFoundException, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
 import { NativeIdentityService, NativeRequest } from "./native-identity.service.js";
 import { NativeQrcodeRepository } from "./native-qrcode.repository.js";
 import { IdentityWechatOAuthService } from "./identity-wechat-oauth.service.js";
 import { AuthTokenResponse, RequestContext, TokenIssuanceService } from "./token-issuance.service.js";
 import { AccountRegistrationService } from "./account-registration.service.js";
 import { denyDeviceSnCredentialDerivation } from "./device-sn-source.js";
+import { LegacyWechatSignupRepository } from "./legacy-wechat-signup.repository.js";
 import { loginCodeContext } from "./login-code-context.js";
 
 export const LOGIN_CODE_LIFETIME_SECONDS = 60;
@@ -15,7 +16,8 @@ const WECHAT_SCENE_LIFETIME_SECONDS = 6 * 24 * 3600;
 export class NativeQrcodeService {
   constructor(private readonly repository: NativeQrcodeRepository, private readonly native: NativeIdentityService,
     private readonly tokens: TokenIssuanceService, private readonly wechat: IdentityWechatOAuthService,
-    private readonly registration: AccountRegistrationService) {}
+    private readonly registration: AccountRegistrationService,
+    @Optional() private readonly legacySignup?:LegacyWechatSignupRepository) {}
 
   get enabled() { return this.native.enabled; }
   get internalToken() { return this.native.config.tokenIssuance.internalToken; }
@@ -58,6 +60,7 @@ export class NativeQrcodeService {
   async redeemLoginCode(input: string, context: RequestContext = {}): Promise<AuthTokenResponse> {
     this.assertEnabled();
     const code = normalizeLoginCode(input);
+    if(code&&await this.legacySignup?.hasCredential(code))throw new UnauthorizedException("A signup credential is not a login code.");
     const stored = code ? await this.repository.loginCode(digest(code)) : null;
     if (!stored || stored.expiresAt <= this.now()) throw new UnauthorizedException("Login code is invalid or expired.");
     // TokenIssuance rechecks current account status and creates a new session.
@@ -100,6 +103,7 @@ export class NativeQrcodeService {
 
   async wechatStatus(input: unknown) {
     this.assertEnabled(); const token = requiredString(input, "token", 128);
+    if(this.legacySignup&&await this.legacySignup.hasCredential(token)){await this.legacySignup.pending(token);return {success:true,message:"signup",token};}
     const scene = await this.activeWechatScene(token);
     if (!scene.openId || !scene.profile || !scene.providerAppId) return { success: false, message: "pending" };
     const resolved = await this.resolveWechat(scene);
@@ -110,6 +114,7 @@ export class NativeQrcodeService {
 
   async wechatLogin(payload: unknown, context: RequestContext = {}) {
     this.assertEnabled(); const token = requiredString(object(payload).token, "token", 128);
+    if(this.legacySignup&&await this.legacySignup.hasCredential(token))throw new UnauthorizedException("微信注册凭据不能用于登录");
     const scene = await this.activeWechatScene(token);
     if (!scene.openId || !scene.profile || !scene.providerAppId) throw new UnauthorizedException("微信扫码尚未完成");
     const resolved = await this.resolveWechat(scene);
@@ -121,6 +126,7 @@ export class NativeQrcodeService {
     this.assertEnabled();
     const body = object(payload);
     let token = requiredString(body.token, "token", 255);
+    if(this.legacySignup&&await this.legacySignup.hasCredential(token))return this.legacySignup.redeem("register",{...body,token},{...context,idempotencyKey:idempotencyKey??context.idempotencyKey});
     // Older signup pages retain the original scene instead of the polled signup token.
     let active = await this.repository.hasActiveRegistration(digest(token), this.now());
     const scene = active ? null : await this.repository.wechatScene(digest(token));
@@ -152,6 +158,8 @@ export class NativeQrcodeService {
 
   async wechatBinding(payload: unknown, context: RequestContext = {}) {
     this.assertEnabled();
+    const body=object(payload),token=requiredString(body.token,"token",255);
+    if(this.legacySignup&&await this.legacySignup.hasCredential(token)){const issued=await this.legacySignup.redeem("bind",{...body,token},context);return {access_token:issued.token.accessToken,code:20000};}
     const bound = await this.wechat.bindExisting(payload);
     const issued = await this.tokens.issueRegisteredUser(bound.user, context, bound.expectedPasswordHash);
     return { access_token: issued.token.accessToken, code: 20000 };

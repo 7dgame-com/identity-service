@@ -1,4 +1,4 @@
-import { Controller, Get, Optional, Post, Req, Res } from "@nestjs/common";
+import { Controller, Get, HttpCode, Optional, Post, Req, Res } from "@nestjs/common";
 import { NativeQrcodeService } from "./native-qrcode.service.js";
 import { loadConfig } from "./config.js";
 import { AccountLifecycleScope, AccountLifecycleService } from "./account-lifecycle.service.js";
@@ -23,6 +23,7 @@ export class AccountLifecycleController {
   }
 
   @Post("v1/wechat/register")
+  @HttpCode(200)
   wechatRegister(@Req() request: AccountLifecycleExpressRequest, @Res({ passthrough: true }) response: AccountLifecycleExpressResponse) {
     if (loadConfig().dataSource === "identity" && this.qrcode) return this.qrcode.wechatRegister(request.body, {}, typeof request.headers["idempotency-key"] === "string" ? request.headers["idempotency-key"] : undefined);
     return this.forward("register", request, response, "/v1/wechat/register");

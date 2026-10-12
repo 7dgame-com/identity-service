@@ -219,6 +219,8 @@ export async function importLegacySessions(
         if (!options.assertDeviceSnAuthorized) throw new Error("A current device authorization check is required for active device sessions.");
         await options.assertDeviceSnAuthorized(row.deviceSnId!, row.userId);
       }
+      const [signupCredentials]=await target.execute<RowDataPacket[]>(`SELECT credential_hash FROM identity_legacy_wechat_signup_credentials WHERE credential_hash=?${lock}`,[row.refreshHash]);
+      if(signupCredentials.length)throw new Error("Refresh credential conflicts with an imported legacy signup classification.");
       const [legacyCredentials] = await target.execute<RowDataPacket[]>(
         `SELECT credential_hash FROM identity_legacy_refresh_credentials WHERE credential_hash=?${lock}`, [row.refreshHash]);
       if (legacyCredentials.length) throw new Error("Refresh credential conflicts with an imported Yii AR credential classification.");

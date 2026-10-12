@@ -137,6 +137,7 @@ jobs:
           apps/identity-adapter/test/apple-identity.mysql.spec.ts
           apps/identity-adapter/test/legacy-session-import.mysql.spec.ts
           apps/identity-adapter/test/legacy-refresh-credential.mysql.spec.ts
+          apps/identity-adapter/test/legacy-wechat-signup.mysql.spec.ts
           apps/identity-adapter/test/legacy-challenge-import.mysql.spec.ts
           apps/identity-adapter/test/legacy-qrcode-import.mysql.spec.ts
           apps/identity-adapter/test/native-qrcode-mysql.spec.ts

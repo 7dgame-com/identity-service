@@ -4,6 +4,7 @@ import mysql, { Pool, PoolConnection, ResultSetHeader, RowDataPacket } from "mys
 import { loadConfig } from "./config.js";
 import { assertDeviceSnAccount, deviceSnSource } from "./device-sn-source.js";
 import { legacyRefreshCredentialSchema } from "./legacy-refresh-credential-schema.js";
+import { legacyWechatSignupSchema } from "./legacy-wechat-signup-schema.js";
 import { revokeLegacyRefreshCredentialsInTransaction, revokeLegacyRefreshFamilyInTransaction } from "./legacy-refresh-credential-revocation.js";
 
 export class InvalidRefreshTokenError extends Error {
@@ -411,6 +412,7 @@ export class IdentitySessionRepository implements OnModuleDestroy {
       user_id BIGINT PRIMARY KEY, revoked_before DATETIME(3) NOT NULL
     ) ENGINE=InnoDB`);
     await pool.query(legacyRefreshCredentialSchema);
+    await pool.query(legacyWechatSignupSchema);
     await pool.query(`CREATE TABLE IF NOT EXISTS identity_oauth_session_bindings (
       session_id VARCHAR(128) PRIMARY KEY, client_id VARCHAR(128) NOT NULL, scopes_json JSON NOT NULL,
       legacy_subject VARCHAR(128) NULL, KEY oauth_client (client_id)
