@@ -4,7 +4,7 @@ import { verifyImportedYii3AccessToken } from "./identity-yii3-token-verifier.js
 import { verifyImportedA1AccessToken } from "./identity-a1-token-verifier.js";
 
 /** Explicit, time-bounded trust for credentials issued before the cutover. */
-export function verifyImportedAccessToken(token: string): Record<string, unknown> {
+export function verifyImportedAccessToken(token: string, atMs = Date.now()): Record<string, unknown> {
   // Each historical signer has independent trust. The unverified shape only
   // selects one strict verifier; failure never falls through to another key.
   const parts = token.split(".");
@@ -13,7 +13,7 @@ export function verifyImportedAccessToken(token: string): Record<string, unknown
   if (header?.alg === "HS256") {
     const claims = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
     return claims && typeof claims === "object" && Object.hasOwn(claims, "iss")
-      ? verifyImportedA1AccessToken(token) : verifyImportedYii3AccessToken(token);
+      ? verifyImportedA1AccessToken(token, atMs) : verifyImportedYii3AccessToken(token, atMs);
   }
   const filename = process.env.IDENTITY_LEGACY_JWT_CONFIG_FILE;
   if (!filename) throw new Error("legacy token trust is not configured");
@@ -21,7 +21,8 @@ export function verifyImportedAccessToken(token: string): Record<string, unknown
   const entries: unknown = JSON.parse(readFileSync(filename, "utf8"));
   if (!Array.isArray(entries)) throw new Error("invalid legacy token trust configuration");
   if (header.alg !== "ES256" || !payload || typeof payload !== "object") throw new Error("invalid legacy token algorithm");
-  const now = Math.floor(Date.now() / 1000);
+  if (!Number.isSafeInteger(atMs) || atMs <= 0) throw new Error("invalid legacy verification time");
+  const now = atMs / 1000;
   if (typeof payload.exp !== "number" || !Number.isFinite(payload.exp) || payload.exp <= now || typeof payload.iat !== "number" || !Number.isFinite(payload.iat)
       || payload.iat > now + 10 || (payload.nbf !== undefined && (!Number.isFinite(payload.nbf) || payload.nbf > now + 10))) {
     throw new Error("legacy token time invalid");

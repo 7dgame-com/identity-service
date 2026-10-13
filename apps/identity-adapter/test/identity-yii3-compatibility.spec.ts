@@ -226,7 +226,7 @@ describe("Yii3 internal controller authorization", () => {
     await controller.loginCode("bridge-internal-key-32-characters-long", login, { ip: "::ffff:192.0.2.42", socket: { remoteAddress: "198.51.100.9" } }, "browser");
     await controller.refresh("bridge-internal-key-32-characters-long", refresh, { socket: { remoteAddress: "::ffff:198.51.100.9" } }, "browser", "operation-id");
     expect(service.loginCode).toHaveBeenCalledExactlyOnceWith(login, { ip: "192.0.2.42", userAgent: "browser" });
-    expect(service.refresh).toHaveBeenCalledExactlyOnceWith(refresh, { ip: "198.51.100.9", userAgent: "browser", idempotencyKey: "operation-id" });
+    expect(service.refresh).toHaveBeenCalledExactlyOnceWith(refresh, { ip: "198.51.100.9", userAgent: "browser", idempotencyKey: "operation-id", idempotencyKeyBytes: Buffer.from("operation-id", "latin1") });
   });
 });
 

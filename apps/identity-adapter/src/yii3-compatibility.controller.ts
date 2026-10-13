@@ -1,3 +1,4 @@
+import { refreshHeaderContext } from "./refresh-request-context.js";
 import { Body, Controller, Headers, Post, Req, UnauthorizedException } from "@nestjs/common";
 import { timingSafeEqual } from "node:crypto";
 import { clientIpFromRequest } from "./auth.controller.js";
@@ -9,13 +10,13 @@ export class Yii3CompatibilityController {
   private readonly config=loadConfig();
   constructor(private readonly service:Yii3CompatibilityService){}
   @Post("login-code") loginCode(@Headers("x-identity-internal-token") key:string|undefined,@Body() body:unknown,
-    @Req() request:{ip?:string;socket?:{remoteAddress?:string|null}},@Headers("user-agent") userAgent?:string){
+    @Req() request:{rawHeaders?:string[];ip?:string;socket?:{remoteAddress?:string|null}},@Headers("user-agent") userAgent?:string){
     this.authorize(key);return this.service.loginCode(body,{ip:clientIpFromRequest(request),userAgent});
   }
   @Post("refresh") refresh(@Headers("x-identity-internal-token") key:string|undefined,@Body() body:unknown,
-    @Req() request:{ip?:string;socket?:{remoteAddress?:string|null}},@Headers("user-agent") userAgent?:string,
+    @Req() request:{rawHeaders?:string[];ip?:string;socket?:{remoteAddress?:string|null}},@Headers("user-agent") userAgent?:string,
     @Headers("idempotency-key") idempotencyKey?:string){
-    this.authorize(key);return this.service.refresh(body,{ip:clientIpFromRequest(request),userAgent,idempotencyKey});
+    this.authorize(key);return this.service.refresh(body,{ip:clientIpFromRequest(request),userAgent,idempotencyKey,...refreshHeaderContext(idempotencyKey,request)});
   }
   private authorize(key:string|undefined){
     const expected=this.config.tokenIssuance.internalToken;

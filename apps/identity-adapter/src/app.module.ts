@@ -79,6 +79,7 @@ import { ProfileWriteService } from "./profile-write.service.js";
 import { TelemetryInterceptor } from "./telemetry.interceptor.js";
 import { TokenIssuanceService } from "./token-issuance.service.js";
 import { LegacyWechatSignupRepository } from "./legacy-wechat-signup.repository.js";
+import { LegacyRefreshGraphRepository } from "./legacy-refresh-graph.repository.js";
 import { LegacyRefreshCredentialRepository } from "./legacy-refresh-credential.repository.js";
 import { UsageBillingController } from "./usage-billing.controller.js";
 import { UsageBillingRepository } from "./usage-billing.repository.js";
@@ -116,6 +117,7 @@ import { UsageBillingService } from "./usage-billing.service.js";
   providers: [
     IdentityActivationService,
     LegacyRefreshCredentialRepository,
+    LegacyRefreshGraphRepository,
     LegacyWechatSignupRepository,
     Yii3CompatibilityService,
     LegacyAdminService,

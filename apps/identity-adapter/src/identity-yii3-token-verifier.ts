@@ -81,7 +81,7 @@ function phpTrim(bytes: Buffer): Buffer {
  * Opt-in, time-bounded verification of JwtService.php's original HS256 access tokens.
  * The caller must still check live private-account status, roles, revocation cutoff and SN provenance.
  */
-export function verifyImportedYii3AccessToken(token: string): Record<string, unknown> {
+export function verifyImportedYii3AccessToken(token: string, atMs = Date.now()): Record<string, unknown> {
   try {
     const configFile = process.env.IDENTITY_LEGACY_YII3_JWT_CONFIG_FILE;
     if (!configFile || typeof token !== "string" || token.length > MAX_TOKEN_BYTES) reject();
@@ -91,7 +91,8 @@ export function verifyImportedYii3AccessToken(token: string): Record<string, unk
       || trust.secretFile.length === 0 || trust.secretFile.length > 4096 || trust.secretFile.includes("\0")
       || !positiveId(trust.maxAccessTtlSeconds) || trust.maxAccessTtlSeconds > MAX_ACCESS_TTL_SECONDS) reject();
     const issuedBefore = isoSeconds(trust.issuedBefore), acceptUntil = isoSeconds(trust.acceptUntil);
-    const now = Date.now() / 1000;
+    if (!Number.isSafeInteger(atMs) || atMs <= 0) reject();
+    const now = atMs / 1000;
     if (issuedBefore > acceptUntil || now >= acceptUntil) reject();
 
     const parts = token.split(".");

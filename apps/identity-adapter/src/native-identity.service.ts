@@ -14,6 +14,7 @@ import { assertAllocatorReady } from "./identity-allocator-state.js";
 import { activateIdentityAuthority } from "./migration-state.js";
 import { deviceSnSource } from "./device-sn-source.js";
 import { revokeLegacyRefreshCredentialsInTransaction } from "./legacy-refresh-credential-revocation.js";
+import { LegacyRefreshGraphRepository } from "./legacy-refresh-graph.repository.js";
 import { IdentityActivationService } from "./identity-activation.service.js";
 
 export interface NativeRequest { headers: Record<string, string | string[] | undefined>; body?: unknown; }
@@ -26,7 +27,7 @@ export class NativeIdentityService implements OnModuleDestroy, OnApplicationBoot
   readonly config = loadConfig();
   private readonly pool: Pool | null;
   constructor(private readonly reader: LegacyIdentityReader, private readonly jwt: JwtIssuerService,
-    private readonly sessions: IdentitySessionRepository, @Optional() private readonly activation?: IdentityActivationService) {
+    private readonly sessions: IdentitySessionRepository, @Optional() private readonly activation?: IdentityActivationService, @Optional() private readonly legacyGraph?: LegacyRefreshGraphRepository) {
     const db = this.config.identityDb;
     this.pool = this.enabled && db.host && db.user ? mysql.createPool({ host: db.host, port: db.port,
       database: db.name, user: db.user, password: db.password, connectionLimit: 10, timezone: "Z" }) : null;
@@ -79,7 +80,7 @@ export class NativeIdentityService implements OnModuleDestroy, OnApplicationBoot
     if (source) await this.reader.assertDeviceSnAuthorized(source.deviceSnId, claims.uid, false);
     const user = await this.subject(claims.uid);
     const payload = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString("utf8"));
-    if (user.status !== 10 || await this.sessions.isAccessRevoked(user.id, Number(payload.iat), claims.sessionId, claims.importedLegacy)) {
+    if (user.status !== 10 || await this.legacyGraph?.isAccessRevoked(token,user.id) || await this.sessions.isAccessRevoked(user.id, Number(payload.iat), claims.sessionId, claims.importedLegacy)) {
       throw new UnauthorizedException({ code: "SESSION_REVOKED", message: "登录已失效" });
     }
     return source ? { ...user, authContext: { auth_method: source.authMethod, device_sn_id: source.deviceSnId } } : user;
@@ -97,7 +98,7 @@ export class NativeIdentityService implements OnModuleDestroy, OnApplicationBoot
       claims=this.jwt.verifyAccessToken(token);
       payload=JSON.parse(Buffer.from(token.split(".")[1],"base64url").toString("utf8"));
     } catch { throw new UnauthorizedException(); }
-    if(claims.uid!==userId || (claims.sessionId && await this.sessions.isOAuthBound(claims.sessionId,connection))
+    if(claims.uid!==userId || await this.legacyGraph?.isAccessRevoked(token,userId,connection) || (claims.sessionId && await this.sessions.isOAuthBound(claims.sessionId,connection))
       || await this.sessions.isAccessRevoked(userId,Number(payload.iat),claims.sessionId,claims.importedLegacy,connection))throw new UnauthorizedException();
     const source = deviceSnSource(claims.authMethod, claims.deviceSnId);
     if (source) await this.reader.assertDeviceSnAuthorized(source.deviceSnId, userId, false);

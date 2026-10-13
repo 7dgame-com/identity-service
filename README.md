@@ -593,3 +593,5 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
 `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` when a provider requires an explicit trace
 endpoint. Optional headers can be supplied with
 `OTEL_EXPORTER_OTLP_HEADERS` or `OTEL_EXPORTER_OTLP_TRACES_HEADERS`.
+
+Reviewed complete-response Y1/AR migration is an optional, default-off protocol with separate explicit schema and strict source-security/MAC/JWT checks. See [the migration contract](docs/legacy-refresh-graph-migration.md) for source exporter requirements, consumer scopes, protected dry-run/apply, original retry deadlines and wrapper integration. Local CI success does not establish a final drained source snapshot or a live cutover.

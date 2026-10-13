@@ -86,7 +86,7 @@ function issuer(value: unknown): value is string {
  * METHOD_FILE / Lcobucci InMemory::file uses all key bytes, without PHP trim or base64 decoding.
  * Live private-account status, roles and revocation cutoffs remain the caller's responsibility.
  */
-export function verifyImportedA1AccessToken(token: string): Record<string, unknown> {
+export function verifyImportedA1AccessToken(token: string, atMs = Date.now()): Record<string, unknown> {
   try {
     const configFile = process.env.IDENTITY_LEGACY_A1_JWT_CONFIG_FILE;
     if (!configFile || typeof token !== "string" || token.length > MAX_TOKEN_BYTES) reject();
@@ -97,7 +97,8 @@ export function verifyImportedA1AccessToken(token: string): Record<string, unkno
       || !Array.isArray(trust.issuers) || trust.issuers.length < 1 || trust.issuers.length > 20
       || !trust.issuers.every(issuer) || new Set(trust.issuers).size !== trust.issuers.length) reject();
     const issuedBefore = isoSeconds(trust.issuedBefore), acceptUntil = isoSeconds(trust.acceptUntil);
-    const now = Date.now() / 1000;
+    if (!Number.isSafeInteger(atMs) || atMs <= 0) reject();
+    const now = atMs / 1000;
     if (issuedBefore > acceptUntil || now >= acceptUntil) reject();
 
     const parts = token.split(".");

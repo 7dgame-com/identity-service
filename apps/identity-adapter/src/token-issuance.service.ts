@@ -10,6 +10,7 @@ import { LoginAuditService } from "./login-audit.service.js";
 import type { PoolConnection, RowDataPacket } from "mysql2/promise";
 import { assertDeviceSnAccount, deviceSnSource, throwDeviceSnFailure, type DeviceSnSource } from "./device-sn-source.js";
 import { LegacyWechatSignupRepository } from "./legacy-wechat-signup.repository.js";
+import { LegacyRefreshGraphRepository, type LegacyFullResponse, type GraphEndpoint } from "./legacy-refresh-graph.repository.js";
 import { LegacyRefreshCredentialRepository } from "./legacy-refresh-credential.repository.js";
 
 const loginSchema = z.object({
@@ -35,10 +36,12 @@ export interface RequestContext {
   ip?: string | null;
   userAgent?: string | null;
   idempotencyKey?: string;
+  idempotencyKeyBytes?: Buffer;
 }
 
 export interface AuthTokenResponse {
   success: true;
+  legacyResponse?: LegacyFullResponse;
   message: "login" | "refresh" | "register";
   token: {
     token: string;
@@ -61,7 +64,8 @@ export class TokenIssuanceService {
     private readonly jwtIssuer: JwtIssuerService,
     private readonly loginAudit: LoginAuditService,
     @Optional() private readonly legacyCredentials?: LegacyRefreshCredentialRepository,
-    @Optional() private readonly legacySignup?: LegacyWechatSignupRepository
+    @Optional() private readonly legacySignup?: LegacyWechatSignupRepository,
+    @Optional() private readonly legacyGraph?: LegacyRefreshGraphRepository
   ) {}
 
   async login(payload: unknown, context: RequestContext = {}): Promise<AuthTokenResponse> {
@@ -85,12 +89,13 @@ export class TokenIssuanceService {
     return response;
   }
 
-  async refresh(payload: unknown, context: RequestContext = {}, consumer: "server" | "a1" = "server"): Promise<AuthTokenResponse> {
+  async refresh(payload: unknown, context: RequestContext = {}, consumer: "server" | "a1" | "yii3" = "server", endpoint?: GraphEndpoint): Promise<AuthTokenResponse> {
     this.assertEnabled();
     const parsed = parseBody(refreshSchema, payload);
+    if(this.config.dataSource === "identity" && this.legacyGraph && await this.legacyGraph.hasCredential(parsed.refreshToken)) return this.legacyGraph.redeem(parsed.refreshToken,context,consumer,endpoint??(consumer==="yii3"?"y1-refresh-pair":"/v1/auth/refresh"));
     if(await this.legacySignup?.hasCredential(parsed.refreshToken))throw new UnauthorizedException("A signup credential is not a refresh token.");
     if (this.config.dataSource === "identity" && this.legacyCredentials && !await this.sessions.hasRefreshToken(parsed.refreshToken) && await this.legacyCredentials.hasCredential(parsed.refreshToken)) {
-      return this.legacyCredentials.redeem(parsed.refreshToken, context, consumer);
+      return this.legacyCredentials.redeem(parsed.refreshToken, context, consumer === "yii3" ? "server" : consumer);
     }
 
     let source: DeviceSnSource | null = null;
@@ -135,12 +140,13 @@ export class TokenIssuanceService {
   }
 
   async hasRefreshCredential(raw: string): Promise<boolean> {
-    return !!(this.legacySignup&&await this.legacySignup.hasCredential(raw)) || await this.sessions.hasRefreshToken(raw) || !!(this.legacyCredentials && await this.legacyCredentials.hasCredential(raw));
+    return !!(this.legacyGraph&&await this.legacyGraph.hasCredential(raw)) || !!(this.legacySignup&&await this.legacySignup.hasCredential(raw)) || await this.sessions.hasRefreshToken(raw) || !!(this.legacyCredentials && await this.legacyCredentials.hasCredential(raw));
   }
 
   async logout(payload: unknown): Promise<{ success: true; message: "logout"; revoked: boolean }> {
     this.assertEnabled();
     const parsed = parseBody(logoutSchema, payload ?? {});
+    if(parsed.refreshToken&&this.legacyGraph&&await this.legacyGraph.hasCredential(parsed.refreshToken)) return {success:true,message:"logout",revoked:await this.legacyGraph.revoke(parsed.refreshToken)};
     if(parsed.refreshToken&&this.legacySignup&&await this.legacySignup.hasCredential(parsed.refreshToken)){
       const signupRevoked=await this.legacySignup.revoke(parsed.refreshToken);
       // Out-of-band classification corruption must not leave another known family live after successful logout.
