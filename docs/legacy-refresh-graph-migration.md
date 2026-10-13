@@ -52,7 +52,7 @@ The production CLI is fixed to `10.206.0.5:3306/xrugc_identity_dev` and `identit
 
 ## Authenticated bridge response
 
-`POST /internal/yii3/refresh` retains the existing auth-scoped internal token and input `{refreshToken,allowLoginCode}`. A1 wrappers additionally send fixed `consumer:"a1",allowLoginCode:false,sourceEndpoint:"/v1/auth/refresh"|"/v1/common/report"`. Y1 wrappers omit consumer and may send their fixed `/v1/auth/refresh` or `/v2/auth/refresh-token`; both select the actual shared source scope. Consumer/scope never come from public request bodies and never change JWT audience. Public `/v1/auth/refresh` always uses the server scope.
+`POST /internal/yii3/refresh` retains the existing auth-scoped internal token and input `{refreshToken,allowLoginCode}`. A1 wrappers additionally send fixed `consumer:"a1",allowLoginCode:false,sourceEndpoint:"/v1/auth/refresh"|"/v1/common/report"`. Y1 wrappers omit consumer and may send their fixed `/v1/auth/refresh` or `/v2/auth/refresh-token`; both select the actual shared source scope. Consumer/scope never come from public request bodies and never change JWT audience. Public `/v1/auth/refresh` derives Y1 shared-pair scope only from a known private graph protocol; AR and ordinary credentials keep server scope. Public consumer/sourceEndpoint fields are ignored, and a known raw or wrapped revoked credential cannot fall through to a login code.
 
 A graph result preserves the existing `{authTokens,subject}` plus:
 

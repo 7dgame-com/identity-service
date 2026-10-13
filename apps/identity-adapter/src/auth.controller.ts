@@ -36,13 +36,13 @@ export class AuthController {
       const normalized = normalizeLoginCode(candidate);
       const knownRaw = await this.tokenIssuance.hasRefreshCredential(candidate);
       if (knownRaw || (normalized !== candidate && normalized && await this.tokenIssuance.hasRefreshCredential(normalized))) {
-        return this.tokenIssuance.refresh({ refreshToken: knownRaw ? candidate : normalized }, {
+        return this.tokenIssuance.publicRefresh({ refreshToken: knownRaw ? candidate : normalized }, {
           idempotencyKey, ...requestContext, ip: clientIpFromRequest(request), userAgent: userAgent ?? null });
       }
       if (!this.qrcode) throw new Error("Native QR service is not available");
       return this.qrcode.redeemLoginCode(candidate, {idempotencyKey,...requestContext,ip:clientIpFromRequest(request),userAgent:userAgent??null});
     }
-    return this.tokenIssuance.refresh(body, {
+    return this.tokenIssuance.publicRefresh(body, {
       idempotencyKey,
       ...requestContext,
       ip: clientIpFromRequest(request),

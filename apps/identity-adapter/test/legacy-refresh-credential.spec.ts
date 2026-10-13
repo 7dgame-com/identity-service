@@ -119,10 +119,10 @@ describe("legacy credential routing stays scoped", () => {
     expect(tokens.refresh).toHaveBeenLastCalledWith({ refreshToken: token }, {}, "a1");
   });
   it("keeps public refresh on the default consumer even if its body asks for A1", async () => {
-    const tokens = { refresh: vi.fn(async () => ({})) };
+    const tokens = { publicRefresh: vi.fn(async () => ({})) };
     const controller = new AuthController(tokens as unknown as TokenIssuanceService);
     await controller.refresh({ refreshToken: token, consumer: "a1" }, {});
-    expect(tokens.refresh).toHaveBeenCalledWith({ refreshToken: token, consumer: "a1" }, { idempotencyKey: undefined, ip: null, userAgent: null });
-    expect(tokens.refresh.mock.calls[0]).toHaveLength(2);
+    expect(tokens.publicRefresh).toHaveBeenCalledWith({ refreshToken: token, consumer: "a1" }, { idempotencyKey: undefined, ip: null, userAgent: null });
+    expect(tokens.publicRefresh.mock.calls[0]).toHaveLength(2);
   });
 });

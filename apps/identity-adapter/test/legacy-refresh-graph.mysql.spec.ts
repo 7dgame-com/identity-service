@@ -136,9 +136,11 @@ describe.skipIf(process.env.IDENTITY_TEST_MYSQL!=="1")("strict full-response gra
     await source.execute("INSERT INTO user(id,username,password_hash,auth_key,status) VALUES (42,'private-user',?,?,10)",[password,auth]);await source.query("INSERT INTO auth_assignment(item_name,user_id) VALUES ('user','42')");
     await db.query("DELETE FROM auth_assignment;DELETE FROM user;DELETE FROM auth_item");
     await importIdentityAccounts(source,db,{apply:true,importKey:"graph-http-baseline"});
-    const a=input(),y=input("yii3"),byteInput=input();
+    const a=input(),y=input("yii3"),yNone=input("yii3"),yOldNone=input("yii3",true,-10000),byteInput=input();
+    for(const item of [yNone,yOldNone]){item.graph.replays[0].requestHash=null;item.graph.replays[0].sourceEncryptedResponse=sourceCipher("yii3",item.graph.replays[0]);}
     const byteHeader=String.fromCharCode(233)+"x".repeat(255);byteInput.graph.replays[0].requestHash=graphHash(Buffer.from(byteHeader,"latin1"));byteInput.graph.replays[0].sourceEncryptedResponse=sourceCipher("ar",byteInput.graph.replays[0]);
-    await load(a);await load(y);await load(byteInput);
+    await load(a);await load(y);await load(yNone);await load(yOldNone);await load(byteInput);
+    await db.execute("INSERT INTO identity_login_codes(code_hash,user_id,issued_at,expires_at,context_json) VALUES (?,42,UNIX_TIMESTAMP(),UNIX_TIMESTAMP()+60,JSON_OBJECT())",[graphHash(y.rawP)]);
     fence=await mysql.createConnection({...options,database:dbName});const inventory=await readSourceAllocatorInventory(source);
     const review={version:1 as const,sourceDatabase:sourceName,targetDatabase:dbName,sourceServerUuid:inventory.serverUuid,importKey:"graph-http-baseline",writersDrainedAt:new Date().toISOString(),finalSyncSha256:allocatorDigest({fixture:"source account import completed"}),referenceReviewSha256:inventory.referenceReviewSha256};
     await finalizeAllocator({source,target:db,fence,review,reviewSha256:allocatorDigest(review),apply:true});
@@ -157,6 +159,11 @@ describe.skipIf(process.env.IDENTITY_TEST_MYSQL!=="1")("strict full-response gra
     const old=await call({refreshToken:a.rawP,allowLoginCode:false,consumer:"a1",sourceEndpoint:"/v1/auth/refresh"});expect(old.status).toBe(201);expect(old.body.legacyResponse.body).toEqual(a.graph.replays[0].response);expect(old.body.authTokens.expires).toMatch(/Z$/);expect(old.body.subject.id).toBe(42);
     for(const route of ["/v1/auth/refresh","/v2/auth/refresh-token"]){const r=await call({refreshToken:y.rawP,allowLoginCode:false,sourceEndpoint:route});expect(r.status).toBe(201);expect(r.body.legacyResponse).toMatchObject({consumer:"yii3",endpoint:"y1-refresh-pair",body:y.graph.replays[0].response});}
     expect((await call({refreshToken:y.rawP,allowLoginCode:false,sourceEndpoint:"/v1/common/report"})).status).toBe(400);
+    const publicCall=async(raw:string,idempotencyKey?:string)=>{const response=await fetch(`http://127.0.0.1:${app.getHttpServer().address().port}/v1/auth/refresh`,{method:"POST",headers:{"content-type":"application/json",...(idempotencyKey===undefined?{}:{"idempotency-key":idempotencyKey})},body:JSON.stringify({refreshToken:raw,consumer:"a1",sourceEndpoint:"/v1/common/report"})});return {status:response.status,body:await response.json() as any};};
+    for(const raw of [y.rawP,`web_${y.rawP}`]){const result=await publicCall(raw,"retry-key");expect(result.status).toBe(201);expect(result.body.legacyResponse).toMatchObject({consumer:"yii3",endpoint:"y1-refresh-pair",body:y.graph.replays[0].response});}
+    const noKey=await publicCall(yNone.rawP);expect(noKey.status).toBe(201);expect(noKey.body.legacyResponse.body).toEqual(yNone.graph.replays[0].response);
+    expect((await publicCall(yOldNone.rawP)).status).toBe(401);expect((await publicCall("web_unknown-qr-code")).status).toBe(401);expect(await count("identity_refresh_sessions")).toBe(0);
+    await repository.revoke(y.rawP);expect((await publicCall(`web_${y.rawP}`,"retry-key")).status).toBe(401);expect(await count("identity_refresh_sessions")).toBe(0);
     const pub=await fetch(`http://127.0.0.1:${app.getHttpServer().address().port}/v1/auth/refresh`,{method:"POST",headers:{"content-type":"application/json","idempotency-key":"server-http"},body:JSON.stringify({refreshToken:a.rawP,consumer:"a1",sourceEndpoint:"/v1/common/report"})});expect(pub.status).toBe(201);expect((await pub.json() as any).legacyResponse.consumer).toBe("server");
     expect((await call({refreshToken:a.rawP,allowLoginCode:false,consumer:"a1",sourceEndpoint:"/v1/auth/refresh"})).status).toBe(401);
    }finally{await app?.close();await fence?.end();await source?.end();await admin.query(`DROP DATABASE IF EXISTS \`${sourceName}\``);await rm(build,{recursive:true,force:true});}

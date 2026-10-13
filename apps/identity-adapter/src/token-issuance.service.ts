@@ -89,6 +89,16 @@ export class TokenIssuanceService {
     return response;
   }
 
+  /** Public callers select no consumer; only retained private provenance may do so. */
+  async publicRefresh(payload: unknown, context: RequestContext = {}): Promise<AuthTokenResponse> {
+    this.assertEnabled();
+    const parsed = parseBody(refreshSchema, payload);
+    const protocol = this.config.dataSource === "identity" ? await this.legacyGraph?.protocol(parsed.refreshToken) : null;
+    return protocol === "yii3"
+      ? this.refresh(parsed, context, "yii3", "y1-refresh-pair")
+      : this.refresh(parsed, context, "server", "/v1/auth/refresh");
+  }
+
   async refresh(payload: unknown, context: RequestContext = {}, consumer: "server" | "a1" | "yii3" = "server", endpoint?: GraphEndpoint): Promise<AuthTokenResponse> {
     this.assertEnabled();
     const parsed = parseBody(refreshSchema, payload);
