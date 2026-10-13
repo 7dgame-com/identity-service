@@ -1,3 +1,4 @@
+import { withAllocatorImportFence, fenceAllocatorImport } from "./identity-allocator-state.js";
 import { Injectable, OnModuleDestroy } from "@nestjs/common";
 import mysql, { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { loadConfig } from "./config.js";
@@ -450,6 +451,7 @@ export class IamRepository implements OnModuleDestroy {
   async upsertIdentityUserShadow(input: IdentityUserShadowInput): Promise<void> {
     const pool = this.requirePool();
     await this.ensureSchema();
+    return withAllocatorImportFence(pool,async pool=>{
 
     await pool.execute(
       `INSERT INTO identity_users
@@ -498,11 +500,14 @@ export class IamRepository implements OnModuleDestroy {
         })
       ]
     );
+
+    });
   }
 
   async upsertIdentityUserProfileShadow(input: IdentityUserProfileShadowInput): Promise<void> {
     const pool = this.requirePool();
     await this.ensureSchema();
+    return withAllocatorImportFence(pool,async pool=>{
     const status = input.status ?? "active";
 
     await pool.execute(
@@ -535,11 +540,14 @@ export class IamRepository implements OnModuleDestroy {
         })
       ]
     );
+
+    });
   }
 
   async upsertPluginSubjectMap(input: PluginSubjectMapInput): Promise<void> {
     const pool = this.requirePool();
     await this.ensureSchema();
+    return withAllocatorImportFence(pool,async pool=>{
     const status = input.status ?? "active";
 
     await pool.execute(
@@ -552,11 +560,14 @@ export class IamRepository implements OnModuleDestroy {
          metadata = VALUES(metadata)`,
       [input.identityUserId, `legacy:${input.legacyUserId}`, status, JSON.stringify(input.metadata ?? {})]
     );
+
+    });
   }
 
   async replaceRoleAssignmentsShadow(legacyUserId: number, roles: RoleShadowInput[]): Promise<number> {
     const pool = this.requirePool();
     await this.ensureSchema();
+    return withAllocatorImportFence(pool,async pool=>{
 
     await pool.execute(
       `UPDATE identity_role_assignments_shadow
@@ -584,11 +595,14 @@ export class IamRepository implements OnModuleDestroy {
     }
 
     return affected;
+
+    });
   }
 
   async replaceOrganizationMembershipsShadow(legacyUserId: number, organizations: OrganizationShadowInput[]): Promise<number> {
     const pool = this.requirePool();
     await this.ensureSchema();
+    return withAllocatorImportFence(pool,async pool=>{
 
     await pool.execute(
       `UPDATE identity_organization_memberships_shadow
@@ -626,6 +640,8 @@ export class IamRepository implements OnModuleDestroy {
     }
 
     return affected;
+
+    });
   }
 
   async upsertPermissionPolicyCandidate(policy: IamPermissionPolicySnapshot, source = "legacy-import"): Promise<IamPermissionPolicyVersionRow> {
@@ -634,7 +650,7 @@ export class IamRepository implements OnModuleDestroy {
     const connection = await pool.getConnection();
 
     try {
-      await connection.beginTransaction();
+      await connection.beginTransaction();await fenceAllocatorImport(connection);
       await connection.execute(
         `INSERT INTO identity_iam_policy_versions
           (checksum, source, status, role_count, permission_count, relation_count)
@@ -706,7 +722,7 @@ export class IamRepository implements OnModuleDestroy {
     const connection = await pool.getConnection();
 
     try {
-      await connection.beginTransaction();
+      await connection.beginTransaction();await fenceAllocatorImport(connection);
       await connection.execute(
         `UPDATE identity_iam_subject_assignments
             SET status = 'inactive'
@@ -866,6 +882,7 @@ export class IamRepository implements OnModuleDestroy {
 
     const pool = this.requirePool();
     await this.ensureSchema();
+    return withAllocatorImportFence(pool,async pool=>{
 
     let affected = 0;
     for (const item of items) {
@@ -894,6 +911,8 @@ export class IamRepository implements OnModuleDestroy {
     }
 
     return affected;
+
+    });
   }
 
   async finishReconciliationRun(input: IamReconciliationRunFinishInput): Promise<void> {

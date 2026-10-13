@@ -1,3 +1,4 @@
+import { allocatorMutation } from "./identity-allocator-state.js";
 import { createHash } from "node:crypto";
 import type { Connection, RowDataPacket } from "mysql2/promise";
 import { z } from "zod";
@@ -344,7 +345,7 @@ export async function importLegacyChallenges(
   };
   await target.beginTransaction();
   try {
-    if (options.apply) await assertMigrationStaging(target);
+    if(options.apply){await assertMigrationStaging(target);}
     const lock = options.apply ? " FOR UPDATE" : "";
     for (const row of [...rows].sort(
       (a, b) =>
@@ -393,16 +394,16 @@ export async function importLegacyChallenges(
         if (limits[0]?.[field])
           throw new Error("Existing challenge limits cannot be overwritten.");
         if (options.apply) {
-          await target.execute(
+          await allocatorMutation(target,()=>target.execute(
             "INSERT IGNORE INTO identity_legacy_challenge_limits (kind,email) VALUES (?,?)",
             [row.kind, row.email],
-          );
-          await target.execute(
+          ));
+          await allocatorMutation(target,()=>target.execute(
             `UPDATE identity_legacy_challenge_limits SET ${field}=?${row.type === "attempts" ? ",attempts=?" : ""} WHERE kind=? AND BINARY email=BINARY ?`,
             row.type === "attempts"
               ? [row.expiresAt, row.attempts, row.kind, row.email]
               : [row.expiresAt, row.kind, row.email],
-          );
+          ));
         }
       } else {
         const table =
@@ -451,7 +452,7 @@ export async function importLegacyChallenges(
                   r.kind === row.kind &&
                   r.email === row.email,
               );
-              await target.execute(
+              await allocatorMutation(target,()=>target.execute(
                 `INSERT INTO ${table} (challenge_key,legacy_user_id,email,code_hash,attempts,expires_at,locked_until,created_at) VALUES (?,?,?,?,?,?,?,?)`,
                 [
                   key,
@@ -463,27 +464,27 @@ export async function importLegacyChallenges(
                   limit && limit.attempts >= 5 ? limit.expiresAt : null,
                   row.issuedAt,
                 ],
-              );
+              ));
             } else if (row.kind === "reset_token")
-              await target.execute(
+              await allocatorMutation(target,()=>target.execute(
                 "INSERT INTO identity_password_reset_tokens (token_hash,legacy_user_id,email,issued_at,expires_at) VALUES (?,?,?,?,?)",
                 [row.hash, row.userId, row.email, row.issuedAt, row.expiresAt],
-              );
+              ));
             else
-              await target.execute(
+              await allocatorMutation(target,()=>target.execute(
                 "INSERT INTO email_change_tokens (token_key,legacy_user_id,token_hash,expires_at,created_at) VALUES (?,?,?,?,?)",
                 [key, row.userId, row.hash, row.expiresAt, row.issuedAt],
-              );
+              ));
           }
           report.wouldImport++;
         }
       }
       if (row.type === "attempts" || row.type === "rate") report.wouldImport++;
       if (options.apply) {
-        await target.execute(
+        await allocatorMutation(target,()=>target.execute(
           "INSERT INTO identity_legacy_challenge_imports (source_key_hash,payload_hash) VALUES (?,?)",
           [row.sourceHash, row.payloadHash],
-        );
+        ));
         report.imported++;
       }
     }

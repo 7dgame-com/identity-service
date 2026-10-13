@@ -1,3 +1,4 @@
+import { invalidateAllocatorReady } from "./identity-allocator-state.js";
 import type { Connection, RowDataPacket } from "mysql2/promise";
 import type { ExecuteValues } from "mysql2";
 import { accountImportTables, appendLegacyProfileHistory, legacyProfileArchiveColumns } from "./identity-account-import.js";
@@ -313,6 +314,7 @@ export async function syncIdentityAccounts(
       await target.rollback();
       return report;
     }
+    await invalidateAllocatorReady(target);
 
     // Delete relations first and write account/role parents first. All table names and columns are static allowlists.
     for (const delta of [...deltas].reverse())

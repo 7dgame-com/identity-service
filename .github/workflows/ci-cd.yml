@@ -128,6 +128,7 @@ jobs:
           IDENTITY_TEST_MYSQL_PASSWORD: identity_test_root_password
         run: >-
           npm test --
+          apps/identity-adapter/test/identity-allocator-attacks.mysql.spec.ts
           apps/identity-adapter/test/identity-accounts.mysql.spec.ts
           apps/identity-adapter/test/identity-runtime.mysql.spec.ts
           apps/identity-adapter/test/identity-http-bootstrap.mysql.spec.ts

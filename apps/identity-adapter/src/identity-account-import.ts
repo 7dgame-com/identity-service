@@ -1,3 +1,4 @@
+import { invalidateAllocatorReady } from "./identity-allocator-state.js";
 import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import type { ExecuteValues } from "mysql2";
 import { loadConfig } from "./config.js";
@@ -112,7 +113,7 @@ export async function importIdentityAccounts(
     if (!options.apply) return report;
     await target.beginTransaction();
     try {
-      await assertMigrationStaging(target);
+      await assertMigrationStaging(target);await invalidateAllocatorReady(target);
       const [lockedCount]=await target.query<RowDataPacket[]>("SELECT COUNT(*) AS count FROM user");
       if(Number(lockedCount[0].count)!==0)throw new Error("Account snapshot import requires an empty target account table");
       // The import marker serializes competing runs before either inserts users.

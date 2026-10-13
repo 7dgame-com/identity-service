@@ -1,3 +1,4 @@
+import { invalidateAllocatorReady } from "./identity-allocator-state.js";
 import { createHash } from "node:crypto";
 import type { Connection, RowDataPacket } from "mysql2/promise";
 import { z } from "zod";
@@ -35,7 +36,7 @@ export async function importLegacyAppleIdentities(source:Connection,target:Conne
     if(!options.apply)return {applied:false,replay:false,rowCount:rows.length,providerBindings:manifest.length};
     await target.beginTransaction();
     try {
-      await assertMigrationStaging(target);
+      await assertMigrationStaging(target);await invalidateAllocatorReady(target);
       const affectedUsers=new Set<number>();
       for(const item of manifest) {
         const row=rows.find(row=>Number(row.id)===item.legacyId)!;

@@ -14,6 +14,7 @@ import { LoginAuditRepository } from "../src/login-audit.repository.js";
 import { LoginAuditService } from "../src/login-audit.service.js";
 import { PluginUserPrimaryReadService } from "../src/plugin-user-primary-read.service.js";
 import { PluginUserReadonlyController } from "../src/plugin-user-readonly.controller.js";
+import { initializeFreshAllocator } from "../src/identity-allocator-state.js";
 
 const options = { host: process.env.IDENTITY_DB_HOST ?? "127.0.0.1", port: Number(process.env.IDENTITY_DB_PORT ?? 3306),
   user: process.env.IDENTITY_DB_USER ?? "root", password: process.env.IDENTITY_DB_PASSWORD ?? "", timezone: "Z", multipleStatements: true };
@@ -42,10 +43,10 @@ describe.skipIf(process.env.IDENTITY_TEST_MYSQL !== "1")("private organization a
     db = await mysql.createConnection({ ...options, database });
     const base = await readFile(new URL("../../../deploy/mysql/init.sql", import.meta.url), "utf8");
     await db.query(base.slice(base.indexOf("CREATE TABLE IF NOT EXISTS `auth_login_events`")));
-    for (const filename of ["identity-account-schema.sql", "identity-runtime-schema.sql"]) {
+    for (const filename of ["identity-account-schema.sql", "identity-runtime-schema.sql", "identity-password-reset-token-schema.sql", "identity-legacy-challenge-schema.sql", "identity-wechat-oauth-schema.sql", "identity-qrcode-schema.sql", "identity-apple-schema.sql", "identity-allocator-schema.sql"]) {
       await db.query(await readFile(new URL(`../../../deploy/mysql/${filename}`, import.meta.url), "utf8"));
     }
-    await db.query("DROP TABLE IF EXISTS identity_organization_memberships_shadow");
+    await initializeFreshAllocator(db);
     const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
     const environment = { IDENTITY_DATA_SOURCE: "identity", IDENTITY_DB_HOST: options.host, IDENTITY_DB_PORT: String(options.port),
       IDENTITY_DB_USER: options.user, IDENTITY_DB_PASSWORD: options.password, IDENTITY_DB_NAME: database,
@@ -65,6 +66,7 @@ describe.skipIf(process.env.IDENTITY_TEST_MYSQL !== "1")("private organization a
     native = new NativeIdentityService(reader, jwt, sessions);
     resources.push(native, reader, sessions, iam, repository);
     await native.onApplicationBootstrap();
+    await db.query("DROP TABLE IF EXISTS identity_organization_memberships_shadow");
     const hash = bcrypt.hashSync("Private-audit!123", 4);
     for (const [id, role] of [[1, "root"], [2, "admin"], [3, "user"], [4, "manager"], [5, "user"]] as const) {
       await db.execute("INSERT INTO user(id,username,nickname,status,password_hash,created_at,updated_at) VALUES (?,?,?,10,?,1,1)", [id, `audit-${id}`, `成员${id}`, hash]);

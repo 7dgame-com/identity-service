@@ -1,3 +1,4 @@
+import { allocatorMutation } from "./identity-allocator-state.js";
 import type { Connection, RowDataPacket } from "mysql2/promise";
 import { assertMigrationStaging } from "./migration-state.js";
 import { legacyRefreshAccountFingerprint, normalizeLegacyRefreshCredentialManifest } from "./legacy-refresh-credential-manifest.js";
@@ -14,7 +15,7 @@ export async function importLegacyRefreshCredentials(target: Connection, payload
     permanent: 0, applied: false, notFinal: true as const };
   await target.beginTransaction();
   try {
-    if (options.apply) await assertMigrationStaging(target);
+    if(options.apply){await assertMigrationStaging(target);}
     const lock = options.apply ? " FOR UPDATE" : "";
     for (const row of [...manifest.credentials].sort((a, b) => a.userId - b.userId || a.recordId - b.recordId)) {
       const [users] = await target.execute<RowDataPacket[]>(`SELECT status,deleted_at,password_hash,auth_key FROM user WHERE id=?${lock}`, [row.userId]);
@@ -51,12 +52,12 @@ export async function importLegacyRefreshCredentials(target: Connection, payload
       report.wouldImport++;
       if (!options.apply) continue;
       const revision = row.sourceKind === "a1" ? manifest.source.a1Revision : manifest.source.serverRevision!;
-      await target.execute(`INSERT INTO identity_legacy_refresh_credentials
+      await allocatorMutation(target,()=>target.execute(`INSERT INTO identity_legacy_refresh_credentials
         (credential_hash,source_record_id,legacy_user_id,source_kind,source_revision,source_fields_json,key_encoding,a1_compatible,server_compatible,snapshot_at,
          account_fingerprint,expires_at,source_revoked_at,revoked_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         [row.credentialHash, row.recordId, row.userId, row.sourceKind, revision, JSON.stringify(row.sourceFields), row.keyEncoding, row.a1Compatible, row.serverCompatible, capturedAt,
           row.accountFingerprint, row.expiresAt ? new Date(row.expiresAt) : null, row.sourceRevokedAt ? new Date(row.sourceRevokedAt) : null,
-          row.sourceRevokedAt ? new Date(row.sourceRevokedAt) : null]);
+          row.sourceRevokedAt ? new Date(row.sourceRevokedAt) : null]));
       report.imported++;
     }
     if (options.apply) { await target.commit(); report.applied = true; } else await target.rollback();

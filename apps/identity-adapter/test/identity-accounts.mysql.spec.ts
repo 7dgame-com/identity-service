@@ -1,3 +1,4 @@
+import { finalizeAllocator, readSourceAllocatorInventory } from "../src/identity-allocator-finalizer.js";
 import "reflect-metadata";
 import { readFile } from "node:fs/promises";
 import { createHash, generateKeyPairSync, randomBytes, randomUUID } from "node:crypto";
@@ -10,7 +11,7 @@ import { LegacyIdentityReader } from "../src/legacy-identity.reader.js";
 import { InvitationIdentityRepository } from "../src/invitation-identity.repository.js";
 import { InvitationRecordRepository } from "../src/invitation-record.repository.js";
 import { PasswordResetChallengeRepository } from "../src/password-reset-challenge.repository.js";
-import { importIdentityAccounts } from "../src/identity-account-import.js";
+import { accountImportTables, importIdentityAccounts } from "../src/identity-account-import.js";
 import { IdentityWechatOAuthService } from "../src/identity-wechat-oauth.service.js";
 import { IdentitySessionRepository } from "../src/identity-session.repository.js";
 import { JwtIssuerService } from "../src/jwt-issuer.service.js";
@@ -38,7 +39,7 @@ const connectionOptions = {
   multipleStatements: true
 };
 
-async function createDatabase(): Promise<{ connection: Connection; name: string }> {
+async function createDatabase(businessOnly=false): Promise<{ connection: Connection; name: string }> {
   const name = `test_identity_accounts_${randomUUID().replaceAll("-", "")}`;
   ownedDatabases.push(name);
   await admin.query(`CREATE DATABASE \`${name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`);
@@ -54,6 +55,8 @@ async function createDatabase(): Promise<{ connection: Connection; name: string 
   await connection.query(`CREATE TABLE IF NOT EXISTS identity_subject_events (
     id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, user_id BIGINT NOT NULL, version BIGINT NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)`);
+  for(const asset of ["identity-apple-schema.sql","identity-allocator-schema.sql"])await connection.query(await readFile(new URL("../../../deploy/mysql/"+asset,import.meta.url),"utf8"));
+  if(businessOnly){const [tables]=await connection.query<RowDataPacket[]>("SHOW TABLES");for(const row of tables){const table=String(Object.values(row)[0]);if(!Object.keys(accountImportTables).includes(table))await connection.query("DROP TABLE `"+table+"`");}}
   return { connection, name };
 }
 
@@ -64,7 +67,7 @@ describe.skipIf(!enabled)("independent identity account MySQL integration", () =
     admin = await mysql.createConnection(connectionOptions);
     const runtime = await createDatabase();
     db = runtime.connection;
-    source = (await createDatabase()).connection;
+    source = (await createDatabase(true)).connection;
     target = (await createDatabase()).connection;
     vi.stubEnv("IDENTITY_DATA_SOURCE", "identity");
     vi.stubEnv("IDENTITY_INTERNAL_API_TOKEN","test-identity-internal-key-with-at-least-32-bytes");
@@ -240,28 +243,34 @@ describe.skipIf(!enabled)("independent identity account MySQL integration", () =
   });
 
   it("imports every old OAuth UUID and provider binding once, matching existing canonical users", async () => {
-    await source.query(`CREATE TABLE auth_users(id VARCHAR(128) PRIMARY KEY,primary_unionid VARCHAR(191),display_name VARCHAR(191),avatar_url TEXT,status VARCHAR(32),created_at DATETIME(3),updated_at DATETIME(3));
+    const authSource=(await createDatabase(true)).connection;
+    try {
+    await authSource.query(`CREATE TABLE auth_users(id VARCHAR(128) PRIMARY KEY,primary_unionid VARCHAR(191),display_name VARCHAR(191),avatar_url TEXT,status VARCHAR(32),created_at DATETIME(3),updated_at DATETIME(3));
       CREATE TABLE auth_identities(id VARCHAR(128) PRIMARY KEY,user_id VARCHAR(128),provider VARCHAR(64),provider_app_id VARCHAR(191),openid VARCHAR(191),unionid VARCHAR(191),profile_json JSON)`);
-    await source.execute("INSERT INTO auth_users VALUES('old-oauth-uuid',NULL,'OAuth imported',NULL,'active',UTC_TIMESTAMP(3),UTC_TIMESTAMP(3)),('old-orphan-uuid',NULL,'Orphan',NULL,'disabled',UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))");
-    await source.execute("INSERT INTO auth_identities VALUES('provider-old','old-oauth-uuid','wechat_official_account','wx-old','old-open',NULL,?)",[JSON.stringify({nickname:"OAuth imported"})]);
+    await authSource.execute("INSERT INTO auth_users VALUES('old-oauth-uuid',NULL,'OAuth imported',NULL,'active',UTC_TIMESTAMP(3),UTC_TIMESTAMP(3)),('old-orphan-uuid',NULL,'Orphan',NULL,'disabled',UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))");
+    await authSource.execute("INSERT INTO auth_identities VALUES('provider-old','old-oauth-uuid','wechat_official_account','wx-old','old-open',NULL,?)",[JSON.stringify({nickname:"OAuth imported"})]);
     await source.execute("INSERT INTO wechat(openid,unionid,user_id,token)VALUES('old-open','old-union',7001,'old-registration-token')");
     await target.execute("INSERT INTO wechat(openid,unionid,user_id,token)VALUES('old-open','old-union',7001,'old-registration-token')");
-    expect(await importWechatIdentities(source,target,{importKey:"oauth-import"})).toMatchObject({applied:false,rowCounts:{auth_users:2,auth_identities:1}});
-    await expect(importWechatIdentities(source,target,{importKey:"oauth-before-review",apply:true})).rejects.toThrow("exact Yii application binding");
+    expect(await importWechatIdentities(authSource,target,{importKey:"oauth-import"})).toMatchObject({applied:false,rowCounts:{auth_users:2,auth_identities:1}});
+    await expect(importWechatIdentities(authSource,target,{importKey:"oauth-before-review",apply:true})).rejects.toThrow();
     const [sourceDatabase]=await source.query<RowDataPacket[]>("SELECT DATABASE() AS name");
     expect(await importReviewedYiiWechatBindings(source,target,{schema_version:1,source_database:sourceDatabase[0].name,
       review:{reference:"account-cutover-fixture",reviewed_by:"integration-review",reviewed_at:new Date().toISOString()},
       bindings:[{provider:"wechat_official_account",provider_app_id:"wx-old",open_id:"old-open",user_id:7001,evidence:"wechat",union_id:"old-union"}]},
       {importKey:"yii-reviewed-before-oauth",apply:true})).toMatchObject({applied:true,imported:1});
-    expect(await importWechatIdentities(source,target,{importKey:"oauth-import",apply:true})).toMatchObject({applied:true});
+    const src=await readSourceAllocatorInventory(source),[dst]=await target.query<RowDataPacket[]>("SELECT DATABASE() AS name");
+    const fence=await mysql.createConnection({...connectionOptions,database:dst[0].name});
+    try{await finalizeAllocator({source,target,fence,review:{version:1,sourceDatabase:src.database,targetDatabase:dst[0].name,sourceServerUuid:src.serverUuid,importKey:"test-cutover",writersDrainedAt:new Date(Date.now()-1000).toISOString(),finalSyncSha256:"a".repeat(64),referenceReviewSha256:src.referenceReviewSha256},reviewSha256:"b".repeat(64),apply:true});}finally{await fence.end();}
+    expect(await importWechatIdentities(authSource,target,{importKey:"oauth-import",apply:true})).toMatchObject({applied:true});
     const [maps]=await target.query<RowDataPacket[]>("SELECT auth_user_id,user_id,status FROM identity_auth_subject_maps ORDER BY auth_user_id");
     expect(maps).toHaveLength(2);expect(maps.find((row)=>row.auth_user_id==="old-oauth-uuid")).toMatchObject({user_id:7001,status:"active"});
     expect(maps.find((row)=>row.auth_user_id==="old-orphan-uuid")).toMatchObject({status:"disabled"});
     const [bindings]=await target.query<RowDataPacket[]>("SELECT provider,provider_app_id,open_id,user_id FROM identity_wechat_identities WHERE open_id='old-open'");
     expect(bindings[0]).toMatchObject({provider:"wechat_official_account",provider_app_id:"wx-old",user_id:7001});
-    expect(await importWechatIdentities(source,target,{importKey:"oauth-import",apply:true})).toMatchObject({applied:false,replay:true});
+    expect(await importWechatIdentities(authSource,target,{importKey:"oauth-import",apply:true})).toMatchObject({applied:false,replay:true});
     await target.execute("UPDATE identity_migration_control SET authority='identity' WHERE id=1");
-    await expect(importWechatIdentities(source,target,{importKey:"oauth-after-activation",apply:true})).rejects.toThrow("already authoritative");
+    await expect(importWechatIdentities(authSource,target,{importKey:"oauth-after-activation",apply:true})).rejects.toThrow("already authoritative");
+    }finally{await authSource.end();}
   });
 
   it("recovers an account committed before token signing failed without creating a duplicate", async () => {

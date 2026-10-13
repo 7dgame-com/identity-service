@@ -21,11 +21,17 @@ import { exportLegacyRefreshCredentials, legacyRefreshAccountFingerprint } from 
 import { NativeIdentityService } from "../src/native-identity.service.js";
 import { TokenIssuanceService } from "../src/token-issuance.service.js";
 import { hashLegacyPassword } from "../src/legacy-password.js";
+import { accountImportTables, importIdentityAccounts } from "../src/identity-account-import.js";
+import { syncIdentityAccounts } from "../src/identity-account-sync.js";
+import { allocatorDigest } from "../src/identity-allocator-manifest.js";
+import { finalizeAllocator, readSourceAllocatorInventory } from "../src/identity-allocator-finalizer.js";
 import type { LoginAuditService } from "../src/login-audit.service.js";
 
 const opts = { host: process.env.IDENTITY_TEST_MYSQL_HOST ?? "127.0.0.1", port: Number(process.env.IDENTITY_TEST_MYSQL_PORT ?? 13316),
   user: process.env.IDENTITY_TEST_MYSQL_USER ?? "root", password: process.env.IDENTITY_TEST_MYSQL_PASSWORD ?? "", multipleStatements: true, timezone: "Z" };
 const name = `test_legacy_refresh_${randomUUID().replaceAll("-", "")}`;
+const allocatorSourceName = `test_legacy_refresh_source_${randomUUID().replaceAll("-", "")}`;
+const allocatorImportKey = "compiled-legacy-refresh-source";
 const projectRoot = fileURLToPath(new URL("../../../", import.meta.url));
 const source = { storage: "yii2-redis-active-record-hash", redisDatabase: 1, keyPrefix: "refresh_token:a:",
   a1Revision: "f5bf6667a6fc5bfc65590f13bccd9d8ba0612a74", serverRevision: "1".repeat(40), namespaceReviewed: true,
@@ -35,7 +41,7 @@ const hash = (value: string) => createHash("sha256").update(value).digest("hex")
 const apply = { apply: true, environment: "staging" };
 
 describe.skipIf(process.env.IDENTITY_TEST_MYSQL !== "1")("reviewed Yii AR credential migration and private authority", () => {
-  let admin: Connection, db: Connection, sessions: IdentitySessionRepository, reader: LegacyIdentityReader, jwt: JwtIssuerService,
+  let admin: Connection, db: Connection, allocatorSource: Connection, allocatorFence: Connection | undefined, sessions: IdentitySessionRepository, reader: LegacyIdentityReader, jwt: JwtIssuerService,
     ledger: LegacyRefreshCredentialRepository, tokens: TokenIssuanceService, native: NativeIdentityService, passwords: AccountPasswordRepository,
     legacyEmail: LegacyEmailLinkService;
   let passwordHash: string, fingerprint: string, app: INestApplication | undefined, buildDirectory: string | undefined, baseUrl: string;
@@ -53,7 +59,7 @@ describe.skipIf(process.env.IDENTITY_TEST_MYSQL !== "1")("reviewed Yii AR creden
   async function importOne(options: Parameters<typeof manifest>[1] = {}) { const input = manifest(undefined, options); await importLegacyRefreshCredentials(db, input.data, apply); return input; }
   async function reset() {
     await db.query("DELETE FROM identity_legacy_refresh_credentials;DELETE FROM identity_refresh_replays;DELETE FROM identity_refresh_sessions;DELETE FROM identity_user_revocations;DELETE FROM identity_login_codes;DELETE FROM identity_native_operations;DELETE FROM identity_account_password_requests;UPDATE identity_migration_control SET authority='staging',activated_at=NULL WHERE id=1");
-    await db.execute("UPDATE user SET status=10,deleted_at=NULL,password_hash=?,auth_key=?,email=NULL,email_verified_at=NULL,password_reset_token=NULL WHERE id IN (1,42)", [passwordHash, authKey]);
+    await db.execute("UPDATE user SET status=10,deleted_at=NULL,password_hash=?,auth_key=?,email=NULL,email_verified_at=NULL,password_reset_token=NULL,updated_at=1 WHERE id IN (1,42)", [passwordHash, authKey]);
     await db.query("DELETE FROM auth_assignment WHERE user_id='42';INSERT INTO auth_assignment(item_name,user_id) VALUES ('user','42')");
   }
   async function http(path: string, body?: unknown, headers: Record<string, string> = {}) {
@@ -66,8 +72,17 @@ describe.skipIf(process.env.IDENTITY_TEST_MYSQL !== "1")("reviewed Yii AR creden
     admin = await mysql.createConnection(opts); await admin.query(`CREATE DATABASE \`${name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`);
     db = await mysql.createConnection({ ...opts, database: name });
     const init = await readFile(join(projectRoot, "deploy/mysql/init.sql"), "utf8"); await db.query(init.slice(init.indexOf("CREATE TABLE IF NOT EXISTS `auth_login_events`")));
-    for (const schema of ["identity-account-schema.sql", "identity-runtime-schema.sql", "identity-password-reset-token-schema.sql", "identity-legacy-challenge-schema.sql", "identity-wechat-oauth-schema.sql", "identity-qrcode-schema.sql", "identity-apple-schema.sql"])
+    for (const schema of ["identity-account-schema.sql", "identity-runtime-schema.sql", "identity-password-reset-token-schema.sql", "identity-legacy-challenge-schema.sql", "identity-wechat-oauth-schema.sql", "identity-qrcode-schema.sql", "identity-apple-schema.sql", "identity-allocator-schema.sql"])
       await db.query(await readFile(join(projectRoot, "deploy/mysql", schema), "utf8"));
+    // Historical credential fixtures use a real imported baseline, never a fresh proof.
+    await admin.query(`CREATE DATABASE \`${allocatorSourceName}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`);
+    allocatorSource = await mysql.createConnection({ ...opts, database: allocatorSourceName });
+    const accountSchema = await readFile(join(projectRoot, "deploy/mysql/identity-account-schema.sql"), "utf8");
+    for (const statement of accountSchema.split(";")) {
+      const table = statement.match(/CREATE TABLE IF NOT EXISTS `?([a-z_]+)`?\s*\(/)?.[1];
+      if (table && Object.hasOwn(accountImportTables, table)) await allocatorSource.query(statement);
+    }
+    await allocatorSource.query("INSERT INTO auth_item(name,type,description) VALUES ('root',1,'root'),('admin',1,'admin'),('manager',1,'manager'),('user',1,'user')");
     const keys = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
     for (const [key, value] of Object.entries({ IDENTITY_DATA_SOURCE: "identity", IDENTITY_DB_HOST: opts.host, IDENTITY_DB_PORT: String(opts.port),
       IDENTITY_DB_USER: opts.user, IDENTITY_DB_PASSWORD: opts.password, IDENTITY_DB_NAME: name, IDENTITY_TOKEN_ISSUANCE_ENABLED: "true",
@@ -79,9 +94,10 @@ describe.skipIf(process.env.IDENTITY_TEST_MYSQL !== "1")("reviewed Yii AR creden
       LEGACY_WRITE_DB_HOST: "127.0.0.1", LEGACY_WRITE_DB_PORT: "1", LEGACY_WRITE_DB_USER: "unreachable" })) vi.stubEnv(key, value);
     passwordHash = await hashLegacyPassword(password); fingerprint = legacyRefreshAccountFingerprint(passwordHash, authKey);
     for (const [id, role] of [[1, "root"], [42, "user"]] as const) {
-      await db.execute("INSERT INTO user(id,username,password_hash,auth_key,status,created_at,updated_at) VALUES (?,?,?,?,10,1,1)", [id, `legacy-user-${id}`, passwordHash, authKey]);
-      await db.execute("INSERT INTO user_info(user_id) VALUES (?)", [id]); await db.execute("INSERT INTO auth_assignment(item_name,user_id) VALUES (?,?)", [role, String(id)]);
+      await allocatorSource.execute("INSERT INTO user(id,username,password_hash,auth_key,status,created_at,updated_at) VALUES (?,?,?,?,10,1,1)", [id, `legacy-user-${id}`, passwordHash, authKey]);
+      await allocatorSource.execute("INSERT INTO user_info(user_id) VALUES (?)", [id]); await allocatorSource.execute("INSERT INTO auth_assignment(item_name,user_id) VALUES (?,?)", [role, String(id)]);
     }
+    await importIdentityAccounts(allocatorSource, db, { apply: true, importKey: allocatorImportKey });
     sessions = new IdentitySessionRepository(); jwt = new JwtIssuerService(); ledger = new LegacyRefreshCredentialRepository(sessions, jwt);
     reader = new LegacyIdentityReader(); native = new NativeIdentityService(reader, jwt, sessions);
     tokens = new TokenIssuanceService(reader, sessions, jwt, {} as LoginAuditService, ledger); passwords = new AccountPasswordRepository();
@@ -89,7 +105,8 @@ describe.skipIf(process.env.IDENTITY_TEST_MYSQL !== "1")("reviewed Yii AR creden
   }, 30_000);
   afterAll(async () => {
     await app?.close(); await Promise.all([sessions?.onModuleDestroy(), ledger?.onModuleDestroy(), reader?.onModuleDestroy(), native?.onModuleDestroy(), passwords?.onModuleDestroy(), legacyEmail?.onModuleDestroy()]);
-    await db?.end(); if (admin) { await admin.query(`DROP DATABASE IF EXISTS \`${name}\``); await admin.end(); }
+    await allocatorFence?.end(); await allocatorSource?.end();
+    await db?.end(); if (admin) { await admin.query(`DROP DATABASE IF EXISTS \`${name}\``); await admin.query(`DROP DATABASE IF EXISTS \`${allocatorSourceName}\``); await admin.end(); }
     if (buildDirectory) await rm(buildDirectory, { recursive: true, force: true }); vi.unstubAllEnvs();
   }, 30_000);
 
@@ -301,11 +318,12 @@ describe.skipIf(process.env.IDENTITY_TEST_MYSQL !== "1")("reviewed Yii AR creden
     let cliReport: Record<string, unknown>;
     beforeAll(async () => {
       await reset();
+      for (const id of [43, 44, 45, 46, 47]) {
+        await allocatorSource.execute("INSERT INTO user(id,username,password_hash,auth_key,status,created_at,updated_at) VALUES (?,?,?,?,10,1,1)", [id, `legacy-user-${id}`, passwordHash, authKey]);
+        await allocatorSource.execute("INSERT INTO user_info(user_id) VALUES (?)", [id]); await allocatorSource.execute("INSERT INTO auth_assignment(item_name,user_id) VALUES ('user',?)", [String(id)]);
+      }
+      await syncIdentityAccounts(allocatorSource, db, { apply: true, maxChanges: 100 });
       for (const id of [42, 43, 44, 45, 46, 47]) {
-        if (id !== 42) {
-          await db.execute("INSERT INTO user(id,username,password_hash,auth_key,status,created_at,updated_at) VALUES (?,?,?,?,10,1,1)", [id, `legacy-user-${id}`, passwordHash, authKey]);
-          await db.execute("INSERT INTO user_info(user_id) VALUES (?)", [id]); await db.execute("INSERT INTO auth_assignment(item_name,user_id) VALUES ('user',?)", [String(id)]);
-        }
         const input = manifest(undefined, { userId: id, recordId: id, expires: Math.floor(Date.now() / 1000) - 10, a1: id !== 47 });
         fixtures.set(id, input.raw); await importLegacyRefreshCredentials(db, input.data, apply);
       }
@@ -322,6 +340,14 @@ describe.skipIf(process.env.IDENTITY_TEST_MYSQL !== "1")("reviewed Yii AR creden
       const imported = await promisify(execFile)(process.execPath, [join(buildDirectory, "scripts/legacy-refresh-credential-import.js"), `--file=${manifestFile}`, "--apply"],
         { env: { ...process.env, NODE_ENV: "staging" } });
       cliReport = JSON.parse(imported.stdout); expect(imported.stdout).not.toContain(raw); expect(imported.stdout).not.toContain(fingerprint);
+      const finalSync = await syncIdentityAccounts(allocatorSource, db, { maxChanges: 100 });
+      expect(finalSync.changes).toBe(0);
+      const sourceInventory = await readSourceAllocatorInventory(allocatorSource);
+      const review = { version: 1 as const, sourceDatabase: allocatorSourceName, targetDatabase: name,
+        sourceServerUuid: sourceInventory.serverUuid, importKey: allocatorImportKey, writersDrainedAt: new Date().toISOString(),
+        finalSyncSha256: allocatorDigest(finalSync), referenceReviewSha256: sourceInventory.referenceReviewSha256 };
+      allocatorFence = await mysql.createConnection({ ...opts, database: name });
+      await finalizeAllocator({ source: allocatorSource, target: db, fence: allocatorFence, review, reviewSha256: allocatorDigest(review), apply: true });
       const { AppModule } = await import(pathToFileURL(join(buildDirectory, "apps/identity-adapter/src/app.module.js")).href);
       app = await NestFactory.create(AppModule, { logger: false, abortOnError: false }); await app.listen(0, "127.0.0.1"); baseUrl = await app.getUrl();
     }, 120_000);

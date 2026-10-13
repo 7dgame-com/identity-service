@@ -27,6 +27,7 @@ import { AccountPasswordResetService } from "../src/account-password-reset.servi
 import { AccountLifecycleOperationRepository } from "../src/account-lifecycle-operation.repository.js";
 import { LegacySessionRevocationService } from "../src/legacy-session-revocation.service.js";
 import { EmailDeliveryService } from "../src/email-delivery.service.js";
+import { initializeFreshAllocator } from "../src/identity-allocator-state.js";
 
 const opts={host:process.env.IDENTITY_DB_HOST??"127.0.0.1",port:Number(process.env.IDENTITY_DB_PORT??3306),user:process.env.IDENTITY_DB_USER??"root",password:process.env.IDENTITY_DB_PASSWORD??"",multipleStatements:true,timezone:"Z"};
 const name=`test_identity_runtime_${randomUUID().replaceAll("-","")}`;
@@ -49,7 +50,8 @@ describe.skipIf(process.env.IDENTITY_TEST_MYSQL!=="1")("private identity runtime
   db=await mysql.createConnection({...opts,database:name});
   const base=await readFile(new URL("../../../deploy/mysql/init.sql",import.meta.url),"utf8");
   await db.query(base.slice(base.indexOf("CREATE TABLE IF NOT EXISTS `auth_login_events`")));
-  for(const filename of ["identity-account-schema.sql","identity-password-reset-token-schema.sql","identity-legacy-challenge-schema.sql","identity-runtime-schema.sql","identity-wechat-oauth-schema.sql"]) await db.query(await readFile(new URL(`../../../deploy/mysql/${filename}`,import.meta.url),"utf8"));
+  for(const filename of ["identity-account-schema.sql","identity-password-reset-token-schema.sql","identity-legacy-challenge-schema.sql","identity-runtime-schema.sql","identity-wechat-oauth-schema.sql","identity-qrcode-schema.sql","identity-apple-schema.sql","identity-allocator-schema.sql"]) await db.query(await readFile(new URL(`../../../deploy/mysql/${filename}`,import.meta.url),"utf8"));
+  await initializeFreshAllocator(db);
   const {privateKey}=generateKeyPairSync("ec",{namedCurve:"P-256"});
   for(const [key,value] of Object.entries({IDENTITY_DATA_SOURCE:"identity",IDENTITY_DB_HOST:opts.host,IDENTITY_DB_PORT:String(opts.port),IDENTITY_DB_USER:opts.user,IDENTITY_DB_PASSWORD:opts.password,IDENTITY_DB_NAME:name,IDENTITY_TOKEN_ISSUANCE_ENABLED:"true",IDENTITY_REFRESH_REPLAY_KEY:randomBytes(32).toString("base64url"),IDENTITY_INTERNAL_API_TOKEN:randomBytes(32).toString("hex"),IDENTITY_JWT_PRIVATE_KEY_PEM:privateKey.export({format:"pem",type:"pkcs8"}).toString(),LEGACY_DB_HOST:"127.0.0.1",LEGACY_DB_PORT:"1",LEGACY_DB_USER:"unreachable",LEGACY_WRITE_DB_HOST:"127.0.0.1",LEGACY_WRITE_DB_PORT:"1",LEGACY_WRITE_DB_USER:"unreachable"})) vi.stubEnv(key,value);
   vi.stubEnv("IDENTITY_LOGIN_AUDIT_ENABLED","true");

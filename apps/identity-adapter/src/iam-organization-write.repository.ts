@@ -1,3 +1,5 @@
+import { invalidateAllocatorReady } from "./identity-allocator-state.js";
+import { assertMigrationStaging } from "./migration-state.js";
 import { createHash } from "node:crypto";
 import { Injectable, OnModuleDestroy } from "@nestjs/common";
 import mysql, { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
@@ -312,6 +314,9 @@ export class IamOrganizationWriteRepository implements OnModuleDestroy {
     const connection = await pool.getConnection();
     try {
       await connection.beginTransaction();
+      const [allocator]=await connection.query<RowDataPacket[]>("SELECT 1 FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='identity_migration_allocator_state'");
+      if(allocator.length){await assertMigrationStaging(connection);await invalidateAllocatorReady(connection);}
+
       if (input.materializationClaim) {
         const [claimRows] = await connection.execute<RowDataPacket[]>(
           `SELECT id

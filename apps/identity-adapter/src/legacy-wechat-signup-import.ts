@@ -1,3 +1,4 @@
+import { allocatorMutation } from "./identity-allocator-state.js";
 import { randomBytes } from "node:crypto";
 import type { Connection,RowDataPacket } from "mysql2/promise";
 import { assertMigrationStaging } from "./migration-state.js";
@@ -11,7 +12,7 @@ export async function importLegacyWechatSignupCredentials(target:Connection,payl
   const report={total:manifest.credentials.length,imported:0,wouldImport:0,existing:0,permanent:0,expired:0,sourceRevoked:0,applied:false,notFinal:true as const};
   await target.beginTransaction();
   try {
-    if(options.apply)await assertMigrationStaging(target);
+    if(options.apply){await assertMigrationStaging(target);}
     const lock=options.apply?" FOR UPDATE":"";
     for(const row of manifest.credentials){
       const evidence=canonicalSignupJson({source:manifest.source,capturedAt:manifest.capturedAt,credential:row});
@@ -39,15 +40,15 @@ export async function importLegacyWechatSignupCredentials(target:Connection,payl
       if(row.expiresAt===null)report.permanent++;else if(new Date(row.expiresAt)<=now)report.expired++;
       if(row.sourceRevokedAt)report.sourceRevoked++;report.wouldImport++;
       if(!options.apply)continue;
-      await target.execute(`INSERT INTO identity_wechat_identities(provider,provider_app_id,open_id) VALUES (?,?,?) ON DUPLICATE KEY UPDATE open_id=open_id`,[row.provider,row.providerAppId,row.openId]);
+      await allocatorMutation(target,()=>target.execute(`INSERT INTO identity_wechat_identities(provider,provider_app_id,open_id) VALUES (?,?,?) ON DUPLICATE KEY UPDATE open_id=open_id`,[row.provider,row.providerAppId,row.openId]));
       // Never copy the legacy bearer into compatibility storage. New scans may use their own random challenge.
-      if(!wechat.length)await target.execute("INSERT INTO wechat(id,openid,token,created_at,updated_at) VALUES (?,?,?,?,?)",
-        [row.recordId,row.openId,randomBytes(32).toString("base64url"),row.createdAt?new Date(row.createdAt):null,row.updatedAt?new Date(row.updatedAt):null]);
-      else await target.execute("UPDATE wechat SET token=? WHERE id=?",[randomBytes(32).toString("base64url"),row.recordId]);
-      await target.execute(`INSERT INTO identity_legacy_wechat_signup_credentials
+      if(!wechat.length)await allocatorMutation(target,()=>target.execute("INSERT INTO wechat(id,openid,token,created_at,updated_at) VALUES (?,?,?,?,?)",
+        [row.recordId,row.openId,randomBytes(32).toString("base64url"),row.createdAt?new Date(row.createdAt):null,row.updatedAt?new Date(row.updatedAt):null]));
+      else await allocatorMutation(target,()=>target.execute("UPDATE wechat SET token=? WHERE id=?",[randomBytes(32).toString("base64url"),row.recordId]));
+      await allocatorMutation(target,()=>target.execute(`INSERT INTO identity_legacy_wechat_signup_credentials
         (credential_hash,source_database,source_record_id,source_revision,manifest_hash,evidence_json,provider,provider_app_id,open_id,expires_at,source_revoked_at,revoked_at)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,[row.credentialHash,manifest.source.database,row.recordId,manifest.source.revision,manifestHash,evidence,row.provider,row.providerAppId,row.openId,
-          row.expiresAt?new Date(row.expiresAt):null,row.sourceRevokedAt?new Date(row.sourceRevokedAt):null,row.sourceRevokedAt?new Date(row.sourceRevokedAt):null]);
+          row.expiresAt?new Date(row.expiresAt):null,row.sourceRevokedAt?new Date(row.sourceRevokedAt):null,row.sourceRevokedAt?new Date(row.sourceRevokedAt):null]));
       report.imported++;
     }
     if(options.apply){await target.commit();report.applied=true;}else await target.rollback();return report;

@@ -1,3 +1,4 @@
+import { assertNativeUserAllocation } from "./identity-allocator-manifest.js";
 import { createHash, randomBytes, randomInt, randomUUID } from "node:crypto";
 import { Injectable, OnModuleDestroy } from "@nestjs/common";
 import mysql, { Pool, PoolConnection, ResultSetHeader, RowDataPacket } from "mysql2/promise";
@@ -283,7 +284,7 @@ export class AccountRegistrationRepository implements OnModuleDestroy {
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
       [username, authKey, passwordHash, email, 10, now, now]
     );
-    const userId = Number(result.insertId);
+    const userId = this.config.dataSource === "identity" ? assertNativeUserAllocation(result.insertId) : Number(result.insertId);
 
     await connection.execute(`INSERT INTO user_info (user_id) VALUES (?)`, [userId]);
     await connection.execute(

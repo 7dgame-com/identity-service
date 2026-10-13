@@ -14,6 +14,7 @@ import { OidcAuthorizationCodeRepository } from "../src/oidc-authorization-code.
 import { OidcController } from "../src/oidc.controller.js";
 import { OidcService } from "../src/oidc.service.js";
 import { TokenIssuanceService } from "../src/token-issuance.service.js";
+import { initializeFreshAllocator } from "../src/identity-allocator-state.js";
 import type { LoginAuditService } from "../src/login-audit.service.js";
 
 const options = { host: process.env.IDENTITY_DB_HOST ?? "127.0.0.1", port: Number(process.env.IDENTITY_DB_PORT ?? 3306),
@@ -44,9 +45,10 @@ describe.skipIf(process.env.IDENTITY_TEST_MYSQL !== "1")("native OIDC sessions w
     db = await mysql.createConnection({ ...options, database });
     const base = await readFile(new URL("../../../deploy/mysql/init.sql", import.meta.url), "utf8");
     await db.query(base.slice(base.indexOf("CREATE TABLE IF NOT EXISTS `auth_login_events`")));
-    for (const filename of ["identity-account-schema.sql", "identity-runtime-schema.sql"]) {
+    for (const filename of ["identity-account-schema.sql", "identity-runtime-schema.sql", "identity-password-reset-token-schema.sql", "identity-legacy-challenge-schema.sql", "identity-wechat-oauth-schema.sql", "identity-qrcode-schema.sql", "identity-apple-schema.sql", "identity-allocator-schema.sql"]) {
       await db.query(await readFile(new URL(`../../../deploy/mysql/${filename}`, import.meta.url), "utf8"));
     }
+    await initializeFreshAllocator(db);
     const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
     const environment = { IDENTITY_DATA_SOURCE: "identity", IDENTITY_DB_HOST: options.host, IDENTITY_DB_PORT: String(options.port),
       IDENTITY_DB_NAME: database, IDENTITY_DB_USER: options.user, IDENTITY_DB_PASSWORD: options.password,
@@ -135,6 +137,13 @@ describe.skipIf(process.env.IDENTITY_TEST_MYSQL !== "1")("native OIDC sessions w
     }).expect(200);
     return { grant_type: "authorization_code", client_id: authorizedClient, redirect_uri: redirectUri, code_verifier: verifier, code: response.body.code };
   }
+
+  it("restarts under the allocator guard after real OIDC authorization-code storage has been used", async () => {
+    await authorization("openid profile");
+    const [rows] = await db.query<RowDataPacket[]>("SELECT COUNT(*) AS n FROM oidc_authorization_codes");
+    expect(Number(rows[0].n)).toBeGreaterThan(0);
+    await expect(native.onApplicationBootstrap()).resolves.toBeUndefined();
+  });
 
   it("rejects cross-client, ordinary and expanding refreshes before rotation, while preserving the owner's narrowed concurrent replay", async () => {
     const issued = await request(app.getHttpServer()).post("/token").send(await authorization()).expect(200);

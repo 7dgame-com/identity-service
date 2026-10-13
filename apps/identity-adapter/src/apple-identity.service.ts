@@ -1,3 +1,4 @@
+import { assertNativeUserAllocation } from "./identity-allocator-manifest.js";
 import { createHash, randomBytes } from "node:crypto";
 import { BadRequestException, ConflictException, Inject, Injectable, OnModuleDestroy, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
 import mysql, { Pool, PoolConnection, ResultSetHeader, RowDataPacket } from "mysql2/promise";
@@ -83,7 +84,7 @@ export class AppleIdentityService implements OnModuleDestroy {
           const nickname=Array.from([identity.first_name,identity.last_name].filter(Boolean).join(" ")).slice(0,255).join("")||null;
           const [created]=await connection.execute<ResultSetHeader>(`INSERT INTO user(username,nickname,email,email_verified_at,password_hash,auth_key,status,created_at,updated_at)
             VALUES(?,?,?,?,?,?,10,?,?)`,[input.username,nickname,email,email?now:null,expectedPasswordHash,randomBytes(24).toString("base64url"),now,now]);
-          userId=created.insertId;
+          userId=assertNativeUserAllocation(created.insertId);
           await connection.execute("INSERT INTO user_info(user_id)VALUES(?)",[userId]);
           await connection.execute("INSERT INTO auth_assignment(item_name,user_id,created_at)VALUES('user',?,?)",[String(userId),now]);
         }

@@ -1,3 +1,5 @@
+import { assertNativeUserAllocation } from "./identity-allocator-manifest.js";
+import { assertAllocatorReady, invalidateAllocatorReady } from "./identity-allocator-state.js";
 import { createHash, randomBytes } from "node:crypto";
 import type { Connection, ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { assertMigrationStaging } from "./migration-state.js";
@@ -23,7 +25,7 @@ export async function importWechatIdentities(source:Connection,target:Connection
     if(!options.apply)return {applied:false,replay:false,rowCounts};
     await target.beginTransaction();
     try {
-      await assertMigrationStaging(target);
+      await assertMigrationStaging(target);const allocationProof=await assertAllocatorReady(target);if(allocationProof.kind!=="migrated")throw new Error("OAuth UUID imports require a finalized migrated allocator proof after actual writer drain");await invalidateAllocatorReady(target);
       await target.execute("INSERT INTO identity_wechat_import_runs(import_key,source_database,row_counts,completed_at)VALUES(?,?,?,UTC_TIMESTAMP(3))",[options.importKey,names[0].name,JSON.stringify(rowCounts)]);
       // A single lock covers the complete batch until commit, preserving outbox cursor order.
       await target.execute("SELECT id FROM identity_event_clock WHERE id=1 FOR UPDATE");
@@ -45,7 +47,7 @@ export async function importWechatIdentities(source:Connection,target:Connection
           // No old account is discarded, including profiles without a completed provider binding.
           const [created]=await target.execute<ResultSetHeader>("INSERT INTO user(username,nickname,auth_key,status,created_at,updated_at)VALUES(?,?,?,?,?,?)",
             [`oauth_${createHash("sha256").update(String(old.id)).digest("hex").slice(0,40)}`,old.display_name??null,randomBytes(24).toString("base64url"),old.status==="active"?10:0,unixSeconds(old.created_at),unixSeconds(old.updated_at)]);
-          userId=created.insertId;
+          userId=assertNativeUserAllocation(created.insertId);
           await target.execute("INSERT INTO user_info(user_id,info)VALUES(?,?)",[userId,JSON.stringify({wechatAvatarUrl:old.avatar_url??null})]);
           await target.execute("INSERT INTO auth_assignment(item_name,user_id,created_at)VALUES('user',?,?)",[String(userId),Math.floor(Date.now()/1000)]);
           await target.execute("INSERT INTO identity_subject_events(user_id,version)VALUES(?,?)",[userId,Date.now()]);

@@ -10,6 +10,7 @@ import { NestFactory } from "@nestjs/core";
 import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { hashLegacyPassword } from "../src/legacy-password.js";
+import { initializeFreshAllocator } from "../src/identity-allocator-state.js";
 
 const enabled=process.env.IDENTITY_TEST_MYSQL==="1";
 const projectRoot=fileURLToPath(new URL("../../../",import.meta.url));
@@ -51,8 +52,9 @@ describe.skipIf(!enabled)("compiled AppModule independent HTTP bootstrap",()=>{
     db=await mysql.createConnection({...options,database:databaseName});
     const init=await readFile(join(projectRoot,"deploy/mysql/init.sql"),"utf8");
     await db.query(init.slice(init.indexOf("CREATE TABLE IF NOT EXISTS `auth_login_events`")));
-    for(const schema of ["identity-account-schema.sql","identity-password-reset-token-schema.sql","identity-legacy-challenge-schema.sql","identity-runtime-schema.sql","identity-wechat-oauth-schema.sql","identity-qrcode-schema.sql","identity-apple-schema.sql"])
+    for(const schema of ["identity-account-schema.sql","identity-password-reset-token-schema.sql","identity-legacy-challenge-schema.sql","identity-runtime-schema.sql","identity-wechat-oauth-schema.sql","identity-qrcode-schema.sql","identity-apple-schema.sql","identity-allocator-schema.sql"])
       await db.query(await readFile(join(projectRoot,"deploy/mysql",schema),"utf8"));
+    await initializeFreshAllocator(db);
     const keys=generateKeyPairSync("ec",{namedCurve:"prime256v1"});
     const environment={IDENTITY_DATA_SOURCE:"identity",IDENTITY_DB_HOST:options.host,IDENTITY_DB_PORT:String(options.port),IDENTITY_DB_USER:options.user,
       IDENTITY_DB_PASSWORD:options.password,IDENTITY_DB_NAME:databaseName,IDENTITY_TOKEN_ISSUANCE_ENABLED:"true",IDENTITY_REFRESH_REPLAY_KEY:randomBytes(32).toString("base64url"),
@@ -70,15 +72,17 @@ describe.skipIf(!enabled)("compiled AppModule independent HTTP bootstrap",()=>{
       LEGACY_DB_HOST:"127.0.0.1",LEGACY_DB_PORT:"1",LEGACY_DB_USER:"unreachable",LEGACY_DB_PASSWORD:"unreachable",
       LEGACY_WRITE_DB_HOST:"127.0.0.1",LEGACY_WRITE_DB_PORT:"1",LEGACY_WRITE_DB_USER:"unreachable",LEGACY_WRITE_DB_PASSWORD:"unreachable"};
     for(const [key,value] of Object.entries(environment))vi.stubEnv(key,value);
+    const {AppModule}=await import(pathToFileURL(join(buildDirectory,"apps/identity-adapter/src/app.module.js")).href);
+    app=await NestFactory.create(AppModule,{logger:false,abortOnError:false});
+    await app.listen(0,"127.0.0.1");baseUrl=await app.getUrl();
+    // Fresh proof is rechecked under the migration fence before activation.
+    // Seed authenticated actors only after the production bootstrap succeeds.
     const hash=await hashLegacyPassword(password);
     for(const [id,role] of [[1,"root"],[2,"admin"],[3,"manager"],[4,"user"]] as const) {
       await db.execute("INSERT INTO user(id,username,password_hash,status,created_at,updated_at) VALUES (?,?,?,10,1700000000,1700000000)",[id,`http-${role}`,hash]);
       await db.execute("INSERT INTO user_info(user_id,info) VALUES (?,?)",[id,JSON.stringify({fixture:role})]);
       await db.execute("INSERT INTO auth_assignment(item_name,user_id) VALUES (?,?)",[role,String(id)]);
     }
-    const {AppModule}=await import(pathToFileURL(join(buildDirectory,"apps/identity-adapter/src/app.module.js")).href);
-    app=await NestFactory.create(AppModule,{logger:false,abortOnError:false});
-    await app.listen(0,"127.0.0.1");baseUrl=await app.getUrl();
   },120000);
   afterAll(async()=>{
     await app?.close();await db?.end();

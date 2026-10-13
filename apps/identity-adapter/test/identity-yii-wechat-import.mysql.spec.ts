@@ -1,3 +1,5 @@
+import { accountImportTables, importIdentityAccounts } from "../src/identity-account-import.js";
+import { finalizeAllocator, readSourceAllocatorInventory } from "../src/identity-allocator-finalizer.js";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import mysql, { Connection, RowDataPacket } from "mysql2/promise";
@@ -340,12 +342,21 @@ describe.skipIf(process.env.IDENTITY_TEST_MYSQL !== "1")(
     });
 
     it("imports auth UUIDs only after a reviewed exact Yii mapping, preserving the canonical integer", async () => {
-      await source.query(`CREATE TABLE auth_users(id VARCHAR(128) PRIMARY KEY,primary_unionid VARCHAR(191),display_name VARCHAR(255),avatar_url VARCHAR(255),status VARCHAR(32),created_at DATETIME(3),updated_at DATETIME(3));
+      const init=readFileSync(new URL("../../../deploy/mysql/init.sql",import.meta.url),"utf8");await target.query(init.slice(init.indexOf("CREATE TABLE IF NOT EXISTS `auth_login_events`")));
+      for(const file of ["identity-password-reset-token-schema.sql","identity-legacy-challenge-schema.sql","identity-apple-schema.sql","identity-allocator-schema.sql"])await target.query(readFileSync(new URL("../../../deploy/mysql/"+file,import.meta.url),"utf8"));
+      const [sourceTables]=await source.query<RowDataPacket[]>("SHOW TABLES");for(const row of sourceTables){const name=String(Object.values(row)[0]);if(!Object.keys(accountImportTables).includes(name))await source.query("DROP TABLE `"+name+"`");}
+      await target.query("DELETE FROM wechat;DELETE FROM user");await importIdentityAccounts(source,target,{importKey:"yii-allocator-baseline",apply:true});
+      const authName="yii_auth_"+randomUUID().replaceAll("-","");await admin.query("CREATE DATABASE `"+authName+"` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");const authSource=await mysql.createConnection({...dbOptions,database:authName});
+      const finalize=async()=>{const info=await readSourceAllocatorInventory(source),fence=await mysql.createConnection({...dbOptions,database:targetName});try{await finalizeAllocator({source,target,fence,review:{version:1,sourceDatabase:sourceName,targetDatabase:targetName,sourceServerUuid:info.serverUuid,importKey:"yii-allocator-baseline",writersDrainedAt:new Date(Date.now()-1000).toISOString(),finalSyncSha256:"a".repeat(64),referenceReviewSha256:info.referenceReviewSha256},reviewSha256:"b".repeat(64),apply:true});}finally{await fence.end();}};
+      try{
+      await authSource.query(`CREATE TABLE auth_users(id VARCHAR(128) PRIMARY KEY,primary_unionid VARCHAR(191),display_name VARCHAR(255),avatar_url VARCHAR(255),status VARCHAR(32),created_at DATETIME(3),updated_at DATETIME(3));
       CREATE TABLE auth_identities(id VARCHAR(128) PRIMARY KEY,user_id VARCHAR(128),provider VARCHAR(64),provider_app_id VARCHAR(191),openid VARCHAR(191),unionid VARCHAR(191),profile_json JSON);
       INSERT INTO auth_users VALUES('old-uuid',NULL,'Old account',NULL,'active','2026-01-01','2026-01-01');
       INSERT INTO auth_identities VALUES('old-provider','old-uuid','wechat_official_account','ReviewedApp','CaseOpenId',NULL,NULL)`);
+      await expect(importWechatIdentities(authSource,target,{importKey:"allocator-missing",apply:true})).rejects.toThrow("ALLOCATOR_NOT_READY");
+      await finalize();
       await expect(
-        importWechatIdentities(source, target, {
+        importWechatIdentities(authSource, target, {
           importKey: "auth-unreviewed",
           apply: true,
         }),
@@ -359,8 +370,9 @@ describe.skipIf(process.env.IDENTITY_TEST_MYSQL !== "1")(
         manifest(),
         options,
       );
+      await finalize();
       expect(
-        await importWechatIdentities(source, target, {
+        await importWechatIdentities(authSource, target, {
           importKey: "auth-reviewed",
           apply: true,
         }),
@@ -374,6 +386,7 @@ describe.skipIf(process.env.IDENTITY_TEST_MYSQL !== "1")(
           )[0].user_id,
         ),
       ).toBe(41);
+      }finally{await authSource.end();await admin.query("DROP DATABASE IF EXISTS `"+authName+"`");}
     });
   },
 );

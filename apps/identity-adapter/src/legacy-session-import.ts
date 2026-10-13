@@ -1,3 +1,4 @@
+import { allocatorMutation } from "./identity-allocator-state.js";
 import { createHash } from "node:crypto";
 import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import { assertMigrationStaging } from "./migration-state.js";
@@ -197,7 +198,7 @@ export async function importLegacySessions(
   };
   await target.beginTransaction();
   try {
-    if (options.apply) await assertMigrationStaging(target);
+    if(options.apply){await assertMigrationStaging(target);}
     // Use the same account-first lock order as rotation, password changes and logout.
     const rows = [...unique.values()].sort(
       (a, b) =>
@@ -278,20 +279,20 @@ export async function importLegacySessions(
         )
           throw new Error("Legacy session client scope conflict.");
         if (!binding && options.apply)
-          await target.execute(
+          await allocatorMutation(target,()=>target.execute(
             "INSERT INTO identity_oauth_session_bindings (session_id,client_id,scopes_json,legacy_subject) VALUES (?,?,?,?)",
             [
               row.sessionId,
-              row.client.client_id,
-              JSON.stringify(row.client.scopes),
-              row.client.legacy_subject ?? null,
+              row.client!.client_id,
+              JSON.stringify(row.client!.scopes),
+              row.client!.legacy_subject ?? null,
             ],
-          );
+          ));
         if (!binding) report.clientBindings++;
       }
       report.wouldImport++;
       if (options.apply) {
-        await target.execute(
+        await allocatorMutation(target,()=>target.execute(
           `INSERT INTO identity_refresh_sessions
           (refresh_token_hash,session_id,legacy_user_id,username,issued_at,expires_at,revoked_at,replaced_by_hash,ip_hash,user_agent_hash,auth_method,device_sn_id)
           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
@@ -309,7 +310,7 @@ export async function importLegacySessions(
             row.authMethod,
             row.deviceSnId,
           ],
-        );
+        ));
         report.imported++;
       }
     }

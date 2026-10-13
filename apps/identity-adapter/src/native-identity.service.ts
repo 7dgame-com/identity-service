@@ -1,3 +1,4 @@
+import { assertNativeUserAllocation } from "./identity-allocator-manifest.js";
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException, OnApplicationBootstrap, OnModuleDestroy, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
 import mysql, { Pool, PoolConnection, ResultSetHeader, RowDataPacket } from "mysql2/promise";
@@ -9,6 +10,7 @@ import { IdentitySessionRepository } from "./identity-session.repository.js";
 import { hashLegacyPassword } from "./legacy-password.js";
 import { validatePasswordPolicy } from "./password-policy.js";
 import { enqueueSubjectEvent } from "./subject-events.js";
+import { assertAllocatorReady } from "./identity-allocator-state.js";
 import { activateIdentityAuthority } from "./migration-state.js";
 import { deviceSnSource } from "./device-sn-source.js";
 import { revokeLegacyRefreshCredentialsInTransaction } from "./legacy-refresh-credential-revocation.js";
@@ -44,7 +46,7 @@ export class NativeIdentityService implements OnModuleDestroy, OnApplicationBoot
     const [clock] = await this.db().query<RowDataPacket[]>("SELECT id FROM identity_event_clock WHERE id=1");
     if (!clock.length) throw new Error("Identity event sequence clock is not initialized");
     const connection=await this.db().getConnection();
-    try{await connection.beginTransaction();await activateIdentityAuthority(connection);await connection.commit();}
+    try{await connection.beginTransaction();await connection.execute("SELECT authority FROM identity_migration_control WHERE id=1 FOR UPDATE");await assertAllocatorReady(connection);await activateIdentityAuthority(connection);await connection.commit();}
     catch(error){await connection.rollback();throw error;}finally{connection.release();}
   }
   async onModuleDestroy() { await this.pool?.end(); }
@@ -218,7 +220,7 @@ export class NativeIdentityService implements OnModuleDestroy, OnApplicationBoot
         "INSERT INTO user (username,nickname,email,password_hash,auth_key,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
         [username, body.nickname == null ? null : parse(z.string().max(255), body.nickname), email, passwordHash,
           randomBytes(24).toString("base64url"), parse(z.coerce.number().int().refine((v) => [0,9,10].includes(v)).default(10), body.status), nowSeconds(), nowSeconds()]);
-      const id = Number(result.insertId);
+      const id = assertNativeUserAllocation(result.insertId);
       await connection.execute("INSERT INTO user_info (user_id) VALUES (?)", [id]);
       await this.assignRoles(connection, id, role);
       await this.replaceOrganizations(connection, id, organizationIds(body) ?? []);

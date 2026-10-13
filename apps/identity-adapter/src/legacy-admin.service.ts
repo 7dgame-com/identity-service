@@ -1,3 +1,4 @@
+import { assertNativeUserAllocation } from "./identity-allocator-manifest.js";
 import { BadRequestException, ConflictException, ForbiddenException, Injectable, OnModuleDestroy, ServiceUnavailableException } from "@nestjs/common";
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import mysql, { Pool, PoolConnection, RowDataPacket, ResultSetHeader } from "mysql2/promise";
@@ -44,7 +45,7 @@ export class LegacyAdminService implements OnModuleDestroy {
         return this.once(c,request,`${operation}:${actor}`,body,async()=>{
           const now=Math.floor(Date.now()/1000);
           if(operation==="user-create"){
-            let id:number;try{const [inserted]=await c.execute<ResultSetHeader>("INSERT INTO user(username,email,password_hash,status,created_at,updated_at) VALUES (?,?,?,10,?,?)",[body.username!,body.email??null,passwordHash,now,now]);id=Number(inserted.insertId);}catch(error){if((error as {code?:string}).code==="ER_DUP_ENTRY")throw new ConflictException("Username or email already exists");throw error;}
+            let id:number;try{const [inserted]=await c.execute<ResultSetHeader>("INSERT INTO user(username,email,password_hash,status,created_at,updated_at) VALUES (?,?,?,10,?,?)",[body.username!,body.email??null,passwordHash,now,now]);id=assertNativeUserAllocation(inserted.insertId);}catch(error){if((error as {code?:string}).code==="ER_DUP_ENTRY")throw new ConflictException("Username or email already exists");throw error;}
             await c.execute("INSERT INTO user_info(user_id) VALUES (?)",[id]);await c.execute("INSERT INTO auth_assignment(item_name,user_id,created_at) VALUES ('user',?,?)",[String(id),now]);await enqueueSubjectEvent(c,id);
             return {id,username:body.username,email:body.email??null,nickname:null,status:10,created_at:now,updated_at:now};
           }

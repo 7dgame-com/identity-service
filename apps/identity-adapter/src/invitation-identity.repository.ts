@@ -1,3 +1,4 @@
+import { invalidateAllocatorReady } from "./identity-allocator-state.js";
 import { Injectable, OnModuleDestroy } from "@nestjs/common";
 import mysql, { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { loadConfig } from "./config.js";
@@ -159,7 +160,7 @@ export class InvitationIdentityRepository implements OnModuleDestroy {
     let affected = 0;
     try {
     await connection.beginTransaction();
-    await assertMigrationStaging(connection);
+    await assertMigrationStaging(connection);await invalidateAllocatorReady(connection);
     for (const invitation of invitations) {
       if (!isImportable(invitation)) {
         continue;

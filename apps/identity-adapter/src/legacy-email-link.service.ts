@@ -1,3 +1,4 @@
+import { assertNativeUserAllocation } from "./identity-allocator-manifest.js";
 import { BadRequestException, ConflictException, Inject, Injectable, OnModuleDestroy, ServiceUnavailableException } from "@nestjs/common";
 import { createHash, createHmac, randomBytes,createCipheriv,createDecipheriv } from "node:crypto";
 import mysql, { Pool, PoolConnection, RowDataPacket, ResultSetHeader } from "mysql2/promise";
@@ -121,7 +122,7 @@ export class LegacyEmailLinkService implements OnModuleDestroy {
       if(invitations.length!==1||invitations[0].recipient_id!=null||Number(invitations[0].used)===1)throw new BadRequestException("Invitation is invalid or already claimed");
       const now=Math.floor(Date.now()/1000),token=`${randomBytes(32).toString("base64url")}_${now}`;
       let id:number;
-      try{const [inserted]=await connection.execute<ResultSetHeader>("INSERT INTO user(username,email,password_hash,auth_key,status,verification_token,created_at,updated_at) VALUES (?,?,?,?,9,?,?,?)",[input.username,input.email,passwordHash,randomBytes(24).toString("base64url"),token,now,now]);id=Number(inserted.insertId);}
+      try{const [inserted]=await connection.execute<ResultSetHeader>("INSERT INTO user(username,email,password_hash,auth_key,status,verification_token,created_at,updated_at) VALUES (?,?,?,?,9,?,?,?)",[input.username,input.email,passwordHash,randomBytes(24).toString("base64url"),token,now,now]);id=assertNativeUserAllocation(inserted.insertId);}
       catch(error){if((error as {code?:string}).code==="ER_DUP_ENTRY")throw new ConflictException("Username or email already exists");throw error;}
       await connection.execute("INSERT INTO user_info(user_id) VALUES (?)",[id]);
       await connection.execute("UPDATE invitation SET recipient_id=? WHERE id=?",[id,invitations[0].id]);

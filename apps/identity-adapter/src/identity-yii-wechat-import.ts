@@ -1,3 +1,4 @@
+import { allocatorMutation } from "./identity-allocator-state.js";
 import { createHash } from "node:crypto";
 import type { Connection, PoolConnection, RowDataPacket } from "mysql2/promise";
 import { z } from "zod";
@@ -84,8 +85,7 @@ export async function importReviewedYiiWechatBindings(
   await target.beginTransaction();
   let sourceStarted = false;
   try {
-    await assertMigrationStaging(target);
-    const [runs] = await target.execute<RowDataPacket[]>(
+    await assertMigrationStaging(target);    const [runs] = await target.execute<RowDataPacket[]>(
       "SELECT source_database,row_counts FROM identity_wechat_import_runs WHERE import_key=? FOR UPDATE",
       [options.importKey],
     );
@@ -199,7 +199,7 @@ export async function importReviewedYiiWechatBindings(
     }
     if (options.apply) {
       for (const binding of changes)
-        await target.execute(
+        await allocatorMutation(target,()=>target.execute(
           `INSERT INTO identity_wechat_identities(provider,provider_app_id,open_id,user_id,union_id)
         VALUES(?,?,?,?,?) ON DUPLICATE KEY UPDATE user_id=VALUES(user_id),union_id=COALESCE(union_id,VALUES(union_id)),signup_token_hash=NULL`,
           [
@@ -209,12 +209,12 @@ export async function importReviewedYiiWechatBindings(
             binding.user_id,
             binding.union_id,
           ],
-        );
+        ));
       for (const userId of [
         ...new Set(changes.map((binding) => binding.user_id)),
       ].sort((a, b) => a - b))
         await enqueueSubjectEvent(target as unknown as PoolConnection, userId);
-      await target.execute(
+      await allocatorMutation(target,()=>target.execute(
         "INSERT INTO identity_wechat_import_runs(import_key,source_database,row_counts,completed_at) VALUES(?,?,?,UTC_TIMESTAMP(3))",
         [
           options.importKey,
@@ -225,7 +225,7 @@ export async function importReviewedYiiWechatBindings(
             manifest_digest: manifestDigest,
           }),
         ],
-      );
+      ));
       await target.commit();
       report.applied = true;
       report.imported = changes.length;

@@ -1,3 +1,4 @@
+import { allocatorMutation } from "./identity-allocator-state.js";
 import { createHash } from "node:crypto";
 import type { Connection, RowDataPacket } from "mysql2/promise";
 import { z } from "zod";
@@ -438,7 +439,7 @@ export async function importLegacyQrManifest(
   };
   await target.beginTransaction();
   try {
-    if (options.apply) await assertMigrationStaging(target);
+    if(options.apply){await assertMigrationStaging(target);}
     const lock = options.apply ? " FOR UPDATE" : "";
     for (const row of [...manifest.login_codes].sort(
       (a, b) => a.user_id - b.user_id || a.code_hash.localeCompare(b.code_hash),
@@ -462,7 +463,7 @@ export async function importLegacyQrManifest(
       if (row.expires_at <= now) report.inactive++;
       report.wouldImport++;
       if (options.apply)
-        await target.execute(
+        await allocatorMutation(target,()=>target.execute(
           "INSERT INTO identity_login_codes(code_hash,user_id,issued_at,expires_at,context_json) VALUES (?,?,?,?,?)",
           [
             row.code_hash,
@@ -471,7 +472,7 @@ export async function importLegacyQrManifest(
             row.expires_at,
             JSON.stringify(row.context),
           ],
-        );
+        ));
     }
     for (const row of [...manifest.wechat_scenes].sort((a, b) =>
       a.scene_hash.localeCompare(b.scene_hash),
@@ -529,7 +530,7 @@ export async function importLegacyQrManifest(
       if (row.expires_at <= now) report.inactive++;
       report.wouldImport++;
       if (options.apply)
-        await target.execute(
+        await allocatorMutation(target,()=>target.execute(
           "INSERT INTO identity_wechat_scenes(scene_hash,expires_at,provider_app_id,open_id,user_id,signup_token_hash,profile_json) VALUES (?,?,?,?,?,?,?)",
           [
             row.scene_hash,
@@ -540,7 +541,7 @@ export async function importLegacyQrManifest(
             signupHash,
             row.profile ? JSON.stringify(row.profile) : null,
           ],
-        );
+        ));
     }
     if (options.apply) {
       await target.commit();

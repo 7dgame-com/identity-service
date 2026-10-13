@@ -1,3 +1,4 @@
+import { assertNativeUserAllocation } from "./identity-allocator-manifest.js";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { BadRequestException, ConflictException, Inject, Injectable, OnModuleDestroy, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
 import mysql, { Pool, RowDataPacket, ResultSetHeader } from "mysql2/promise";
@@ -79,7 +80,7 @@ export class IdentityWechatOAuthService implements OnModuleDestroy {
         const username = `wx_${createHash("sha256").update(`${profile.provider}:${profile.providerAppId}:${profile.openId}`).digest("hex").slice(0,40)}`;
         const [created] = await connection.execute<ResultSetHeader>(`INSERT INTO user (username,nickname,auth_key,status,created_at,updated_at)
           VALUES (?,?,?,10,?,?)`,[username,profile.nickname??null,randomBytes(24).toString("base64url"),now,now]);
-        userId = created.insertId;
+        userId = assertNativeUserAllocation(created.insertId);
         await connection.execute("INSERT INTO user_info (user_id,info) VALUES (?,?)",[userId,JSON.stringify({wechatAvatarUrl:profile.avatarUrl??null})]);
         await connection.execute("INSERT INTO auth_assignment (item_name,user_id,created_at) VALUES ('user',?,?)",[String(userId),now]);
         await enqueueSubjectEvent(connection,userId);

@@ -12,6 +12,7 @@ import {LegacyAdminService} from "../src/legacy-admin.service.js";
 import {LegacyAdminController,LegacyPolicyController} from "../src/legacy-admin.controller.js";
 import {hashLegacyPassword} from "../src/legacy-password.js";
 import type {LoginAuditService} from "../src/login-audit.service.js";
+import {initializeFreshAllocator} from "../src/identity-allocator-state.js";
 
 const options={host:process.env.IDENTITY_DB_HOST??"127.0.0.1",port:Number(process.env.IDENTITY_DB_PORT??3306),user:process.env.IDENTITY_DB_USER??"root",password:process.env.IDENTITY_DB_PASSWORD??"",multipleStatements:true,timezone:"Z"};
 const name=`test_legacy_admin_${randomUUID().replaceAll("-","")}`,password="Admin-private!73",authKey=randomBytes(32).toString("hex"),iamKey=randomBytes(32).toString("hex");
@@ -32,7 +33,8 @@ describe.skipIf(process.env.IDENTITY_TEST_MYSQL!=="1")("legacy administration ag
  beforeAll(async()=>{
   adminDb=await mysql.createConnection(options);await adminDb.query(`CREATE DATABASE ${name}`);db=await mysql.createConnection({...options,database:name});
   const init=await readFile(new URL("../../../deploy/mysql/init.sql",import.meta.url),"utf8");await db.query(init.slice(init.indexOf("CREATE TABLE IF NOT EXISTS `auth_login_events`")));
-  for(const file of ["identity-account-schema.sql","identity-runtime-schema.sql"])await db.query(await readFile(new URL(`../../../deploy/mysql/${file}`,import.meta.url),"utf8"));
+  for(const file of ["identity-account-schema.sql","identity-runtime-schema.sql","identity-password-reset-token-schema.sql","identity-legacy-challenge-schema.sql","identity-wechat-oauth-schema.sql","identity-qrcode-schema.sql","identity-apple-schema.sql","identity-allocator-schema.sql"])await db.query(await readFile(new URL(`../../../deploy/mysql/${file}`,import.meta.url),"utf8"));
+  await initializeFreshAllocator(db);
   const keys=generateKeyPairSync("ec",{namedCurve:"prime256v1"});for(const [key,value] of Object.entries({IDENTITY_DATA_SOURCE:"identity",IDENTITY_DB_HOST:options.host,IDENTITY_DB_PORT:String(options.port),IDENTITY_DB_USER:options.user,IDENTITY_DB_PASSWORD:options.password,IDENTITY_DB_NAME:name,IDENTITY_TOKEN_ISSUANCE_ENABLED:"true",IDENTITY_TOKEN_ISSUANCE_INTERNAL_API_TOKEN:authKey,IDENTITY_IAM_INTERNAL_API_TOKEN:iamKey,IDENTITY_REFRESH_REPLAY_KEY:randomBytes(32).toString("base64url"),IDENTITY_JWT_PRIVATE_KEY_PEM:keys.privateKey.export({type:"pkcs8",format:"pem"}).toString(),IDENTITY_LOGIN_AUDIT_ENABLED:"false",LEGACY_DB_HOST:"127.0.0.1",LEGACY_DB_PORT:"1",LEGACY_DB_USER:"unreachable"}))vi.stubEnv(key,value);
   reader=new LegacyIdentityReader();sessions=new IdentitySessionRepository();const jwt=new JwtIssuerService();tokens=new TokenIssuanceService(reader,sessions,jwt,{record:vi.fn()} as unknown as LoginAuditService);native=new NativeIdentityService(reader,jwt,sessions);admin=new LegacyAdminService(native);controller=new LegacyAdminController(admin);
   await native.onApplicationBootstrap();await db.query("INSERT INTO auth_item(name,type) VALUES ('agent',1)");const hash=await hashLegacyPassword(password);
