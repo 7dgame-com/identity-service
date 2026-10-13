@@ -1,14 +1,20 @@
-import { CanActivate, ExecutionContext, Injectable, UnauthorizedException } from "@nestjs/common";
+import { CanActivate, ExecutionContext, Injectable, Optional, UnauthorizedException } from "@nestjs/common";
+import { Reflector } from "@nestjs/core";
 import { denyDeviceSnCredentialDerivation } from "./device-sn-source.js";
 import { JwtIssuerService } from "./jwt-issuer.service.js";
 import { LegacyIdentityReader } from "./legacy-identity.reader.js";
+import { loadConfig } from "./config.js";
+import { activationProbe } from "./identity-activation.guard.js";
 
 /** Applies to every HTTP surface, including legacy-proxy account endpoints. */
 @Injectable()
 export class DeviceSnAccessGuard implements CanActivate {
-  constructor(private readonly jwtIssuer: JwtIssuerService, private readonly legacyReader: LegacyIdentityReader) {}
+  private readonly explicit = loadConfig().activationMode === "explicit";
+  constructor(private readonly jwtIssuer: JwtIssuerService, private readonly legacyReader: LegacyIdentityReader,
+    @Optional() private readonly reflector?: Reflector) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
+    if (this.explicit && this.reflector?.getAllAndOverride<boolean>(activationProbe, [context.getHandler(), context.getClass()])) return true;
     const request = context.switchToHttp().getRequest<{
       headers: Record<string, string | undefined>; path?: string; url?: string; method: string; body?: Record<string, unknown>;
     }>();

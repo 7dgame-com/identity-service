@@ -1,28 +1,44 @@
-import { Controller, Get, Inject, ServiceUnavailableException } from "@nestjs/common";
+import { Controller, Get, Inject, Optional, ServiceUnavailableException } from "@nestjs/common";
 import { trace } from "@opentelemetry/api";
 import { publicBuildRevision } from "./build-revision.js";
 import { loadConfig } from "./config.js";
 import { LegacyIdentityReader } from "./legacy-identity.reader.js";
+import { ActivationProbe } from "./identity-activation.guard.js";
+import { IdentityActivationService } from "./identity-activation.service.js";
 
 @Controller()
 export class HealthController {
   private readonly config = loadConfig();
 
-  constructor(@Inject(LegacyIdentityReader) private readonly legacyReader: LegacyIdentityReader) {}
+  constructor(@Inject(LegacyIdentityReader) private readonly legacyReader: LegacyIdentityReader,
+    @Optional() private readonly activation?: IdentityActivationService) {}
+
+  @Get("health/live")
+  @ActivationProbe()
+  live() { return { status: "alive", service: "identity-adapter" }; }
 
   @Get("health")
+  @ActivationProbe()
   async health() {
     const span = trace.getTracer(this.config.otel.serviceName).startSpan("identity.health");
     try {
+      let activation;
+      if (this.config.activationMode === "explicit") {
+        try { activation = await this.activation?.status(); }
+        catch { throw new ServiceUnavailableException({ status: "sealed", code: "IDENTITY_SEALED", ready: false, accountAuthority: "unavailable" }); }
+        if (!activation?.ready) throw new ServiceUnavailableException({ status: "sealed", code: "IDENTITY_SEALED", ready: false,
+          service: "identity-adapter", accountAuthority: activation?.authority ?? "unavailable", activation });
+      }
       const legacyDatabase = await this.legacyReader.health();
       if(this.config.dataSource==="identity"&&legacyDatabase!=="configured")throw new ServiceUnavailableException("Identity account storage is unavailable");
       return {
         status: "ok",
         service: "identity-adapter",
         mode: this.config.dataSource === "identity" ? "independent" : this.config.readonlyMode ? "readonly" : "unsafe",
-        accountAuthority: this.config.dataSource,
+        accountAuthority: activation?.authority ?? this.config.dataSource,
+        ...(activation ? { activation } : {}),
         version: process.env.npm_package_version ?? "0.1.0",
-        revision: publicBuildRevision(),
+        revision: activation?.revision ?? publicBuildRevision(),
         dependencies: {
           ...(this.config.dataSource === "identity" ? {identityDatabase: legacyDatabase} : {legacyDatabase}),
           keycloak: this.config.keycloak.baseUrl ? "configured" : "not_configured"

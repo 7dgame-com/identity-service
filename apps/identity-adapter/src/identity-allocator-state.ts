@@ -84,6 +84,7 @@ export const formalAllocatorTables = [
 ] as const;
 const allowedPrivateTables = new Set<string>([
   ...formalAllocatorTables,
+  "identity_activation_receipt",
   "identity_iam_item_relations",
   "identity_iam_permissions",
   "identity_iam_policy_versions",

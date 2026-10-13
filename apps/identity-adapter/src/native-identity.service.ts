@@ -1,6 +1,6 @@
 import { assertNativeUserAllocation } from "./identity-allocator-manifest.js";
 import { createHash, createHmac, randomBytes } from "node:crypto";
-import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException, OnApplicationBootstrap, OnModuleDestroy, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
+import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException, OnApplicationBootstrap, OnModuleDestroy, Optional, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
 import mysql, { Pool, PoolConnection, ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { z } from "zod";
 import { loadConfig } from "./config.js";
@@ -14,6 +14,7 @@ import { assertAllocatorReady } from "./identity-allocator-state.js";
 import { activateIdentityAuthority } from "./migration-state.js";
 import { deviceSnSource } from "./device-sn-source.js";
 import { revokeLegacyRefreshCredentialsInTransaction } from "./legacy-refresh-credential-revocation.js";
+import { IdentityActivationService } from "./identity-activation.service.js";
 
 export interface NativeRequest { headers: Record<string, string | string[] | undefined>; body?: unknown; }
 const positiveId = z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER);
@@ -25,7 +26,7 @@ export class NativeIdentityService implements OnModuleDestroy, OnApplicationBoot
   readonly config = loadConfig();
   private readonly pool: Pool | null;
   constructor(private readonly reader: LegacyIdentityReader, private readonly jwt: JwtIssuerService,
-    private readonly sessions: IdentitySessionRepository) {
+    private readonly sessions: IdentitySessionRepository, @Optional() private readonly activation?: IdentityActivationService) {
     const db = this.config.identityDb;
     this.pool = this.enabled && db.host && db.user ? mysql.createPool({ host: db.host, port: db.port,
       database: db.name, user: db.user, password: db.password, connectionLimit: 10, timezone: "Z" }) : null;
@@ -39,12 +40,18 @@ export class NativeIdentityService implements OnModuleDestroy, OnApplicationBoot
     }
     if (!this.config.jwt.privateKeyPem && !this.config.jwt.privateKeyFile) throw new Error("Independent Identity requires its signing key");
     this.jwt.assertSigningReady();
-    await this.sessions.ensureSchema();
+    if (this.config.activationMode === "explicit") await this.sessions.useExistingSchema();
+    else await this.sessions.ensureSchema();
     for (const table of ["user","user_info","auth_item","auth_assignment","user_organization","identity_native_operations","identity_subject_events","identity_event_clock","identity_profile_avatars"]) {
       await this.db().query(`SELECT 1 FROM ${table} LIMIT 1`);
     }
     const [clock] = await this.db().query<RowDataPacket[]>("SELECT id FROM identity_event_clock WHERE id=1");
     if (!clock.length) throw new Error("Identity event sequence clock is not initialized");
+    if (this.config.activationMode === "explicit") {
+      if (!this.activation) throw new Error("Explicit activation requires the global activation coordinator");
+      await this.activation.warm();
+      return;
+    }
     const connection=await this.db().getConnection();
     try{await connection.beginTransaction();await connection.execute("SELECT authority FROM identity_migration_control WHERE id=1 FOR UPDATE");await assertAllocatorReady(connection);await activateIdentityAuthority(connection);await connection.commit();}
     catch(error){await connection.rollback();throw error;}finally{connection.release();}

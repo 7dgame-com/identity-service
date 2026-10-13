@@ -89,7 +89,7 @@ export class IamService implements OnApplicationBootstrap {
   ) {}
 
   async onApplicationBootstrap() {
-    if (this.config.iam.schemaAutoEnsureEnabled) {
+    if (this.config.activationMode !== "explicit" && this.config.iam.schemaAutoEnsureEnabled) {
       await this.ensureSchema();
     }
   }

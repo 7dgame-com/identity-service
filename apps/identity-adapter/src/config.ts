@@ -43,6 +43,7 @@ function validMailHost(value: string): boolean {
 export const configSchema = z.object({
   nodeEnv: z.string().default("development"),
   dataSource: z.enum(["legacy", "identity"]).default("legacy"),
+  activationMode: z.enum(["bootstrap", "explicit"]).default("bootstrap"),
   port: numberFromEnv.default(8086),
   readonlyMode: boolFromEnv.default(true),
   corsOrigins: z.string().default("http://localhost:3000,http://localhost:3001,http://localhost:3002,http://localhost:3004,http://localhost:3005,http://localhost:3008"),
@@ -337,6 +338,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): IdentityConfig
   return configSchema.parse({
     nodeEnv: env.NODE_ENV,
     dataSource: env.IDENTITY_DATA_SOURCE,
+    activationMode: env.IDENTITY_ACTIVATION_MODE,
     port: env.PORT,
     readonlyMode: env.IDENTITY_READONLY_MODE,
     corsOrigins: env.IDENTITY_CORS_ORIGINS,

@@ -4,8 +4,14 @@ This repository provides the XR UGC platform's identity service. The default
 `IDENTITY_DATA_SOURCE=legacy` keeps the existing readonly comparison deployment.
 Explicit `identity` mode makes the private database authoritative for accounts,
 permissions, organizations, credentials and sessions, with no old account-store
-fallback. Native startup requires completed staging imports and activates the
-migration fence; follow the deployment instructions before starting it.
+fallback. The default `IDENTITY_ACTIVATION_MODE=bootstrap` requires completed
+staging imports and activates the migration fence during native startup.
+
+For a prewarmed online development candidate, optional
+`IDENTITY_ACTIVATION_MODE=explicit` keeps HTTP sealed while staging and requires
+a private CLI to commit activation. Provision its empty receipt table first and
+follow [explicit activation](deploy/explicit-activation.md). Keep sealed instances
+out of user routing; this mode does not provide request queuing or writer drain.
 
 ## Local Start
 
@@ -42,7 +48,8 @@ so uncommitted or untracked build inputs must be committed first. The build
 revision is required and must be a full lowercase 40-character service commit.
 Leave the application stopped while importing and checking the staging
 database, including final sessions and provider bindings. The first native HTTP
-bootstrap permanently activates Identity authority and blocks later legacy imports.
+bootstrap in the default activation mode permanently activates Identity authority
+and blocks later legacy imports. Explicit mode follows the separate procedure above.
 After completing those checks, start the prebuilt application:
 
 ```bash

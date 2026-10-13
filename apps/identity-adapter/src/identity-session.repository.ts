@@ -362,10 +362,77 @@ export class IdentitySessionRepository implements OnModuleDestroy {
 
   async ensureSchema(): Promise<void> {
     if (!this.schemaReady) {
-      this.schemaReady = this.createSchema().catch((error) => { this.schemaReady = null; throw error; });
+      this.schemaReady = (this.config.activationMode === "explicit" ? this.validateExistingSchema() : this.createSchema())
+        .catch((error) => { this.schemaReady = null; throw error; });
     }
 
     return this.schemaReady;
+  }
+
+  /** Explicit standby performs no automatic DDL, including CREATE IF NOT EXISTS. */
+  async useExistingSchema(): Promise<void> {
+    if (!this.schemaReady) this.schemaReady = this.validateExistingSchema()
+      .catch((error) => { this.schemaReady = null; throw error; });
+    return this.schemaReady;
+  }
+
+  private async validateExistingSchema(): Promise<void> {
+    // Keep the complete contracts in step with createSchema and its two imported ledgers.
+    // LIMIT 0 checks even nullable/replay fields without reading credential contents.
+    const columns: Record<string, string> = {
+      identity_refresh_sessions: "id,refresh_token_hash,session_id,legacy_user_id,username,issued_at,expires_at,revoked_at,replaced_by_hash,ip_hash,user_agent_hash,auth_method,device_sn_id,created_at,updated_at",
+      identity_refresh_replays: "predecessor_hash,successor_hash,request_hash,encrypted_response,created_at,expires_at",
+      identity_user_revocations: "user_id,revoked_before",
+      identity_legacy_refresh_credentials: "credential_hash,source_record_id,legacy_user_id,source_kind,source_revision,source_fields_json,key_encoding,a1_compatible,server_compatible,snapshot_at,account_fingerprint,expires_at,source_revoked_at,revoked_at,redeemed_at,redeemed_consumer,session_id,successor_hash,request_hash,encrypted_response,replay_expires_at",
+      identity_legacy_wechat_signup_credentials: "credential_hash,source_database,source_record_id,source_revision,manifest_hash,evidence_json,provider,provider_app_id,open_id,expires_at,source_revoked_at,revoked_at,consumed_at,consumed_user_id,consumed_action,account_fingerprint,session_id,successor_hash,request_hash,encrypted_response,replay_expires_at",
+      identity_oauth_session_bindings: "session_id,client_id,scopes_json,legacy_subject",
+      identity_oidc_session_bindings: "session_id,client_id,scopes_json",
+    };
+    type RequiredIndex = { columns: string[]; primary?: true; unique?: true };
+    const indexes: Record<string, RequiredIndex[]> = {
+      identity_refresh_sessions: [
+        { columns: ["id"], primary: true }, { columns: ["refresh_token_hash"], unique: true },
+        { columns: ["legacy_user_id", "expires_at"] }, { columns: ["session_id"] },
+      ],
+      identity_refresh_replays: [{ columns: ["predecessor_hash"], primary: true }, { columns: ["expires_at"] }],
+      identity_user_revocations: [{ columns: ["user_id"], primary: true }],
+      identity_legacy_refresh_credentials: [
+        { columns: ["credential_hash"], primary: true }, { columns: ["source_record_id"], unique: true },
+        { columns: ["legacy_user_id"] }, { columns: ["session_id"] },
+      ],
+      identity_legacy_wechat_signup_credentials: [
+        { columns: ["credential_hash"], primary: true }, { columns: ["source_database", "source_record_id"], unique: true },
+        { columns: ["provider", "provider_app_id", "open_id"], unique: true },
+        { columns: ["consumed_user_id"] }, { columns: ["session_id"] },
+      ],
+      identity_oauth_session_bindings: [{ columns: ["session_id"], primary: true }, { columns: ["client_id"] }],
+      identity_oidc_session_bindings: [{ columns: ["session_id"], primary: true }, { columns: ["client_id"] }],
+    };
+    const pool = this.requirePool();
+    for (const [table, fields] of Object.entries(columns)) await pool.query(`SELECT ${fields} FROM ${table} LIMIT 0`);
+    const tables = Object.keys(columns);
+    const [rows] = await pool.query<RowDataPacket[]>(`SELECT TABLE_NAME,INDEX_NAME,NON_UNIQUE,SEQ_IN_INDEX,COLUMN_NAME,SUB_PART,INDEX_TYPE,IS_VISIBLE
+      FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME IN (${tables.map(() => "?").join(",")})
+      ORDER BY TABLE_NAME,INDEX_NAME,SEQ_IN_INDEX`, tables);
+    for (const [table, required] of Object.entries(indexes)) {
+      const actual = new Map<string, RowDataPacket[]>();
+      for (const row of rows.filter((row) => row.TABLE_NAME === table)) {
+        const parts = actual.get(String(row.INDEX_NAME)) ?? [];
+        parts.push(row); actual.set(String(row.INDEX_NAME), parts);
+      }
+      for (const index of required) {
+        // Names may differ in a historical schema. Column order, complete keys and
+        // uniqueness must match; a prefix/fulltext/invisible lookup index is insufficient.
+        const present = [...actual.entries()].some(([name, parts]) =>
+          (!index.primary || name === "PRIMARY") &&
+          (!index.primary && !index.unique || parts.every((part) => Number(part.NON_UNIQUE) === 0)) &&
+          (index.primary || index.unique || parts.every((part) => part.IS_VISIBLE === "YES")) &&
+          parts.length === index.columns.length && parts.every((part, position) =>
+            Number(part.SEQ_IN_INDEX) === position + 1 && part.COLUMN_NAME === index.columns[position] &&
+            part.SUB_PART == null && part.INDEX_TYPE === "BTREE"));
+        if (!present) throw new Error(`IDENTITY_SESSION_SCHEMA_INDEX_REQUIRED:${table}`);
+      }
+    }
   }
 
   private async createSchema(): Promise<void> {
