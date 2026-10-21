@@ -1,3 +1,4 @@
+import { AdmissionWriter } from "./identity-admission.js";
 import { createHash, createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { Injectable, type OnModuleDestroy, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
 import mysql, { type Pool, type RowDataPacket } from "mysql2/promise";
@@ -26,6 +27,7 @@ export class LegacyRefreshCredentialRepository implements OnModuleDestroy {
     return rows.length > 0;
   }
 
+  @AdmissionWriter()
   async redeem(raw: string, context: RequestContext = {}, consumer: "server" | "a1" = "server"): Promise<AuthTokenResponse> {
     const hash = credentialHash(raw), key = replayKey();
     this.jwt.assertSigningReady();
@@ -78,6 +80,7 @@ export class LegacyRefreshCredentialRepository implements OnModuleDestroy {
     } catch (error) { await connection.rollback(); throw error; } finally { connection.release(); }
   }
 
+  @AdmissionWriter()
   async revoke(raw: string): Promise<boolean> {
     const hash = credentialHash(raw);
     const [owners] = await this.db().execute<RowDataPacket[]>("SELECT legacy_user_id FROM identity_legacy_refresh_credentials WHERE credential_hash=?", [hash]);

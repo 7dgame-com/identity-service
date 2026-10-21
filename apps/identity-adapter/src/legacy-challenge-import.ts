@@ -1,3 +1,4 @@
+import { assertAdmissionWriter } from "./identity-admission.js";
 import { allocatorMutation } from "./identity-allocator-state.js";
 import { createHash } from "node:crypto";
 import type { Connection, RowDataPacket } from "mysql2/promise";
@@ -320,6 +321,7 @@ export async function importLegacyChallenges(
     now?: Date;
   } = {},
 ) {
+  assertAdmissionWriter();
   if (
     options.apply &&
     (options.environment ?? process.env.NODE_ENV) !== "staging"

@@ -1,3 +1,4 @@
+import { AdmissionWriter, markAdmissionUnknown } from "./identity-admission.js";
 import { assertNativeUserAllocation } from "./identity-allocator-manifest.js";
 import { createHash, randomBytes, randomInt, randomUUID } from "node:crypto";
 import { Injectable, OnModuleDestroy } from "@nestjs/common";
@@ -53,6 +54,7 @@ export class AccountRegistrationRepository implements OnModuleDestroy {
     return this.pool !== null;
   }
 
+  @AdmissionWriter()
   async register(input: NativeRegisterInput, operationKey?: string): Promise<NativeRegisteredUser> {
     const connection = await this.requireConnection();
     try {
@@ -75,6 +77,7 @@ export class AccountRegistrationRepository implements OnModuleDestroy {
     }
   }
 
+  @AdmissionWriter()
   async registerWechat(input: NativeWechatRegisterInput, operationKey?: string): Promise<NativeRegisteredUser> {
     const connection = await this.requireConnection();
     try {
@@ -117,6 +120,7 @@ export class AccountRegistrationRepository implements OnModuleDestroy {
     }
   }
 
+  @AdmissionWriter()
   async createInvitationEmailChallenge(inviteCode: string, rawEmail: string): Promise<string> {
     this.assertIndependent();
     const email = rawEmail.trim().toLowerCase();
@@ -151,6 +155,7 @@ export class AccountRegistrationRepository implements OnModuleDestroy {
     }
   }
 
+  @AdmissionWriter()
   async registerInvitation(input: NativeInvitationRegisterInput, operationKey: string): Promise<LegacyUserReadModel> {
     this.assertIndependent();
     const connection = await this.requireConnection();
@@ -259,6 +264,7 @@ export class AccountRegistrationRepository implements OnModuleDestroy {
   }
 
   /** Reuse the native account/role/profile policy inside an atomic provider-proof transaction. */
+  @AdmissionWriter()
   async createUserInTransaction(connection:PoolConnection,input:NativeRegisterInput):Promise<NativeRegisteredUser>{
     this.assertIndependent();
     try{return await this.insertUser(connection,input);}catch(error){throw normalizeWriteError(error);}
@@ -392,6 +398,7 @@ async function rollbackQuietly(connection: PoolConnection): Promise<void> {
   try {
     await connection.rollback();
   } catch {
+    await markAdmissionUnknown();
     // Nothing useful to recover here; the original error is more important.
   }
 }

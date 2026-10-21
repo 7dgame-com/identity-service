@@ -1,3 +1,4 @@
+import { assertAdmissionWriter } from "./identity-admission.js";
 import { allocatorMutation } from "./identity-allocator-state.js";
 import { createHash } from "node:crypto";
 import type { Connection, PoolConnection, RowDataPacket } from "mysql2/promise";
@@ -42,6 +43,7 @@ export async function importReviewedYiiWechatBindings(
   input: unknown,
   options: { importKey: string; apply?: boolean; maxRows?: number },
 ) {
+  assertAdmissionWriter();
   if (source === target || !/^[A-Za-z0-9_.:-]{1,160}$/.test(options.importKey))
     throw new Error("Invalid reviewed WeChat import configuration");
   const manifest = manifestSchema.parse(input);

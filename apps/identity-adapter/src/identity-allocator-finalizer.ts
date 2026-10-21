@@ -1,3 +1,4 @@
+import { assertAdmissionWriter } from "./identity-admission.js";
 import type { RowDataPacket } from "mysql2/promise";
 import {
   allocatorDigest,
@@ -210,6 +211,7 @@ export async function finalizeAllocator(options: {
   apply?: boolean;
   onStep?: (step: AllocatorStep) => Promise<void>;
 }): Promise<AllocatorPlan> {
+  assertAdmissionWriter();
   const { source, target, fence, review } = options;
   strictReview(review);
   if (

@@ -1,3 +1,4 @@
+import { AdmissionWriter } from "./identity-admission.js";
 import { createHash, randomBytes } from "node:crypto";
 import { Injectable, OnModuleDestroy } from "@nestjs/common";
 import mysql, { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
@@ -51,6 +52,7 @@ export class OidcAuthorizationCodeRepository implements OnModuleDestroy {
     return this.pool !== null;
   }
 
+  @AdmissionWriter()
   async issue(input: OidcAuthorizationCodeInput): Promise<IssuedOidcAuthorizationCode> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -86,6 +88,7 @@ export class OidcAuthorizationCodeRepository implements OnModuleDestroy {
     };
   }
 
+  @AdmissionWriter()
   async consume(input: { code: string; clientId: string; redirectUri: string }): Promise<ConsumedOidcAuthorizationCode> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -138,6 +141,7 @@ export class OidcAuthorizationCodeRepository implements OnModuleDestroy {
     return this.schemaReady;
   }
 
+  @AdmissionWriter()
   private async createSchema(): Promise<void> {
     const pool = this.requirePool();
 

@@ -1,3 +1,4 @@
+import { AdmissionWriter } from "./identity-admission.js";
 import { Socket } from "node:net";
 import { Injectable } from "@nestjs/common";
 import { loadConfig } from "./config.js";
@@ -196,6 +197,7 @@ export class RedisClient {
     return Number(result) === 1;
   }
 
+  @AdmissionWriter()
   async command(...args: string[]): Promise<RedisValue> {
     if (!this.socket) {
       throw new Error("redis socket is not connected");

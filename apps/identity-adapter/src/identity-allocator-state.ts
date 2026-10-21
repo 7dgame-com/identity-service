@@ -1,3 +1,4 @@
+import { assertAdmissionWriter } from "./identity-admission.js";
 import type {
   Connection,
   Pool,
@@ -399,6 +400,7 @@ export async function readPrivateAllocatorInventory(
 export async function invalidateAllocatorReady(
   c: AllocatorConnection,
 ): Promise<void> {
+  assertAdmissionWriter();
   const [exists] = await c.query<RowDataPacket[]>(
     "SELECT 1 FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='identity_migration_allocator_state'",
   );
@@ -468,6 +470,7 @@ async function assertFreshEmpty(c: AllocatorConnection) {
 export async function initializeFreshAllocator(
   c: AllocatorConnection,
 ): Promise<void> {
+  assertAdmissionWriter();
   await c.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
   const [mode] = await c.query<RowDataPacket[]>(
     "SELECT @@autocommit AS enabled",
@@ -573,6 +576,7 @@ export async function allocatorMutation<T>(
   c: AllocatorConnection,
   write: () => Promise<T>,
 ): Promise<T> {
+  assertAdmissionWriter();
   await invalidateAllocatorReady(c);
   return write();
 }
@@ -582,6 +586,7 @@ export async function withAllocatorImportFence<T>(
   pool: Pool,
   work: (c: Pool | PoolConnection) => Promise<T>,
 ): Promise<T> {
+  assertAdmissionWriter();
   const [exists] = await pool.query<RowDataPacket[]>(
     "SELECT 1 FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='identity_migration_allocator_state'",
   );
@@ -605,6 +610,7 @@ export async function withAllocatorImportFence<T>(
 export async function fenceAllocatorImport(
   c: AllocatorConnection,
 ): Promise<void> {
+  assertAdmissionWriter();
   const [exists] = await c.query<RowDataPacket[]>(
     "SELECT 1 FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='identity_migration_allocator_state'",
   );

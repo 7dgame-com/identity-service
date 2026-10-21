@@ -1,3 +1,4 @@
+import { AdmissionWriter } from "./identity-admission.js";
 import { Injectable } from "@nestjs/common";
 import { loadConfig } from "./config.js";
 import { RedisClient } from "./invitation-redis.reader.js";
@@ -21,6 +22,7 @@ export class InvitationLegacyRedisRepository {
     return this.config.dataSource === "legacy" && Boolean(this.config.invitationDiagnostics.redisUrl);
   }
 
+  @AdmissionWriter()
   async create(input: InvitationLegacyRedisInput): Promise<void> {
     const client = await this.client();
     try {
@@ -49,6 +51,7 @@ export class InvitationLegacyRedisRepository {
     }
   }
 
+  @AdmissionWriter()
   async delete(code: string): Promise<boolean> {
     const client = await this.client();
     try {

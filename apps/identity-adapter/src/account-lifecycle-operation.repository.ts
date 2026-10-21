@@ -1,3 +1,4 @@
+import { AdmissionWriter } from "./identity-admission.js";
 import { createHash, createHmac } from "node:crypto";
 import { Injectable, OnModuleDestroy } from "@nestjs/common";
 import mysql, { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
@@ -79,6 +80,7 @@ export class AccountLifecycleOperationRepository implements OnModuleDestroy {
     };
   }
 
+  @AdmissionWriter()
   async begin(input: AccountLifecycleOperationInput): Promise<void> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -122,6 +124,7 @@ export class AccountLifecycleOperationRepository implements OnModuleDestroy {
     throw new AccountLifecycleOperationInProgressError(input.operationKey);
   }
 
+  @AdmissionWriter()
   async complete(input: AccountLifecycleOperationCompletion): Promise<void> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -151,6 +154,7 @@ export class AccountLifecycleOperationRepository implements OnModuleDestroy {
     );
   }
 
+  @AdmissionWriter()
   async fail(input: AccountLifecycleOperationInput & { errorCode: string }): Promise<void> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -174,6 +178,7 @@ export class AccountLifecycleOperationRepository implements OnModuleDestroy {
     return this.schemaReady;
   }
 
+  @AdmissionWriter()
   private async createSchema(): Promise<void> {
     const pool = this.requirePool();
 

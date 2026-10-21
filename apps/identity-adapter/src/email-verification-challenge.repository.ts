@@ -1,3 +1,4 @@
+import { AdmissionWriter } from "./identity-admission.js";
 import { createHash, randomInt, randomUUID } from "node:crypto";
 import { Injectable, OnModuleDestroy } from "@nestjs/common";
 import mysql, { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
@@ -53,6 +54,7 @@ export class EmailVerificationChallengeRepository implements OnModuleDestroy {
     return this.pool !== null;
   }
 
+  @AdmissionWriter()
   async createChallenge(input: { email: string; legacyUserId: number }): Promise<{ code: string; challenge: EmailVerificationChallenge }> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -85,6 +87,7 @@ export class EmailVerificationChallengeRepository implements OnModuleDestroy {
     return { code, challenge };
   }
 
+  @AdmissionWriter()
   async verifyCode(email: string, code: string): Promise<EmailVerificationChallenge> {
     const limits = this.config.dataSource === "identity" ? await readLegacyChallengeLimits(this.requirePool(), "email_verification", normalizeEmail(email)) : null;
     if (limits?.attemptsExpiresAt && limits.attemptsExpiresAt.getTime() > Date.now() && limits.attempts >= this.config.emailVerification.maxAttempts) {
@@ -110,6 +113,7 @@ export class EmailVerificationChallengeRepository implements OnModuleDestroy {
     return challenge;
   }
 
+  @AdmissionWriter()
   async consume(challengeKey: string): Promise<void> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -168,6 +172,7 @@ export class EmailVerificationChallengeRepository implements OnModuleDestroy {
     return rows[0] ? normalizeChallenge(rows[0]) : null;
   }
 
+  @AdmissionWriter()
   private async incrementAttempts(challenge: EmailVerificationChallenge): Promise<void> {
     const pool = this.requirePool();
     if (this.config.dataSource === "identity" && await incrementLegacyChallengeAttempts(pool, "email_verification", challenge.email)) return;
@@ -194,6 +199,7 @@ export class EmailVerificationChallengeRepository implements OnModuleDestroy {
     return this.schemaReady;
   }
 
+  @AdmissionWriter()
   private async createSchema(): Promise<void> {
     const pool = this.requirePool();
     await pool.query(`

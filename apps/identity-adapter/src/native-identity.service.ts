@@ -1,3 +1,4 @@
+import { AdmissionWriter } from "./identity-admission.js";
 import { assertNativeUserAllocation } from "./identity-allocator-manifest.js";
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException, OnApplicationBootstrap, OnModuleDestroy, Optional, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
@@ -405,6 +406,7 @@ export class NativeIdentityService implements OnModuleDestroy, OnApplicationBoot
     const [organizations] = await connection.execute<RowDataPacket[]>("SELECT o.id,o.name,o.title FROM organization o JOIN user_organization uo ON o.id=uo.organization_id WHERE uo.user_id = ? ORDER BY o.title,o.id",[id]);
     return {...users[0],id,username:users[0].username,nickname:users[0].nickname,roles:await rolesFor(connection,id),organizations};
   }
+  @AdmissionWriter()
   private async mutate<T>(request:NativeRequest,actor:LegacyUserReadModel,route:string,work:(connection:PoolConnection)=>Promise<T>):Promise<T> {
     const connection = await this.db().getConnection();
     const key = typeof request.headers["idempotency-key"] === "string" ? request.headers["idempotency-key"] : randomBytes(24).toString("hex");

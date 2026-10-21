@@ -1,3 +1,4 @@
+import { AdmissionWriter } from "./identity-admission.js";
 import { createHash, randomBytes } from "node:crypto";
 import { Injectable, OnModuleDestroy } from "@nestjs/common";
 import mysql, { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
@@ -42,6 +43,7 @@ export class EmailChangeTokenRepository implements OnModuleDestroy {
     return this.pool !== null;
   }
 
+  @AdmissionWriter()
   async createToken(legacyUserId: number,challengeKey?:string): Promise<{ token: string; expiresIn: number; record: EmailChangeToken }> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -92,6 +94,7 @@ export class EmailChangeTokenRepository implements OnModuleDestroy {
     return record;
   }
 
+  @AdmissionWriter()
   async consume(tokenKey: string): Promise<void> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -136,6 +139,7 @@ export class EmailChangeTokenRepository implements OnModuleDestroy {
     return this.schemaReady;
   }
 
+  @AdmissionWriter()
   private async createSchema(): Promise<void> {
     const pool = this.requirePool();
     await pool.query(`

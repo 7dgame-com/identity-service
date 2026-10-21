@@ -1,3 +1,4 @@
+import { admissionFetch } from "./identity-admission.js";
 import { Injectable, Logger } from "@nestjs/common";
 import { loadConfig } from "./config.js";
 
@@ -24,7 +25,7 @@ export class LegacySessionRevocationService {
 
     const { url, token, timeoutMs } = this.config.legacySessionRevoke;
     try {
-      const response = await fetch(url!, {
+      const response = await admissionFetch(url!, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",

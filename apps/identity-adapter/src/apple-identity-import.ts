@@ -1,3 +1,4 @@
+import { assertAdmissionWriter } from "./identity-admission.js";
 import { invalidateAllocatorReady } from "./identity-allocator-state.js";
 import { createHash } from "node:crypto";
 import type { Connection, RowDataPacket } from "mysql2/promise";
@@ -10,6 +11,7 @@ export type ReviewedAppleManifest=z.infer<typeof manifestSchema>;
 
 /** The historical table has no audience. Never infer it from email, subject or environment. */
 export async function importLegacyAppleIdentities(source:Connection,target:Connection,options:{importKey:string;manifest?:ReviewedAppleManifest;apply?:boolean}) {
+  assertAdmissionWriter();
   if(source===target||!/^[A-Za-z0-9_.:-]{1,160}$/.test(options.importKey))throw new Error("Invalid Apple import configuration");
   const [tables]=await source.query<RowDataPacket[]>("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='apple_id'");
   if(!tables.length)return {applied:false,replay:false,rowCount:0,subjects:[]};

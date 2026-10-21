@@ -1,3 +1,4 @@
+import { assertAdmissionWriter } from "./identity-admission.js";
 import { invalidateAllocatorReady } from "./identity-allocator-state.js";
 import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import type { ExecuteValues } from "mysql2";
@@ -15,6 +16,7 @@ function importBind(value:unknown):ExecuteValues {
   throw new Error("Unsupported account import value");
 }
 export async function appendLegacyProfileHistory(connection: Connection, rows: readonly Record<string,unknown>[], sourceDatabase: string) {
+  assertAdmissionWriter();
   for (const row of rows) {
     const payload = typeof row.payload_json === "string" ? JSON.parse(row.payload_json) : row.payload_json;
     await connection.execute(`INSERT INTO identity_legacy_profile_history(id,payload_hash,payload_json,source_database)
@@ -53,6 +55,7 @@ export async function importIdentityAccounts(
   target: Connection,
   options: { apply?: boolean; importKey: string; maxRows?: number; profileSelection?: ProfileSelectionManifest }
 ): Promise<AccountImportReport> {
+  assertAdmissionWriter();
   if (source === target) throw new Error("Source and target account connections must differ.");
   if (!/^[A-Za-z0-9_.:-]{1,160}$/.test(options.importKey)) throw new Error("Invalid account import key.");
   const [sourceName] = await source.query<RowDataPacket[]>("SELECT DATABASE() AS name, @@server_uuid AS server_uuid");

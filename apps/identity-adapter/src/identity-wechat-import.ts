@@ -1,3 +1,4 @@
+import { assertAdmissionWriter } from "./identity-admission.js";
 import { assertNativeUserAllocation } from "./identity-allocator-manifest.js";
 import { assertAllocatorReady, invalidateAllocatorReady } from "./identity-allocator-state.js";
 import { createHash, randomBytes } from "node:crypto";
@@ -8,6 +9,7 @@ export { importReviewedYiiWechatBindings } from "./identity-yii-wechat-import.js
 
 /** One-time auth UUID/provider import. Source remains a consistent read-only snapshot. */
 export async function importWechatIdentities(source:Connection,target:Connection,options:{importKey:string;apply?:boolean;maxRows?:number}) {
+  assertAdmissionWriter();
   if(source===target||!/^[A-Za-z0-9_.:-]{1,160}$/.test(options.importKey))throw new Error("Invalid WeChat identity import configuration");
   await assertWechatBinarySchema(target);
   const [names]=await source.query<RowDataPacket[]>("SELECT DATABASE() AS name");

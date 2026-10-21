@@ -1,3 +1,4 @@
+import { admissionFetch } from "./identity-admission.js";
 import { createHash, randomBytes } from "node:crypto";
 import { BadRequestException, ConflictException, Injectable, Optional, NotFoundException, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
 import { NativeIdentityService, NativeRequest } from "./native-identity.service.js";
@@ -185,7 +186,7 @@ export class NativeQrcodeService {
     if (!base || !key) throw new ServiceUnavailableException("WeChat provider is not configured");
     let response: Response;
     try {
-      response = await fetch(`${base.replace(/\/$/, "")}/internal/wechat-provider/${action}`, { method: "POST",
+      response = await admissionFetch(`${base.replace(/\/$/, "")}/internal/wechat-provider/${action}`, { method: "POST",
         headers: { "Content-Type": "application/json", "x-identity-internal-token": key },
         body: JSON.stringify(payload), signal: AbortSignal.timeout(5000) });
     } catch { throw new ServiceUnavailableException("WeChat provider is unavailable"); }

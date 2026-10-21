@@ -1,3 +1,4 @@
+import { AdmissionWriter } from "./identity-admission.js";
 import { createCipheriv,createDecipheriv,createHash,createHmac,randomBytes } from "node:crypto";
 import { BadRequestException,ConflictException,HttpException,Injectable,OnModuleDestroy,ServiceUnavailableException,UnauthorizedException } from "@nestjs/common";
 import mysql,{type Pool,type PoolConnection,type RowDataPacket} from "mysql2/promise";
@@ -36,6 +37,7 @@ export class LegacyWechatSignupRepository implements OnModuleDestroy {
     const [owners]=await this.db().execute<RowDataPacket[]>("SELECT user_id FROM identity_wechat_identities WHERE provider=? AND provider_app_id=? AND open_id=?",[row.provider,row.provider_app_id,row.open_id]);
     if(!owners[0]||owners[0].user_id!=null)throw invalid();
   }
+  @AdmissionWriter()
   async redeem(action:"register"|"bind",payload:unknown,context:RequestContext={}):Promise<LegacyWechatSignupResult>{
     const parsed=inputSchema.safeParse(payload);if(!parsed.success)throw new BadRequestException("Invalid WeChat registration payload.");
     const input=parsed.data,credentialHash=hash(input.token),candidate=await this.lookup(credentialHash);
@@ -111,6 +113,7 @@ export class LegacyWechatSignupRepository implements OnModuleDestroy {
       await connection.commit();return result;
     }catch(error){await connection.rollback();if(error instanceof NativeRegistrationError)throw new HttpException(error.body,error.status);throw error;}finally{connection.release();}
   }
+  @AdmissionWriter()
   async revoke(raw:string):Promise<boolean>{
     const credentialHash=hash(raw);await this.sessions.ensureSchema();if(!await this.lookup(credentialHash))return false;
     const connection=await this.db().getConnection();

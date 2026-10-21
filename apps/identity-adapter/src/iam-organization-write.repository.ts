@@ -1,3 +1,4 @@
+import { AdmissionWriter } from "./identity-admission.js";
 import { invalidateAllocatorReady } from "./identity-allocator-state.js";
 import { assertMigrationStaging } from "./migration-state.js";
 import { createHash } from "node:crypto";
@@ -79,6 +80,7 @@ export class IamOrganizationWriteRepository implements OnModuleDestroy {
     return this.pool !== null;
   }
 
+  @AdmissionWriter()
   async begin(input: {
     operationKey: string;
     idempotencyKeyDigest: string;
@@ -108,6 +110,7 @@ export class IamOrganizationWriteRepository implements OnModuleDestroy {
     return { duplicate: result.affectedRows === 0 };
   }
 
+  @AdmissionWriter()
   async beginCandidateMaterialization(input: {
     operationKey: string;
     idempotencyKeyDigest: string;
@@ -134,6 +137,7 @@ export class IamOrganizationWriteRepository implements OnModuleDestroy {
     return { duplicate: result.affectedRows === 0 };
   }
 
+  @AdmissionWriter()
   async resumeCandidateMaterialization(
     operationKey: string,
     expectedRequestFingerprint: string,
@@ -169,6 +173,7 @@ export class IamOrganizationWriteRepository implements OnModuleDestroy {
     return { claimed: result.affectedRows === 1 };
   }
 
+  @AdmissionWriter()
   async reclaimStaleCandidateMaterialization(input: {
     operationKey: string;
     expectedRequestFingerprint: string;
@@ -206,6 +211,7 @@ export class IamOrganizationWriteRepository implements OnModuleDestroy {
     return { claimed: result.affectedRows === 1 };
   }
 
+  @AdmissionWriter()
   async finalizeCandidateMaterialization(input: {
     operationKey: string;
     status: "completed" | "failed";
@@ -272,6 +278,7 @@ export class IamOrganizationWriteRepository implements OnModuleDestroy {
     return row ? operationRecord(row) : null;
   }
 
+  @AdmissionWriter()
   async update(input: {
     operationKey: string;
     status: OrganizationWriteOperationStatus;
@@ -306,6 +313,7 @@ export class IamOrganizationWriteRepository implements OnModuleDestroy {
     );
   }
 
+  @AdmissionWriter()
   async replaceCandidate(input: OrganizationCandidateSnapshot & {
     operationKey: string;
     materializationClaim?: { claimToken: string; leaseValidAfter: Date };
@@ -611,6 +619,7 @@ export class IamOrganizationWriteRepository implements OnModuleDestroy {
     await this.schemaReady;
   }
 
+  @AdmissionWriter()
   private async createSchema(): Promise<void> {
     const pool = this.requirePool();
     await pool.query(`CREATE TABLE IF NOT EXISTS identity_organizations_candidate (

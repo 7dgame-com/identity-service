@@ -1,3 +1,4 @@
+import { AdmissionWriter } from "./identity-admission.js";
 import { Injectable, OnModuleDestroy, ServiceUnavailableException, UnauthorizedException, ConflictException, HttpException } from "@nestjs/common";
 import mysql, { Pool, RowDataPacket } from "mysql2/promise";
 import { loadConfig } from "./config.js";
@@ -23,6 +24,7 @@ export class NativeQrcodeRepository implements OnModuleDestroy {
     return this.pool;
   }
 
+  @AdmissionWriter()
   async issueLoginCode(userId: number, digest: string, issuedAt: number, expiresAt: number, context: {frontend_domain?: string} = {}): Promise<void> {
     const connection = await this.db().getConnection();
     try {
@@ -52,6 +54,7 @@ export class NativeQrcodeRepository implements OnModuleDestroy {
     return { userId: Number(rows[0].user_id), expiresAt: Number(rows[0].expires_at), context:context??null };
   }
 
+  @AdmissionWriter()
   async createWechatScene(digest: string, expiresAt: number): Promise<void> {
     await this.db().execute("INSERT INTO identity_wechat_scenes (scene_hash,expires_at) VALUES (?,?)", [digest, expiresAt]);
   }
@@ -71,6 +74,7 @@ export class NativeQrcodeRepository implements OnModuleDestroy {
     return rows.length > 0;
   }
 
+  @AdmissionWriter()
   async confirmWechatScene(digest: string, providerAppId: string, openId: string, userId: number | null, signupTokenHash: string | null,
     profile: Record<string, unknown>, now: number): Promise<void> {
     const connection = await this.db().getConnection();

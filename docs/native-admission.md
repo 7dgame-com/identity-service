@@ -1,0 +1,63 @@
+# Native 请求准入适配器（默认关闭）
+
+本适配器接 `driver/identity-dev-admission` 的私控协议，尚不能作为线上入口、全部 writer 已覆盖、真实排空或请求预算满足的证明。当前控制 URL 和子上游只允许同主机 `127.0.0.1` HTTP fixture；跨 host daemon、TLS/edge、双主备入口、完整实际 roster、进程观察与恢复仍须现场独立接通。没有云启动命令、凭据生成、public 激活 API 或自动 fallback。
+
+`IDENTITY_ADMISSION_ENABLED` 默认 false。关闭时不读取 admission config/key 文件，现有认证、会话、SQL 和 bootstrap 规则保持。入口会删除 admission/continuation/instance/router/generation 伪标记；它们不参与用户授权。启用后以下两个现有受控文件必须由运行用户拥有、单硬链接、普通文件、无 symlink、group/other 不可访问：
+
+- `IDENTITY_ADMISSION_CONFIG_FILE`：最多 32KiB，下面的严格 JSON。
+- `IDENTITY_ADMISSION_KEY_FILE`：当前参与者已有的 boot 私控 key，canonical base64url、32..128 bytes、不带换行。不能从 JWT 派生、不自动生成；各参与者/operator 的 distinct key 由 coordinator 独立核验。
+
+```json
+{
+  "version": 1,
+  "controlUrl": "http://127.0.0.1:<reviewed-port>/",
+  "identity": {
+    "id": "<reviewed-instance-id>",
+    "bootId": "<reviewed-current-boot-id>",
+    "revision": "<exact-compiled-40hex-sha>",
+    "routerHash": "<reviewed-router-64hex-sha>",
+    "generation": "legacy"
+  },
+  "allowedChildren": [
+    {"id":"<same-generation-child-id>","origin":"http://127.0.0.1:<child-port>","paths":["/internal/wechat-provider/qrcode","/internal/wechat-provider/profile"]}
+  ],
+  "childWaitMs": 1500
+}
+```
+
+编译常量必须非空并精确匹配 revision；普通本地 build 不能启用。上述 JSON 是受控配置，不自动证明 router/roster 真实完整。实例 ID、boot、revision、router hash 和 generation 每次 RPC 都由 coordinator 核验。真实开发有 B0/B1 主备和共享私库，不能将此单进程配置当作完整现场拓扑。
+
+## 入口与完成点
+
+`IdentityAdmissionExpressAdapter` 在 Nest parser/auth/guard/session 之前装 middleware。`X-Identity-Admission-Lease` 只能有一个原始头、ASCII signed capability、最多 2048 bytes。私控 `enter` 成功才创建 writable scope；错实例、重复或重用 capability 不会降级成新 root，也不撤销另一真实 handler。没有 capability 的直接 HTTP 必须先 `begin` 再 `enter`；关闸后拒绝。公开 body/其它身份标记均不能选择 lease、consumer 或 scope。
+
+只有不带 capability 的固定 `GET /health`、`GET /health/live` 走无写权限 probe。携带 gateway 已发 capability 时，即使 health 也必须真实 enter/complete，不能遗留 active lease；错误 capability 不因路径豁免。它们保留原 authority/DB/liveness 语义，不宣称 coordinator 全局已排空。任意其它 GET、错误路由、parser error 和普通 OPTIONS 都要真实 handler lease；CORS preflight 继续到经过包装的 OPTIONS fallback。health 路径上若尝试写方法，同样被拒绝。首位全局 AdmissionGuard 拒绝没有经过本入口 scope 的替代 Nest 启动；该检查先于原 explicit activation guard。
+
+Nest `RouterProxy` 会 await 实际 route callback；本适配器包住这个 Promise 和 error/notfound callback 的 finally。`response.finish`、`response.end`、`response.close` 都不是完成证明。客户端异常断开只将本操作标为 unknown，随后事务即使提交也不能普通 complete 清除它。
+
+写入通过显式 `@AdmissionWriter()` 方法登记到 AsyncLocalStorage scope，不改 mysql driver、不按 SQL 文本猜写入，也不替换 Pool/release。方法的 Promise 包含原 commit/rollback/release finally；无 lease 的直接 repository 写入会在进入方法前拒绝。已登记的未 await 方法仍在 pending 集合中，收尾 seal 后只允许这些尚未结束任务的重入子操作；没有登记的迟到 timer 不能启动新 writer。一旦 unknown，不能通过 scope.run/track 登记新工作，原已登记 Promise 的事务 commit/rollback/release finally 可实际收尾，但不能借其上下文新增 typed 写入。已知 SQL 连接异常或原 quiet rollback 失败会保留 unknown。未知/遗漏的原始 SQL、外部 cron、动态 provider、自定义异步 filter/streaming 不会因此被自动证明覆盖。
+
+当前显式写边界包括账户注册/密码/邮箱/验证码、原生 session/OIDC/graph/旧凭据/ownerless signup、Native mutate/MDM transaction、Apple/WeChat OAuth、邀请、IAM shadow/materialization/operation ledger、audit/billing 和 Redis invitation command。正式 account/sync/session/provider/QR/challenge/graph/allocator/activation CLI 的写函数也前置 scope guard：启用环境里无专门已审 CLI scope 会直接拒绝。**本版本没有 CLI lease runner，不能称激活/最终同步已接入屏障。** 新 writer 必须独立审核并显式登记；此列表不是自动拓扑发现。
+
+`admissionFetch` 在发行 continuation 之前登记整个异步任务，只允许配置中的固定 origin+exact path 和 coordinator `allowedChildren` 的同 generation 目标。保留原有内部认证/用户认证，删除旧伪标记，注入唯一新 child capability，拒绝重定向。Identity 当前 HTTP 外呼（provider、legacy proxy/revoke、邮件 webhook）都经过该 helper；未接真实 callee adapter 时必须拒绝或保留 unknown。SMTP 由本地 typed email method await 原 send/cancel/cleanup，不声称远端邮件系统已成为 roster participant。
+
+父 scope 完成前验证原 operation/root/epoch、unknown=false、childrenActive=0；子 HTTP 响应不能替代子 complete。默认 child wait 总 1500ms、每次 25ms，只能配置 25..5000ms；本进程从最早 header 到达的单调时间计时，handler/control 时间消耗该预算，不能在 finish 续期。未发行 child 的长 handler 只允许一次 bounded validate 证明没有 child；有 child 则读取也受剩余预算限制。edge 原始排队预算仍是外部门槛，capability 当前没有携带跨服务 deadline，不能据此声称端到端预算已经验证。
+
+continue 前和 ACK 后都核对原剩余预算，超时不开始远端 fetch；fetch signal 同样受剩余预算与原 caller signal 限制。已发行 child 后的失败须保留 parent/child unknown，不能把网络尚未调用当作取消证明。
+
+complete 只发一次。仅按 action 对应的已审无副作用拒绝 code 和精确 409 形状处理为确定拒绝；5xx、未知/日志错误 409、畸形错误或成功 ACK 均永久锁住本实例并尝试既有 private lost。unknown 的拒绝或 ACK 失败同样走 lost，不能吞掉错误后重新 register、自动重试 mutation 或退回旧系统。暂存日志/实际 receipt/真实进程结果的恢复由 coordinator 的独立审核处理。
+
+## 启动和现场门槛
+
+main 在 create/init 前独立 register。旧 generation 的启动写入必须独立 begin+enter，包住整个 Nest create/init，完成后才 listen；不能借 HTTP lease 假包初始化。Native 启用 admission 时必须使用既有 explicit activation：在只读 probe scope create/init，任何 module init writer 都拒绝，仍保持原预热零账号/凭据/event 写入合同。默认 explicit activation schema/receipt/allocator proof 没有修改。启动先后及全部 participant 注册是外部协调条件，失败不自动重试启动写入。
+
+本地测试使用 compiled AppModule/真实 Nest middleware/guard、随机私库、真实 event clock 行锁、事务提交及连接 KILL、断开客户端和本机 coordinator。它证明此候选进程的上述边界，不证明 B0/B1、F、PHP/A1/Y1、所有 ingress/worker 已切换。
+
+```sh
+IDENTITY_TEST_MYSQL=1 IDENTITY_TEST_MYSQL_HOST=127.0.0.1 \
+IDENTITY_TEST_MYSQL_PORT=13316 IDENTITY_TEST_MYSQL_USER=root \
+IDENTITY_TEST_MYSQL_PASSWORD='' node node_modules/vitest/vitest.mjs run \
+  apps/identity-adapter/test/identity-admission.mysql.spec.ts
+```
+
+只允许本机专用 13316，或 GitHub CI 明确声明下的 loopback 3306，随机 `_test` 库 finally 清理。没有真实 stable key、云 DB/Redis/Portainer 操作。

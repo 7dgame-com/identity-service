@@ -1,3 +1,4 @@
+import { admissionFetch } from "./identity-admission.js";
 import { createHash, randomUUID } from "node:crypto";
 import {
   BadRequestException,
@@ -622,7 +623,7 @@ export class PluginUserWriteService {
 
     let upstream: Response;
     try {
-      return await fetch(url, init);
+      return await admissionFetch(url, init);
     } catch (error) {
       throw new ServiceUnavailableException({
         code: "PLUGIN_USER_WRITE_LEGACY_API_UNAVAILABLE",

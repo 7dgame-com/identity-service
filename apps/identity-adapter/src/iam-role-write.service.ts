@@ -1,3 +1,4 @@
+import { admissionFetch } from "./identity-admission.js";
 import { createHash, randomUUID } from "node:crypto";
 import { ConflictException, Injectable, Logger, NotFoundException, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
 import { loadConfig } from "./config.js";
@@ -1199,7 +1200,7 @@ export class IamRoleWriteService {
       copyHeader(request.headers, headers, "x-identity-iam-role-write-correlation", "X-Identity-IAM-Role-Write-Correlation");
     }
     try {
-      return await fetch(url, {
+      return await admissionFetch(url, {
         method: request.method.toUpperCase(),
         headers,
         body: JSON.stringify(request.body ?? {}),

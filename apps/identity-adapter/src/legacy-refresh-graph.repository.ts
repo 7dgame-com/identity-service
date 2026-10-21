@@ -1,3 +1,4 @@
+import { AdmissionWriter } from "./identity-admission.js";
 import { Injectable, OnModuleDestroy, OnApplicationBootstrap, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
 import mysql, { type Pool, type PoolConnection, type RowDataPacket } from "mysql2/promise";
 import { refreshRequestHash } from "./refresh-request-context.js";
@@ -41,6 +42,7 @@ export class LegacyRefreshGraphRepository implements OnModuleDestroy, OnApplicat
     if(!await this.hasCredential(raw))return null;
     const [rows]=await this.db().execute<RowDataPacket[]>(`SELECT f.protocol FROM identity_legacy_refresh_graph_credentials c JOIN identity_legacy_refresh_graph_families f ON f.family_key=c.family_key WHERE c.credential_hash=?`,[graphHash(raw)]);return rows[0]?.protocol??null;
   }
+  @AdmissionWriter()
   async redeem(raw:string,context:RequestContext={},consumer:GraphConsumer="server",endpoint:GraphEndpoint="/v1/auth/refresh"):Promise<AuthTokenResponse>{
     if(!this.enabled)throw new ServiceUnavailableException("Annotated legacy graph redemption is disabled.");
     const hash=graphHash(raw),key=graphEncryptionKey(),c=await this.db().getConnection();
@@ -112,6 +114,7 @@ export class LegacyRefreshGraphRepository implements OnModuleDestroy, OnApplicat
     const [cutoffs]=await c.execute<RowDataPacket[]>("SELECT revoked_before FROM identity_user_revocations WHERE user_id=? FOR SHARE",[credential.userId]);if(ms(cutoffs[0]?.revoked_before)!==(f.target_cutoff_ms==null?null:Number(f.target_cutoff_ms)))throw invalid();
     if("auth_method" in credential.authContext)await this.reader.assertDeviceSnAuthorized(credential.authContext.device_sn_id,credential.userId,requireEnabled);
   }
+  @AdmissionWriter()
   async revoke(raw:string):Promise<boolean>{
     const hash=graphHash(raw),c=await this.db().getConnection();try{
       const [owners]=await c.execute<RowDataPacket[]>("SELECT legacy_user_id FROM identity_legacy_refresh_graph_credentials WHERE credential_hash=?",[hash]);if(!owners[0])return false;

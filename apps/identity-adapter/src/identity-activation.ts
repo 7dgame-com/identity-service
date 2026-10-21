@@ -1,3 +1,4 @@
+import { assertAdmissionWriter } from "./identity-admission.js";
 import type { Connection, PoolConnection, RowDataPacket } from "mysql2/promise";
 import { allocatorDigest } from "./identity-allocator-manifest.js";
 import { assertAllocatorReady, allocatorDatabase } from "./identity-allocator-state.js";
@@ -102,6 +103,7 @@ export interface ExplicitActivationResult {
 }
 /** Private-only operation. No source DB, automatic retry, schema creation or downgrade path. */
 export async function activateExplicitIdentity(options: ExplicitActivationOptions): Promise<ExplicitActivationResult> {
+  assertAdmissionWriter();
   const { connection: c } = options;
   const compiledRevision = immutableIdentityRevision();
   if (!revision.test(options.expectedRevision) || options.expectedRevision !== compiledRevision) fail("ACTIVATION_REVISION_MISMATCH");

@@ -1,3 +1,4 @@
+import { assertAdmissionWriter } from "./identity-admission.js";
 import { allocatorMutation } from "./identity-allocator-state.js";
 import type { Connection, RowDataPacket } from "mysql2/promise";
 import { assertMigrationStaging } from "./migration-state.js";
@@ -7,6 +8,7 @@ import { legacyRefreshAccountFingerprint, normalizeLegacyRefreshCredentialManife
 export async function importLegacyRefreshCredentials(target: Connection, payload: unknown, options: {
   apply?: boolean; environment?: string; now?: Date;
 } = {}) {
+  assertAdmissionWriter();
   if (options.apply && (options.environment ?? process.env.NODE_ENV) !== "staging") throw new Error("Legacy credentials may only be applied in staging.");
   const manifest = normalizeLegacyRefreshCredentialManifest(payload), now = options.now ?? new Date();
   const capturedAt = new Date(manifest.capturedAt);

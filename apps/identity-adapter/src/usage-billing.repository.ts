@@ -1,3 +1,4 @@
+import { AdmissionWriter } from "./identity-admission.js";
 import { Injectable, OnModuleDestroy } from "@nestjs/common";
 import mysql, { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { loadConfig } from "./config.js";
@@ -119,6 +120,7 @@ export class UsageBillingRepository implements OnModuleDestroy {
     return rows.map(normalizeSourceEvent);
   }
 
+  @AdmissionWriter()
   async insertLedger(record: UsageLedgerRecord): Promise<{ duplicate: boolean }> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -146,6 +148,7 @@ export class UsageBillingRepository implements OnModuleDestroy {
     return { duplicate: result.affectedRows === 0 };
   }
 
+  @AdmissionWriter()
   async createReplayRun(input: { runKey: string; mode: string; metadata: Record<string, unknown> }): Promise<void> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -167,6 +170,7 @@ export class UsageBillingRepository implements OnModuleDestroy {
     );
   }
 
+  @AdmissionWriter()
   async finishReplayRun(input: {
     runKey: string;
     status: "succeeded" | "failed";
@@ -199,6 +203,7 @@ export class UsageBillingRepository implements OnModuleDestroy {
     );
   }
 
+  @AdmissionWriter()
   async rebuildShadowBalances(input: { includedQuota: number; billingCycle: string }): Promise<number> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -340,6 +345,7 @@ export class UsageBillingRepository implements OnModuleDestroy {
     return this.schemaReady;
   }
 
+  @AdmissionWriter()
   private async createSchema(): Promise<void> {
     const pool = this.requirePool();
 

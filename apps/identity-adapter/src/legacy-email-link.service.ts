@@ -1,3 +1,4 @@
+import { AdmissionWriter } from "./identity-admission.js";
 import { assertNativeUserAllocation } from "./identity-allocator-manifest.js";
 import { BadRequestException, ConflictException, Inject, Injectable, OnModuleDestroy, ServiceUnavailableException } from "@nestjs/common";
 import { createHash, createHmac, randomBytes,createCipheriv,createDecipheriv } from "node:crypto";
@@ -138,6 +139,7 @@ export class LegacyEmailLinkService implements OnModuleDestroy {
     const [users]=await connection.execute<RowDataPacket[]>(`SELECT * FROM user WHERE id=? AND BINARY ${column}=BINARY ? AND status=? AND deleted_at IS NULL FOR UPDATE`,[candidates[0].id,token,status]);
     if(users.length!==1)throw invalidLink();return users[0];
   }
+  @AdmissionWriter()
   private async transaction<T>(work:(connection:PoolConnection)=>Promise<T>):Promise<T>{const connection=await this.db().getConnection();try{await connection.beginTransaction();const response=await work(connection);await connection.commit();return response;}catch(error){await connection.rollback();throw error;}finally{connection.release();}}
   private fingerprint(value:unknown){const key=process.env.IDENTITY_REFRESH_REPLAY_KEY;if(!key)throw new ServiceUnavailableException("Identity request fingerprint key is required");return createHmac("sha256",key).update(JSON.stringify(value)).digest("hex");}
   private operation(kind:string,token:string,key?:string){if(key&&key.length>200)throw new BadRequestException("Idempotency-Key too long");return createHash("sha256").update(`legacy-email:${kind}:${this.fingerprint(token)}:${key??"implicit"}`).digest("hex");}

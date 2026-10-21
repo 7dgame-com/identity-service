@@ -1,3 +1,4 @@
+import { AdmissionWriter } from "./identity-admission.js";
 import { Injectable, OnModuleDestroy } from "@nestjs/common";
 import mysql, { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { loadConfig } from "./config.js";
@@ -107,6 +108,7 @@ export class LoginAuditRepository implements OnModuleDestroy {
     }
   }
 
+  @AdmissionWriter()
   async recordEvent(event: PersistedLoginAuditEvent): Promise<{ duplicate: boolean }> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -278,6 +280,7 @@ export class LoginAuditRepository implements OnModuleDestroy {
     return this.schemaReady;
   }
 
+  @AdmissionWriter()
   private async createSchema(): Promise<void> {
     const pool = this.requirePool();
 

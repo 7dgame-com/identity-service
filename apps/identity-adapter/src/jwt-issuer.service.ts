@@ -1,4 +1,5 @@
 import { createPrivateKey, createPublicKey, randomBytes, sign, verify } from "node:crypto";
+import { assertAdmissionWriter } from "./identity-admission.js";
 import { readFileSync } from "node:fs";
 import { Injectable, ServiceUnavailableException } from "@nestjs/common";
 import { verifyImportedAccessToken } from "./legacy-token-verifier.js";
@@ -43,6 +44,7 @@ export class JwtIssuerService {
   }
 
   issue(user: LegacyUserReadModel, sessionId: string, options?: { audience?: string; scopes?: string[]; expiresInSeconds?: number } & Partial<DeviceSnSource>): IssuedAccessToken {
+    assertAdmissionWriter();
     const source = deviceSnSource(options?.authMethod, options?.deviceSnId);
     if (source) assertDeviceSnAccount(user);
     const now = new Date();
@@ -91,6 +93,7 @@ export class JwtIssuerService {
   }
 
   issueOidcIdToken(input: OidcIdTokenInput): IssuedAccessToken {
+    assertAdmissionWriter();
     const now = new Date();
     const expiresAt = new Date(now.getTime() + (input.expiresInSeconds ?? this.config.tokenIssuance.accessTokenTtlSeconds) * 1000);
     const jwtId = randomId();

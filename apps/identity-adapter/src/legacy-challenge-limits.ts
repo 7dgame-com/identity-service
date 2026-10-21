@@ -1,4 +1,5 @@
 import type { Pool, RowDataPacket } from "mysql2/promise";
+import { assertAdmissionWriter } from "./identity-admission.js";
 
 export type LegacyChallengeKind = "password_reset" | "email_verification";
 export const importedChallengePrefix = "legacy-challenge:";
@@ -31,6 +32,7 @@ export async function incrementLegacyChallengeAttempts(
   kind: LegacyChallengeKind,
   email: string,
 ): Promise<boolean> {
+  assertAdmissionWriter();
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();

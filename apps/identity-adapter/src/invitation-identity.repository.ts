@@ -1,3 +1,4 @@
+import { AdmissionWriter } from "./identity-admission.js";
 import { invalidateAllocatorReady } from "./identity-allocator-state.js";
 import { Injectable, OnModuleDestroy } from "@nestjs/common";
 import mysql, { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
@@ -103,6 +104,7 @@ export class InvitationIdentityRepository implements OnModuleDestroy {
     return rows.map(normalizeIdentityInvitation);
   }
 
+  @AdmissionWriter()
   async create(input: CreateIdentityInvitationInput): Promise<IdentityInvitation> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -134,6 +136,7 @@ export class InvitationIdentityRepository implements OnModuleDestroy {
     return created;
   }
 
+  @AdmissionWriter()
   async markDeleted(inviteCode: string): Promise<boolean> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -149,6 +152,7 @@ export class InvitationIdentityRepository implements OnModuleDestroy {
     return result.affectedRows > 0;
   }
 
+  @AdmissionWriter()
   async upsertImported(invitations: LegacyRedisInvitation[]): Promise<number> {
     if (invitations.length === 0) {
       return 0;
@@ -209,6 +213,7 @@ export class InvitationIdentityRepository implements OnModuleDestroy {
     return this.schemaReady;
   }
 
+  @AdmissionWriter()
   private async createSchema(): Promise<void> {
     const pool = this.requirePool();
     await pool.query(`

@@ -1,3 +1,4 @@
+import { admissionFetch, admissionEnabled, markAdmissionUnknown, AdmissionWriter } from "./identity-admission.js";
 import { BadRequestException, Injectable, ServiceUnavailableException } from "@nestjs/common";
 import { connect, type Socket } from "node:net";
 import nodemailer from "nodemailer";
@@ -41,6 +42,7 @@ export class EmailDeliveryService {
     return this.sendCodeEmail("email_verification_code", input);
   }
 
+  @AdmissionWriter()
   private async sendCodeEmail(type: CodeEmailType, input: PasswordResetCodeEmail | EmailVerificationCodeEmail): Promise<void> {
     if (this.config.emailDelivery.transport === "smtp") return this.sendSmtp(type, input);
     return this.sendWebhook(type, input);
@@ -78,6 +80,7 @@ export class EmailDeliveryService {
       }
     };
     const transporter = nodemailer.createTransport(options);
+    let sending: Promise<unknown> | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const deadline = new Promise<never>((_resolve, reject) => {
       timer = setTimeout(() => {
@@ -88,7 +91,7 @@ export class EmailDeliveryService {
       }, deliveryBudgetMs);
     });
     try {
-      const result = await Promise.race([transporter.sendMail({
+      const result = await Promise.race([sending = transporter.sendMail({
         from: { name: `${smtp.appName} 团队`, address: smtp.from! },
         to: [{ address: input.email, name: "" }],
         envelope: { from: smtp.from!, to: [input.email] },
@@ -100,6 +103,12 @@ export class EmailDeliveryService {
     } catch (error) {
       const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
       const responseCode = typeof error === "object" && error !== null && "responseCode" in error ? error.responseCode : undefined;
+      // Ordinary explicit rejection is a known outcome. Timeout, disconnect or
+      // an unclassified SMTP result can follow acceptance and must not become
+      // a false successful admission completion when its public error is wrapped.
+      if (admissionEnabled() && (timedOut || code === "ETIMEDOUT" ||
+        !(code === "EAUTH" || code === "EENVELOPE" || (typeof responseCode === "number" && responseCode >= 400 && responseCode <= 599))))
+        await markAdmissionUnknown();
       if (timedOut || code === "ETIMEDOUT") throw new ServiceUnavailableException({ code: "EMAIL_SMTP_TIMEOUT", message: "Email SMTP delivery timed out." });
       if (code === "EAUTH" || code === "EENVELOPE" || (typeof responseCode === "number" && responseCode >= 400 && responseCode <= 599)) {
         throw new ServiceUnavailableException({ code: "EMAIL_SMTP_REJECTED", message: "Email SMTP delivery rejected the request." });
@@ -110,6 +119,10 @@ export class EmailDeliveryService {
       controller.abort();
       socket?.destroy();
       transporter.close();
+      // In enabled mode the tracked writer includes the original send's actual
+      // settlement. A transport that never settles remains unknown; closing a
+      // socket alone is not proof of remote cancellation or local completion.
+      if (admissionEnabled() && sending) await sending.catch(() => undefined);
     }
   }
 
@@ -131,7 +144,7 @@ export class EmailDeliveryService {
 
     let response: Response;
     try {
-      response = await fetch(this.config.emailDelivery.webhookUrl, {
+      response = await admissionFetch(this.config.emailDelivery.webhookUrl, {
         method: "POST",
         redirect: "error",
         headers,

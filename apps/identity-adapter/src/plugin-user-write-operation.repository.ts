@@ -1,3 +1,4 @@
+import { AdmissionWriter } from "./identity-admission.js";
 import { createHash } from "node:crypto";
 import { Injectable, OnModuleDestroy } from "@nestjs/common";
 import mysql, { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
@@ -124,6 +125,7 @@ export class PluginUserWriteOperationRepository implements OnModuleDestroy {
     return this.pool !== null;
   }
 
+  @AdmissionWriter()
   async begin(input: PluginUserWriteOperationInput): Promise<{ duplicate: boolean }> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -200,6 +202,7 @@ export class PluginUserWriteOperationRepository implements OnModuleDestroy {
     };
   }
 
+  @AdmissionWriter()
   async update(input: PluginUserWriteOperationUpdate): Promise<void> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -233,6 +236,7 @@ export class PluginUserWriteOperationRepository implements OnModuleDestroy {
    * mutation path. Keep every eligibility predicate in this UPDATE so two
    * service instances cannot both reopen the same operation.
    */
+  @AdmissionWriter()
   async reopenFailedLegacyUnauthorized(input: PluginUserWriteOperationReopenInput): Promise<boolean> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -433,6 +437,7 @@ export class PluginUserWriteOperationRepository implements OnModuleDestroy {
     return this.schemaReady;
   }
 
+  @AdmissionWriter()
   private async createSchema(): Promise<void> {
     const pool = this.requirePool();
 

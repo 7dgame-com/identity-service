@@ -1,3 +1,4 @@
+import { AdmissionWriter, markAdmissionUnknown } from "./identity-admission.js";
 import { Injectable, OnModuleDestroy } from "@nestjs/common";
 import mysql, { Pool, PoolConnection, RowDataPacket } from "mysql2/promise";
 import { loadConfig } from "./config.js";
@@ -56,6 +57,7 @@ export class PluginUserTemporaryAuthorizationRepository implements OnModuleDestr
     return this.pool !== null;
   }
 
+  @AdmissionWriter()
   async grant(input: PluginUserTemporaryAuthorizationGrantInput): Promise<PluginUserTemporaryAuthorizationGrantState> {
     const connection = await this.requireConnection();
     try {
@@ -89,6 +91,7 @@ export class PluginUserTemporaryAuthorizationRepository implements OnModuleDestr
     }
   }
 
+  @AdmissionWriter()
   async revoke(state: PluginUserTemporaryAuthorizationGrantState): Promise<PluginUserTemporaryAuthorizationRevokeResult> {
     const connection = await this.requireConnection();
     try {
@@ -290,6 +293,7 @@ async function rollbackQuietly(connection: PoolConnection): Promise<void> {
   try {
     await connection.rollback();
   } catch {
+    await markAdmissionUnknown();
     // Keep the original error.
   }
 }

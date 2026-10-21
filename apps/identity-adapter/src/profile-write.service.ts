@@ -1,3 +1,4 @@
+import { admissionFetch } from "./identity-admission.js";
 import { createHash, randomUUID } from "node:crypto";
 import { HttpException, Injectable, Logger, NotFoundException, ServiceUnavailableException } from "@nestjs/common";
 import { loadConfig } from "./config.js";
@@ -509,7 +510,7 @@ export class ProfileWriteService {
 
     let upstream: Response;
     try {
-      upstream = await fetch(url, init);
+      upstream = await admissionFetch(url, init);
     } catch (error) {
       throw new ServiceUnavailableException({
         code: "PROFILE_WRITE_LEGACY_API_UNAVAILABLE",

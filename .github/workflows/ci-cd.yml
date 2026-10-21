@@ -130,6 +130,7 @@ jobs:
           npm test --
           apps/identity-adapter/test/identity-allocator-attacks.mysql.spec.ts
           apps/identity-adapter/test/identity-explicit-activation.mysql.spec.ts
+          apps/identity-adapter/test/identity-admission.mysql.spec.ts
           apps/identity-adapter/test/identity-accounts.mysql.spec.ts
           apps/identity-adapter/test/identity-runtime.mysql.spec.ts
           apps/identity-adapter/test/identity-http-bootstrap.mysql.spec.ts
@@ -139,6 +140,7 @@ jobs:
           apps/identity-adapter/test/apple-identity.mysql.spec.ts
           apps/identity-adapter/test/legacy-session-import.mysql.spec.ts
           apps/identity-adapter/test/legacy-refresh-credential.mysql.spec.ts
+          apps/identity-adapter/test/legacy-refresh-graph.mysql.spec.ts
           apps/identity-adapter/test/legacy-wechat-signup.mysql.spec.ts
           apps/identity-adapter/test/legacy-challenge-import.mysql.spec.ts
           apps/identity-adapter/test/legacy-qrcode-import.mysql.spec.ts

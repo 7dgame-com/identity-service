@@ -1,3 +1,4 @@
+import { AdmissionWriter } from "./identity-admission.js";
 import { assertNativeUserAllocation } from "./identity-allocator-manifest.js";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { BadRequestException, ConflictException, Inject, Injectable, OnModuleDestroy, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
@@ -45,6 +46,7 @@ export class IdentityWechatOAuthService implements OnModuleDestroy {
   metadata() { this.enabled(); return {issuer:this.config.jwt.issuer,...this.jwt.jwks()}; }
 
   /** Provider proof was checked by auth-service. Never match a user by email or display name. */
+  @AdmissionWriter()
   async resolveWechat(payload: IdentityWechatProfile, createAccount = false): Promise<{userId:number|null;signupToken:string|null}> {
     const profile = parse(profileSchema,payload); const connection = await this.db().getConnection();
     try {
@@ -107,6 +109,7 @@ export class IdentityWechatOAuthService implements OnModuleDestroy {
   }
 
   /** A confirmed, unexpired scan and the account password are both required. */
+  @AdmissionWriter()
   async bindExisting(payload: unknown): Promise<{ user: LegacyUserReadModel; expectedPasswordHash: string }> {
     const body = parse(
       z.object({
@@ -228,6 +231,7 @@ export class IdentityWechatOAuthService implements OnModuleDestroy {
     return { user: await this.requireUser(credential.id), expectedPasswordHash: credential.passwordHash };
   }
 
+  @AdmissionWriter()
   async createCode(payload: unknown) {
     const code = parse(codeSchema,payload); const client = this.client(code.clientId);
     if (!client.redirectUris.includes(code.redirectUri) || !code.scopes.every((scope)=>client.scopes.includes(scope))) throw invalidGrant();
@@ -239,6 +243,7 @@ export class IdentityWechatOAuthService implements OnModuleDestroy {
     return {success:true};
   }
 
+  @AdmissionWriter()
   async token(payload: unknown) {
     const body = parse(z.record(z.unknown()),payload); const client = this.client(String(body.client_id??""));
     if (!client.publicClient && !secretEqual(client.clientSecret,body.client_secret)) throw new UnauthorizedException({error:"invalid_client"});
@@ -264,6 +269,7 @@ export class IdentityWechatOAuthService implements OnModuleDestroy {
     } catch(error) { await connection.rollback(); throw error; } finally { connection.release(); }
   }
 
+  @AdmissionWriter()
   private async refresh(client: BridgeClient, body: Record<string,unknown>) {
     if (typeof body.refresh_token!=="string" || body.refresh_token.length>4096) throw invalidGrant();
     let current; try { current = await this.sessions.findRefreshCandidate(body.refresh_token); } catch { throw invalidGrant(); }
@@ -279,6 +285,7 @@ export class IdentityWechatOAuthService implements OnModuleDestroy {
     catch { throw invalidGrant(); }
     return this.tokens(user,client,scopes,next.sessionId,next.refreshToken);
   }
+  @AdmissionWriter()
   async revoke(payload: unknown) {
     const body = parse(z.object({token:z.string().max(4096)}),payload); await this.sessions.revoke(body.token); return {success:true};
   }

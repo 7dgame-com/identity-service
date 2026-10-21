@@ -1,3 +1,4 @@
+import { AdmissionWriter } from "./identity-admission.js";
 import { createHash, randomBytes, createCipheriv, createDecipheriv, timingSafeEqual } from "node:crypto";
 import { Injectable, OnModuleDestroy } from "@nestjs/common";
 import mysql, { Pool, PoolConnection, ResultSetHeader, RowDataPacket } from "mysql2/promise";
@@ -73,6 +74,7 @@ export class IdentitySessionRepository implements OnModuleDestroy {
     return this.pool !== null;
   }
 
+  @AdmissionWriter()
   async issue(input: IdentitySessionInput): Promise<IssuedIdentitySession> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -91,6 +93,7 @@ export class IdentitySessionRepository implements OnModuleDestroy {
   }
 
   /** OIDC grants and their session family must become visible in the same commit. */
+  @AdmissionWriter()
   async issueOidcSession(input: IdentitySessionInput, binding: OidcSessionBinding): Promise<IssuedIdentitySession> {
     await this.ensureSchema();
     const connection = await this.requirePool().getConnection();
@@ -119,6 +122,7 @@ export class IdentitySessionRepository implements OnModuleDestroy {
   }
 
   /** Caller owns the transaction; readiness must be checked before taking account locks. */
+  @AdmissionWriter()
   async issueInTransaction(connection:PoolConnection,input:IdentitySessionInput):Promise<IssuedIdentitySession>{
     await this.lockActiveUser(connection,input);
     return this.insertSession(connection,input);
@@ -134,6 +138,7 @@ export class IdentitySessionRepository implements OnModuleDestroy {
   }
 
   /** Consume and replace under the same row lock. Never issue two successors. */
+  @AdmissionWriter()
   async rotate(refreshToken: string, next: IdentitySessionInput, idempotencyKey?: string): Promise<IssuedIdentitySession> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -240,6 +245,7 @@ export class IdentitySessionRepository implements OnModuleDestroy {
     return !!session.revoked_at && !session.replaced_by_hash;
   }
 
+  @AdmissionWriter()
   async revoke(refreshToken: string | null | undefined): Promise<boolean> {
     if (!refreshToken) return true;
     await this.ensureSchema();
@@ -271,6 +277,7 @@ export class IdentitySessionRepository implements OnModuleDestroy {
     finally { connection.release(); }
   }
 
+  @AdmissionWriter()
   async revokeUserSessions(legacyUserId: number): Promise<number> {
     await this.ensureSchema();
     const connection = await this.requirePool().getConnection();
@@ -435,6 +442,7 @@ export class IdentitySessionRepository implements OnModuleDestroy {
     }
   }
 
+  @AdmissionWriter()
   private async createSchema(): Promise<void> {
     const pool = this.requirePool();
 

@@ -1,3 +1,4 @@
+import { AdmissionWriter } from "./identity-admission.js";
 import { assertNativeUserAllocation } from "./identity-allocator-manifest.js";
 import { createHash, randomBytes } from "node:crypto";
 import { BadRequestException, ConflictException, Inject, Injectable, OnModuleDestroy, ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
@@ -31,6 +32,7 @@ export class AppleIdentityService implements OnModuleDestroy {
     if(!Number.isInteger(this.challengeTtl)||this.challengeTtl<30||this.challengeTtl>600)throw new Error("Apple challenge TTL must be between 30 and 600 seconds");
   }
   async onModuleDestroy(){await this.pool?.end();}
+  @AdmissionWriter()
   async resolve(payload:unknown) {
     const profile=parse(profileSchema,payload);this.app(profile.providerAppId);this.jwt.assertSigningReady();
     const connection=await this.db().getConnection();let identity:RowDataPacket,challenge:string|null=null;
@@ -53,6 +55,7 @@ export class AppleIdentityService implements OnModuleDestroy {
     return this.response(identity!,challenge);
   }
 
+  @AdmissionWriter()
   async complete(mode:"create"|"link",payload:unknown) {
     const input=parse(completionSchema,payload);this.jwt.assertSigningReady();
     const connection=await this.db().getConnection();let identity:RowDataPacket,expectedPasswordHash:string;

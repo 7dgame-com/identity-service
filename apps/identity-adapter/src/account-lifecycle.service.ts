@@ -1,3 +1,4 @@
+import { admissionFetch } from "./identity-admission.js";
 import { HttpException, Injectable, NotFoundException, ServiceUnavailableException } from "@nestjs/common";
 import { AccountEmailService, EmailNativeFallbackRequiredError } from "./account-email.service.js";
 import { AccountInvitationService, InvitationNativeFallbackRequiredError } from "./account-invitation.service.js";
@@ -211,7 +212,7 @@ export class AccountLifecycleService {
 
     let upstream: Response;
     try {
-      upstream = await fetch(url, init);
+      upstream = await admissionFetch(url, init);
     } catch (error) {
       throw new ServiceUnavailableException({
         code: "ACCOUNT_LIFECYCLE_LEGACY_API_UNAVAILABLE",

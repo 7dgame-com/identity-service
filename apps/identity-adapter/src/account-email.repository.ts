@@ -1,3 +1,4 @@
+import { AdmissionWriter } from "./identity-admission.js";
 import { Injectable, OnModuleDestroy } from "@nestjs/common";
 import mysql, { Pool, PoolConnection, ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { identityAccountWriteDb, loadConfig } from "./config.js";
@@ -73,6 +74,7 @@ export class AccountEmailRepository implements OnModuleDestroy {
     return Boolean(rows[0]);
   }
 
+  @AdmissionWriter()
   async bindVerifiedEmail(legacyUserId: number, email: string, verifiedAt: number, proof?:EmailWriteProof): Promise<EmailUserProfile> {
     try {
       const result = await this.writeUser(
@@ -99,6 +101,7 @@ export class AccountEmailRepository implements OnModuleDestroy {
     return user;
   }
 
+  @AdmissionWriter()
   async unbindEmail(legacyUserId: number, updatedAt: number, proof?:EmailWriteProof): Promise<EmailUserProfile> {
     const result = await this.writeUser(
       `UPDATE user

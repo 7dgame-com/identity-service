@@ -1,3 +1,4 @@
+import { assertAdmissionWriter } from "./identity-admission.js";
 import { allocatorMutation } from "./identity-allocator-state.js";
 import { randomBytes } from "node:crypto";
 import type { Connection,RowDataPacket } from "mysql2/promise";
@@ -6,6 +7,7 @@ import { assertLegacyWechatSignupTrust,canonicalSignupJson,normalizeLegacyWechat
 
 /** Offline, explicit reviewed hash-only import; never creates tables or infers an application. */
 export async function importLegacyWechatSignupCredentials(target:Connection,payload:unknown,options:{apply?:boolean;environment?:string;now?:Date}={}) {
+  assertAdmissionWriter();
   if(options.apply&&(options.environment??process.env.NODE_ENV)!=="staging")throw new Error("Legacy signup apply requires staging.");
   const manifest=normalizeLegacyWechatSignupManifest(payload), manifestHash=assertLegacyWechatSignupTrust(manifest), now=options.now??new Date();
   if(!Number.isFinite(now.getTime())||new Date(manifest.capturedAt)>now)throw new Error("Invalid legacy signup capture time.");

@@ -1,3 +1,4 @@
+import { assertAdmissionWriter } from "./identity-admission.js";
 import type { Connection, PoolConnection, RowDataPacket } from "mysql2/promise";
 import { allocatorMutation } from "./identity-allocator-state.js";
 import { assertMigrationStaging } from "./migration-state.js";
@@ -29,6 +30,7 @@ export async function importRefreshGraph(target: Connection, manifestBytes: Buff
   /** Explicit library-only common-key compatibility; the CLI never infers it. */
   sourceResponseKey?:Buffer;
 } = {}) {
+  assertAdmissionWriter();
   if (manifestBytes.length > 64 * 1024 * 1024 || accountsBytes.length > 32 * 1024 * 1024) throw new Error("Legacy graph input exceeds its bound.");
   const manifestSha256 = graphHash(manifestBytes), accountsSha256 = graphHash(accountsBytes), now = options.now ?? Date.now();
   if (options.apply && ((options.environment ?? process.env.NODE_ENV) !== "staging" || options.reviewedSha256 !== manifestSha256)) {

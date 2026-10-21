@@ -1,3 +1,4 @@
+import { assertAdmissionWriter } from "./identity-admission.js";
 import { createHash } from "node:crypto";
 import type { Connection, PoolConnection, RowDataPacket } from "mysql2/promise";
 
@@ -14,6 +15,7 @@ export async function assertMigrationStaging(connection:Transaction):Promise<voi
   if(rows[0]?.authority!=="staging")throw new Error("Identity is already authoritative; importing or syncing legacy data is forbidden. Use a reviewed reverse migration to change authority.");
 }
 export async function activateIdentityAuthority(connection:Transaction):Promise<void> {
+  assertAdmissionWriter();
   await connection.execute("SELECT authority FROM identity_migration_control WHERE id=1 FOR UPDATE");
   await connection.execute("UPDATE identity_migration_control SET authority='identity',activated_at=COALESCE(activated_at,UTC_TIMESTAMP(3)) WHERE id=1");
 }
@@ -31,6 +33,7 @@ export function migrationRowHash(row:Record<string,unknown>,columns:readonly str
   return createHash("sha256").update(JSON.stringify(values)).digest("hex");
 }
 export async function recordMigrationBaseline(connection:Transaction,table:string,columns:readonly string[],source:Record<string,unknown>|null,target:Record<string,unknown>|null):Promise<void> {
+  assertAdmissionWriter();
   if(!source&&!target)throw new Error("A migration row is required");
   const key=migrationRowKey(table,(source??target)!);
   await connection.execute(`INSERT INTO identity_migration_rows (table_name,key_hash,key_json,columns_json,source_hash,target_hash)

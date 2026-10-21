@@ -1,3 +1,4 @@
+import { AdmissionWriter } from "./identity-admission.js";
 import { Injectable, OnModuleDestroy } from "@nestjs/common";
 import mysql, { Pool, PoolConnection, ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { identityAccountWriteDb, loadConfig } from "./config.js";
@@ -110,6 +111,7 @@ export class AccountPasswordRepository implements OnModuleDestroy {
     return user ? this.readModel(user) : null;
   }
 
+  @AdmissionWriter()
   async changePassword(user: PasswordUserCredential, newPassword: string, operation?: { operationKey: string; resetChallengeKey?: string; resetTokenHash?: string; authorize?:(connection:PoolConnection)=>Promise<void> }): Promise<LegacyUserReadModel> {
     const pool = this.requirePool();
     const passwordHash = await hashLegacyPassword(newPassword);

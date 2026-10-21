@@ -1,3 +1,4 @@
+import { AdmissionWriter } from "./identity-admission.js";
 import { createHash } from "node:crypto";
 import { Injectable, OnModuleDestroy } from "@nestjs/common";
 import mysql, { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
@@ -93,6 +94,7 @@ export class ProfileWriteOperationRepository implements OnModuleDestroy {
     return this.pool !== null;
   }
 
+  @AdmissionWriter()
   async begin(input: ProfileWriteOperationInput): Promise<{ duplicate: boolean }> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -164,6 +166,7 @@ export class ProfileWriteOperationRepository implements OnModuleDestroy {
     };
   }
 
+  @AdmissionWriter()
   async update(input: ProfileWriteOperationUpdate): Promise<void> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -273,6 +276,7 @@ export class ProfileWriteOperationRepository implements OnModuleDestroy {
     return this.schemaReady;
   }
 
+  @AdmissionWriter()
   private async createSchema(): Promise<void> {
     const pool = this.requirePool();
 

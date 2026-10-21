@@ -1,3 +1,4 @@
+import { AdmissionWriter } from "./identity-admission.js";
 import { withAllocatorImportFence, fenceAllocatorImport } from "./identity-allocator-state.js";
 import { Injectable, OnModuleDestroy } from "@nestjs/common";
 import mysql, { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
@@ -448,6 +449,7 @@ export class IamRepository implements OnModuleDestroy {
     return result;
   }
 
+  @AdmissionWriter()
   async upsertIdentityUserShadow(input: IdentityUserShadowInput): Promise<void> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -504,6 +506,7 @@ export class IamRepository implements OnModuleDestroy {
     });
   }
 
+  @AdmissionWriter()
   async upsertIdentityUserProfileShadow(input: IdentityUserProfileShadowInput): Promise<void> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -544,6 +547,7 @@ export class IamRepository implements OnModuleDestroy {
     });
   }
 
+  @AdmissionWriter()
   async upsertPluginSubjectMap(input: PluginSubjectMapInput): Promise<void> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -564,6 +568,7 @@ export class IamRepository implements OnModuleDestroy {
     });
   }
 
+  @AdmissionWriter()
   async replaceRoleAssignmentsShadow(legacyUserId: number, roles: RoleShadowInput[]): Promise<number> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -599,6 +604,7 @@ export class IamRepository implements OnModuleDestroy {
     });
   }
 
+  @AdmissionWriter()
   async replaceOrganizationMembershipsShadow(legacyUserId: number, organizations: OrganizationShadowInput[]): Promise<number> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -644,6 +650,7 @@ export class IamRepository implements OnModuleDestroy {
     });
   }
 
+  @AdmissionWriter()
   async upsertPermissionPolicyCandidate(policy: IamPermissionPolicySnapshot, source = "legacy-import"): Promise<IamPermissionPolicyVersionRow> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -710,6 +717,7 @@ export class IamRepository implements OnModuleDestroy {
     };
   }
 
+  @AdmissionWriter()
   async replaceSubjectAssignments(input: {
     identityUserId: string;
     legacyUserId: number | null;
@@ -850,6 +858,7 @@ export class IamRepository implements OnModuleDestroy {
     }));
   }
 
+  @AdmissionWriter()
   async createReconciliationRun(input: IamReconciliationRunInput): Promise<void> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -875,6 +884,7 @@ export class IamRepository implements OnModuleDestroy {
     await pool.execute("DELETE FROM iam_reconciliation_items WHERE run_key = ?", [input.runKey]);
   }
 
+  @AdmissionWriter()
   async insertReconciliationItems(items: IamReconciliationItemInput[]): Promise<number> {
     if (items.length === 0) {
       return 0;
@@ -915,6 +925,7 @@ export class IamRepository implements OnModuleDestroy {
     });
   }
 
+  @AdmissionWriter()
   async finishReconciliationRun(input: IamReconciliationRunFinishInput): Promise<void> {
     const pool = this.requirePool();
     await this.ensureSchema();
@@ -1055,6 +1066,7 @@ export class IamRepository implements OnModuleDestroy {
     return this.schemaReady;
   }
 
+  @AdmissionWriter()
   private async createSchema(): Promise<void> {
     const pool = this.requirePool();
 
