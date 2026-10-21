@@ -43,7 +43,7 @@ const replaySchema = z.object({ predecessorHash: digest, successorHash: digest, 
   issuer: z.string().max(2048).nullable(), requestHash: digest.nullable(), createdAtMs: time, expiresAtMs: time,
   sourceEncryptedResponse:z.string().min(1).max(400000).nullable(), response: graphBodySchema }).strict();
 export const graphManifestSchema = z.object({ version: z.literal("legacy-refresh-graph-v1"), protocol: graphProtocolSchema,
-  capturedAtMs: time, source: z.object({ revisions: z.array(z.string().regex(/^[a-f0-9]{40}$/)).min(1).max(3),
+  capturedAtMs: time, source: z.object({ revisions: z.array(z.string().regex(/^[a-f0-9]{40}$/)).min(1).max(4),
     redisDatabase: z.literal(1), keyPrefix: z.enum(["refresh_token:", "refresh_token:a:"]),
     metadataPrefix: z.enum(["y1:refresh-replay:v1:", "identity:legacy-refresh:ar:v1:"]),
     namespaceReviewSha256: digest, drainReviewSha256: digest, sourceSnapshotSha256: digest, accountSnapshotSha256: digest,
