@@ -1,4 +1,8 @@
 import "reflect-metadata";
+import {
+  frozenAdmissionProtocolDirectory,
+  verifyAdmissionProtocolSnapshot,
+} from "./support/admission-protocol-fixture.js";
 import { execFile } from "node:child_process";
 import {
   generateKeyPairSync,
@@ -45,9 +49,7 @@ const options = {
   timezone: "Z",
   multipleStatements: true,
 };
-const driver = fileURLToPath(
-  new URL("../../../../../driver/identity-dev-admission/", import.meta.url),
-);
+const driver = frozenAdmissionProtocolDirectory;
 const execute = promisify(execFile),
   pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 async function until(check: () => boolean | Promise<boolean>) {
@@ -439,6 +441,7 @@ describe.skipIf(!enabled)(
     }
 
     beforeAll(async () => {
+      await verifyAdmissionProtocolSnapshot();
       if (
         options.host !== "127.0.0.1" ||
         (options.port !== 13316 &&

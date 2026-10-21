@@ -61,3 +61,7 @@ IDENTITY_TEST_MYSQL_PASSWORD='' node node_modules/vitest/vitest.mjs run \
 ```
 
 只允许本机专用 13316，或 GitHub CI 明确声明下的 loopback 3306，随机 `_test` 库 finally 清理。没有真实 stable key、云 DB/Redis/Portainer 操作。
+
+## 独立仓库测试依赖
+
+27 项真实 Nest/MySQL 准入测试始终加载 `apps/identity-adapter/test/support/admission-protocol/` 中冻结的五个正式 driver 模块；来源提交和每文件 SHA-256 记录在其 `manifest.json`。这使独立服务仓库的 CI 不再依赖超级项目目录。测试先核对所有冻结摘要；本地存在上游目录时再逐字核对，漂移即失败。上游缺席不会跳过测试，也不会换成 mock。更新流程见同目录 README；该快照只用于测试，不进入产品 runtime 接线。
