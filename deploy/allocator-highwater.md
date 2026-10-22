@@ -10,6 +10,16 @@ A migrated database must retain the source AUTO_INCREMENT highwater, actual sour
 
 Keep native HTTP off. Prepare the new checkpoint asset separately. The production CLI only accepts direct `10.206.0.5:3306`, readonly source `bujiaban_development`, target `xrugc_identity_dev`, and the existing private principal `identity_dev`; credentials come from current config and are never printed. Source SELECT permission is not evidence that source writers have stopped.
 
+`runAllocatorHighwaterOperation(args)` in `scripts/lib/allocator-highwater-operation.js`
+is an import-safe awaited entry; the existing CLI is its thin compatibility wrapper.
+It settles after business work, each report/journal file and parent-directory fsync and every acquired
+connection/file close. All closes are attempted and awaited even when one fails.
+A failed close rejects as `MIGRATION_RESOURCE_CLOSE_UNKNOWN`; a report write/fsync
+failure rejects as `MIGRATION_REPORT_WRITE_UNKNOWN` (CLI exit 3), with no
+success output or automatic retry. The existing staging fence, fixed development
+target and admission writer guard are unchanged. This entry creates no new fence,
+lease, authorization scope or coordinator gate.
+
 1. Before the final window, obtain schema/reference evidence with `node dist/scripts/allocator-highwater.js --inventory`. This performs readonly inventory and does not create proof or change counters.
 2. Actually hold every old account, provider, PHP, session and reconciliation writer. Keep that hold through activation. Run final account sync and all approved binding/session/challenge imports. Then run `node dist/scripts/account-sync.js --dry-run --max-changes=100000` and save the complete original JSON report in a protected 0600 file. It must contain the exact AccountSyncReport fields, all five counters zero and empty tableChanges. Any subsequent mutating import invalidates ready; account-sync apply does so even with zero deltas. Pure readonly dry-run and exact replay do not invalidate.
 3. Prepare a reviewed 0600 JSON file with exactly `version:1`, `sourceDatabase`, `targetDatabase`, `sourceServerUuid`, `importKey`, `writersDrainedAt` (ISO UTC milliseconds), `finalSyncSha256` and `referenceReviewSha256`. Use the source UUID/reference digest actually returned by inventory, the existing account import key, and the SHA256 of the exact final zero-sync report. The reviewer must independently verify the real writer hold; hashes cannot manufacture this fact.

@@ -1,4 +1,6 @@
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import {
@@ -9,6 +11,7 @@ import {
   describe,
   expect,
   it,
+  vi,
 } from "vitest";
 import {
   accountImportTables,
@@ -20,6 +23,7 @@ import {
   recordMigrationBaseline,
 } from "../src/migration-state.js";
 import { importLegacySessions } from "../src/legacy-session-import.js";
+import { runAccountSyncOperation } from "../../../scripts/lib/account-sync-operation.js";
 
 const enabled = process.env.IDENTITY_TEST_MYSQL === "1";
 const options = {
@@ -114,6 +118,8 @@ describe.skipIf(!enabled)("staging account delta MySQL sync", () => {
     });
   }, 30_000);
   afterEach(async () => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
     await Promise.all([source?.end(), target?.end()]);
     for (const name of owned.splice(0))
       await admin.query(`DROP DATABASE IF EXISTS \`${name}\``);
@@ -426,5 +432,56 @@ describe.skipIf(!enabled)("staging account delta MySQL sync", () => {
     expect(
       (await rows("SELECT nickname FROM user WHERE id=7001"))[0].nickname,
     ).toBe("First");
+  });
+
+  function configureAwaitedOperation() {
+    for (const [prefix, name] of [["LEGACY_DB", sourceName], ["IDENTITY_DB", targetName]]) {
+      vi.stubEnv(`${prefix}_HOST`, options.host); vi.stubEnv(`${prefix}_PORT`, String(options.port));
+      vi.stubEnv(`${prefix}_USER`, options.user); vi.stubEnv(`${prefix}_PASSWORD`, options.password); vi.stubEnv(`${prefix}_NAME`, name);
+    }
+  }
+
+  it("awaited CLI entry persists the complete report and waits for both real MySQL connections to close", async () => {
+    configureAwaitedOperation();
+    await source.query("UPDATE user SET nickname='Awaited operation' WHERE id=7001");
+    const directory = await mkdtemp(join(tmpdir(), "identity-sync-mysql-await-")), report = join(directory, "sync.json");
+    const create = mysql.createConnection.bind(mysql), acquired: Connection[] = [];
+    let closeStarted!: () => void, releaseClose!: () => void;
+    const started = new Promise<void>(done => { closeStarted = done; }), late = new Promise<void>(done => { releaseClose = done; });
+    vi.spyOn(mysql, "createConnection").mockImplementation(async (input: any) => {
+      const c = await create(input); acquired.push(c);
+      if (acquired.length === 2) {
+        const end = c.end.bind(c);
+        c.end = async () => { closeStarted(); await late; await end(); };
+      }
+      return c;
+    });
+    let settled = false;
+    const operation = runAccountSyncOperation(["--apply", "--max-changes=100", `--report=${report}`]).finally(() => { settled = true; });
+    try {
+      await started; expect(settled).toBe(false); expect(acquired).toHaveLength(2);
+      const durable = JSON.parse(await readFile(report, "utf8"));
+      expect(durable).toMatchObject({ applied: true, changes: 1 });
+      expect((await stat(report)).mode & 0o777).toBe(0o600);
+      releaseClose(); expect(await operation).toEqual(durable);
+      const [processes] = await admin.query<RowDataPacket[]>("SHOW PROCESSLIST");
+      expect(processes.filter(row => acquired.some(c => c.threadId === Number(row.Id)))).toEqual([]);
+      expect((await rows("SELECT nickname FROM user WHERE id=7001"))[0].nickname).toBe("Awaited operation");
+    } finally {
+      releaseClose(); await operation.catch(() => {}); await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("awaited entry retains the admission writer guard and closes both real connections on refusal", async () => {
+    configureAwaitedOperation(); vi.stubEnv("IDENTITY_ADMISSION_ENABLED", "true");
+    const create = mysql.createConnection.bind(mysql), acquired: Connection[] = [];
+    vi.spyOn(mysql, "createConnection").mockImplementation(async (input: any) => { const c = await create(input); acquired.push(c); return c; });
+    await expect(runAccountSyncOperation(["--apply", "--max-changes=100"])).rejects.toMatchObject({
+      response: { code: "ADMISSION_WRITER_SCOPE_REQUIRED" },
+    });
+    expect(acquired).toHaveLength(2);
+    const [processes] = await admin.query<RowDataPacket[]>("SHOW PROCESSLIST");
+    expect(processes.filter(row => acquired.some(c => c.threadId === Number(row.Id)))).toEqual([]);
+    expect((await rows("SELECT nickname FROM user WHERE id=7001"))[0].nickname).toBe("First");
   });
 });

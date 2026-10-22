@@ -13,6 +13,31 @@ then preview the bounded delta:
 node dist/scripts/account-sync.js --dry-run --max-changes=500 --max-rows=100000
 ```
 
+`--report=/protected/new-sync.json` additionally writes the complete report to a new
+owner-only 0600 regular file and waits for `writeFile`, file `fsync`, parent
+directory `fsync` and every descriptor close.
+The destination is never overwritten or followed through a symlink. In-process
+callers import `runAccountSyncOperation(args)` from
+`scripts/lib/account-sync-operation.js`; importing it or the compatibility CLI
+does not execute a migration. Its Promise settles only after the business Promise
+and every acquired connection/file close have settled. A failed close rejects with
+`MIGRATION_RESOURCE_CLOSE_UNKNOWN`; a report write/fsync failure rejects with
+`MIGRATION_REPORT_WRITE_UNKNOWN`. The CLI exits 3, emits no success and forbids
+automatic retry for either outcome, including a failure after a committed sync.
+Check current database state before any separately reviewed retry.
+
+The MySQL resource owner listens from each connection's acquisition, including
+while the second endpoint is connecting, and waits for both `end()` and the actual
+socket `close` event. mysql2's `end()` fulfillment alone is not closure proof.
+Connection/transport errors and a fulfilled `Error` result remain unknown. A
+report durability failure is latched even if a later rollback error replaces the
+original exception. Report content or file existence alone never proves that all
+connections and descriptors have closed.
+
+This awaited entry does not create an admission scope, acquire a migration lease,
+enforce the coordinator's finalization ledger or grant authorization. The existing
+writer guard still refuses it when admission is enabled without a reviewed scope.
+
 Review the count-only report. To apply a rehearsed staging delta:
 
 ```sh

@@ -10,6 +10,14 @@ The final drain, sync, credential import, allocator finalization and ingress swi
 
 Use the compiled CLI in the same immutable candidate image. The revision comes from the build-generated module; an environment `IDENTITY_BUILD_REVISION` alone cannot attest it. The CLI is hard restricted to `10.206.0.5:3306`, database `xrugc_identity_dev`, authenticated principal `identity_dev`, independent data source and explicit mode. It opens no legacy database or HTTP connection, creates no principal, grants no permission, and executes no DDL.
 
+In-process callers import `runIdentityActivateOperation(args)` from
+`scripts/lib/identity-activate-operation.js`. Importing this entry or the CLI does
+not execute activation. Its Promise includes the actual business operation,
+prepared/intent/result report file and parent-directory fsyncs and every acquired connection/file close.
+Invocation-local receipt state prevents a previous call from contaminating a later
+result. It grants no admission scope or migration lease and implements no final
+coordinator gate; the existing writer guard and single authority fence remain.
+
 First inspect without changing state:
 
 ```sh
@@ -31,6 +39,18 @@ Only add `--apply` after the external writer/issuer drain and routing generation
 ## Uncertain outcomes
 
 The deadline is the final permitted decision time. A client cannot guarantee when COMMIT becomes durable after the command has been sent. A lost COMMIT response returns `outcome=unknown` and exit code 3, with a durable local intent where available. The `acknowledgementAfterDeadline` flag compares the host wall clock when a successful acknowledgement is observed with the requested deadline. It does not establish the database commit time or prove that COMMIT met the deadline, and it does not imply cancellation. If COMMIT was acknowledged but writing the final report failed, the CLI reports `ACTIVATION_COMMITTED_REPORT_FAILED`, also exit code 3.
+
+Any connection/file close failure is also explicit and conservative:
+`MIGRATION_RESOURCE_CLOSE_UNKNOWN`, exit 3, `statusRequired=true`. Even an
+acknowledged activation is not reported as completed until every close settles.
+Errors from the business operation, failure-report write and resource cleanup are
+preserved in the rejected Promise's cause chain; CLI output remains count/code-only.
+
+A prepared or commit-intent report write/fsync failure also rejects with
+`MIGRATION_REPORT_WRITE_UNKNOWN`, exit 3 and `statusRequired=true`. Report failures
+remain latched if later rollback or failure-report errors replace the original
+exception. This conservative result grants no automatic retry, even when the
+failure happened before the core operation could send COMMIT.
 
 In all these cases, keep old identity writers stopped and routing gated. Run the read-only `--status` from the fixed image and compare receipt proof/request/revision with the protected intent. An active receipt confirms authority; staging with no receipt means that activation did not persist. A failed or inconsistent status requires investigation. Never infer rollback from a timeout, destroy the receipt, downgrade authority, retry COMMIT automatically or resume legacy writers. There is no public activation endpoint and no additional activation credential.
 
