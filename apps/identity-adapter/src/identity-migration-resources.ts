@@ -3,6 +3,7 @@ import { lstat, open, type FileHandle } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import type { Socket } from "node:net";
 import type { EventEmitter } from "node:events";
+import { consumeMigrationJournalLease, appendMigrationJournal, syncMigrationJournal, closeMigrationJournal, type MigrationJournalLease } from "../../../packages/identity-finalization-runtime/migration-artifacts.mjs";
 
 type Resource = {
   kind: "connection" | "file" | "directory";
@@ -130,6 +131,25 @@ export class MigrationResources {
   file<T extends { close(): Promise<unknown> }>(file: T): T {
     this.resources.push({ kind: "file", close: () => file.close() });
     return file;
+  }
+  /** Only a genuine lease from this exact pinned adapter module can transfer its
+   * descriptors. No path/FileHandle/callback or caller cleanup statement enters.
+   */
+  async adoptMigrationJournal(lease: MigrationJournalLease, claim: unknown): Promise<MigrationReportFile> {
+    const owner = consumeMigrationJournalLease(lease, claim);
+    this.resources.push({ kind: "file", close: () => closeMigrationJournal(owner) });
+    const report: MigrationReportFile = {
+      writeFile: (async (data: unknown, options?: unknown) => {
+        if (typeof data !== "string" || options !== undefined) throw new Error("MIGRATION_NATIVE_JOURNAL_EVENT_REQUIRED");
+        await appendMigrationJournal(owner, Buffer.from(data, "utf8"));
+      }) as MigrationReportFile["writeFile"],
+      sync: async () => { await syncMigrationJournal(owner); },
+    };
+    Object.freeze(report); reportOwners.set(report, this); reportMethods.set(report, { ...report });
+    // Consumption is synchronous ownership transfer, not fresh I/O validation.
+    try { await report.sync(); }
+    catch (cause) { const failure = new MigrationReportWriteError(cause); this.noteReportFailure(failure); throw failure; }
+    return report;
   }
   async openReport(path: string): Promise<MigrationReportFile> {
     const reportPath = resolve(path),

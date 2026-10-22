@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "upstreamRepository": "xrugc superproject",
+  "upstreamCommit": "8f24384aee82d8bf03e6e799d57ed7d48d9d8a0a",
+  "upstreamDirectory": "driver/identity-dev-admission",
+  "purpose": "Production runtime adapter shared by the closed Native executor; not a fixture or authorization grant",
+  "files": [
+    {
+      "path": "migration-artifacts.mjs",
+      "sha256": "3413f91456561657323479fe384c7b907b80205e4f2cecf3406c65b24fb05bb0"
+    },
+    {
+      "path": "migration-plan.mjs",
+      "sha256": "16a863a88f0189d083a09af53b93a39132e36cfe89b4a5f8eaea2d5924567782"
+    }
+  ]
+}

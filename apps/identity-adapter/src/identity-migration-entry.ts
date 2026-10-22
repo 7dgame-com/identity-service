@@ -2,13 +2,17 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomBytes } from "node:crypto";
 import { constants, closeSync, fstatSync, openSync, readFileSync } from "node:fs";
 import { isProxy } from "node:util/types";
+import mysql from "mysql2";
 import type { Connection, RowDataPacket } from "mysql2/promise";
+import { openMigrationArtifacts, validateMigrationTypedReport, type MigrationArtifactSession } from "../../../packages/identity-finalization-runtime/migration-artifacts.mjs";
+import { prepareExpectedSourceFingerprint, expectedSourceManifest, readActualSourceFingerprint, assertSameSourceFingerprint, type ExpectedSourceFingerprint } from "./identity-source-fingerprint.js";
+import type { ProfileSelectionManifest } from "./identity-profile-migration.js";
 import { z } from "zod";
 import { syncIdentityAccounts, type AccountSyncReport } from "./identity-account-sync.js";
 import { finalizeAllocator, type AllocatorPlan, type AllocatorDrainReview } from "./identity-allocator-finalizer.js";
 import { activateExplicitIdentity, activationRequestSha256, immutableIdentityRevision, type ExplicitActivationResult } from "./identity-activation.js";
 import { assertZeroAccountSyncReport } from "./identity-allocator-manifest.js";
-import { assertOwnedMigrationReport, writeMigrationReport, type MigrationReportFile } from "./identity-migration-resources.js";
+import { assertOwnedMigrationReport, writeMigrationReport, withMigrationResources, type MigrationResources, type MigrationReportFile } from "./identity-migration-resources.js";
 
 /** These are identities, never caller supplied executable paths. */
 export const nativeMigrationEntries = Object.freeze({
@@ -89,7 +93,7 @@ export function assertNativeMigrationWriter(permission?: NativeMigrationPermissi
   return true;
 }
 
-const configurationSchema = z.object({ version: z.literal(1), controlUrl: z.string(), executor: executorSchema, compiledRevision: revision, imageDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/), target: targetSchema }).strict();
+const configurationSchema = z.object({ version: z.literal(1), controlUrl: z.string(), executor: executorSchema, compiledRevision: revision, imageDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/), target: targetSchema, planSha256: hex.optional() }).strict();
 type Configuration = z.infer<typeof configurationSchema>;
 const capabilitySchema = z.string().regex(/^[A-Za-z0-9_-]{32,2048}\.[A-Za-z0-9_-]{32,2048}$/);
 const configuredRuntime = Symbol("protected migration runtime");
@@ -104,19 +108,26 @@ function protectedText(filename: string | undefined, max: number): string {
     return body.toString("utf8");
   } finally { closeSync(fd); }
 }
-/** The future private coordinator must authenticate the executor, validate its currently
+/** The private coordinator must authenticate the executor, validate its currently
  * unique ledger claim and consume its opaque single-use capability. Plain claims and
  * ordinary HTTP admission leases cannot authorize migration-enter. There is deliberately
- * no server, default endpoint, default key, register/begin or complete action here.
+ * no server, default endpoint/key, participant register/begin, or generic
+ * caller-supplied completion envelope here.
  */
 export class NativeMigrationAdmission {
   #unknown = false;
   readonly #attempted = new Set<string>();
   readonly #config: Configuration;
   readonly #key: string;
+  #prepared: OwnedPreparation | undefined;
+  #preparing = false;
+  #preparationFinished: Promise<void> = Promise.resolve();
+  #finishPreparation: (() => void) | undefined;
+  #lastOwned: ScopeState | undefined;
   private constructor(config: Configuration, key: string, authorization: symbol) {
     if (authorization !== configuredRuntime) fail("MIGRATION_PROTECTED_CONFIGURATION_REQUIRED");
     this.#config = config; this.#key = key;
+    Object.preventExtensions(this);
   }
   static environment(): NativeMigrationAdmission {
     const parsed = configurationSchema.safeParse(JSON.parse(protectedText(process.env.IDENTITY_MIGRATION_CONFIG_FILE, 16384)));
@@ -128,7 +139,7 @@ export class NativeMigrationAdmission {
     if (!/^[A-Za-z0-9_-]{43,171}$/.test(key) || Buffer.from(key, "base64url").toString("base64url") !== key) fail("MIGRATION_PROTECTED_KEY_REQUIRED");
     return new NativeMigrationAdmission(Object.freeze(config), key, configuredRuntime);
   }
-  private async post(action: "migration-enter" | "migration-unknown", body: unknown, deadline: string): Promise<unknown> {
+  async #post(action: "migration-enter" | "migration-unknown" | "migration-complete", body: unknown, deadline: string): Promise<unknown> {
     const response = await fetch(new URL(action, this.#config.controlUrl), { method: "POST", headers: { authorization: `Bearer ${this.#key}`, "content-type": "application/json", "x-identity-migration-executor": this.#config.executor.id, "x-identity-migration-boot": this.#config.executor.bootId }, body: JSON.stringify(body), redirect: "error", signal: AbortSignal.timeout(Math.max(1, Math.min(2000, Date.parse(deadline) - Date.now()))) });
     if (!response.ok || !response.body) fail("MIGRATION_ENTER_ACK_REQUIRED");
     const reader = response.body.getReader();
@@ -139,6 +150,90 @@ export class NativeMigrationAdmission {
     if (!Buffer.from(bytes.toString("utf8")).equals(bytes)) fail("MIGRATION_ENTER_ACK_REQUIRED");
     return JSON.parse(bytes.toString("utf8"));
   }
+  /** Claim-free, read-only preflight. It is neither drain evidence nor authority. */
+  async prepareOwnedPlan(): Promise<void> {
+    this.assertKnown();
+    if (this.#prepared || this.#preparing || !this.#config.planSha256) fail("MIGRATION_OWNED_PLAN_NOT_WIRED");
+    this.#preparing = true;
+    this.#preparationFinished = new Promise<void>(resolve => { this.#finishPreparation = resolve; });
+    let artifacts: MigrationArtifactSession | undefined;
+    try {
+      artifacts = await openMigrationArtifacts({ planSha256: this.#config.planSha256, compiledRevision: this.#config.compiledRevision, imageDigest: this.#config.imageDigest });
+      const p = artifacts.plan;
+      if (canonical(p.executor) !== canonical(this.#config.executor) || canonical(p.target) !== canonical(this.#config.target)) fail("MIGRATION_OWNED_PLAN_BINDING");
+      const bytes = await artifacts.readPreparedInputs();
+      const review = ownedReviewSchema.parse(JSON.parse(bytes.review.toString("utf8")));
+      if (Date.parse(review.writersDrainedAt) > Date.now()) fail("MIGRATION_OWNED_REVIEW_BINDING");
+      const expected = prepareExpectedSourceFingerprint(bytes.source, bytes.profile ?? null, p.limits.maxRows);
+      const credentials = databaseCredentialsSchema.parse(JSON.parse(protectedText(ownedDatabaseConfiguration, 16384)));
+      await withMigrationResources(async resources => {
+        const source = await freshConnection(resources, credentials, false);
+        await location(source, false);
+        assertSameSourceFingerprint(expectedSourceManifest(expected), await readActualSourceFingerprint(source, { profileSelectionSha256: p.inputs.profileSelectionSha256, maxRows: p.limits.maxRows }));
+      });
+      this.assertKnown();
+      this.#prepared = { artifacts, expected, credentials, profile: bytes.profile ? profileSelectionSchema.parse(JSON.parse(bytes.profile.toString("utf8"))) : undefined };
+    } catch (cause) {
+      this.#unknown = true;
+      if (artifacts) { try { await artifacts.close(); } catch (closeError) { throw new NativeMigrationEntryError("MIGRATION_PREFLIGHT_UNKNOWN", "unknown", new AggregateError([cause, closeError])); } }
+      throw new NativeMigrationEntryError("MIGRATION_PREFLIGHT_UNKNOWN", "unknown", cause);
+    } finally { this.#preparing = false; this.#finishPreparation?.(); this.#finishPreparation = undefined; }
+  }
+  async noteOwnedControlUnknown(): Promise<void> {
+    this.#unknown = true;
+    if (this.#lastOwned) await this.noteUnknown(this.#lastOwned);
+  }
+  async closePreparedPlan(): Promise<void> {
+    if (this.#preparing) {
+      this.#unknown = true;
+      await this.#preparationFinished;
+      throw new NativeMigrationEntryError("MIGRATION_PREFLIGHT_CLOSED_DURING_PREPARATION", "unknown");
+    }
+    const prepared = this.#prepared; this.#prepared = undefined;
+    if (!prepared) return;
+    this.#unknown = true;
+    await prepared.artifacts.close();
+  }
+  async enterOwned(value: unknown, claimCapability: string): Promise<NativeMigrationScope> {
+    this.assertKnown();
+    const prepared = this.#prepared; this.#prepared = undefined;
+    if (!prepared) fail("MIGRATION_OWNED_PREFLIGHT_REQUIRED");
+    try {
+      const c = claim(value);
+      if (c.planSha256 !== prepared.artifacts.planSha256) fail("MIGRATION_OWNED_PLAN_BINDING");
+      const scope = await this.enter(c, claimCapability);
+      ownedScopes.set(scope, prepared);
+      this.#lastOwned = scopes.get(scope)!;
+      return scope;
+    } catch (cause) {
+      this.#unknown = true;
+      try { await prepared.artifacts.close(); } catch (closeError) { throw new NativeMigrationEntryError("MIGRATION_OWNED_ENTER_UNKNOWN", "unknown", new AggregateError([cause, closeError])); }
+      throw cause;
+    }
+  }
+  /** Only the private brand minted AFTER actual resource cleanup can complete. */
+  async completeOwned(receipt: ClosedStepReceipt): Promise<Readonly<{ reportSha256: string; outputSha256: string; chainSha256: string }>> {
+    const closed = closedReceipts.get(receipt);
+    if (!closed || closed.state.client !== this) fail("MIGRATION_CLOSED_RECEIPT_REQUIRED");
+    if (closed.consumed) { await this.noteUnknown(closed.state); throw new NativeMigrationEntryError("MIGRATION_COMPLETION_REPLAY_UNKNOWN", "unknown"); }
+    closed.consumed = true;
+    const state = closed.state, c = state.claim;
+    try {
+      this.assertKnown(); assertDeadline(c);
+      const nonce = randomBytes(32).toString("base64url");
+      const request = { version: 1, nonce, enterNonce: state.nonce, claim: c, scopeCapability: state.capability, typedReportBase64: closed.bytes.toString("base64"), typedReportSha256: digest(closed.bytes) };
+      const requestSha256 = migrationBindingSha256(request);
+      const expected = completionHashes(c, closed.output);
+      const ack = z.object({ version: z.literal(1), nonce: z.literal(nonce), requestSha256: z.literal(requestSha256), claim: claimSchema, reportSha256: z.literal(expected.reportSha256), outputSha256: z.literal(expected.outputSha256), chainSha256: z.literal(expected.chainSha256) }).strict().parse(await this.#post("migration-complete", { ...request, requestSha256 }, c.deadline));
+      if (canonical(ack.claim) !== canonical(c)) fail("MIGRATION_COMPLETE_ACK_BINDING");
+      this.assertKnown(); assertDeadline(c);
+      if (c.stepId === "sync-zero") completedZero.set(this, { runId: c.runId, planSha256: c.planSha256, bytes: canonicalBytes(closed.output), outputSha256: expected.outputSha256 });
+      return Object.freeze(expected);
+    } catch (cause) {
+      await this.noteUnknown(state);
+      throw new NativeMigrationEntryError("MIGRATION_COMPLETION_UNKNOWN", "unknown", cause);
+    }
+  }
   async enter(value: unknown, claimCapability: string): Promise<NativeMigrationScope> {
     this.assertKnown();
     const c = claim(value); assertDeadline(c);
@@ -147,7 +242,7 @@ export class NativeMigrationAdmission {
     this.#attempted.add(c.claimId);
     const nonce = randomBytes(32).toString("base64url"), request = { version: 1, nonce, claim: c, claimCapability }, requestSha256 = migrationBindingSha256(request);
     try {
-      const ack = z.object({ version: z.literal(1), nonce: z.literal(nonce), requestSha256: z.literal(requestSha256), claim: claimSchema, scopeCapability: capabilitySchema }).strict().parse(await this.post("migration-enter", { ...request, requestSha256 }, c.deadline));
+      const ack = z.object({ version: z.literal(1), nonce: z.literal(nonce), requestSha256: z.literal(requestSha256), claim: claimSchema, scopeCapability: capabilitySchema }).strict().parse(await this.#post("migration-enter", { ...request, requestSha256 }, c.deadline));
       if (canonical(ack.claim) !== canonical(c)) fail("MIGRATION_ENTER_ACK_BINDING_MISMATCH");
       this.assertKnown();
       assertDeadline(c);
@@ -158,14 +253,14 @@ export class NativeMigrationAdmission {
       this.#unknown = true;
       // The enter may have consumed its capability even though no ACK arrived.
       // Report that uncertainty without retrying enter or inventing a scope.
-      try { await this.post("migration-unknown", { ...request, requestSha256 }, c.deadline); } catch { /* Local unknown is permanent. */ }
+      try { await this.#post("migration-unknown", { ...request, requestSha256 }, c.deadline); } catch { /* Local unknown is permanent. */ }
       throw new NativeMigrationEntryError("MIGRATION_ENTER_UNKNOWN", "unknown", cause);
     }
   }
   /** Best effort only; no response can clear the local permanent unknown latch. */
   async noteUnknown(state: ScopeState): Promise<void> {
     state.state = "unknown"; this.#unknown = true;
-    try { await this.post("migration-unknown", { version: 1, nonce: state.nonce, claim: state.claim, scopeCapability: state.capability }, state.claim.deadline); } catch { /* Permanent local unknown remains authoritative. */ }
+    try { await this.#post("migration-unknown", { version: 1, nonce: state.nonce, claim: state.claim, scopeCapability: state.capability }, state.claim.deadline); } catch { /* Permanent local unknown remains authoritative. */ }
   }
   assertKnown(): void { if (this.#unknown) fail("MIGRATION_CONTROL_UNKNOWN"); }
 }
@@ -174,6 +269,7 @@ type SyncInvocation = { entry: "account-sync"; source: Connection; target: Conne
 type AllocatorInvocation = { entry: "allocator-highwater"; source: Connection; target: Connection; fence: Connection; sourceSnapshot: Buffer; review: Buffer; finalSyncReport: Buffer; journal: MigrationReportFile };
 type ActivationInvocation = { entry: "identity-activate"; target: Connection; journal: MigrationReportFile };
 export type NativeMigrationInvocation = SyncInvocation | AllocatorInvocation | ActivationInvocation;
+export const nativeMigrationInputBounds = Object.freeze({ sourceSnapshot: 16 * 1024 * 1024, profileSelection: 2 * 1024 * 1024, review: 65536, finalSyncReport: 65536 });
 export type NativeAllocatorResult = { plan: AllocatorPlan; summary: { success: true; applied: true; ready: true; manifestSha256: string; tables: 6; authorityActivated: false; sourceWritten: false } };
 function dataDescriptors(value: unknown): Record<string, PropertyDescriptor> {
   if (!value || typeof value !== "object" || isProxy(value) || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) fail("MIGRATION_TYPED_INPUT_REQUIRED");
@@ -201,7 +297,7 @@ function captureInvocation(value: NativeMigrationInvocation): NativeMigrationInv
     const field = d[k].value;
     if (["sourceSnapshot", "profileSelection", "review", "finalSyncReport"].includes(k)) {
       if (k === "profileSelection" && field === null) captured[k] = null;
-      else { if (!Buffer.isBuffer(field) || isProxy(field) || field.length > 1048576) fail("MIGRATION_TYPED_INPUT_REQUIRED"); captured[k] = Buffer.from(field); }
+      else { if (!Buffer.isBuffer(field) || isProxy(field) || field.length > nativeMigrationInputBounds[k as keyof typeof nativeMigrationInputBounds]) fail("MIGRATION_TYPED_INPUT_REQUIRED"); captured[k] = Buffer.from(field); }
     } else captured[k] = field;
   }
   if (entry !== "account-sync") assertOwnedMigrationReport(captured.journal as MigrationReportFile);
@@ -210,8 +306,8 @@ function captureInvocation(value: NativeMigrationInvocation): NativeMigrationInv
 function exactKeys(value: object, keys: string[]) {
   if (Object.keys(value).sort().join(",") !== keys.sort().join(",")) fail("MIGRATION_TYPED_INPUT_REQUIRED");
 }
-function jsonBytes(bytes: Buffer, expected: string): unknown {
-  if (!Buffer.isBuffer(bytes) || bytes.length < 2 || bytes.length > 1048576 || digest(bytes) !== expected || !Buffer.from(bytes.toString("utf8")).equals(bytes)) fail("MIGRATION_INPUT_BINDING_MISMATCH");
+function jsonBytes(bytes: Buffer, expected: string, bound = 65536): unknown {
+  if (!Buffer.isBuffer(bytes) || bytes.length < 2 || bytes.length > bound || digest(bytes) !== expected || !Buffer.from(bytes.toString("utf8")).equals(bytes)) fail("MIGRATION_INPUT_BINDING_MISMATCH");
   return JSON.parse(bytes.toString("utf8"));
 }
 async function location(c: Connection, target: boolean) {
@@ -235,6 +331,10 @@ async function location(c: Connection, target: boolean) {
  * Resource ownership and the trusted FD/artifact bridge remain the caller's obligation.
  */
 export async function invokeNativeMigration(scope: NativeMigrationScope, value: NativeMigrationInvocation): Promise<AccountSyncReport | NativeAllocatorResult | ExplicitActivationResult> {
+  if (ownedScopes.has(scope) || invocationOwned.has(scope)) fail("MIGRATION_OWNED_SCOPE_ONLY");
+  return invokeNativeMigrationInternal(scope, value);
+}
+async function invokeNativeMigrationInternal(scope: NativeMigrationScope, value: NativeMigrationInvocation): Promise<AccountSyncReport | NativeAllocatorResult | ExplicitActivationResult> {
   const state = scopes.get(scope);
   if (!state || state.state !== "ready") fail("MIGRATION_VERIFIED_SINGLE_USE_SCOPE_REQUIRED");
   state.state = "running";
@@ -246,23 +346,23 @@ export async function invokeNativeMigration(scope: NativeMigrationScope, value: 
     const result = await context.run(state, async () => {
       if (input.entry === "account-sync" && (c.stepId === "sync-apply" || c.stepId === "sync-zero")) {
         exactKeys(input, ["entry", "source", "target", "sourceSnapshot", "profileSelection"]);
-        jsonBytes(input.sourceSnapshot, c.inputs.sourceSnapshotSha256);
-        const profileSchema = z.object({ version: z.literal(1), selections: z.array(z.object({ userId: z.number().int().positive().safe(), profileId: z.number().int().positive().safe(), sourceRowsSha256: hex }).strict()).max(100000) }).strict();
-        const profile = c.inputs.profileSelectionSha256 === null ? undefined : profileSchema.parse(jsonBytes(input.profileSelection!, c.inputs.profileSelectionSha256));
+        jsonBytes(input.sourceSnapshot, c.inputs.sourceSnapshotSha256, nativeMigrationInputBounds.sourceSnapshot);
+        const profile = c.inputs.profileSelectionSha256 === null ? undefined : profileSelectionSchema.parse(jsonBytes(input.profileSelection!, c.inputs.profileSelectionSha256, nativeMigrationInputBounds.profileSelection));
         if (c.inputs.profileSelectionSha256 === null && input.profileSelection !== null) fail("MIGRATION_INPUT_BINDING_MISMATCH");
         await location(input.source, false); await location(input.target, true);
-        return syncIdentityAccounts(input.source, input.target, { ...c.inputs.limits, apply: c.inputs.apply, profileSelection: profile });
+        return syncIdentityAccounts(input.source, input.target, { ...c.inputs.limits, apply: c.inputs.apply, profileSelection: profile, ...(invocationOwned.has(scope) ? { expectedSourceFingerprint: invocationOwned.get(scope)!.expected } : {}) });
       }
       if (input.entry === "allocator-highwater" && c.stepId === "allocator") {
         exactKeys(input, ["entry", "source", "target", "fence", "sourceSnapshot", "review", "finalSyncReport", "journal"]);
         assertOwnedMigrationReport(input.journal);
-        jsonBytes(input.sourceSnapshot, c.inputs.sourceSnapshotSha256);
+        jsonBytes(input.sourceSnapshot, c.inputs.sourceSnapshotSha256, nativeMigrationInputBounds.sourceSnapshot);
         const review = jsonBytes(input.review, c.inputs.reviewSha256) as AllocatorDrainReview;
         const finalSync = jsonBytes(input.finalSyncReport, c.inputs.finalSyncReportSha256);
         assertZeroAccountSyncReport(finalSync);
         if (review.finalSyncSha256 !== c.inputs.finalSyncReportSha256 || review.sourceDatabase !== reviewedSource || review.targetDatabase !== reviewedTarget.database) fail("MIGRATION_INPUT_BINDING_MISMATCH");
         await location(input.source, false); await location(input.target, true); await location(input.fence, true);
-        assertZeroAccountSyncReport(await syncIdentityAccounts(input.source, input.target, { apply: false, maxChanges: 100000 }));
+        const owned = invocationOwned.get(scope);
+        assertZeroAccountSyncReport(await syncIdentityAccounts(input.source, input.target, owned ? { apply: false, ...owned.artifacts.plan.limits, expectedSourceFingerprint: owned.expected, profileSelection: owned.profile } : { apply: false, maxChanges: 100000 }));
         const plan = await finalizeAllocator({ source: input.source, target: input.target, fence: input.fence, review, reviewSha256: c.inputs.reviewSha256, apply: true,
           onStep: async step => { await writeMigrationReport(input.journal, { ...step, at: new Date().toISOString() }); } });
         return { plan, summary: { success: true, applied: true, ready: true, manifestSha256: plan.manifestSha256, tables: 6, authorityActivated: false, sourceWritten: false } } as NativeAllocatorResult;
@@ -286,3 +386,97 @@ export async function invokeNativeMigration(scope: NativeMigrationScope, value: 
     throw new NativeMigrationEntryError("MIGRATION_INVOCATION_UNKNOWN", "unknown", cause);
   } finally { if (state.state === "running") state.state = "consumed"; }
 }
+
+const profileSelectionSchema = z.object({ version: z.literal(1), selections: z.array(z.object({ userId: z.number().int().positive().safe(), profileId: z.number().int().positive().safe(), sourceRowsSha256: hex }).strict()).max(100000) }).strict();
+const ownedReviewSchema = z.object({ version: z.literal(1), sourceDatabase: z.literal(reviewedSource), targetDatabase: z.literal(reviewedTarget.database), importKey: z.string().regex(/^[A-Za-z0-9_.:-]{1,160}$/), sourceServerUuid: z.literal(reviewedServerUuid), writersDrainedAt: utc, finalSyncSha256: hex, referenceReviewSha256: hex }).strict();
+const ownedDatabaseConfiguration = "/run/xrugc/identity-finalization/config/database.json";
+const credential = z.object({ user: z.string().regex(/^[a-zA-Z0-9_]{1,32}$/), password: z.string().min(1).max(4096) }).strict();
+const databaseCredentialsSchema = z.object({ version: z.literal(1), source: credential, target: credential.extend({ user: z.literal(reviewedTarget.principal) }) }).strict();
+type DatabaseCredentials = z.infer<typeof databaseCredentialsSchema>;
+type OwnedPreparation = { artifacts: MigrationArtifactSession; expected: ExpectedSourceFingerprint; credentials: DatabaseCredentials; profile?: ProfileSelectionManifest };
+const ownedScopes = new WeakMap<NativeMigrationScope, OwnedPreparation>();
+const completedZero = new WeakMap<NativeMigrationAdmission, { runId: string; planSha256: string; bytes: Buffer; outputSha256: string }>();
+declare const closedReceiptBrand: unique symbol;
+export type ClosedStepReceipt = { readonly [closedReceiptBrand]: true };
+const closedReceipts = new WeakMap<ClosedStepReceipt, { state: ScopeState; bytes: Buffer; output: unknown; consumed: boolean }>();
+const canonicalBytes = (value: unknown) => Buffer.from(`${canonical(value)}\n`);
+async function freshConnection(resources: MigrationResources, credentials: DatabaseCredentials, target: boolean): Promise<Connection> {
+  const auth = target ? credentials.target : credentials.source;
+  // Register immediately after acquisition, including during later acquisitions.
+  const raw = mysql.createConnection({ host: reviewedTarget.host, port: reviewedTarget.port, database: target ? reviewedTarget.database : reviewedSource, user: auth.user, password: auth.password, timezone: "Z", supportBigNumbers: true, bigNumberStrings: false, multipleStatements: false, connectTimeout: 2000 });
+  // The raw socket exists before handshake success. Own it now, so a rejected
+  // handshake also waits for actual physical close rather than losing its FD.
+  const connection = resources.connection(raw.promise());
+  try { await new Promise<void>((resolve, reject) => raw.connect(error => error ? reject(error) : resolve())); }
+  catch (error) { raw.destroy(); throw error; }
+  return connection;
+}
+function completionHashes(c: NativeMigrationClaim, output: unknown) {
+  // These fields are private conclusions of the resource owner, never wire input.
+  const envelope = { version: 1, runId: c.runId, claimId: c.claimId, stepId: c.stepId, planSha256: c.planSha256, inputSha256: c.inputSha256, previousChainSha256: c.previousChainSha256, compiledRevision: c.compiledRevision, epoch: c.epoch, target: c.target, deadline: c.deadline, outcome: "completed", sideEffectsFinished: true, connectionsClosed: true, output };
+  const reportSha256 = digest(canonicalBytes(envelope)), outputSha256 = digest(canonicalBytes(output));
+  return { reportSha256, outputSha256, chainSha256: migrationBindingSha256({ previousChainSha256: c.previousChainSha256, claimSha256: migrationBindingSha256(c), reportSha256, outputSha256 }) };
+}
+/** Closed production owner. Only a prepared, genuinely entered scope is accepted.
+ * All inputs come from held pinned-adapter FDs; all DBs are fresh and exclusive.
+ * No caller connection, pathname, callback, file descriptor or cleanup flag exists.
+ */
+export async function executeOwnedStep(scope: NativeMigrationScope): Promise<ClosedStepReceipt> {
+  const arity = arguments.length;
+  const state = scopes.get(scope), prepared = ownedScopes.get(scope);
+  if (!state || !prepared) fail("MIGRATION_OWNED_SCOPE_REQUIRED");
+  // Consume preparation before the first await; a failed invocation never revives it.
+  ownedScopes.delete(scope);
+  // The closed dispatcher may read this internal binding, but it is never caller data.
+  invocationOwned.set(scope, prepared);
+  try {
+    const c = state.claim;
+    const typed = await withMigrationResources(async resources => {
+      resources.file(prepared.artifacts);
+      state.client.assertKnown(); assertDeadline(c);
+      if (arity !== 1 || state.state !== "ready") fail("MIGRATION_OWNED_SCOPE_REQUIRED");
+      const inputs = await prepared.artifacts.readStep(c);
+      const source = await freshConnection(resources, prepared.credentials, false);
+      await location(source, false);
+      const expected = expectedSourceManifest(prepared.expected);
+      const observe = () => readActualSourceFingerprint(source, { profileSelectionSha256: expected.profileSelectionSha256, maxRows: expected.maxRows });
+      assertSameSourceFingerprint(expected, await observe());
+      state.client.assertKnown(); assertDeadline(c);
+      const target = await freshConnection(resources, prepared.credentials, true);
+      let invocation: NativeMigrationInvocation;
+      if (c.entry === "account-sync") invocation = { entry: c.entry, source, target, sourceSnapshot: inputs.source, profileSelection: inputs.profile ?? null };
+      else {
+        const journal = await resources.adoptMigrationJournal(await prepared.artifacts.reserveJournal(c), c);
+        if (c.entry === "allocator-highwater") {
+          const zero = completedZero.get(state.client);
+          if (!zero || zero.runId !== c.runId || zero.planSha256 !== c.planSha256 || c.stepId !== "allocator" || zero.outputSha256 !== c.inputs.finalSyncReportSha256) fail("MIGRATION_OWNED_ZERO_RESULT_REQUIRED");
+          const fence = await freshConnection(resources, prepared.credentials, true);
+          invocation = { entry: c.entry, source, target, fence, sourceSnapshot: inputs.source, review: inputs.review, finalSyncReport: Buffer.from(zero.bytes), journal };
+        } else invocation = { entry: c.entry, target, journal };
+      }
+      const result = await invokeNativeMigrationInternal(scope, invocation);
+      // A changed source after any step (including activation) makes the run unknown.
+      assertSameSourceFingerprint(expected, await observe());
+      state.client.assertKnown(); assertDeadline(c);
+      const allocator = c.stepId === "allocator" ? result as NativeAllocatorResult : null;
+      const written = await prepared.artifacts.writeTypedOutput(c, canonicalBytes(allocator ? allocator.plan : result), allocator ? canonicalBytes(allocator.summary) : null);
+      const bytes = canonicalBytes(written.report);
+      const checked = validateMigrationTypedReport(c, bytes);
+      if (checked.reportSha256 !== written.reportSha256 || checked.outputSha256 !== written.outputSha256) fail("MIGRATION_OWNED_OUTPUT_BINDING");
+      return { bytes, output: checked.report.output };
+    });
+    // withMigrationResources has awaited every actual transport/file/parent close.
+    state.client.assertKnown(); assertDeadline(state.claim);
+    const receipt = Object.freeze(Object.create(null)) as ClosedStepReceipt;
+    closedReceipts.set(receipt, { state, bytes: Buffer.from(typed.bytes), output: typed.output, consumed: false });
+    return receipt;
+  } catch (cause) {
+    await state.client.noteUnknown(state);
+    throw new NativeMigrationEntryError("MIGRATION_OWNED_EXECUTION_UNKNOWN", "unknown", cause);
+  } finally { invocationOwned.delete(scope); }
+}
+const invocationOwned = new WeakMap<NativeMigrationScope, OwnedPreparation>();
+
+// No instance or prototype shadowing can replace internal public compatibility
+// methods (enter/assertKnown/noteUnknown) used by the closed trusted bridge.
+Object.freeze(NativeMigrationAdmission.prototype);

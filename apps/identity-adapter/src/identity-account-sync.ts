@@ -7,6 +7,7 @@ import { accountImportTables, legacyProfileArchiveColumns } from "./identity-acc
 import { projectLegacyProfiles, type ProfileSelectionManifest } from "./identity-profile-migration.js";
 import { assertAccountImportUniqueConstraints } from "./identity-account-constraints.js";
 import { assertProfileJsonValues, legacyProfileJsonTypeSelection } from "./identity-profile-source.js";
+import { RawSourceFingerprint, assertActualSourceFingerprint, type ExpectedSourceFingerprint } from "./identity-source-fingerprint.js";
 import {
   assertMigrationStaging,
   migrationPrimaryKeys,
@@ -70,7 +71,7 @@ function bind(value: unknown): ExecuteValues {
 export async function syncIdentityAccounts(
   source: Connection,
   target: Connection,
-  options: { apply?: boolean; maxChanges: number; maxRows?: number; profileSelection?: ProfileSelectionManifest },
+  options: { apply?: boolean; maxChanges: number; maxRows?: number; profileSelection?: ProfileSelectionManifest; expectedSourceFingerprint?: ExpectedSourceFingerprint },
 ): Promise<AccountSyncReport> {
   assertAdmissionWriter(options.apply ? "sync-apply" : "sync-read");
   const maxRows = options.maxRows ?? 100_000;
@@ -84,6 +85,7 @@ export async function syncIdentityAccounts(
     );
   if (!Number.isSafeInteger(maxRows) || maxRows < 1 || maxRows > 1_000_000)
     throw new Error("maxRows must be an integer between 1 and 1000000.");
+  const sourceFingerprint = options.expectedSourceFingerprint ? new RawSourceFingerprint(maxRows) : undefined;
   if (source === target)
     throw new Error("Source and target account databases must differ.");
   const [[sourceLocation], [targetLocation]] = await Promise.all([
@@ -186,6 +188,7 @@ export async function syncIdentityAccounts(
           )
             throw new Error(`Legacy source table disappeared: ${table}`);
           columns = [...(baseline.values().next().value?.columns ?? allowed)];
+          sourceFingerprint?.add(table, null, [], []);
         } else {
           const [schema] = await source.query<RowDataPacket[]>(
             `SHOW COLUMNS FROM \`${table}\``,
@@ -204,6 +207,7 @@ export async function syncIdentityAccounts(
           [rows] = await source.query<RowDataPacket[]>(
             `SELECT ${quoted(readColumns)}${profileType} FROM \`${table}\` LIMIT ${maxRows + 1}`,
           );
+          sourceFingerprint?.add(table, schema, readColumns, rows);
           if(table==="user_info"){
             if(rows.length>maxRows)throw new Error("Account sync exceeds the bounded raw profile size");
             assertProfileJsonValues(rows,true);
@@ -238,6 +242,8 @@ export async function syncIdentityAccounts(
         target: indexRows(table, targetRows),
       });
     }
+    if (sourceFingerprint)
+      await assertActualSourceFingerprint(source, { name: sourceLocation[0].name, server_id: sourceLocation[0].server_id }, sourceFingerprint, options.expectedSourceFingerprint!, options.profileSelection);
     await assertAccountImportUniqueConstraints(source,target,new Map([...datasets].map(([table,dataset])=>
       [table,{columns:dataset.columns,rows:[...dataset.source.values()]}])));
 

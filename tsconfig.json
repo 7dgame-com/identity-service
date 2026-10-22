@@ -14,11 +14,14 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
+    "allowJs": true,
+    "checkJs": false,
     "types": ["node"]
   },
   "include": [
     "apps/**/*.ts",
     "packages/**/*.ts",
+    "packages/identity-finalization-runtime/*.mjs",
     "scripts/**/*.ts"
   ],
   "exclude": ["dist", "node_modules"]
