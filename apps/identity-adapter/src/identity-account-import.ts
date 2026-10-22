@@ -1,5 +1,5 @@
 import { assertAdmissionWriter } from "./identity-admission.js";
-import { MigrationResources } from "./identity-migration-resources.js";
+import { type MigrationResources, withMigrationResources } from "./identity-migration-resources.js";
 import { invalidateAllocatorReady } from "./identity-allocator-state.js";
 import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import type { ExecuteValues } from "mysql2";
@@ -182,17 +182,21 @@ export async function connectAccountImportDatabases(resources?: MigrationResourc
   if (!config.legacyDb.host || !config.legacyDb.user || !config.identityDb.host || !config.identityDb.user) {
     throw new Error("Explicit source and target account database connections are required.");
   }
-  const owner = resources ?? new MigrationResources();
-  const source = owner.connection(await mysql.createConnection({ host: config.legacyDb.host, port: config.legacyDb.port, user: config.legacyDb.user, password: config.legacyDb.password, database: config.legacyDb.name, timezone:"Z" }));
+  // Legacy import CLIs own the returned pair themselves. Do not retain observers
+  // they cannot consume; only the explicit awaited owner receives ownership here.
+  const acquired = <T extends Connection>(connection: T): T => resources ? resources.connection(connection) : connection;
+  const source = acquired(await mysql.createConnection({ host: config.legacyDb.host, port: config.legacyDb.port, user: config.legacyDb.user, password: config.legacyDb.password, database: config.legacyDb.name, timezone:"Z" }));
   let target: Connection | undefined;
   try {
-    target = owner.connection(await mysql.createConnection({ host: config.identityDb.host, port: config.identityDb.port, user: config.identityDb.user, password: config.identityDb.password, database: config.identityDb.name, timezone:"Z" }));
+    target = acquired(await mysql.createConnection({ host: config.identityDb.host, port: config.identityDb.port, user: config.identityDb.user, password: config.identityDb.password, database: config.identityDb.name, timezone:"Z" }));
     const sourceEndpoint = [config.legacyDb.host, config.legacyDb.port, config.legacyDb.name].join(":");
     const targetEndpoint = [config.identityDb.host, config.identityDb.port, config.identityDb.name].join(":");
     if (sourceEndpoint === targetEndpoint) throw new Error("Source and target account databases must differ.");
     return { source, target };
   } catch (error) {
-    if (!resources) await owner.close(true, error);
+    if (!resources) return withMigrationResources(async cleanup => {
+      cleanup.connection(source); if (target) cleanup.connection(target); throw error;
+    });
     throw error;
   }
 }

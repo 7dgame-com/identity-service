@@ -20,6 +20,12 @@ success output or automatic retry. The existing staging fence, fixed development
 target and admission writer guard are unchanged. This entry creates no new fence,
 lease, authorization scope or coordinator gate.
 
+Parent device/inode checkpoints detect a changed report directory but are not a
+complete trusted-path or artifact-provenance boundary. Formal finalization still
+needs canonical-path, owner/ancestor, descriptor-relative race protection and
+runtime/input identity checks; see `account-sync.md`. Do not infer these from a
+0600 report, its digest, or a successful fsync.
+
 1. Before the final window, obtain schema/reference evidence with `node dist/scripts/allocator-highwater.js --inventory`. This performs readonly inventory and does not create proof or change counters.
 2. Actually hold every old account, provider, PHP, session and reconciliation writer. Keep that hold through activation. Run final account sync and all approved binding/session/challenge imports. Then run `node dist/scripts/account-sync.js --dry-run --max-changes=100000` and save the complete original JSON report in a protected 0600 file. It must contain the exact AccountSyncReport fields, all five counters zero and empty tableChanges. Any subsequent mutating import invalidates ready; account-sync apply does so even with zero deltas. Pure readonly dry-run and exact replay do not invalidate.
 3. Prepare a reviewed 0600 JSON file with exactly `version:1`, `sourceDatabase`, `targetDatabase`, `sourceServerUuid`, `importKey`, `writersDrainedAt` (ISO UTC milliseconds), `finalSyncSha256` and `referenceReviewSha256`. Use the source UUID/reference digest actually returned by inventory, the existing account import key, and the SHA256 of the exact final zero-sync report. The reviewer must independently verify the real writer hold; hashes cannot manufacture this fact.

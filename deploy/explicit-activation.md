@@ -18,6 +18,11 @@ Invocation-local receipt state prevents a previous call from contaminating a lat
 result. It grants no admission scope or migration lease and implements no final
 coordinator gate; the existing writer guard and single authority fence remain.
 
+Report parent device/inode checkpoints are only change detection. They do not
+provide canonical trusted ancestry, owner/ancestor validation, descriptor-relative
+race protection or source/runtime artifact provenance. The formal runner must
+establish those separately before accepting a report; see `account-sync.md`.
+
 First inspect without changing state:
 
 ```sh

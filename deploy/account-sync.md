@@ -34,6 +34,23 @@ report durability failure is latched even if a later rollback error replaces the
 original exception. Report content or file existence alone never proves that all
 connections and descriptors have closed.
 
+Ownership is explicit. Only callers passing `MigrationResources` receive these
+acquisition-time observers. The legacy account, WeChat and Apple import CLIs do
+not pass an owner: successful acquisition returns their original unobserved pair
+for caller-managed closure; a failed acquisition waits for temporary cleanup.
+Those legacy entrypoints are not awaited finalization steps.
+
+The report helper checks the opened parent descriptor's device/inode against the
+current parent path before/after creation and each write/fsync. A changed parent
+refuses completion. These checkpoints are not descriptor-relative `openat`, do not
+validate trusted owner/ancestor permissions, and cannot eliminate an adversarial
+rename-away/rename-back race or a same-parent report-directory-entry replacement.
+Changes after the final checkpoint are also outside this helper's guarantee.
+These checks do not establish trusted artifact provenance.
+The formal runner must separately require reviewed canonical paths, trusted owners
+and immutable ancestors, race-safe descriptor-relative access, and exact source,
+input and runtime artifact bindings before accepting any report as evidence.
+
 This awaited entry does not create an admission scope, acquire a migration lease,
 enforce the coordinator's finalization ledger or grant authorization. The existing
 writer guard still refuses it when admission is enabled without a reviewed scope.

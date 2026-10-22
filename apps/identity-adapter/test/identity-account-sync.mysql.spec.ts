@@ -15,6 +15,7 @@ import {
 } from "vitest";
 import {
   accountImportTables,
+  connectAccountImportDatabases,
   importIdentityAccounts,
 } from "../src/identity-account-import.js";
 import { syncIdentityAccounts } from "../src/identity-account-sync.js";
@@ -469,6 +470,24 @@ describe.skipIf(!enabled)("staging account delta MySQL sync", () => {
       expect((await rows("SELECT nickname FROM user WHERE id=7001"))[0].nickname).toBe("Awaited operation");
     } finally {
       releaseClose(); await operation.catch(() => {}); await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("legacy no-owner successful acquisition preserves each real MySQL connection's original listeners", async () => {
+    configureAwaitedOperation();
+    const streamOf = (c: Connection) => (c as unknown as { connection: { stream: import("node:net").Socket } }).connection.stream;
+    const counts = (c: Connection) => ({ connectionErrors: c.listenerCount("error"), streamErrors: streamOf(c).listenerCount("error"), streamCloses: streamOf(c).listenerCount("close") });
+    const original = mysql.createConnection.bind(mysql), baseline = new Map<Connection, ReturnType<typeof counts>>();
+    vi.spyOn(mysql, "createConnection").mockImplementation(async (input: any) => { const c = await original(input); baseline.set(c, counts(c)); return c; });
+    const pair = await connectAccountImportDatabases();
+    try {
+      for (const c of [pair.source, pair.target]) expect(counts(c)).toEqual(baseline.get(c));
+    } finally {
+      const cleanup = await Promise.allSettled([pair.source, pair.target].map(async c => {
+        const stream = streamOf(c), closed = stream.closed ? Promise.resolve() : new Promise<void>(done => { stream.once("close", () => done()); });
+        await c.end(); await closed;
+      }));
+      for (const result of cleanup) expect(result.status).toBe("fulfilled");
     }
   });
 

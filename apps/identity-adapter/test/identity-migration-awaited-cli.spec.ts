@@ -1,6 +1,8 @@
 import {
+  mkdir,
   mkdtemp,
   readFile,
+  rename,
   rm,
   stat,
   symlink,
@@ -312,6 +314,71 @@ describe("import-safe awaited compatibility CLI operations", () => {
       code: "MIGRATION_RESOURCE_CLOSE_UNKNOWN",
       errors: [transportError],
       automaticRetry: false,
+    });
+    expect(source.end).toHaveBeenCalledOnce();
+    expect(target.end).toHaveBeenCalledOnce();
+  });
+  it("hands a successful legacy no-owner pair back without installing or retaining observers", async () => {
+    const source = Object.assign(new EventEmitter(), connection()),
+      target = Object.assign(new EventEmitter(), connection());
+    mocks.connect.mockResolvedValueOnce(source).mockResolvedValueOnce(target);
+    const pair = await connectAccountImportDatabases();
+    expect(pair).toEqual({ source, target });
+    for (const c of [source, target]) {
+      expect(c.listenerCount("error")).toBe(0);
+      expect(c.connection.stream.listenerCount("error")).toBe(0);
+      expect(c.connection.stream.listenerCount("close")).toBe(0);
+    }
+    const failure = new Error("owned by legacy caller, not swallowed");
+    expect(() => source.emit("error", failure)).toThrow(failure);
+    await Promise.all([source.end(), target.end()]);
+    for (const c of [source, target]) expect(c.listenerCount("error")).toBe(0);
+  });
+  it("explicit awaited ownership removes its observers after a successful pair completes", async () => {
+    const source = Object.assign(new EventEmitter(), connection()),
+      target = Object.assign(new EventEmitter(), connection());
+    mocks.connect.mockResolvedValueOnce(source).mockResolvedValueOnce(target);
+    mocks.sync.mockImplementation(async () => {
+      for (const c of [source, target])
+        expect(c.listenerCount("error")).toBe(1);
+      return zeroReport;
+    });
+    expect(await runAccountSyncOperation(["--max-changes=100"])).toEqual(
+      zeroReport,
+    );
+    for (const c of [source, target]) {
+      expect(c.listenerCount("error")).toBe(0);
+      expect(c.connection.stream.listenerCount("error")).toBe(0);
+      expect(c.connection.stream.listenerCount("close")).toBe(0);
+    }
+  });
+  it("detects a real parent directory replacement before writing a post-commit report", async () => {
+    const source = connection(),
+      target = connection(),
+      reports = join(directory, "reports"),
+      retained = join(directory, "retained-reports");
+    await mkdir(reports);
+    mocks.connect.mockResolvedValueOnce(source).mockResolvedValueOnce(target);
+    mocks.sync.mockImplementation(async () => {
+      await rename(reports, retained);
+      await mkdir(reports);
+      return { ...zeroReport, applied: true };
+    });
+    await expect(
+      runAccountSyncOperation([
+        "--apply",
+        "--max-changes=100",
+        `--report=${join(reports, "sync.json")}`,
+      ]),
+    ).rejects.toMatchObject({
+      code: "MIGRATION_REPORT_WRITE_UNKNOWN",
+      outcome: "unknown",
+      automaticRetry: false,
+      cause: { message: "MIGRATION_REPORT_PARENT_CHANGED" },
+    });
+    expect(await readFile(join(retained, "sync.json"), "utf8")).toBe("");
+    await expect(stat(join(reports, "sync.json"))).rejects.toMatchObject({
+      code: "ENOENT",
     });
     expect(source.end).toHaveBeenCalledOnce();
     expect(target.end).toHaveBeenCalledOnce();

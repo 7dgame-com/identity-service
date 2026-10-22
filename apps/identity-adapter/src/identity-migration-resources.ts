@@ -1,6 +1,6 @@
 import { constants } from "node:fs";
-import { open, type FileHandle } from "node:fs/promises";
-import { dirname } from "node:path";
+import { lstat, open, type FileHandle } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import type { Socket } from "node:net";
 import type { EventEmitter } from "node:events";
 
@@ -131,14 +131,30 @@ export class MigrationResources {
     return file;
   }
   async openReport(path: string): Promise<MigrationReportFile> {
+    const reportPath = resolve(path),
+      parentPath = dirname(reportPath);
     const directory = await open(
-      dirname(path),
+      parentPath,
       constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
     );
     this.resources.push({ kind: "directory", close: () => directory.close() });
+    const identity = await directory.stat({ bigint: true });
+    const assertParent = async () => {
+      const current = await lstat(parentPath, { bigint: true });
+      if (
+        !identity.isDirectory() ||
+        !current.isDirectory() ||
+        identity.dev !== current.dev ||
+        identity.ino !== current.ino
+      )
+        throw new Error("MIGRATION_REPORT_PARENT_CHANGED");
+    };
+    // This detects a changed parent at these checkpoints; it is not openat and
+    // cannot establish trusted ancestry or eliminate an adversarial ABA race.
+    await assertParent();
     const file = this.file(
       await open(
-        path,
+        reportPath,
         constants.O_WRONLY |
           constants.O_CREAT |
           constants.O_EXCL |
@@ -146,6 +162,7 @@ export class MigrationResources {
         0o600,
       ),
     );
+    await assertParent();
     const stat = await file.stat();
     if (
       !stat.isFile() ||
@@ -155,10 +172,16 @@ export class MigrationResources {
     )
       throw new Error("MIGRATION_PROTECTED_REPORT_REQUIRED");
     const report = {
-      writeFile: file.writeFile.bind(file),
+      writeFile: (async (...args: Parameters<FileHandle["writeFile"]>) => {
+        await assertParent();
+        await file.writeFile(...args);
+        await assertParent();
+      }) as FileHandle["writeFile"],
       sync: async () => {
+        await assertParent();
         await file.sync();
         await directory.sync();
+        await assertParent();
       },
     };
     reportOwners.set(report, this);

@@ -1,13 +1,21 @@
 import { constants } from "node:fs";
 import { EventEmitter } from "node:events";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   MigrationResourceCloseError,
   withMigrationResources,
   writeMigrationReport,
 } from "../src/identity-migration-resources.js";
-const filesystem = vi.hoisted(() => ({ open: vi.fn() }));
-vi.mock("node:fs/promises", () => ({ open: filesystem.open }));
+const filesystem = vi.hoisted(() => ({ open: vi.fn(), lstat: vi.fn() }));
+vi.mock("node:fs/promises", () => ({
+  open: filesystem.open,
+  lstat: filesystem.lstat,
+}));
+const directoryIdentity = () => ({ isDirectory: () => true, dev: 1n, ino: 2n });
+beforeEach(() => {
+  filesystem.open.mockReset();
+  filesystem.lstat.mockReset().mockResolvedValue(directoryIdentity());
+});
 
 function deferred() {
   let resolve!: () => void;
@@ -310,6 +318,7 @@ describe("awaited migration resource completion", () => {
       parentStarted = deferred(),
       events: string[] = [];
     const directory = {
+      stat: async () => directoryIdentity(),
       sync: vi.fn(async () => {
         events.push("parent-fsync");
         parentStarted.resolve();
@@ -370,6 +379,7 @@ describe("awaited migration resource completion", () => {
   it("does not complete when parent directory fsync fails, while still closing both descriptors", async () => {
     const failure = new Error("parent-fsync"),
       directory = {
+        stat: async () => directoryIdentity(),
         sync: async () => {
           throw failure;
         },
@@ -408,7 +418,11 @@ describe("awaited migration resource completion", () => {
   it("latches report failure even when business finally replaces it with a rollback error", async () => {
     const fsyncError = new Error("fsync"),
       rollbackError = new Error("rollback");
-    const directory = { sync: async () => {}, close: vi.fn(async () => {}) };
+    const directory = {
+      stat: async () => directoryIdentity(),
+      sync: async () => {},
+      close: vi.fn(async () => {}),
+    };
     const file = {
       writeFile: async () => {},
       sync: async () => {
@@ -448,6 +462,41 @@ describe("awaited migration resource completion", () => {
       cause: fsyncError,
     });
     expect(failure.cause.errors[1]).toBe(rollbackError);
+    expect(directory.close).toHaveBeenCalledOnce();
+    expect(file.close).toHaveBeenCalledOnce();
+  });
+  it("rejects a changed parent identity before creating a report and closes the directory descriptor", async () => {
+    const directory = {
+      stat: async () => directoryIdentity(),
+      close: vi.fn(async () => {}),
+    };
+    filesystem.open.mockResolvedValueOnce(directory);
+    filesystem.lstat.mockResolvedValue({ ...directoryIdentity(), ino: 3n });
+    await expect(
+      withMigrationResources(async (resources) => {
+        await resources.openReport("/protected/report.json");
+      }),
+    ).rejects.toThrow("MIGRATION_REPORT_PARENT_CHANGED");
+    expect(filesystem.open).toHaveBeenCalledOnce();
+    expect(directory.close).toHaveBeenCalledOnce();
+  });
+  it("rejects a parent changed during report creation and still closes both acquired descriptors", async () => {
+    const directory = {
+        stat: async () => directoryIdentity(),
+        close: vi.fn(async () => {}),
+      },
+      file = { close: vi.fn(async () => {}) };
+    filesystem.open
+      .mockResolvedValueOnce(directory)
+      .mockResolvedValueOnce(file);
+    filesystem.lstat
+      .mockResolvedValueOnce(directoryIdentity())
+      .mockResolvedValueOnce({ ...directoryIdentity(), ino: 3n });
+    await expect(
+      withMigrationResources(async (resources) => {
+        await resources.openReport("/protected/report.json");
+      }),
+    ).rejects.toThrow("MIGRATION_REPORT_PARENT_CHANGED");
     expect(directory.close).toHaveBeenCalledOnce();
     expect(file.close).toHaveBeenCalledOnce();
   });
