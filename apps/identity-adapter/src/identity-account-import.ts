@@ -9,7 +9,8 @@ import { projectLegacyProfiles, type ProfileSelectionManifest } from "./identity
 import { assertAccountImportUniqueConstraints } from "./identity-account-constraints.js";
 import { assertProfileJsonValues, legacyProfileJsonTypeSelection } from "./identity-profile-source.js";
 
-export const legacyProfileArchiveColumns = ["id","user_id","payload_json","selected_profile_id","is_present"];
+import { accountImportTables, legacyProfileArchiveColumns } from "./identity-account-import-tables.js";
+export { accountImportTables, legacyProfileArchiveColumns } from "./identity-account-import-tables.js";
 function importBind(value:unknown):ExecuteValues {
   if(value==null)return null;
   if(["string","number","bigint","boolean"].includes(typeof value)||Buffer.isBuffer(value)||value instanceof Date)return value as ExecuteValues;
@@ -17,7 +18,7 @@ function importBind(value:unknown):ExecuteValues {
   throw new Error("Unsupported account import value");
 }
 export async function appendLegacyProfileHistory(connection: Connection, rows: readonly Record<string,unknown>[], sourceDatabase: string) {
-  assertAdmissionWriter();
+  assertAdmissionWriter("sync-leaf");
   for (const row of rows) {
     const payload = typeof row.payload_json === "string" ? JSON.parse(row.payload_json) : row.payload_json;
     await connection.execute(`INSERT INTO identity_legacy_profile_history(id,payload_hash,payload_json,source_database)
@@ -26,20 +27,7 @@ export async function appendLegacyProfileHistory(connection: Connection, rows: r
   }
 }
 
-// Explicit identity-only columns. Business balances and file references never cross this boundary.
-export const accountImportTables: Readonly<Record<string, readonly string[]>> = {
-  user: ["id", "username", "auth_key", "password_hash", "password_reset_token", "verification_token", "email", "status", "nickname", "wx_openid", "email_verified_at", "created_at", "updated_at"],
-  user_info: ["id", "user_id", "info"],
-  auth_rule: ["name", "data", "created_at", "updated_at"],
-  auth_item: ["name", "type", "description", "rule_name", "data", "created_at", "updated_at"],
-  auth_item_child: ["parent", "child"],
-  auth_assignment: ["item_name", "user_id", "created_at"],
-  organization: ["id", "name", "title", "created_at", "updated_at"],
-  user_organization: ["user_id", "organization_id"],
-  wechat: ["id", "openid", "unionid", "user_id", "token", "created_at", "updated_at"],
-  invitation_record: ["id", "invite_code", "inviter_id", "invitee_id", "created_at"],
-  invitation: ["id", "code", "sender_id", "recipient_id", "used", "auth_item_name", "create_at"]
-};
+
 
 export interface AccountImportReport {
   applied: boolean;

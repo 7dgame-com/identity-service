@@ -131,6 +131,7 @@ jobs:
           apps/identity-adapter/test/identity-allocator-attacks.mysql.spec.ts
           apps/identity-adapter/test/identity-explicit-activation.mysql.spec.ts
           apps/identity-adapter/test/identity-admission.mysql.spec.ts
+          apps/identity-adapter/test/identity-migration-entry.mysql.spec.ts
           apps/identity-adapter/test/identity-accounts.mysql.spec.ts
           apps/identity-adapter/test/identity-runtime.mysql.spec.ts
           apps/identity-adapter/test/identity-http-bootstrap.mysql.spec.ts

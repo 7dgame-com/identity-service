@@ -2,7 +2,8 @@ import { assertAdmissionWriter } from "./identity-admission.js";
 import { invalidateAllocatorReady } from "./identity-allocator-state.js";
 import type { Connection, RowDataPacket } from "mysql2/promise";
 import type { ExecuteValues } from "mysql2";
-import { accountImportTables, appendLegacyProfileHistory, legacyProfileArchiveColumns } from "./identity-account-import.js";
+import { appendLegacyProfileHistory } from "./identity-account-import.js";
+import { accountImportTables, legacyProfileArchiveColumns } from "./identity-account-import-tables.js";
 import { projectLegacyProfiles, type ProfileSelectionManifest } from "./identity-profile-migration.js";
 import { assertAccountImportUniqueConstraints } from "./identity-account-constraints.js";
 import { assertProfileJsonValues, legacyProfileJsonTypeSelection } from "./identity-profile-source.js";
@@ -71,7 +72,7 @@ export async function syncIdentityAccounts(
   target: Connection,
   options: { apply?: boolean; maxChanges: number; maxRows?: number; profileSelection?: ProfileSelectionManifest },
 ): Promise<AccountSyncReport> {
-  assertAdmissionWriter();
+  assertAdmissionWriter(options.apply ? "sync-apply" : "sync-read");
   const maxRows = options.maxRows ?? 100_000;
   if (
     !Number.isSafeInteger(options.maxChanges) ||

@@ -103,7 +103,7 @@ export interface ExplicitActivationResult {
 }
 /** Private-only operation. No source DB, automatic retry, schema creation or downgrade path. */
 export async function activateExplicitIdentity(options: ExplicitActivationOptions): Promise<ExplicitActivationResult> {
-  assertAdmissionWriter();
+  assertAdmissionWriter(options.apply ? "activation-apply" : "activation-read");
   const { connection: c } = options;
   const compiledRevision = immutableIdentityRevision();
   if (!revision.test(options.expectedRevision) || options.expectedRevision !== compiledRevision) fail("ACTIVATION_REVISION_MISMATCH");

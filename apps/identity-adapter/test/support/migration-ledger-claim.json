@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "purpose": "Public non-authorizing interoperability fixture from actual MigrationLedgerFixture beginRun/claimStep; not an RPC capability",
+  "sourceTree": "driver/identity-dev-admission",
+  "sources": [
+    {
+      "path": "migration-plan.mjs",
+      "sha256": "16a863a88f0189d083a09af53b93a39132e36cfe89b4a5f8eaea2d5924567782"
+    },
+    {
+      "path": "migration-ledger.mjs",
+      "sha256": "bf77d4f3acbf7480f4cdea8e77bac6e49f5960dfe0471b0608bad3f90bcdd03d"
+    },
+    {
+      "path": "coordinator.mjs",
+      "sha256": "625829299613ca329a3275e64ed327b7ee7e5a03b93eabc3f24ca379229046c1"
+    },
+    {
+      "path": "journal.mjs",
+      "sha256": "1d9d48d8de5d09b9bc88e410350bd95930b892afab310d1e2719bacf90ecc300"
+    },
+    {
+      "path": "test-support.mjs",
+      "sha256": "53baf09cd2a820727b92ee270dadf2daa927dd233ccc228d113c7c5a5abb32e8"
+    }
+  ],
+  "claim": {
+    "version": 1,
+    "runId": "42bce940-901f-4507-8503-d882fde17a61",
+    "planSha256": "f8d26729fff4785d536d647a2c10037b092abe7e2e8009c7f8e63e5dafeee07e",
+    "epoch": 2,
+    "drainSha256": "c44819fa56b39de661852bc670991794b1f56afee9d21e87acef2f9991a481bc",
+    "compiledRevision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "imageDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "executor": {
+      "bootId": "boot_fixture_20261022",
+      "id": "migration-executor"
+    },
+    "target": {
+      "database": "xrugc_identity_dev",
+      "fenceId": 1,
+      "host": "10.206.0.5",
+      "port": 3306,
+      "principal": "identity_dev"
+    },
+    "deadline": "2026-10-21T00:00:02.500Z",
+    "stepId": "sync-apply",
+    "entry": "account-sync",
+    "entrypoint": "dist/scripts/account-sync.js",
+    "entrySha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "mode": "apply",
+    "inputs": {
+      "sourceSnapshotSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "profileSelectionSha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "limits": {
+        "maxChanges": 100,
+        "maxRows": 1000
+      },
+      "apply": true
+    },
+    "claimId": "c5955379-0ab1-4662-a460-f5c6d58f9261",
+    "inputSha256": "97cfec2e534738176820b127d68dd921e6ed7260b69c3914d2c79857f42e35e4",
+    "previousChainSha256": "17bf256d6e3713aad0a893f10f7eebcb735f4eba7e99e8097c8d280ce6c9e354"
+  },
+  "sourceRevision": "6d02a08e2cf18947f7fe45d134fb3630593022c4"
+}

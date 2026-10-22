@@ -33,7 +33,7 @@ export function migrationRowHash(row:Record<string,unknown>,columns:readonly str
   return createHash("sha256").update(JSON.stringify(values)).digest("hex");
 }
 export async function recordMigrationBaseline(connection:Transaction,table:string,columns:readonly string[],source:Record<string,unknown>|null,target:Record<string,unknown>|null):Promise<void> {
-  assertAdmissionWriter();
+  assertAdmissionWriter("sync-leaf");
   if(!source&&!target)throw new Error("A migration row is required");
   const key=migrationRowKey(table,(source??target)!);
   await connection.execute(`INSERT INTO identity_migration_rows (table_name,key_hash,key_json,columns_json,source_hash,target_hash)

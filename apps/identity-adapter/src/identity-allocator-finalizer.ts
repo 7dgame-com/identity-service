@@ -211,7 +211,7 @@ export async function finalizeAllocator(options: {
   apply?: boolean;
   onStep?: (step: AllocatorStep) => Promise<void>;
 }): Promise<AllocatorPlan> {
-  assertAdmissionWriter();
+  assertAdmissionWriter(options.apply ? "allocator-apply" : "allocator-read");
   const { source, target, fence, review } = options;
   strictReview(review);
   if (

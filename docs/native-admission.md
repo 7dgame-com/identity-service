@@ -37,7 +37,7 @@ Nest `RouterProxy` 会 await 实际 route callback；本适配器包住这个 Pr
 
 写入通过显式 `@AdmissionWriter()` 方法登记到 AsyncLocalStorage scope，不改 mysql driver、不按 SQL 文本猜写入，也不替换 Pool/release。方法的 Promise 包含原 commit/rollback/release finally；无 lease 的直接 repository 写入会在进入方法前拒绝。已登记的未 await 方法仍在 pending 集合中，收尾 seal 后只允许这些尚未结束任务的重入子操作；没有登记的迟到 timer 不能启动新 writer。一旦 unknown，不能通过 scope.run/track 登记新工作，原已登记 Promise 的事务 commit/rollback/release finally 可实际收尾，但不能借其上下文新增 typed 写入。已知 SQL 连接异常或原 quiet rollback 失败会保留 unknown。未知/遗漏的原始 SQL、外部 cron、动态 provider、自定义异步 filter/streaming 不会因此被自动证明覆盖。
 
-当前显式写边界包括账户注册/密码/邮箱/验证码、原生 session/OIDC/graph/旧凭据/ownerless signup、Native mutate/MDM transaction、Apple/WeChat OAuth、邀请、IAM shadow/materialization/operation ledger、audit/billing 和 Redis invitation command。正式 account/sync/session/provider/QR/challenge/graph/allocator/activation CLI 的写函数也前置 scope guard：启用环境里无专门已审 CLI scope 会直接拒绝。**本版本没有 CLI lease runner，不能称激活/最终同步已接入屏障。** 新 writer 必须独立审核并显式登记；此列表不是自动拓扑发现。
+当前显式写边界包括账户注册/密码/邮箱/验证码、原生 session/OIDC/graph/旧凭据/ownerless signup、Native mutate/MDM transaction、Apple/WeChat OAuth、邀请、IAM shadow/materialization/operation ledger、audit/billing 和 Redis invitation command。正式 account/sync/session/provider/QR/challenge/graph/allocator/activation CLI 的写函数也前置 scope guard：启用环境里无专门已审 CLI scope 会直接拒绝。下面的固定迁移入口已有局部实现，**仍没有完整 CLI lease runner，不能称激活/最终同步已接入屏障。** 新 writer 必须独立审核并显式登记；此列表不是自动拓扑发现。
 
 `admissionFetch` 在发行 continuation 之前登记整个异步任务，只允许配置中的固定 origin+exact path 和 coordinator `allowedChildren` 的同 generation 目标。保留原有内部认证/用户认证，删除旧伪标记，注入唯一新 child capability，拒绝重定向。Identity 当前 HTTP 外呼（provider、legacy proxy/revoke、邮件 webhook）都经过该 helper；未接真实 callee adapter 时必须拒绝或保留 unknown。SMTP 由本地 typed email method await 原 send/cancel/cleanup，不声称远端邮件系统已成为 roster participant。
 
@@ -65,3 +65,17 @@ IDENTITY_TEST_MYSQL_PASSWORD='' node node_modules/vitest/vitest.mjs run \
 ## 独立仓库测试依赖
 
 27 项真实 Nest/MySQL 准入测试始终加载 `apps/identity-adapter/test/support/admission-protocol/` 中冻结的五个正式 driver 模块；来源提交和每文件 SHA-256 记录在其 `manifest.json`。这使独立服务仓库的 CI 不再依赖超级项目目录。测试先核对所有冻结摘要；本地存在上游目录时再逐字核对，漂移即失败。上游缺席不会跳过测试，也不会换成 mock。更新流程见同目录 README；该快照只用于测试，不进入产品 runtime 接线。
+
+## 专用迁移入口的局部合同
+
+`identity-migration-entry.ts` 固定注册 `account-sync`、`allocator-highwater`、`identity-activate` 三个 compiled entry 身份，分别只接受明确的 typed invocation。没有 pathname、command、环境配置覆盖、动态 import 或外部 callback。它直接 await 现有业务 core；SQL、事务、fence 以及原 proof/deadline 校验保持原实现。普通 HTTP writable scope 不能执行这三个 core；迁移上下文也不能调用普通或装饰器 writer。allocator scope 仅额外允许固定的同步只读前置审核，不能 sync apply、直接账户导入、fresh allocator 或激活。
+
+`NativeMigrationAdmission.environment()` 默认因缺少 `IDENTITY_MIGRATION_CONFIG_FILE`/`IDENTITY_MIGRATION_KEY_FILE` 拒绝，错误为 `MIGRATION_ENTER_NOT_WIRED`。它不创建 key、不提供 server、不注册普通 HTTP active、不调用 begin/complete。配置和 key 只读取已有的 owner 私有普通文件。严格配置为 `{version:1,controlUrl,executor:{id,bootId},compiledRevision,imageDigest,target}`；URL 仅同机 `http://127.0.0.1:<port>/`，target 固定为 `10.206.0.5:3306/xrugc_identity_dev/identity_dev/fenceId=1`，revision 必须匹配不可变编译值。
+
+私控服务端接线仍缺失：未来 `migration-enter` 必须认证专用 executor/boot，核对已绑定 ledger 的当前唯一 active claim，并验证和消费不可伪造、单用的 claim capability；plain claim、HTTP lease 或自报字段都不能签发权限。本客户端要求完整 claim、请求 nonce/SHA 和严格 ACK 绑定，才创建内部 WeakMap 记录的单用 scope；claim 包含 run、claim、entry/mode、inputs、target、revision/image、plan/drain/epoch、deadline 与链摘要。请求应答丢失、畸形、超时或业务错误会永久锁存本地 unknown，仅尝试一次 best-effort unknown 通报，不能重试 enter/complete 或恢复为 verified。剩余截止时间不得超过原 3 秒窗口。
+
+typed invocation 在首个 await 前拒绝非 plain/proxy/accessor、额外 symbol/非枚举字段，同步捕获固定连接和 journal 引用、复制所有输入 Buffer。随后检查字节摘要、实际 mysql2 endpoint/socket、`DATABASE()`/`CURRENT_USER()`、固定实例 UUID `1c6c32c4-00a9-11f1-9d18-0c42a14c701e` 和固定源库。object binding 使用 canonical JSON **不含 LF**，与 driver `migrationDigest` 一致；报告工件则按实际完整字节（包括 LF）计算摘要。冻结的真实 ledger claim 互操作 fixture 记录 root 来源提交及五个源文件摘要，避免客户端和测试用同一错误算法而互相通过。
+
+source/target/fence 均先检查 autocommit，再用 `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ` 拒绝已有事务；该语句在 MySQL 既有事务中报错，不隐式 commit/rollback，不建立外层事务或 fence。连接仍必须来自受信 owner，禁止其它调用方并发复用；本入口不能单靠一个 Connection 对象证明独占生命周期。业务 core 继续做自身独立校验。allocator/activation apply 必须提供 `MigrationResources` 已持有的 journal 对象；任意结构相同对象、改写方法或 callback 均拒绝。内部固定 callbacks await journal write/file fsync/parent fsync。品牌仅证明资源 owner，**不证明 artifact 的路径、所有者/祖先信任、工件来源或运行版本**；本地 helper 的 parent 检查也不能消除 ABA/同目录项替换等竞态。
+
+返回值仅为真实 sync report、allocator plan+summary 或 activation result，不包含 `connectionsClosed`、`sideEffectsFinished` 或 ledger completed。调用方仍须持有真实连接/file owner、等待所有资源实际关闭、核对工件/镜像/运行身份，再向独立 ledger 完成步骤。source snapshot 当前仅绑定已审工件的字节摘要，**尚未证明实际数据库前后 fingerprint 与该快照一致**。可信 FD 输入桥、前后 source fingerprint 读器、不可变工件来源和完整 server/runner 都尚未接通，不能回退到重开 pathname，也不能把结果或文件存在当作全局完成证明。本地真实 MySQL 测试仅在临时 compiled fixture 树替换固定目标/实例 UUID/编译 revision；产品源码没有 fixture flag、可配置目标或测试 scope 签发器。

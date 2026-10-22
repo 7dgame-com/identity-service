@@ -400,7 +400,7 @@ export async function readPrivateAllocatorInventory(
 export async function invalidateAllocatorReady(
   c: AllocatorConnection,
 ): Promise<void> {
-  assertAdmissionWriter();
+  assertAdmissionWriter("sync-leaf");
   const [exists] = await c.query<RowDataPacket[]>(
     "SELECT 1 FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='identity_migration_allocator_state'",
   );

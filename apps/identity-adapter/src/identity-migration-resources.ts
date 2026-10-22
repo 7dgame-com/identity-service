@@ -10,6 +10,7 @@ type Resource = {
 };
 export type MigrationReportFile = Pick<FileHandle, "writeFile" | "sync">;
 const reportOwners = new WeakMap<MigrationReportFile, MigrationResources>();
+const reportMethods = new WeakMap<MigrationReportFile, MigrationReportFile>();
 
 /** mysql2 resolves end() before writing QUIT and can fulfill with an Error.
  * Capture transport state when ownership begins, before business work can destroy
@@ -185,6 +186,7 @@ export class MigrationResources {
       },
     };
     reportOwners.set(report, this);
+    reportMethods.set(report, { ...report });
     return report;
   }
   noteReportFailure(failure: MigrationReportWriteError) {
@@ -225,6 +227,15 @@ export class MigrationResources {
     if (failures.length)
       throw new MigrationResourceCloseError(failures, causes);
   }
+}
+
+/** Ownership only. This does not attest the report pathname or its ancestry. */
+export function assertOwnedMigrationReport(file: MigrationReportFile): void {
+  const methods = reportMethods.get(file);
+  const descriptors = methods ? Object.getOwnPropertyDescriptors(file) : undefined;
+  if (!reportOwners.has(file) || !methods || methods.writeFile !== descriptors?.writeFile?.value || methods.sync !== descriptors?.sync?.value)
+    throw new Error("MIGRATION_OWNED_JOURNAL_NOT_WIRED");
+  Object.freeze(file);
 }
 
 /** The returned Promise owns the business work and every resource it acquired.

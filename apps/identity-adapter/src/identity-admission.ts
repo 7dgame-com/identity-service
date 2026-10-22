@@ -10,6 +10,7 @@ import { ServiceUnavailableException } from "@nestjs/common";
 import { z } from "zod";
 import { performance } from "node:perf_hooks";
 import { ORGANIZATION_RECONCILIATION_COMPILED_BUILD_REVISION as compiledRevision } from "./generated/iam-organization-reconciliation-compiled-revision.js";
+import { assertNativeMigrationWriter, type NativeMigrationPermission } from "./identity-migration-entry.js";
 
 const identitySchema = z
   .object({
@@ -644,10 +645,13 @@ export class IdentityAdmission {
     }
   }
 }
-export function assertAdmissionWriter() {
+export function assertAdmissionWriter(permission?: NativeMigrationPermission) {
+  if (assertNativeMigrationWriter(permission)) return;
   if (!admissionEnabled()) return;
   const scope = storage.getStore()?.scope;
   if (!scope) throw unavailable("ADMISSION_WRITER_SCOPE_REQUIRED");
+  if (permission && permission !== "sync-leaf")
+    throw unavailable("ADMISSION_MIGRATION_ENTER_REQUIRED");
   scope.assertWritable();
 }
 export function assertAdmissionRequest(probe: boolean) {
@@ -668,6 +672,7 @@ export function AdmissionWriter(): MethodDecorator {
   return (_target, _name, descriptor: PropertyDescriptor) => {
     const original = descriptor.value;
     descriptor.value = function (...args: unknown[]) {
+      assertNativeMigrationWriter();
       if (!admissionEnabled()) return original.apply(this, args);
       assertAdmissionWriter();
       return storage.getStore()!.scope.track(() => original.apply(this, args));
